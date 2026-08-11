@@ -61,3 +61,33 @@
   verification reject dirty trees, derived migration/media inputs from commit
   blobs, and replaced anonymous PostgreSQL storage with labeled volumes that
   are removed and checked after each task.
+- Added a small read-only `rustodon::mastodon` compatibility library using
+  dynamic SQLx PostgreSQL queries, Tokio, Chrono, JSON, prefix-preserving
+  `inet`, and Saphyr YAML parsing. The private pool sets UTC and read-only
+  session defaults; no write or Active Record callback surface is exposed.
+- Represented IDs as signed `i64`, secrets as opaque redacted values, and
+  visibility, notification, polymorphic, integer, and permission-bit values as
+  lossless open/raw wrappers. Normal status reads exclude soft-deleted rows;
+  notification reads hide filtered rows by default while retaining parent
+  metadata when a target status has been deleted.
+- Expanded the deterministic 4.6.5 seed with the `-99` instance actor, raw user
+  JSON and array edge states, account JSONB, status edits, tag/conversation
+  joins, missing v1 relationships and policies, Rails YAML tags, a tombstone,
+  an unknown deleted status/filtered notification, and a valid deterministic
+  Active Record encrypted keypair envelope. Rails still verifies all 17 known
+  notification types separately.
+- Added an ignored Podman-backed Rust schema integration task. Its random-port
+  LOGIN role receives only `CONNECT`, `USAGE`, and `SELECT`; tests prove INSERT,
+  UPDATE, DELETE, TRUNCATE, and schema creation remain forbidden even after the
+  session read-only default is disabled.
+- Aligned Saphyr 0.0.6 with SQLx's `hashlink` dependency line and pinned the
+  compatible `indexmap` lock entry. Cargo-deny exceptions are limited to exact
+  Redox, Syn, and Windows transitive versions selected by SQLx and the existing
+  CLI stack.
+- Closed schema-review gaps by preserving nullable account and notification
+  columns, redacting OTP recovery codes, retaining arbitrary-precision JSON,
+  and distinguishing unavailable local users from service and login accounts.
+- Expanded account, OAuth, status, media, relation, and notification-activity
+  mappings needed by the first REST and federation milestones. Direct status
+  reads suppress soft-deleted rows while live parent records such as
+  notifications and quotes remain lossless when a referenced status is gone.

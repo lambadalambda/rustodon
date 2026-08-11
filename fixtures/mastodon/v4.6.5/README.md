@@ -17,6 +17,21 @@ millisecond epoch in their upper 48 bits; SQL and Rails verification decode
 every account, status, media attachment, quote, collection, collection item,
 and notification request ID and check sequence state.
 
+The fixture includes a local instance actor with signed ID `-99` and no user,
+an unavailable local user, NULL/empty/populated user arrays and raw JSON
+settings, nullable and populated account arrays, and account JSONB data. It
+covers all five known status visibilities plus a soft-deleted unknown value,
+status history, tag joins, featured tags, a direct conversation and mute, and
+the v1 relationship and domain-policy records. Deleted-status associations are
+present for every ordinary Rust read path so their exclusion is testable.
+Notification data retains the original 17 known checks and adds filtered
+unknown and NULL types, a deleted known activity, plus policy, permission,
+request, and activity-target rows.
+It also covers scalar/tagged Rails YAML without normalization, a tombstone, and
+a valid deterministic Active Record encrypted local keypair value that Rust
+treats as opaque. Existing quote, collection, collection-item, poll, remote
+public keypair, OAuth, and media records remain part of the 4.6.5 baseline.
+
 ## Test identities
 
 All domains use the reserved `.invalid` suffix. The local instance domain is
@@ -51,12 +66,14 @@ mise run fixture-generate
 mise run fixture-verify
 mise run fixture-restore-verify
 mise run fixture-repro
+mise run mastodon-schema-integration
 ```
 
 `fixture-verify` is fast and does not require Podman. The generate,
-restore/verify, and byte-for-byte reproducibility tasks are separate expensive
-Podman tasks. The generator does not load `.env` files or pass inherited
-database, domain, or secret variables into containers. Its database and
+restore/verify, byte-for-byte reproducibility, and read-only Rust integration
+tasks are separate expensive Podman tasks. The generator does not load `.env`
+files or pass inherited database, domain, or secret variables into containers.
+Its database and
 domains are constants, and `seed.sql` aborts unless connected to the dedicated
 fixture database.
 
@@ -74,6 +91,14 @@ and `verify.sql` enforce `rustodon_mastodon_v4_6_5_fixture`. Do not manually pip
 `database.sql` into an operator database; the supported restore command is the
 guarded fixture task above. Redis is not started because direct Paperclip
 processing and all verified Rails reads complete without it.
+
+`mastodon-schema-integration` restores the checked dump into an isolated
+container published on a random `127.0.0.1` port. It creates a non-owner LOGIN
+role with only database `CONNECT`, public-schema `USAGE`, and table `SELECT`;
+the role has no sequence, DML, truncation, or schema-creation privileges and
+defaults to read-only transactions. The ignored Rust test deliberately turns
+that session default off and confirms PostgreSQL privileges still reject every
+mutation before checking that fixture rows are unchanged.
 
 The only four narrow normalizations address known nondeterminism and terminal
 dump formatting: Mastodon's schema loader creates `timestamp_id()` with a random

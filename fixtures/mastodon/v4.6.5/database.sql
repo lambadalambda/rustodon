@@ -4855,6 +4855,7 @@ COPY public.account_aliases (id, account_id, acct, created_at, updated_at, uri) 
 --
 
 COPY public.account_conversations (id, account_id, conversation_id, last_status_id, lock_version, participant_account_ids, status_ids, unread) FROM stdin;
+9302	116844606259201001	9301	116844853985285004	0	{116844606259202001}	{116844853985285004,116846257766400501}	t
 \.
 
 
@@ -4871,6 +4872,7 @@ COPY public.account_deletion_requests (id, account_id, created_at, updated_at) F
 --
 
 COPY public.account_domain_blocks (id, account_id, created_at, domain, updated_at) FROM stdin;
+9504	116844606259201001	2026-07-01 15:07:00	account-blocked.fixture.invalid	2026-07-01 15:07:00
 \.
 
 
@@ -4925,6 +4927,8 @@ COPY public.account_stats (id, account_id, created_at, followers_count, followin
 11003	116844606259201003	2026-07-01 18:10:00	0	0	\N	0	2026-07-01 18:10:00
 11004	116844606259202001	2026-07-01 18:10:00	1	1	2026-07-01 00:00:00	7	2026-07-01 18:10:00
 11005	116844606259202002	2026-07-01 18:10:00	0	0	\N	0	2026-07-01 18:10:00
+11006	-99	2026-07-01 18:10:00	0	0	\N	0	2026-07-01 18:10:00
+11007	116844606259202003	2026-07-01 18:10:00	0	0	\N	0	2026-07-01 18:10:00
 \.
 
 
@@ -4960,9 +4964,11 @@ COPY public.account_warnings (id, account_id, action, created_at, overruled_at, 
 COPY public.accounts (id, actor_type, also_known_as, attribution_domains, avatar_content_type, avatar_description, avatar_file_name, avatar_file_size, avatar_remote_url, avatar_storage_schema_version, avatar_updated_at, collections_url, created_at, discoverable, display_name, domain, feature_approval_policy, featured_collection_url, fields, followers_url, following_url, header_content_type, header_description, header_file_name, header_file_size, header_remote_url, header_storage_schema_version, header_updated_at, hide_collections, id_scheme, inbox_url, indexable, last_webfingered_at, locked, memorial, moved_to_account_id, note, outbox_url, private_key, protocol, public_key, requested_review_at, reviewed_at, sensitized_at, shared_inbox_url, show_featured, show_media, show_media_replies, silenced_at, suspended_at, suspension_origin, trendable, updated_at, uri, url, username) FROM stdin;
 116844606259201002	Person	\N	{}	\N		\N	\N	\N	\N	\N	\N	2026-07-01 12:00:00	f	Moderator Fixture	\N	0	\N	\N			\N		\N	\N		\N	\N	\N	1		f	\N	f	f	\N	Local moderator fixture		-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAqIAYvNFGbZ5g4iiK6feSdXD4bDStFM58A7tHycYXaYtzZQpI\neHXAmaXuZzXIwtrP4N0gIk8JNwZvXj2UPS+S07t0V9wNK94he01LV5EMz/GN4eNn\nFmDL64HIEuKLvV8TvgjbUPRD6Y5X0UpKi2ZIFLSb96Q5w0Z/k7ntpVKV52y8kz5F\njr/O/0JuHryZe0yItzJh8kzFfeMf0EXzfSnaKvT7P9jhgC6uTre+jXyvVZjiHDrn\nqvvucdI3I7DRfXo1OqARBrLjy+TdseUAjNYJ+OuPRI1URIWQI01DCHqcohVu9+Ar\n+BiCjFp3ua+XMuJvrvbD61d1Fvig/9nbBRR+8QIDAQABAoIBAAgySHnFWI6gItR3\nfkfiqIm80cHCN3Xk1C6iiVu+3oBOZbHpW9R7vl9e/WOA/9O+LPjiSsQOegtWnVvd\nRRjrl7Hj20VDlZKv5Mssm6zOGAxksrcVbqwdj+fUJaNJCL0AyyseH0x/IE9T8rDC\nI1GH+3tB3JkhkIN/qjipdX5ab8MswEPu8IC4ViTpdBgWYY/xBcAHPw4xuL0tcwzh\nFBlf4DqoEVQo8GdK5GAJ2Ny0S4xbXHUURzx/R4y4CCts7niAiLGqd9jmLU1kUTMk\nQcXfQYK6l+unLc7wDYAz7sFEHh04M48VjWwiIZJnlCqmQbLda7uhhu8zkF1DqZTu\nulWDGQECgYEA0TIAc8BQBVab979DHEEmMdgqBwxLY3OIAk0b+r50h7VBGWCDPRsC\nSTD73fQY3lNet/7/jgSGwwAlAJ5PpMXxXiZAE3bUwPmHzgF7pvIOOLhA8O07tHSO\nL2mvQe6NPzjZ+6iAO2U9PkClxcvGvPx2OBvisfHqZLmxC9PIVxzruQECgYEAzjM6\nBTUXa6T/qHvLFbN699BXsUOGmHBGaLRapFDBfVvgZrwqYQcZpBBhesLdGTGSqwE7\ngWsITPIJ+Ldo+38oGYyVys+w/V67q6ud7hgSDTW3hSvm+GboCjk6gzxlt9hQ0t9X\n8vfDOYhEXvVUJNv3mYO60ENqQhILO4bQ0zi+VfECgYBb/nUccfG+pzunU0Cb6Dp3\nqOuydcGhVmj1OhuXxLFSDG84Tazo7juvHA9mp7VX76mzmDuhpHPuxN2AzB2SBEoE\ncSW0aYld413JRfWukLuYTc6hJHIhBTCRwRQFFnae2s1hUdQySm8INT2xIc+fxBXo\nzrp+Ljg5Wz90SAnN5TX0AQKBgDaatDOq0o/r+tPYLHiLtfWoE4Dau+rkWJDjqdk3\nlXWn/e3WyHY3Vh/vQpEqxzgju45TXjmwaVtPATr+/usSykCxzP0PMPR3wMT+Rm1F\nrIoY/odij+CaB7qlWwxj0x/zRbwB7x1lZSp4HnrzBpxYL+JUUwVRxPLIKndSBTza\nGvVRAoGBAIVBcNcRQYF4fvZjDKAb4fdBsEuHmycqtRCsnkGOz6ebbEQznSaZ0tZE\n+JuouZaGjyp8uPjNGD5D7mIGbyoZ3KyG4mTXNxDAGBso1hrNDKGBOrGaPhZx8LgO\n4VXJ+ybXrATf4jr8ccZYsZdFpOphPzz+j55Mqg5vac5P1XjmsGTb\n-----END RSA PRIVATE KEY-----\n	0	-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqIAYvNFGbZ5g4iiK6feS\ndXD4bDStFM58A7tHycYXaYtzZQpIeHXAmaXuZzXIwtrP4N0gIk8JNwZvXj2UPS+S\n07t0V9wNK94he01LV5EMz/GN4eNnFmDL64HIEuKLvV8TvgjbUPRD6Y5X0UpKi2ZI\nFLSb96Q5w0Z/k7ntpVKV52y8kz5Fjr/O/0JuHryZe0yItzJh8kzFfeMf0EXzfSna\nKvT7P9jhgC6uTre+jXyvVZjiHDrnqvvucdI3I7DRfXo1OqARBrLjy+TdseUAjNYJ\n+OuPRI1URIWQI01DCHqcohVu9+Ar+BiCjFp3ua+XMuJvrvbD61d1Fvig/9nbBRR+\n8QIDAQAB\n-----END PUBLIC KEY-----\n	\N	\N	\N		t	t	t	\N	\N	\N	\N	2026-07-01 12:00:00		https://fixture-v4-6-5.rustodon.invalid/@moderator	moderator
 116844606259201003	Person	\N	{}	\N		\N	\N	\N	\N	\N	\N	2026-07-01 12:00:00	t	New User Fixture	\N	0	\N	\N			\N		\N	\N		\N	\N	\N	1		t	\N	f	f	\N	Local sign-up notification actor		-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAqIAYvNFGbZ5g4iiK6feSdXD4bDStFM58A7tHycYXaYtzZQpI\neHXAmaXuZzXIwtrP4N0gIk8JNwZvXj2UPS+S07t0V9wNK94he01LV5EMz/GN4eNn\nFmDL64HIEuKLvV8TvgjbUPRD6Y5X0UpKi2ZIFLSb96Q5w0Z/k7ntpVKV52y8kz5F\njr/O/0JuHryZe0yItzJh8kzFfeMf0EXzfSnaKvT7P9jhgC6uTre+jXyvVZjiHDrn\nqvvucdI3I7DRfXo1OqARBrLjy+TdseUAjNYJ+OuPRI1URIWQI01DCHqcohVu9+Ar\n+BiCjFp3ua+XMuJvrvbD61d1Fvig/9nbBRR+8QIDAQABAoIBAAgySHnFWI6gItR3\nfkfiqIm80cHCN3Xk1C6iiVu+3oBOZbHpW9R7vl9e/WOA/9O+LPjiSsQOegtWnVvd\nRRjrl7Hj20VDlZKv5Mssm6zOGAxksrcVbqwdj+fUJaNJCL0AyyseH0x/IE9T8rDC\nI1GH+3tB3JkhkIN/qjipdX5ab8MswEPu8IC4ViTpdBgWYY/xBcAHPw4xuL0tcwzh\nFBlf4DqoEVQo8GdK5GAJ2Ny0S4xbXHUURzx/R4y4CCts7niAiLGqd9jmLU1kUTMk\nQcXfQYK6l+unLc7wDYAz7sFEHh04M48VjWwiIZJnlCqmQbLda7uhhu8zkF1DqZTu\nulWDGQECgYEA0TIAc8BQBVab979DHEEmMdgqBwxLY3OIAk0b+r50h7VBGWCDPRsC\nSTD73fQY3lNet/7/jgSGwwAlAJ5PpMXxXiZAE3bUwPmHzgF7pvIOOLhA8O07tHSO\nL2mvQe6NPzjZ+6iAO2U9PkClxcvGvPx2OBvisfHqZLmxC9PIVxzruQECgYEAzjM6\nBTUXa6T/qHvLFbN699BXsUOGmHBGaLRapFDBfVvgZrwqYQcZpBBhesLdGTGSqwE7\ngWsITPIJ+Ldo+38oGYyVys+w/V67q6ud7hgSDTW3hSvm+GboCjk6gzxlt9hQ0t9X\n8vfDOYhEXvVUJNv3mYO60ENqQhILO4bQ0zi+VfECgYBb/nUccfG+pzunU0Cb6Dp3\nqOuydcGhVmj1OhuXxLFSDG84Tazo7juvHA9mp7VX76mzmDuhpHPuxN2AzB2SBEoE\ncSW0aYld413JRfWukLuYTc6hJHIhBTCRwRQFFnae2s1hUdQySm8INT2xIc+fxBXo\nzrp+Ljg5Wz90SAnN5TX0AQKBgDaatDOq0o/r+tPYLHiLtfWoE4Dau+rkWJDjqdk3\nlXWn/e3WyHY3Vh/vQpEqxzgju45TXjmwaVtPATr+/usSykCxzP0PMPR3wMT+Rm1F\nrIoY/odij+CaB7qlWwxj0x/zRbwB7x1lZSp4HnrzBpxYL+JUUwVRxPLIKndSBTza\nGvVRAoGBAIVBcNcRQYF4fvZjDKAb4fdBsEuHmycqtRCsnkGOz6ebbEQznSaZ0tZE\n+JuouZaGjyp8uPjNGD5D7mIGbyoZ3KyG4mTXNxDAGBso1hrNDKGBOrGaPhZx8LgO\n4VXJ+ybXrATf4jr8ccZYsZdFpOphPzz+j55Mqg5vac5P1XjmsGTb\n-----END RSA PRIVATE KEY-----\n	0	-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqIAYvNFGbZ5g4iiK6feS\ndXD4bDStFM58A7tHycYXaYtzZQpIeHXAmaXuZzXIwtrP4N0gIk8JNwZvXj2UPS+S\n07t0V9wNK94he01LV5EMz/GN4eNnFmDL64HIEuKLvV8TvgjbUPRD6Y5X0UpKi2ZI\nFLSb96Q5w0Z/k7ntpVKV52y8kz5Fjr/O/0JuHryZe0yItzJh8kzFfeMf0EXzfSna\nKvT7P9jhgC6uTre+jXyvVZjiHDrnqvvucdI3I7DRfXo1OqARBrLjy+TdseUAjNYJ\n+OuPRI1URIWQI01DCHqcohVu9+Ar+BiCjFp3ua+XMuJvrvbD61d1Fvig/9nbBRR+\n8QIDAQAB\n-----END PUBLIC KEY-----\n	\N	\N	\N		t	t	t	\N	\N	\N	\N	2026-07-01 12:00:00		https://fixture-v4-6-5.rustodon.invalid/@newbie	newbie
-116844606259202001	Person	\N	{}	\N		\N	\N	\N	\N	\N	https://remote.fixture.invalid/users/bob/collections	2026-07-01 12:00:00	t	Bob Remote	remote.fixture.invalid	0	https://remote.fixture.invalid/users/bob/collections/featured	\N	https://remote.fixture.invalid/users/bob/followers	https://remote.fixture.invalid/users/bob/following	\N		\N	\N		\N	\N	\N	1	https://remote.fixture.invalid/users/bob/inbox	t	\N	f	f	\N	Primary remote fixture actor	https://remote.fixture.invalid/users/bob/outbox	\N	0	-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqIAYvNFGbZ5g4iiK6feS\ndXD4bDStFM58A7tHycYXaYtzZQpIeHXAmaXuZzXIwtrP4N0gIk8JNwZvXj2UPS+S\n07t0V9wNK94he01LV5EMz/GN4eNnFmDL64HIEuKLvV8TvgjbUPRD6Y5X0UpKi2ZI\nFLSb96Q5w0Z/k7ntpVKV52y8kz5Fjr/O/0JuHryZe0yItzJh8kzFfeMf0EXzfSna\nKvT7P9jhgC6uTre+jXyvVZjiHDrnqvvucdI3I7DRfXo1OqARBrLjy+TdseUAjNYJ\n+OuPRI1URIWQI01DCHqcohVu9+Ar+BiCjFp3ua+XMuJvrvbD61d1Fvig/9nbBRR+\n8QIDAQAB\n-----END PUBLIC KEY-----\n	\N	\N	\N	https://remote.fixture.invalid/inbox	t	t	t	\N	\N	\N	\N	2026-07-01 12:00:00	https://remote.fixture.invalid/users/bob	https://remote.fixture.invalid/@bob	bob
 116844606259202002	Person	\N	{}	\N		\N	\N	\N	\N	\N	\N	2026-07-01 12:00:00	t	Carol Remote	remote.fixture.invalid	0	\N	\N	https://remote.fixture.invalid/users/carol/followers	https://remote.fixture.invalid/users/carol/following	\N		\N	\N		\N	\N	\N	1	https://remote.fixture.invalid/users/carol/inbox	t	\N	f	f	\N	Remote pending follower	https://remote.fixture.invalid/users/carol/outbox	\N	0	-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqIAYvNFGbZ5g4iiK6feS\ndXD4bDStFM58A7tHycYXaYtzZQpIeHXAmaXuZzXIwtrP4N0gIk8JNwZvXj2UPS+S\n07t0V9wNK94he01LV5EMz/GN4eNnFmDL64HIEuKLvV8TvgjbUPRD6Y5X0UpKi2ZI\nFLSb96Q5w0Z/k7ntpVKV52y8kz5Fjr/O/0JuHryZe0yItzJh8kzFfeMf0EXzfSna\nKvT7P9jhgC6uTre+jXyvVZjiHDrnqvvucdI3I7DRfXo1OqARBrLjy+TdseUAjNYJ\n+OuPRI1URIWQI01DCHqcohVu9+Ar+BiCjFp3ua+XMuJvrvbD61d1Fvig/9nbBRR+\n8QIDAQAB\n-----END PUBLIC KEY-----\n	\N	\N	\N	https://remote.fixture.invalid/inbox	t	t	t	\N	\N	\N	\N	2026-07-01 12:00:00	https://remote.fixture.invalid/users/carol	https://remote.fixture.invalid/@carol	carol
-116844606259201001	Person	\N	{}	image/png	Deterministic Mastodon test avatar	0112603425bb49c1.png	329555	\N	1	2026-07-01 12:00:00	\N	2026-07-01 12:00:00	t	Alice Fixture	\N	0	\N	\N			\N		\N	\N		\N	\N	\N	1		t	\N	t	f	\N	Primary local fixture account		-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAqIAYvNFGbZ5g4iiK6feSdXD4bDStFM58A7tHycYXaYtzZQpI\neHXAmaXuZzXIwtrP4N0gIk8JNwZvXj2UPS+S07t0V9wNK94he01LV5EMz/GN4eNn\nFmDL64HIEuKLvV8TvgjbUPRD6Y5X0UpKi2ZIFLSb96Q5w0Z/k7ntpVKV52y8kz5F\njr/O/0JuHryZe0yItzJh8kzFfeMf0EXzfSnaKvT7P9jhgC6uTre+jXyvVZjiHDrn\nqvvucdI3I7DRfXo1OqARBrLjy+TdseUAjNYJ+OuPRI1URIWQI01DCHqcohVu9+Ar\n+BiCjFp3ua+XMuJvrvbD61d1Fvig/9nbBRR+8QIDAQABAoIBAAgySHnFWI6gItR3\nfkfiqIm80cHCN3Xk1C6iiVu+3oBOZbHpW9R7vl9e/WOA/9O+LPjiSsQOegtWnVvd\nRRjrl7Hj20VDlZKv5Mssm6zOGAxksrcVbqwdj+fUJaNJCL0AyyseH0x/IE9T8rDC\nI1GH+3tB3JkhkIN/qjipdX5ab8MswEPu8IC4ViTpdBgWYY/xBcAHPw4xuL0tcwzh\nFBlf4DqoEVQo8GdK5GAJ2Ny0S4xbXHUURzx/R4y4CCts7niAiLGqd9jmLU1kUTMk\nQcXfQYK6l+unLc7wDYAz7sFEHh04M48VjWwiIZJnlCqmQbLda7uhhu8zkF1DqZTu\nulWDGQECgYEA0TIAc8BQBVab979DHEEmMdgqBwxLY3OIAk0b+r50h7VBGWCDPRsC\nSTD73fQY3lNet/7/jgSGwwAlAJ5PpMXxXiZAE3bUwPmHzgF7pvIOOLhA8O07tHSO\nL2mvQe6NPzjZ+6iAO2U9PkClxcvGvPx2OBvisfHqZLmxC9PIVxzruQECgYEAzjM6\nBTUXa6T/qHvLFbN699BXsUOGmHBGaLRapFDBfVvgZrwqYQcZpBBhesLdGTGSqwE7\ngWsITPIJ+Ldo+38oGYyVys+w/V67q6ud7hgSDTW3hSvm+GboCjk6gzxlt9hQ0t9X\n8vfDOYhEXvVUJNv3mYO60ENqQhILO4bQ0zi+VfECgYBb/nUccfG+pzunU0Cb6Dp3\nqOuydcGhVmj1OhuXxLFSDG84Tazo7juvHA9mp7VX76mzmDuhpHPuxN2AzB2SBEoE\ncSW0aYld413JRfWukLuYTc6hJHIhBTCRwRQFFnae2s1hUdQySm8INT2xIc+fxBXo\nzrp+Ljg5Wz90SAnN5TX0AQKBgDaatDOq0o/r+tPYLHiLtfWoE4Dau+rkWJDjqdk3\nlXWn/e3WyHY3Vh/vQpEqxzgju45TXjmwaVtPATr+/usSykCxzP0PMPR3wMT+Rm1F\nrIoY/odij+CaB7qlWwxj0x/zRbwB7x1lZSp4HnrzBpxYL+JUUwVRxPLIKndSBTza\nGvVRAoGBAIVBcNcRQYF4fvZjDKAb4fdBsEuHmycqtRCsnkGOz6ebbEQznSaZ0tZE\n+JuouZaGjyp8uPjNGD5D7mIGbyoZ3KyG4mTXNxDAGBso1hrNDKGBOrGaPhZx8LgO\n4VXJ+ybXrATf4jr8ccZYsZdFpOphPzz+j55Mqg5vac5P1XjmsGTb\n-----END RSA PRIVATE KEY-----\n	0	-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqIAYvNFGbZ5g4iiK6feS\ndXD4bDStFM58A7tHycYXaYtzZQpIeHXAmaXuZzXIwtrP4N0gIk8JNwZvXj2UPS+S\n07t0V9wNK94he01LV5EMz/GN4eNnFmDL64HIEuKLvV8TvgjbUPRD6Y5X0UpKi2ZI\nFLSb96Q5w0Z/k7ntpVKV52y8kz5Fjr/O/0JuHryZe0yItzJh8kzFfeMf0EXzfSna\nKvT7P9jhgC6uTre+jXyvVZjiHDrnqvvucdI3I7DRfXo1OqARBrLjy+TdseUAjNYJ\n+OuPRI1URIWQI01DCHqcohVu9+Ar+BiCjFp3ua+XMuJvrvbD61d1Fvig/9nbBRR+\n8QIDAQAB\n-----END PUBLIC KEY-----\n	\N	\N	\N		t	t	t	\N	\N	\N	\N	2026-07-01 12:00:00		https://fixture-v4-6-5.rustodon.invalid/@alice	alice
+116844606259202001	Person	{https://alias.remote.fixture.invalid/users/bob}	{media.remote.fixture.invalid}	\N		\N	\N	\N	\N	\N	https://remote.fixture.invalid/users/bob/collections	2026-07-01 12:00:00	t	Bob Remote	remote.fixture.invalid	0	https://remote.fixture.invalid/users/bob/collections/featured	[{"name": "Fixture field", "value": "Exact JSONB value", "verified_at": null}]	https://remote.fixture.invalid/users/bob/followers	https://remote.fixture.invalid/users/bob/following	\N		\N	\N		\N	\N	\N	1	https://remote.fixture.invalid/users/bob/inbox	t	\N	f	f	\N	Primary remote fixture actor	https://remote.fixture.invalid/users/bob/outbox	\N	0	-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqIAYvNFGbZ5g4iiK6feS\ndXD4bDStFM58A7tHycYXaYtzZQpIeHXAmaXuZzXIwtrP4N0gIk8JNwZvXj2UPS+S\n07t0V9wNK94he01LV5EMz/GN4eNnFmDL64HIEuKLvV8TvgjbUPRD6Y5X0UpKi2ZI\nFLSb96Q5w0Z/k7ntpVKV52y8kz5Fjr/O/0JuHryZe0yItzJh8kzFfeMf0EXzfSna\nKvT7P9jhgC6uTre+jXyvVZjiHDrnqvvucdI3I7DRfXo1OqARBrLjy+TdseUAjNYJ\n+OuPRI1URIWQI01DCHqcohVu9+Ar+BiCjFp3ua+XMuJvrvbD61d1Fvig/9nbBRR+\n8QIDAQAB\n-----END PUBLIC KEY-----\n	\N	\N	\N	https://remote.fixture.invalid/inbox	t	t	t	\N	\N	\N	\N	2026-07-01 12:00:00	https://remote.fixture.invalid/users/bob	https://remote.fixture.invalid/@bob	bob
+-99	Application	\N	\N	\N		\N	\N	\N	\N	\N	\N	2026-07-01 12:00:00	f	Fixture Instance Actor	\N	0	\N	\N	https://fixture-v4-6-5.rustodon.invalid/actor/followers	https://fixture-v4-6-5.rustodon.invalid/actor/following	\N		\N	\N		\N	\N	\N	1	https://fixture-v4-6-5.rustodon.invalid/actor/inbox	f	\N	f	f	\N	Local service actor without a login-capable user	https://fixture-v4-6-5.rustodon.invalid/actor/outbox	\N	0		\N	\N	\N	https://fixture-v4-6-5.rustodon.invalid/inbox	t	t	t	\N	\N	\N	\N	2026-07-01 12:00:00	https://fixture-v4-6-5.rustodon.invalid/actor	https://fixture-v4-6-5.rustodon.invalid/actor	fixture-v4-6-5.rustodon.invalid
+116844606259201001	Person	\N	{}	image/png	Deterministic Mastodon test avatar	0112603425bb49c1.png	329555	\N	1	2026-07-01 12:00:00	\N	2026-07-01 12:00:00	t	Alice Fixture	\N	0	\N	\N			\N		\N	\N		\N	\N	\N	0		t	\N	t	f	\N	Primary local fixture account		-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAqIAYvNFGbZ5g4iiK6feSdXD4bDStFM58A7tHycYXaYtzZQpI\neHXAmaXuZzXIwtrP4N0gIk8JNwZvXj2UPS+S07t0V9wNK94he01LV5EMz/GN4eNn\nFmDL64HIEuKLvV8TvgjbUPRD6Y5X0UpKi2ZIFLSb96Q5w0Z/k7ntpVKV52y8kz5F\njr/O/0JuHryZe0yItzJh8kzFfeMf0EXzfSnaKvT7P9jhgC6uTre+jXyvVZjiHDrn\nqvvucdI3I7DRfXo1OqARBrLjy+TdseUAjNYJ+OuPRI1URIWQI01DCHqcohVu9+Ar\n+BiCjFp3ua+XMuJvrvbD61d1Fvig/9nbBRR+8QIDAQABAoIBAAgySHnFWI6gItR3\nfkfiqIm80cHCN3Xk1C6iiVu+3oBOZbHpW9R7vl9e/WOA/9O+LPjiSsQOegtWnVvd\nRRjrl7Hj20VDlZKv5Mssm6zOGAxksrcVbqwdj+fUJaNJCL0AyyseH0x/IE9T8rDC\nI1GH+3tB3JkhkIN/qjipdX5ab8MswEPu8IC4ViTpdBgWYY/xBcAHPw4xuL0tcwzh\nFBlf4DqoEVQo8GdK5GAJ2Ny0S4xbXHUURzx/R4y4CCts7niAiLGqd9jmLU1kUTMk\nQcXfQYK6l+unLc7wDYAz7sFEHh04M48VjWwiIZJnlCqmQbLda7uhhu8zkF1DqZTu\nulWDGQECgYEA0TIAc8BQBVab979DHEEmMdgqBwxLY3OIAk0b+r50h7VBGWCDPRsC\nSTD73fQY3lNet/7/jgSGwwAlAJ5PpMXxXiZAE3bUwPmHzgF7pvIOOLhA8O07tHSO\nL2mvQe6NPzjZ+6iAO2U9PkClxcvGvPx2OBvisfHqZLmxC9PIVxzruQECgYEAzjM6\nBTUXa6T/qHvLFbN699BXsUOGmHBGaLRapFDBfVvgZrwqYQcZpBBhesLdGTGSqwE7\ngWsITPIJ+Ldo+38oGYyVys+w/V67q6ud7hgSDTW3hSvm+GboCjk6gzxlt9hQ0t9X\n8vfDOYhEXvVUJNv3mYO60ENqQhILO4bQ0zi+VfECgYBb/nUccfG+pzunU0Cb6Dp3\nqOuydcGhVmj1OhuXxLFSDG84Tazo7juvHA9mp7VX76mzmDuhpHPuxN2AzB2SBEoE\ncSW0aYld413JRfWukLuYTc6hJHIhBTCRwRQFFnae2s1hUdQySm8INT2xIc+fxBXo\nzrp+Ljg5Wz90SAnN5TX0AQKBgDaatDOq0o/r+tPYLHiLtfWoE4Dau+rkWJDjqdk3\nlXWn/e3WyHY3Vh/vQpEqxzgju45TXjmwaVtPATr+/usSykCxzP0PMPR3wMT+Rm1F\nrIoY/odij+CaB7qlWwxj0x/zRbwB7x1lZSp4HnrzBpxYL+JUUwVRxPLIKndSBTza\nGvVRAoGBAIVBcNcRQYF4fvZjDKAb4fdBsEuHmycqtRCsnkGOz6ebbEQznSaZ0tZE\n+JuouZaGjyp8uPjNGD5D7mIGbyoZ3KyG4mTXNxDAGBso1hrNDKGBOrGaPhZx8LgO\n4VXJ+ybXrATf4jr8ccZYsZdFpOphPzz+j55Mqg5vac5P1XjmsGTb\n-----END RSA PRIVATE KEY-----\n	0	-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqIAYvNFGbZ5g4iiK6feS\ndXD4bDStFM58A7tHycYXaYtzZQpIeHXAmaXuZzXIwtrP4N0gIk8JNwZvXj2UPS+S\n07t0V9wNK94he01LV5EMz/GN4eNnFmDL64HIEuKLvV8TvgjbUPRD6Y5X0UpKi2ZI\nFLSb96Q5w0Z/k7ntpVKV52y8kz5Fjr/O/0JuHryZe0yItzJh8kzFfeMf0EXzfSna\nKvT7P9jhgC6uTre+jXyvVZjiHDrnqvvucdI3I7DRfXo1OqARBrLjy+TdseUAjNYJ\n+OuPRI1URIWQI01DCHqcohVu9+Ar+BiCjFp3ua+XMuJvrvbD61d1Fvig/9nbBRR+\n8QIDAQAB\n-----END PUBLIC KEY-----\n	\N	\N	\N		t	t	t	\N	\N	\N	\N	2026-07-01 12:00:00		https://fixture-v4-6-5.rustodon.invalid/@alice	alice
+116844606259202003	Person	\N	{}	\N		\N	\N	\N	\N	\N	\N	2026-07-01 12:00:00	\N	Suspended Remote Fixture	remote.fixture.invalid	0	\N	\N	https://remote.fixture.invalid/users/suspended/followers	https://remote.fixture.invalid/users/suspended/following	\N		\N	\N		\N	\N	\N	1	https://remote.fixture.invalid/users/suspended/inbox	f	\N	f	f	\N	Suspended sender exclusion coverage	https://remote.fixture.invalid/users/suspended/outbox	\N	1	-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqIAYvNFGbZ5g4iiK6feS\ndXD4bDStFM58A7tHycYXaYtzZQpIeHXAmaXuZzXIwtrP4N0gIk8JNwZvXj2UPS+S\n07t0V9wNK94he01LV5EMz/GN4eNnFmDL64HIEuKLvV8TvgjbUPRD6Y5X0UpKi2ZI\nFLSb96Q5w0Z/k7ntpVKV52y8kz5Fjr/O/0JuHryZe0yItzJh8kzFfeMf0EXzfSna\nKvT7P9jhgC6uTre+jXyvVZjiHDrnqvvucdI3I7DRfXo1OqARBrLjy+TdseUAjNYJ\n+OuPRI1URIWQI01DCHqcohVu9+Ar+BiCjFp3ua+XMuJvrvbD61d1Fvig/9nbBRR+\n8QIDAQAB\n-----END PUBLIC KEY-----\n	\N	\N	\N	https://remote.fixture.invalid/inbox	t	t	t	\N	2026-07-01 18:30:00	\N	\N	2026-07-01 18:30:00	https://remote.fixture.invalid/users/suspended	https://remote.fixture.invalid/@suspended	suspended
 \.
 
 
@@ -4971,6 +4977,7 @@ COPY public.accounts (id, actor_type, also_known_as, attribution_domains, avatar
 --
 
 COPY public.accounts_tags (account_id, tag_id) FROM stdin;
+116844606259201001	9201
 \.
 
 
@@ -5045,6 +5052,7 @@ COPY public.backups (id, created_at, dump_content_type, dump_file_name, dump_fil
 --
 
 COPY public.blocks (id, account_id, created_at, target_account_id, updated_at, uri) FROM stdin;
+9502	116844606259201001	2026-07-01 15:05:00	116844606259202002	2026-07-01 15:05:00	https://fixture-v4-6-5.rustodon.invalid/users/alice#blocks/9502
 \.
 
 
@@ -5053,6 +5061,8 @@ COPY public.blocks (id, account_id, created_at, target_account_id, updated_at, u
 --
 
 COPY public.bookmarks (id, account_id, created_at, status_id, updated_at) FROM stdin;
+9501	116844606259201001	2026-07-01 15:04:00	116845078118405101	2026-07-01 15:04:00
+9507	116844606259201001	2026-07-01 19:10:00	116846257766400501	2026-07-01 19:10:00
 \.
 
 
@@ -5111,6 +5121,7 @@ COPY public.collections (id, account_id, created_at, description, description_ht
 --
 
 COPY public.conversation_mutes (id, account_id, conversation_id) FROM stdin;
+9303	116844606259201001	9301
 \.
 
 
@@ -5119,6 +5130,7 @@ COPY public.conversation_mutes (id, account_id, conversation_id) FROM stdin;
 --
 
 COPY public.conversations (id, created_at, parent_account_id, parent_status_id, updated_at, uri) FROM stdin;
+9301	2026-07-01 13:03:00	116844606259201001	116844853985285004	2026-07-01 13:03:00	https://fixture-v4-6-5.rustodon.invalid/conversations/9301
 \.
 
 
@@ -5153,6 +5165,7 @@ COPY public.custom_filter_keywords (id, created_at, custom_filter_id, keyword, u
 
 COPY public.custom_filter_statuses (id, created_at, custom_filter_id, status_id, updated_at) FROM stdin;
 9103	2026-07-01 12:22:00	9101	116845105643525105	2026-07-01 12:22:00
+9104	2026-07-01 19:10:00	9101	116846257766400501	2026-07-01 19:10:00
 \.
 
 
@@ -5170,6 +5183,7 @@ COPY public.custom_filters (id, account_id, action, context, created_at, expires
 --
 
 COPY public.domain_allows (id, created_at, domain, updated_at) FROM stdin;
+9601	2026-07-01 15:10:00	allowed.fixture.invalid	2026-07-01 15:10:00
 \.
 
 
@@ -5178,6 +5192,7 @@ COPY public.domain_allows (id, created_at, domain, updated_at) FROM stdin;
 --
 
 COPY public.domain_blocks (id, created_at, domain, obfuscate, private_comment, public_comment, reject_media, reject_reports, severity, updated_at) FROM stdin;
+9602	2026-07-01 15:11:00	blocked.fixture.invalid	t	Raw private moderation note		t	f	99	2026-07-01 15:11:00
 \.
 
 
@@ -5243,6 +5258,7 @@ COPY public.fasp_subscriptions (id, category, created_at, fasp_provider_id, max_
 
 COPY public.favourites (id, account_id, created_at, status_id, updated_at) FROM stdin;
 8101	116844606259202001	2026-07-01 15:03:00	116844842188805001	2026-07-01 15:03:00
+8102	116844606259202001	2026-07-01 19:10:00	116846257766400501	2026-07-01 19:10:00
 \.
 
 
@@ -5251,6 +5267,7 @@ COPY public.favourites (id, account_id, created_at, status_id, updated_at) FROM 
 --
 
 COPY public.featured_tags (id, account_id, created_at, last_status_at, name, statuses_count, tag_id, updated_at) FROM stdin;
+9202	116844606259201001	2026-07-01 13:00:00	2026-07-01 13:00:00	fixturetag	1	9201	2026-07-01 13:00:00
 \.
 
 
@@ -5336,6 +5353,7 @@ COPY public.ip_blocks (id, comment, created_at, expires_at, ip, severity, update
 
 COPY public.keypairs (id, account_id, created_at, expires_at, private_key, public_key, revoked, type, updated_at, uri) FROM stdin;
 8901	116844606259202001	2026-07-01 16:10:00	\N	\N	-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqIAYvNFGbZ5g4iiK6feS\ndXD4bDStFM58A7tHycYXaYtzZQpIeHXAmaXuZzXIwtrP4N0gIk8JNwZvXj2UPS+S\n07t0V9wNK94he01LV5EMz/GN4eNnFmDL64HIEuKLvV8TvgjbUPRD6Y5X0UpKi2ZI\nFLSb96Q5w0Z/k7ntpVKV52y8kz5Fjr/O/0JuHryZe0yItzJh8kzFfeMf0EXzfSna\nKvT7P9jhgC6uTre+jXyvVZjiHDrnqvvucdI3I7DRfXo1OqARBrLjy+TdseUAjNYJ\n+OuPRI1URIWQI01DCHqcohVu9+Ar+BiCjFp3ua+XMuJvrvbD61d1Fvig/9nbBRR+\n8QIDAQAB\n-----END PUBLIC KEY-----\n	f	0	2026-07-01 16:10:00	https://remote.fixture.invalid/users/bob#secondary-key
+8902	116844606259201001	2026-07-01 16:11:00	\N	{"p":"9q4gHslWnbK8a5zNjL1ySdpX5I8wunpM6ed7whTvAnwlyUs=","h":{"iv":"jvVW4mOA+IzCBTv/","at":"Wd+qB8DnQnN2bRo/7ukJmQ=="}}	opaque-public-key-material	f	0	2026-07-01 16:11:00	https://fixture-v4-6-5.rustodon.invalid/users/alice#opaque-key
 \.
 
 
@@ -5380,6 +5398,17 @@ COPY public.markers (id, created_at, last_read_id, lock_version, timeline, updat
 --
 
 COPY public.media_attachments (id, account_id, blurhash, created_at, description, file_content_type, file_file_name, file_file_size, file_meta, file_storage_schema_version, file_updated_at, processing, remote_url, scheduled_status_id, shortcode, status_id, thumbnail_content_type, thumbnail_file_name, thumbnail_file_size, thumbnail_remote_url, thumbnail_storage_schema_version, thumbnail_updated_at, type, updated_at) FROM stdin;
+-101	116844606259201001	\N	2026-07-01 13:00:00	First ordered attachment	\N	\N	\N	\N	\N	\N	2	https://media.fixture.invalid/first.jpg	\N	\N	116844842188805001	\N	\N	\N	\N	\N	\N	0	2026-07-01 13:00:00
+-102	116844606259201001	\N	2026-07-01 13:00:00	Third ordered attachment	\N	\N	\N	\N	\N	\N	2	https://media.fixture.invalid/third.jpg	\N	\N	116844842188805001	\N	\N	\N	\N	\N	\N	0	2026-07-01 13:00:00
+-103	116844606259201001	\N	2026-07-01 13:00:00	Fourth ordered attachment	\N	\N	\N	\N	\N	\N	2	https://media.fixture.invalid/fourth.jpg	\N	\N	116844842188805001	\N	\N	\N	\N	\N	\N	0	2026-07-01 13:00:00
+-104	116844606259201001	\N	2026-07-01 13:00:00	Over-limit ordered attachment	\N	\N	\N	\N	\N	\N	2	https://media.fixture.invalid/fifth.jpg	\N	\N	116844842188805001	\N	\N	\N	\N	\N	\N	0	2026-07-01 13:00:00
+-105	116844606259201001	\N	2026-07-01 13:00:00	Stale unordered attachment	\N	\N	\N	\N	\N	\N	2	https://media.fixture.invalid/stale.jpg	\N	\N	116844842188805001	\N	\N	\N	\N	\N	\N	0	2026-07-01 13:00:00
+-210	116844606259201001	\N	2026-07-01 13:01:00	NULL-order fallback first	\N	\N	\N	\N	\N	\N	2	https://media.fixture.invalid/fallback-first.jpg	\N	\N	116844846120965002	\N	\N	\N	\N	\N	\N	0	2026-07-01 13:01:00
+-209	116844606259201001	\N	2026-07-01 13:01:00	NULL-order fallback second	\N	\N	\N	\N	\N	\N	2	https://media.fixture.invalid/fallback-second.jpg	\N	\N	116844846120965002	\N	\N	\N	\N	\N	\N	0	2026-07-01 13:01:00
+-208	116844606259201001	\N	2026-07-01 13:01:00	NULL-order fallback third	\N	\N	\N	\N	\N	\N	2	https://media.fixture.invalid/fallback-third.jpg	\N	\N	116844846120965002	\N	\N	\N	\N	\N	\N	0	2026-07-01 13:01:00
+-207	116844606259201001	\N	2026-07-01 13:01:00	NULL-order fallback fourth	\N	\N	\N	\N	\N	\N	2	https://media.fixture.invalid/fallback-fourth.jpg	\N	\N	116844846120965002	\N	\N	\N	\N	\N	\N	0	2026-07-01 13:01:00
+-206	116844606259201001	\N	2026-07-01 13:01:00	NULL-order fallback over limit	\N	\N	\N	\N	\N	\N	2	https://media.fixture.invalid/fallback-fifth.jpg	\N	\N	116844846120965002	\N	\N	\N	\N	\N	\N	0	2026-07-01 13:01:00
+-98	116844606259201001	\N	2026-07-01 19:10:00	Deleted status media must not be returned	\N	\N	\N	\N	\N	\N	2		\N	\N	116846257766400501	\N	\N	\N	\N	\N	\N	0	2026-07-01 19:10:00
 116844842188806001	116844606259201001	UDKw:zyZ.9xs?KKQocn#0;-;%1i^Rk-.IVIU	2026-07-01 13:00:00	Deterministic Mastodon test attachment	image/jpeg	cd63911ad76f4d5d.jpg	36381	{"original":{"width":600,"height":400,"size":"600x400","aspect":1.5},"small":{"width":588,"height":392,"size":"588x392","aspect":1.5}}	1	2026-07-01 13:00:00	2		\N	\N	116844842188805001	\N	\N	\N	\N	\N	\N	0	2026-07-01 13:00:00
 \.
 
@@ -5391,6 +5420,7 @@ COPY public.media_attachments (id, account_id, blurhash, created_at, description
 COPY public.mentions (id, account_id, created_at, silent, status_id, updated_at) FROM stdin;
 7001	116844606259201001	2026-07-01 14:00:00	f	116845078118405101	2026-07-01 14:00:00
 7002	116844606259202001	2026-07-01 13:03:00	f	116844853985285004	2026-07-01 13:03:00
+7003	116844606259202001	2026-07-01 19:10:00	f	116846257766400501	2026-07-01 19:10:00
 \.
 
 
@@ -5399,6 +5429,7 @@ COPY public.mentions (id, account_id, created_at, silent, status_id, updated_at)
 --
 
 COPY public.mutes (id, account_id, created_at, expires_at, hide_notifications, target_account_id, updated_at) FROM stdin;
+9503	116844606259201001	2026-07-01 15:06:00	2026-08-01 00:00:00	f	116844606259202001	2026-07-01 15:06:00
 \.
 
 
@@ -5407,6 +5438,7 @@ COPY public.mutes (id, account_id, created_at, expires_at, hide_notifications, t
 --
 
 COPY public.notification_permissions (id, account_id, created_at, from_account_id, updated_at) FROM stdin;
+9702	116844606259201001	2026-07-01 15:13:00	116844606259202001	2026-07-01 15:13:00
 \.
 
 
@@ -5415,6 +5447,7 @@ COPY public.notification_permissions (id, account_id, created_at, from_account_i
 --
 
 COPY public.notification_policies (id, account_id, created_at, for_bots, for_limited_accounts, for_new_accounts, for_not_followers, for_not_following, for_private_mentions, updated_at) FROM stdin;
+9701	116844606259201001	2026-07-01 15:12:00	0	1	2	0	99	1	2026-07-01 15:12:00
 \.
 
 
@@ -5423,6 +5456,9 @@ COPY public.notification_policies (id, account_id, created_at, for_bots, for_lim
 --
 
 COPY public.notification_requests (id, account_id, created_at, from_account_id, last_status_id, notifications_count, updated_at) FROM stdin;
+116846261698560601	116844606259201001	2026-07-01 19:01:00	116844606259202001	116845078118405101	1	2026-07-01 19:01:00
+-96	116844606259201001	2026-07-01 19:02:00	116844606259202002	116846257766400501	1	2026-07-01 19:02:00
+-95	116844606259201001	2026-07-01 19:03:00	116844606259202003	116844842188805001	1	2026-07-01 19:03:00
 \.
 
 
@@ -5448,6 +5484,10 @@ COPY public.notifications (id, account_id, activity_id, activity_type, created_a
 10015	116844606259201001	116845314048005201	Status	2026-07-01 18:00:15	f	116844606259202001	\N	quoted_update	2026-07-01 18:00:15
 10016	116844606259201001	116845549977608802	CollectionItem	2026-07-01 18:00:16	f	116844606259202001	\N	added_to_collection	2026-07-01 18:00:16
 10017	116844606259201001	116845549977608801	Collection	2026-07-01 18:00:17	f	116844606259202001	\N	collection_update	2026-07-01 18:00:17
+10018	116844606259201001	116846257766400501	FutureActivity	2026-07-01 18:00:18	t	116844606259202001	\N	future_event	2026-07-01 18:00:18
+10019	116844606259201001	116846257766400501	FutureActivity	2026-07-01 18:00:19	t	116844606259202001	\N	\N	2026-07-01 18:00:19
+10020	116844606259201001	116846257766400501	Status	2026-07-01 18:00:20	t	116844606259202001	\N	future_deleted_status	2026-07-01 18:00:20
+10021	116844606259201001	116844606259202003	FutureActivity	2026-07-01 18:00:21	t	116844606259202003	\N	future_suspended	2026-07-01 18:00:21
 \.
 
 
@@ -5491,6 +5531,7 @@ COPY public.pghero_space_stats (id, captured_at, database, relation, schema, siz
 
 COPY public.poll_votes (id, account_id, choice, created_at, poll_id, updated_at, uri) FROM stdin;
 8202	116844606259201001	0	2024-01-01 13:00:00	8201	2024-01-01 13:00:00	https://fixture-v4-6-5.rustodon.invalid/users/alice#votes/8202
+8204	116844606259201001	0	2026-07-01 19:10:00	8203	2026-07-01 19:10:00	\N
 \.
 
 
@@ -5500,6 +5541,7 @@ COPY public.poll_votes (id, account_id, choice, created_at, poll_id, updated_at,
 
 COPY public.polls (id, account_id, cached_tallies, created_at, expires_at, hide_totals, last_fetched_at, lock_version, multiple, options, status_id, updated_at, voters_count, votes_count) FROM stdin;
 8201	116844606259202001	{1,0}	2024-01-01 12:00:00	2024-01-02 12:00:00	f	2024-01-02 12:00:00	0	f	{Tea,Coffee}	111680579174405102	2024-01-02 12:00:00	1	1
+8203	116844606259201001	{1}	2026-07-01 19:00:00	2026-07-01 20:00:00	f	\N	0	f	{Deleted}	116846257766400501	2026-07-01 19:30:00	1	1
 \.
 
 
@@ -5542,6 +5584,8 @@ COPY public.preview_cards_statuses (preview_card_id, status_id, url) FROM stdin;
 COPY public.quotes (id, account_id, activity_uri, approval_uri, created_at, legacy, quoted_account_id, quoted_status_id, state, status_id, updated_at) FROM stdin;
 116845317980168701	116844606259202001	https://remote.fixture.invalid/activities/quote-116845317980168701	\N	2026-07-01 15:01:00	f	116844606259201001	116844842188805001	1	116845317980165202	2026-07-01 15:01:00
 116845314048008702	116844606259201001	https://fixture-v4-6-5.rustodon.invalid/users/alice/quote_requests/116845314048008702	https://remote.fixture.invalid/activities/accept-116845314048008702	2026-07-01 15:00:00	f	116844606259202001	116845093847045103	1	116845314048005201	2026-07-01 15:00:00
+-97	116844606259201001	\N	\N	2026-07-01 19:10:00	f	116844606259201001	116844842188805001	0	116846257766400501	2026-07-01 19:10:00
+-94	116844606259201001	\N	\N	2026-07-01 19:20:00	f	116844606259201001	116846257766400501	4	116844846120965002	2026-07-01 19:20:00
 \.
 
 
@@ -6212,6 +6256,8 @@ COPY public.session_activations (id, access_token_id, created_at, ip, session_id
 --
 
 COPY public.settings (id, created_at, updated_at, value, var) FROM stdin;
+9801	2026-07-01 15:14:00	2026-07-01 15:14:00	--- true\n	fixture_scalar
+9802	2026-07-01 15:15:00	2026-07-01 15:15:00	--- !ruby/hash:ActiveSupport::HashWithIndifferentAccess\nfixture: value\n	fixture_tagged
 \.
 
 
@@ -6245,6 +6291,9 @@ COPY public.software_updates (id, created_at, release_notes, type, updated_at, u
 --
 
 COPY public.status_edits (id, account_id, created_at, media_descriptions, ordered_media_attachment_ids, poll_options, quote_id, sensitive, spoiler_text, status_id, text, updated_at) FROM stdin;
+9401	116844606259202001	2026-07-01 14:07:30	{}	{}	\N	\N	f		116845105643525105	Edited remote status before the current revision	2026-07-01 14:07:30
+9402	116844606259201001	2026-07-01 19:15:00	\N	\N	\N	\N	f		116846257766400501	Deleted status edit must not be returned	2026-07-01 19:15:00
+9403	116844606259201001	2026-07-01 13:00:30	{NULL,"Deterministic Mastodon test attachment"}	{-101,116844842188806001}	\N	\N	f		116844842188805001	Public status snapshot with a nullable media description	2026-07-01 13:00:30
 \.
 
 
@@ -6253,6 +6302,8 @@ COPY public.status_edits (id, account_id, created_at, media_descriptions, ordere
 --
 
 COPY public.status_pins (id, account_id, created_at, status_id, updated_at) FROM stdin;
+9505	116844606259201001	2026-07-01 15:03:00	116844842188805001	2026-07-01 15:03:00
+9508	116844606259201001	2026-07-01 19:10:00	116846257766400501	2026-07-01 19:10:00
 \.
 
 
@@ -6261,10 +6312,8 @@ COPY public.status_pins (id, account_id, created_at, status_id, updated_at) FROM
 --
 
 COPY public.status_stats (id, created_at, favourites_count, quotes_count, reblogs_count, replies_count, status_id, untrusted_favourites_count, untrusted_reblogs_count, updated_at) FROM stdin;
-12001	2026-07-01 18:11:00	1	1	1	0	116844842188805001	\N	\N	2026-07-01 18:11:00
 12002	2026-07-01 18:11:00	0	0	0	0	116844846120965002	\N	\N	2026-07-01 18:11:00
 12003	2026-07-01 18:11:00	0	0	0	0	116844850053125003	\N	\N	2026-07-01 18:11:00
-12004	2026-07-01 18:11:00	0	0	0	0	116844853985285004	\N	\N	2026-07-01 18:11:00
 12005	2026-07-01 18:11:00	0	0	0	0	116844857917445005	\N	\N	2026-07-01 18:11:00
 12006	2026-07-01 18:11:00	0	0	0	0	116845078118405101	\N	\N	2026-07-01 18:11:00
 12008	2026-07-01 18:11:00	0	1	0	0	116845093847045103	\N	\N	2026-07-01 18:11:00
@@ -6273,7 +6322,10 @@ COPY public.status_stats (id, created_at, favourites_count, quotes_count, reblog
 12011	2026-07-01 18:11:00	0	0	0	0	116845314048005201	\N	\N	2026-07-01 18:11:00
 12012	2026-07-01 18:11:00	0	0	0	0	116845317980165202	\N	\N	2026-07-01 18:11:00
 12013	2026-07-01 18:11:00	0	0	0	0	116845321912325301	\N	\N	2026-07-01 18:11:00
+12001	2026-07-01 18:11:00	1	1	1	0	116844842188805001	\N	\N	2026-07-01 18:11:00
+12004	2026-07-01 18:11:00	0	0	0	0	116844853985285004	\N	\N	2026-07-01 18:11:00
 12007	2026-07-01 18:11:00	0	0	0	0	111680579174405102	\N	\N	2026-07-01 18:11:00
+12014	2026-07-01 18:11:00	0	0	0	0	116846257766400501	\N	\N	2026-07-01 18:11:00
 \.
 
 
@@ -6290,10 +6342,8 @@ COPY public.status_trends (id, account_id, allowed, language, rank, score, statu
 --
 
 COPY public.statuses (id, account_id, application_id, conversation_id, created_at, deleted_at, edited_at, fetched_replies_at, in_reply_to_account_id, in_reply_to_id, language, local, ordered_media_attachment_ids, poll_id, quote_approval_policy, reblog_of_id, reply, sensitive, spoiler_text, text, trendable, updated_at, uri, url, visibility) FROM stdin;
-116844842188805001	116844606259201001	\N	\N	2026-07-01 13:00:00	\N	\N	\N	\N	\N	en	t	{116844842188806001}	\N	0	\N	f	f		Public fixture status with local media	\N	2026-07-01 13:00:00	\N	\N	0
 116844846120965002	116844606259201001	\N	\N	2026-07-01 13:01:00	\N	\N	\N	\N	\N	en	t	\N	\N	0	\N	f	f		Unlisted fixture status	\N	2026-07-01 13:01:00	\N	\N	1
 116844850053125003	116844606259201001	\N	\N	2026-07-01 13:02:00	\N	\N	\N	\N	\N	en	t	\N	\N	0	\N	f	f		Followers-only fixture status	\N	2026-07-01 13:02:00	\N	\N	2
-116844853985285004	116844606259201001	\N	\N	2026-07-01 13:03:00	\N	\N	\N	\N	\N	en	t	\N	\N	0	\N	f	f		Direct fixture status for Bob	\N	2026-07-01 13:03:00	\N	\N	3
 116844857917445005	116844606259201001	\N	\N	2026-07-01 13:04:00	\N	\N	\N	\N	\N	en	t	\N	\N	0	\N	f	f		Limited fixture status	\N	2026-07-01 13:04:00	\N	\N	4
 116845078118405101	116844606259202001	\N	\N	2026-07-01 14:00:00	\N	\N	\N	\N	\N	en	f	\N	\N	0	\N	f	f		Remote mention of @alice	\N	2026-07-01 14:00:00	https://remote.fixture.invalid/users/bob/statuses/116845078118405101	https://remote.fixture.invalid/@bob/116845078118405101	0
 116845093847045103	116844606259202001	\N	\N	2026-07-01 14:04:00	\N	2026-07-01 14:05:00	\N	\N	\N	en	f	\N	\N	0	\N	f	f		Remote status quoted by Alice	\N	2026-07-01 14:05:00	https://remote.fixture.invalid/users/bob/statuses/116845093847045103	https://remote.fixture.invalid/@bob/116845093847045103	0
@@ -6302,7 +6352,10 @@ COPY public.statuses (id, account_id, application_id, conversation_id, created_a
 116845314048005201	116844606259201001	\N	\N	2026-07-01 15:00:00	\N	\N	\N	\N	\N	en	t	\N	\N	0	\N	f	f		Alice quotes Bob for quoted-update coverage	\N	2026-07-01 15:00:00	\N	\N	0
 116845317980165202	116844606259202001	\N	\N	2026-07-01 15:01:00	\N	\N	\N	\N	\N	en	f	\N	\N	0	\N	f	f		Bob quotes Alice for quote coverage	\N	2026-07-01 15:01:00	https://remote.fixture.invalid/users/bob/statuses/116845317980165202	https://remote.fixture.invalid/@bob/116845317980165202	0
 116845321912325301	116844606259202001	\N	\N	2026-07-01 15:02:00	\N	\N	\N	\N	\N	\N	f	\N	\N	0	116844842188805001	f	f			\N	2026-07-01 15:02:00	https://remote.fixture.invalid/users/bob/statuses/116845321912325301/activity	https://remote.fixture.invalid/@bob/116845321912325301	0
+116844842188805001	116844606259201001	301	\N	2026-07-01 13:00:00	\N	\N	\N	\N	\N	en	t	{-101,116844842188806001,-102,-103,-104}	\N	2	\N	f	f		Public fixture status with local media	\N	2026-07-01 13:00:00	\N	\N	0
+116844853985285004	116844606259201001	\N	9301	2026-07-01 13:03:00	\N	\N	\N	116844606259202001	116845078118405101	en	t	\N	\N	0	\N	t	f		Direct fixture status for Bob	\N	2026-07-01 13:03:00	\N	\N	3
 111680579174405102	116844606259202001	\N	\N	2024-01-01 12:00:00	\N	\N	\N	\N	\N	en	f	\N	8201	0	\N	f	f		Historical fixture poll	\N	2024-01-02 12:00:00	https://remote.fixture.invalid/users/bob/statuses/111680579174405102	https://remote.fixture.invalid/@bob/111680579174405102	0
+116846257766400501	116844606259201001	\N	\N	2026-07-01 19:00:00	2026-07-01 19:30:00	\N	\N	\N	\N	en	t	{}	8203	0	\N	f	f		Soft-deleted unknown visibility fixture status	\N	2026-07-01 19:30:00	\N	\N	99
 \.
 
 
@@ -6311,6 +6364,8 @@ COPY public.statuses (id, account_id, application_id, conversation_id, created_a
 --
 
 COPY public.statuses_tags (status_id, tag_id) FROM stdin;
+116844842188805001	9201
+116846257766400501	9201
 \.
 
 
@@ -6343,6 +6398,7 @@ COPY public.tagged_objects (id, ap_type, created_at, object_id, object_type, sta
 --
 
 COPY public.tags (id, created_at, display_name, last_status_at, listable, max_score, max_score_at, name, requested_review_at, reviewed_at, trendable, updated_at, usable) FROM stdin;
+9201	2026-07-01 13:00:00	FixtureTag	2026-07-01 13:00:00	t	\N	\N	fixturetag	\N	\N	f	2026-07-01 13:00:00	t
 \.
 
 
@@ -6359,6 +6415,7 @@ COPY public.terms_of_services (id, changelog, created_at, effective_date, notifi
 --
 
 COPY public.tombstones (id, account_id, by_moderator, created_at, updated_at, uri) FROM stdin;
+9901	116844606259202001	t	2026-07-01 16:12:00	2026-07-01 16:12:00	https://remote.fixture.invalid/users/bob/statuses/deleted-fixture
 \.
 
 
@@ -6383,9 +6440,9 @@ COPY public.user_invite_requests (id, created_at, text, updated_at, user_id) FRO
 --
 
 COPY public.user_roles (id, collection_limit, color, created_at, highlighted, name, permissions, "position", require_2fa, updated_at) FROM stdin;
--99	10		2026-07-01 12:00:00	f		65536	-1	f	2026-07-01 12:00:00
-91	10		2026-07-01 12:00:00	f	Fixture user	0	0	f	2026-07-01 12:00:00
-92	10	1d9bf0	2026-07-01 12:00:00	t	Fixture moderator	1049616	10	f	2026-07-01 12:00:00
+-99	10		2026-07-01 12:00:00	f		1152921504606912512	-1	f	2026-07-01 12:00:00
+91	10		2026-07-01 12:00:00	f	Fixture user	0	0	t	2026-07-01 12:00:00
+92	10	1d9bf0	2026-07-01 12:00:00	t	Fixture moderator	1049616	10	t	2026-07-01 12:00:00
 \.
 
 
@@ -6402,9 +6459,9 @@ COPY public.username_blocks (id, allow_with_approval, created_at, exact, normali
 --
 
 COPY public.users (id, account_id, age_verified_at, approved, chosen_languages, confirmation_sent_at, confirmation_token, confirmed_at, consumed_timestep, created_at, created_by_application_id, current_sign_in_at, disabled, email, encrypted_password, invite_id, last_emailed_at, last_sign_in_at, locale, otp_backup_codes, otp_required_for_login, otp_secret, require_tos_interstitial, reset_password_sent_at, reset_password_token, role_id, settings, sign_in_count, sign_in_token, sign_in_token_sent_at, sign_up_ip, skip_sign_in_token, time_zone, unconfirmed_email, updated_at, webauthn_id) FROM stdin;
-101	116844606259201001	\N	t	{en}	\N	\N	2026-07-01 12:00:00	\N	2026-07-01 12:00:00	\N	\N	f	alice@fixture.invalid	$2a$04$eYtbMaSJeYOgS7ENqTs6vezGAQVltj68iGTiHiIsdst5LyirUp5JC	\N	\N	\N	en	\N	f	\N	f	\N	\N	91	\N	0	\N	\N	192.0.2.10	\N	\N	\N	2026-07-01 12:00:00	\N
-102	116844606259201002	\N	t	{en}	\N	\N	2026-07-01 12:00:00	\N	2026-07-01 12:00:00	\N	\N	f	moderator@fixture.invalid	$2a$04$eYtbMaSJeYOgS7ENqTs6vezGAQVltj68iGTiHiIsdst5LyirUp5JC	\N	\N	\N	en	\N	f	\N	f	\N	\N	92	\N	0	\N	\N	192.0.2.11	\N	\N	\N	2026-07-01 12:00:00	\N
-103	116844606259201003	\N	t	{en}	\N	\N	2026-07-01 12:00:00	\N	2026-07-01 12:00:00	\N	\N	f	newbie@fixture.invalid	$2a$04$eYtbMaSJeYOgS7ENqTs6vezGAQVltj68iGTiHiIsdst5LyirUp5JC	\N	\N	\N	en	\N	f	\N	f	\N	\N	91	\N	0	\N	\N	192.0.2.12	\N	\N	\N	2026-07-01 12:00:00	\N
+102	116844606259201002	\N	t	{}	\N	\N	2026-07-01 12:00:00	\N	2026-07-01 12:00:00	\N	\N	f	moderator@fixture.invalid	$2a$04$eYtbMaSJeYOgS7ENqTs6vezGAQVltj68iGTiHiIsdst5LyirUp5JC	\N	\N	\N	en	{}	f	\N	f	\N	\N	92	\N	0	\N	\N	192.0.2.11	\N	\N	\N	2026-07-01 12:00:00	\N
+103	116844606259201003	\N	t	{en,fr}	\N	\N	2026-07-01 12:00:00	\N	2026-07-01 12:00:00	\N	\N	t	newbie@fixture.invalid	$2a$04$eYtbMaSJeYOgS7ENqTs6vezGAQVltj68iGTiHiIsdst5LyirUp5JC	\N	\N	\N	en	\N	f	\N	f	\N	\N	91		0	\N	\N	192.0.2.12	\N	\N	\N	2026-07-01 12:00:00	\N
+101	116844606259201001	\N	t	{en}	\N	\N	2026-07-01 12:00:00	\N	2026-07-01 12:00:00	\N	\N	f	alice@fixture.invalid	$2a$04$eYtbMaSJeYOgS7ENqTs6vezGAQVltj68iGTiHiIsdst5LyirUp5JC	\N	\N	\N	en	{fixture-recovery-code}	f	\N	f	\N	\N	91	{"default_privacy":"private","nested":{"number":9007199254740993}}	0	\N	\N	192.0.2.0/24	\N	\N	\N	2026-07-01 12:00:00	fixture-alice-webauthn-id
 \.
 
 
@@ -6429,6 +6486,7 @@ COPY public.web_settings (id, created_at, data, updated_at, user_id) FROM stdin;
 --
 
 COPY public.webauthn_credentials (id, created_at, external_id, nickname, public_key, sign_count, updated_at, user_id) FROM stdin;
+1	2026-07-01 12:00:00	fixture-alice-webauthn-credential	Fixture security key	fixture-public-credential-key	0	2026-07-01 12:00:00	101
 \.
 
 
@@ -6451,7 +6509,7 @@ SELECT pg_catalog.setval('public.account_aliases_id_seq', 1, false);
 -- Name: account_conversations_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.account_conversations_id_seq', 1, false);
+SELECT pg_catalog.setval('public.account_conversations_id_seq', 9302, true);
 
 
 --
@@ -6465,7 +6523,7 @@ SELECT pg_catalog.setval('public.account_deletion_requests_id_seq', 1, false);
 -- Name: account_domain_blocks_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.account_domain_blocks_id_seq', 1, false);
+SELECT pg_catalog.setval('public.account_domain_blocks_id_seq', 9504, true);
 
 
 --
@@ -6507,7 +6565,7 @@ SELECT pg_catalog.setval('public.account_relationship_severance_events_id_seq', 
 -- Name: account_stats_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.account_stats_id_seq', 11005, true);
+SELECT pg_catalog.setval('public.account_stats_id_seq', 11007, true);
 
 
 --
@@ -6535,7 +6593,7 @@ SELECT pg_catalog.setval('public.account_warnings_id_seq', 8401, true);
 -- Name: accounts_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.accounts_id_seq', 5, true);
+SELECT pg_catalog.setval('public.accounts_id_seq', 6, true);
 
 
 --
@@ -6591,14 +6649,14 @@ SELECT pg_catalog.setval('public.backups_id_seq', 1, false);
 -- Name: blocks_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.blocks_id_seq', 1, false);
+SELECT pg_catalog.setval('public.blocks_id_seq', 9502, true);
 
 
 --
 -- Name: bookmarks_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.bookmarks_id_seq', 1, false);
+SELECT pg_catalog.setval('public.bookmarks_id_seq', 9507, true);
 
 
 --
@@ -6647,14 +6705,14 @@ SELECT pg_catalog.setval('public.collections_id_seq', 1, true);
 -- Name: conversation_mutes_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.conversation_mutes_id_seq', 1, false);
+SELECT pg_catalog.setval('public.conversation_mutes_id_seq', 9303, true);
 
 
 --
 -- Name: conversations_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.conversations_id_seq', 1, false);
+SELECT pg_catalog.setval('public.conversations_id_seq', 9301, true);
 
 
 --
@@ -6682,7 +6740,7 @@ SELECT pg_catalog.setval('public.custom_filter_keywords_id_seq', 9102, true);
 -- Name: custom_filter_statuses_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.custom_filter_statuses_id_seq', 9103, true);
+SELECT pg_catalog.setval('public.custom_filter_statuses_id_seq', 9104, true);
 
 
 --
@@ -6696,14 +6754,14 @@ SELECT pg_catalog.setval('public.custom_filters_id_seq', 9101, true);
 -- Name: domain_allows_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.domain_allows_id_seq', 1, false);
+SELECT pg_catalog.setval('public.domain_allows_id_seq', 9601, true);
 
 
 --
 -- Name: domain_blocks_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.domain_blocks_id_seq', 1, false);
+SELECT pg_catalog.setval('public.domain_blocks_id_seq', 9602, true);
 
 
 --
@@ -6759,14 +6817,14 @@ SELECT pg_catalog.setval('public.fasp_subscriptions_id_seq', 1, false);
 -- Name: favourites_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.favourites_id_seq', 8101, true);
+SELECT pg_catalog.setval('public.favourites_id_seq', 8102, true);
 
 
 --
 -- Name: featured_tags_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.featured_tags_id_seq', 1, false);
+SELECT pg_catalog.setval('public.featured_tags_id_seq', 9202, true);
 
 
 --
@@ -6836,7 +6894,7 @@ SELECT pg_catalog.setval('public.ip_blocks_id_seq', 1, false);
 -- Name: keypairs_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.keypairs_id_seq', 8901, true);
+SELECT pg_catalog.setval('public.keypairs_id_seq', 8902, true);
 
 
 --
@@ -6878,42 +6936,42 @@ SELECT pg_catalog.setval('public.media_attachments_id_seq', 1, true);
 -- Name: mentions_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.mentions_id_seq', 7002, true);
+SELECT pg_catalog.setval('public.mentions_id_seq', 7003, true);
 
 
 --
 -- Name: mutes_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.mutes_id_seq', 1, false);
+SELECT pg_catalog.setval('public.mutes_id_seq', 9503, true);
 
 
 --
 -- Name: notification_permissions_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.notification_permissions_id_seq', 1, false);
+SELECT pg_catalog.setval('public.notification_permissions_id_seq', 9702, true);
 
 
 --
 -- Name: notification_policies_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.notification_policies_id_seq', 1, false);
+SELECT pg_catalog.setval('public.notification_policies_id_seq', 9701, true);
 
 
 --
 -- Name: notification_requests_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.notification_requests_id_seq', 1, false);
+SELECT pg_catalog.setval('public.notification_requests_id_seq', 1, true);
 
 
 --
 -- Name: notifications_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.notifications_id_seq', 10017, true);
+SELECT pg_catalog.setval('public.notifications_id_seq', 10021, true);
 
 
 --
@@ -6948,14 +7006,14 @@ SELECT pg_catalog.setval('public.pghero_space_stats_id_seq', 1, false);
 -- Name: poll_votes_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.poll_votes_id_seq', 8202, true);
+SELECT pg_catalog.setval('public.poll_votes_id_seq', 8204, true);
 
 
 --
 -- Name: polls_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.polls_id_seq', 8201, true);
+SELECT pg_catalog.setval('public.polls_id_seq', 8203, true);
 
 
 --
@@ -7046,7 +7104,7 @@ SELECT pg_catalog.setval('public.session_activations_id_seq', 1, false);
 -- Name: settings_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.settings_id_seq', 1, false);
+SELECT pg_catalog.setval('public.settings_id_seq', 9802, true);
 
 
 --
@@ -7074,21 +7132,21 @@ SELECT pg_catalog.setval('public.software_updates_id_seq', 1, false);
 -- Name: status_edits_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.status_edits_id_seq', 1, false);
+SELECT pg_catalog.setval('public.status_edits_id_seq', 9403, true);
 
 
 --
 -- Name: status_pins_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.status_pins_id_seq', 1, false);
+SELECT pg_catalog.setval('public.status_pins_id_seq', 9508, true);
 
 
 --
 -- Name: status_stats_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.status_stats_id_seq', 12013, true);
+SELECT pg_catalog.setval('public.status_stats_id_seq', 12014, true);
 
 
 --
@@ -7102,7 +7160,7 @@ SELECT pg_catalog.setval('public.status_trends_id_seq', 1, false);
 -- Name: statuses_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.statuses_id_seq', 13, true);
+SELECT pg_catalog.setval('public.statuses_id_seq', 14, true);
 
 
 --
@@ -7130,7 +7188,7 @@ SELECT pg_catalog.setval('public.tagged_objects_id_seq', 1, false);
 -- Name: tags_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.tags_id_seq', 1, false);
+SELECT pg_catalog.setval('public.tags_id_seq', 9201, true);
 
 
 --
@@ -7144,7 +7202,7 @@ SELECT pg_catalog.setval('public.terms_of_services_id_seq', 1, false);
 -- Name: tombstones_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.tombstones_id_seq', 1, false);
+SELECT pg_catalog.setval('public.tombstones_id_seq', 9901, true);
 
 
 --
@@ -7200,7 +7258,7 @@ SELECT pg_catalog.setval('public.web_settings_id_seq', 1, false);
 -- Name: webauthn_credentials_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.webauthn_credentials_id_seq', 1, false);
+SELECT pg_catalog.setval('public.webauthn_credentials_id_seq', 1, true);
 
 
 --

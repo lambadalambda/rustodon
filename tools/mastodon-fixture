@@ -16,6 +16,8 @@ POSTGRES_IMAGE="docker.io/library/postgres@$POSTGRES_MANIFEST_DIGEST"
 DATABASE_NAME='rustodon_mastodon_v4_6_5_fixture'
 DATABASE_USER='rustodon_fixture'
 DATABASE_PASSWORD='fixture-only-password-v4-6-5'
+DATABASE_READER='rustodon_reader'
+DATABASE_READER_PASSWORD='fixture-reader-password-v4-6-5'
 LOCAL_DOMAIN='fixture-v4-6-5.rustodon.invalid'
 REMOTE_DOMAIN='remote.fixture.invalid'
 MIGRATION_COUNT='588'
@@ -94,6 +96,7 @@ verify_images() {
 }
 
 start_database() {
+  publish=${1:-false}
   need_command podman
   NETWORK="rustodon-fixture-v4-6-5-network-$$"
   PG_CONTAINER="rustodon-fixture-v4-6-5-postgres-$$"
@@ -105,12 +108,20 @@ start_database() {
     --label 'io.rustodon.fixture=mastodon-v4.6.5' \
     --label "io.rustodon.fixture.session=$$" \
     "$PG_VOLUME" >/dev/null
+  publish_arguments=''
+  if [ "$publish" = 'publish' ]; then
+    publish_arguments='--publish 127.0.0.1::5432'
+  elif [ "$publish" != 'false' ]; then
+    die "unknown database publication mode: $publish"
+  fi
+
   run_podman run -d \
     --platform "$PLATFORM" \
     --name "$PG_CONTAINER" \
     --label 'io.rustodon.fixture=mastodon-v4.6.5' \
     --network "$NETWORK" \
     --volume "$PG_VOLUME:/var/lib/postgresql/data" \
+    $publish_arguments \
     --env "POSTGRES_DB=$DATABASE_NAME" \
     --env "POSTGRES_USER=$DATABASE_USER" \
     --env "POSTGRES_PASSWORD=$DATABASE_PASSWORD" \
@@ -379,11 +390,13 @@ write_manifest() {
     "contract": "local accounts private/public; remote accounts and remote keypair public-only"
   },
   "labels": {
+    "account.instance_actor": -99,
     "account.local.alice": 116844606259201001,
     "account.local.moderator": 116844606259201002,
     "account.local.newbie": 116844606259201003,
     "account.remote.bob": 116844606259202001,
     "account.remote.carol": 116844606259202002,
+    "account.remote.suspended": 116844606259202003,
     "user.alice": 101,
     "user.moderator": 102,
     "user.newbie": 103,
@@ -405,15 +418,41 @@ write_manifest() {
     "status.quote.local": 116845314048005201,
     "status.quote.remote": 116845317980165202,
     "status.reblog": 116845321912325301,
+    "status.visibility.unknown_deleted": 116846257766400501,
+    "status_edit.remote_updated": 9401,
+    "status_edit.deleted": 9402,
+    "status_edit.nullable_media_descriptions": 9403,
     "media.status.image": 116844842188806001,
+    "media.status.deleted": -98,
+    "media.status.ordered_first": -101,
+    "media.status.ordered_third": -102,
+    "media.status.ordered_fourth": -103,
+    "media.status.ordered_over_limit": -104,
+    "media.status.stale_unordered": -105,
+    "media.status.null_order_first": -210,
+    "media.status.null_order_second": -209,
+    "media.status.null_order_third": -208,
+    "media.status.null_order_fourth": -207,
+    "media.status.null_order_over_limit": -206,
     "mention.remote_to_alice": 7001,
     "mention.direct_to_bob": 7002,
+    "mention.deleted": 7003,
     "relationship.following": 8001,
     "relationship.follower": 8002,
     "relationship.follow_request": 8003,
     "relationship.favourite": 8101,
+    "relationship.favourite.deleted": 8102,
+    "relationship.bookmark": 9501,
+    "relationship.bookmark.deleted": 9507,
+    "relationship.status_pin": 9505,
+    "relationship.status_pin.deleted": 9508,
+    "relationship.block": 9502,
+    "relationship.mute": 9503,
+    "relationship.account_domain_block": 9504,
     "poll.historical": 8201,
     "poll.vote": 8202,
+    "poll.deleted": 8203,
+    "poll.vote.deleted": 8204,
     "relationship.severance": 8301,
     "account_relationship.severance": 8302,
     "relationship.severed": 8303,
@@ -422,9 +461,13 @@ write_manifest() {
     "admin.report": 8601,
     "quote.remote_quotes_local": 116845317980168701,
     "quote.local_quotes_remote": 116845314048008702,
+    "quote.deleted": -97,
+    "quote.deleted_target": -94,
     "collection.remote": 116845549977608801,
     "collection_item.local_account": 116845549977608802,
     "keypair.remote.public_only": 8901,
+    "keypair.local.opaque_encrypted": 8902,
+    "webauthn.alice": 1,
     "list.normal": 9001,
     "list.exclusive": 9002,
     "list.normal.membership": 9003,
@@ -432,6 +475,22 @@ write_manifest() {
     "filter.custom": 9101,
     "filter.keyword": 9102,
     "filter.status": 9103,
+    "filter.status.deleted": 9104,
+    "tag.fixture": 9201,
+    "tag.featured": 9202,
+    "conversation.direct": 9301,
+    "account_conversation.alice": 9302,
+    "conversation_mute.alice": 9303,
+    "domain.allow": 9601,
+    "domain.block": 9602,
+    "notification.policy": 9701,
+    "notification.permission": 9702,
+    "notification.request": 116846261698560601,
+    "notification.request.deleted_status": -96,
+    "notification.request.suspended_sender": -95,
+    "setting.scalar": 9801,
+    "setting.tagged": 9802,
+    "tombstone.remote_status": 9901,
     "notification.mention": 10001,
     "notification.status": 10002,
     "notification.reblog": 10003,
@@ -449,11 +508,17 @@ write_manifest() {
     "notification.quoted_update": 10015,
     "notification.added_to_collection": 10016,
     "notification.collection_update": 10017,
+    "notification.unknown_filtered": 10018,
+    "notification.null_filtered": 10019,
+    "notification.deleted_status_filtered": 10020,
+    "notification.suspended_sender_filtered": 10021,
     "account_stat.alice": 11001,
     "account_stat.moderator": 11002,
     "account_stat.newbie": 11003,
     "account_stat.bob": 11004,
     "account_stat.carol": 11005,
+    "account_stat.instance_actor": 11006,
+    "account_stat.suspended": 11007,
     "status_stat.public": 12001,
     "status_stat.unlisted": 12002,
     "status_stat.private": 12003,
@@ -466,7 +531,8 @@ write_manifest() {
     "status_stat.notification_updated": 12010,
     "status_stat.local_quote": 12011,
     "status_stat.remote_quote": 12012,
-    "status_stat.reblog": 12013
+    "status_stat.reblog": 12013,
+    "status_stat.unknown_deleted": 12014
   }
 }
 EOF
@@ -652,6 +718,48 @@ restore_verify() {
   printf 'restored and verified Mastodon %s fixture with Rails\n' "$RELEASE"
 }
 
+schema_read_test() {
+  fixture=${1:-$FIXTURE_DIR}
+  verify_static "$fixture"
+  verify_images
+  start_database publish
+
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$fixture/database.sql" >/dev/null
+
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" >/dev/null <<EOF
+CREATE ROLE $DATABASE_READER LOGIN PASSWORD '$DATABASE_READER_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+ALTER ROLE $DATABASE_READER SET default_transaction_read_only = on;
+REVOKE ALL ON DATABASE $DATABASE_NAME FROM PUBLIC;
+REVOKE ALL ON DATABASE $DATABASE_NAME FROM $DATABASE_READER;
+GRANT CONNECT ON DATABASE $DATABASE_NAME TO $DATABASE_READER;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON SCHEMA public FROM $DATABASE_READER;
+GRANT USAGE ON SCHEMA public TO $DATABASE_READER;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM $DATABASE_READER;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO $DATABASE_READER;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM $DATABASE_READER;
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM $DATABASE_READER;
+EOF
+
+  published_endpoint=$(run_podman port "$PG_CONTAINER" 5432/tcp)
+  published_port=${published_endpoint##*:}
+  case "$published_port" in
+    ''|*[!0-9]*) die "invalid published PostgreSQL endpoint: $published_endpoint" ;;
+  esac
+  database_url="postgresql://$DATABASE_READER:$DATABASE_READER_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
+
+  RUSTODON_MASTODON_DATABASE_URL="$database_url" \
+    cargo test --locked --test mastodon_schema -- --ignored --nocapture
+
+  finish_database
+  printf 'read-only Rust schema integration passed for Mastodon %s\n' "$RELEASE"
+}
+
 reproducibility_check() {
   verify_static "$FIXTURE_DIR"
   candidate="$ROOT/target/mastodon-v4.6.5-repro-$$"
@@ -675,6 +783,7 @@ Commands:
   generate [PATH]        Generate artifacts (default: checked fixture path)
   verify [PATH]          Verify pinned metadata and artifact checksums (fast)
   restore-verify [PATH]  Restore and verify with PostgreSQL and Mastodon Rails
+  schema-read-test       Run ignored Rust reads through a least-privilege role
   repro                   Regenerate and compare every fixture byte
 EOF
 }
@@ -708,6 +817,10 @@ case "$command" in
   restore-verify)
     [ "$#" -le 1 ] || die 'restore-verify accepts at most one path'
     restore_verify "${1:-$FIXTURE_DIR}"
+    ;;
+  schema-read-test)
+    [ "$#" -eq 0 ] || die 'schema-read-test takes no arguments'
+    schema_read_test
     ;;
   repro)
     [ "$#" -eq 0 ] || die 'repro takes no arguments'

@@ -41,6 +41,10 @@ run = "tools/mastodon-fixture restore-verify"
 description = "Regenerate and byte-compare the Mastodon 4.6.5 fixture"
 run = "tools/mastodon-fixture repro"
 
+[tasks.mastodon-schema-integration]
+description = "Run read-only Rust schema integration against the restored fixture"
+run = "tools/mastodon-fixture schema-read-test"
+
 [tasks.check]
 description = "Run all local and CI checks"
 depends = ["fmt", "lint", "test", "deny", "fixture-verify"]

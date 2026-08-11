@@ -138,6 +138,8 @@ fn manifest_pins_the_exact_mastodon_baseline_and_fixture_labels() {
         ])
     );
 
+    assert_eq!(manifest["labels"]["account.instance_actor"], -99);
+
     let expected_labels = [
         ("account.local.alice", 116_844_606_259_201_001_u64),
         ("status.visibility.public", 116_844_842_188_805_001),

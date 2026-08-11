@@ -1,6 +1,5 @@
 # Open Issues
 
-- [ ] [Map the Mastodon 4.6.5 schema in Rust](issues/map-mastodon-4-6-5-schema.md)
 - [ ] [Build the Rails-versus-Rust differential test harness](issues/build-differential-test-harness.md)
 - [ ] [Implement configuration loading and preflight checks](issues/implement-configuration-and-preflight.md)
 - [ ] [Implement existing OAuth bearer-token authentication](issues/implement-oauth-bearer-authentication.md)

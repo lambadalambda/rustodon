@@ -7,10 +7,13 @@ description = "A mostly-in-place Mastodon replacement written in Rust"
 publish = false
 
 [dependencies]
+chrono = { version = "0.4.41", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive"] }
-
-[dev-dependencies]
-serde_json = "1.0"
+ipnetwork = "0.20.0"
+saphyr = { version = "=0.0.6", default-features = false }
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "json", "ipnetwork", "derive"] }
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread"] }
 
 [lints.rust]
 unsafe_code = "forbid"

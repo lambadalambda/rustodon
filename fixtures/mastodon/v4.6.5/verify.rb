@@ -27,8 +27,17 @@ expected = {
   'collection_update' => ['Collection', 116_845_549_977_608_801, 116_844_606_259_201_001, 116_844_606_259_202_001],
 }.freeze
 
-notifications = Notification.order(:id).to_a
+notifications = Notification.where(type: expected.keys, filtered: false).order(:id).to_a
 raise "expected 17 notifications, found #{notifications.size}" unless notifications.size == expected.size
+raise 'known notification checks no longer cover exactly the unfiltered rows' unless Notification.where(filtered: false).count == 17
+unknown_notification = Notification.find(10_018)
+raise 'filtered unknown notification fixture mismatch' unless unknown_notification[:type] == 'future_event' && unknown_notification.filtered?
+suspended_notification = Notification.find(10_021)
+raise 'suspended notification sender fixture mismatch' unless suspended_notification.from_account.suspended?
+raise 'suspended sender notification leaked through Mastodon scope' if Notification.where(id: suspended_notification.id).without_suspended.exists?
+suspended_request = NotificationRequest.find(-95)
+raise 'suspended request sender fixture mismatch' unless suspended_request.from_account.suspended?
+raise 'suspended sender request leaked through Mastodon scope' if NotificationRequest.where(id: suspended_request.id).without_suspended.exists?
 groupable_types = %w(favourite reblog follow admin.sign_up).freeze
 
 notifications.each do |notification|
@@ -76,19 +85,20 @@ snowflake_records = [
   CollectionItem.all,
   NotificationRequest.all,
 ].flat_map(&:to_a)
+snowflake_records.select! { |record| record.id >= 0 }
 snowflake_records.each do |record|
   decoded = Mastodon::Snowflake.to_time(record.id)
   raise "#{record.class} #{record.id} Snowflake timestamp mismatch" unless decoded == record.created_at.utc
 end
 
 expected_sequences = {
-  'accounts_id_seq' => [5, true],
-  'statuses_id_seq' => [13, true],
+  'accounts_id_seq' => [6, true],
+  'statuses_id_seq' => [14, true],
   'media_attachments_id_seq' => [1, true],
   'quotes_id_seq' => [2, true],
   'collections_id_seq' => [1, true],
   'collection_items_id_seq' => [1, true],
-  'notification_requests_id_seq' => [1, false],
+  'notification_requests_id_seq' => [1, true],
 }.freeze
 expected_sequences.each do |sequence, expected_state|
   state = ActiveRecord::Base.connection.select_rows("SELECT last_value, is_called FROM #{sequence}").first
@@ -111,6 +121,10 @@ remote_keypair = Keypair.find(8901)
 raise 'remote keypair unexpectedly has private material' unless remote_keypair.private_key.nil?
 OpenSSL::PKey::RSA.new(remote_keypair.public_key)
 
+opaque_keypair = Keypair.find(8902)
+raise 'encrypted local keypair did not decrypt through Mastodon 4.6.5' unless opaque_keypair.private_key == 'fixture opaque private key material'
+raise 'opaque keypair fixture did not retain its raw encrypted envelope' unless opaque_keypair.attributes_before_type_cast['private_key'].start_with?('{"p":')
+
 attachment = MediaAttachment.find(116_844_842_188_806_001)
 raise 'status image original is not readable from Paperclip' unless attachment.file.exists?(:original)
 raise 'status image small style is not readable from Paperclip' unless attachment.file.exists?(:small)
@@ -131,6 +145,13 @@ end
 raise 'avatar file size metadata mismatch' unless alice.avatar_file_size == File.size(alice.avatar.path(:original))
 raise 'attachment file size metadata mismatch' unless attachment.file_file_size == File.size(attachment.file.path(:original))
 
+ordered_media_ids = Status.find(116_844_842_188_805_001).ordered_media_attachments.map(&:id)
+raise 'explicit media ordering or limit mismatch' unless ordered_media_ids == [-101, 116_844_842_188_806_001, -102, -103]
+fallback_media_ids = Status.find(116_844_846_120_965_002).ordered_media_attachments.map(&:id)
+raise 'NULL media ordering fallback mismatch' unless fallback_media_ids == [-210, -209, -208, -207]
+expected_descriptions = [nil, 'Deterministic Mastodon test attachment']
+raise 'nullable status-edit media descriptions mismatch' unless StatusEdit.find(9403).media_descriptions == expected_descriptions
+
 token = Doorkeeper::AccessToken.find_by(token: 'fixture-bearer-token-v4-6-5')
 raise 'OAuth bearer token is not readable' if token.nil? || token.revoked? || token.expired?
 
@@ -139,5 +160,16 @@ raise 'historical poll should be expired' unless Poll.find(8201).expired?
 raise 'exclusive list is unreadable' unless List.find(9002).exclusive?
 raise 'accepted collection item is unreadable' unless CollectionItem.find(116_845_549_977_608_802).accepted?
 raise 'accepted quote is unreadable' unless Quote.find(116_845_314_048_008_702).accepted?
+deleted_target_quote = Quote.find(-94)
+raise 'deleted-target quote state is unreadable' unless deleted_target_quote.deleted?
+raise 'soft-deleted quoted status should be hidden by default' unless deleted_target_quote.quoted_status.nil?
 
-puts 'fixture Rails verification passed: 17 notification types and local media are readable'
+raise 'instance actor should be local without a user' unless Account.find(-99).local? && Account.find(-99).user.nil?
+raise 'soft-deleted unknown visibility fixture should be hidden by default' if Status.exists?(116_846_257_766_400_501)
+unknown_visibility_status = Status.unscoped.find(116_846_257_766_400_501)
+raise 'soft-deleted status is missing from unscoped raw reads' unless unknown_visibility_status.attributes_before_type_cast['visibility'] == 99
+raise 'scalar Rails YAML setting is unreadable' unless Setting.find(9801).value == true
+tagged_setting = Setting.find(9802).value
+raise 'tagged Rails YAML setting is unreadable' unless tagged_setting.is_a?(ActiveSupport::HashWithIndifferentAccess) && tagged_setting[:fixture] == 'value'
+
+puts 'fixture Rails verification passed: notifications, suspended senders, status edits, and local media are readable'

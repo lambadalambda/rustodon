@@ -34,8 +34,8 @@ BEGIN
   END IF;
 
   IF (SELECT array_agg(DISTINCT visibility ORDER BY visibility) FROM statuses)
-     <> ARRAY[0, 1, 2, 3, 4] THEN
-    RAISE EXCEPTION 'fixture does not cover all five stored status visibility values';
+     <> ARRAY[0, 1, 2, 3, 4, 99] THEN
+    RAISE EXCEPTION 'fixture does not cover known and unknown stored status visibility values';
   END IF;
 
   IF EXISTS (
@@ -50,24 +50,25 @@ BEGIN
     )
     SELECT 1
     FROM snowflake_rows
-    WHERE (id >> 16) <> floor(extract(epoch FROM created_at) * 1000)::bigint
-  ) OR (SELECT count(*) FROM accounts) <> 5
-     OR (SELECT count(*) FROM statuses) <> 13
-     OR (SELECT count(*) FROM media_attachments) <> 1
-     OR (SELECT count(*) FROM quotes) <> 2
+    WHERE id >= 0
+      AND (id >> 16) <> floor(extract(epoch FROM created_at) * 1000)::bigint
+  ) OR (SELECT count(*) FROM accounts) <> 7
+     OR (SELECT count(*) FROM statuses) <> 14
+     OR (SELECT count(*) FROM media_attachments) <> 12
+     OR (SELECT count(*) FROM quotes) <> 4
      OR (SELECT count(*) FROM collections) <> 1
      OR (SELECT count(*) FROM collection_items) <> 1
-     OR (SELECT count(*) FROM notification_requests) <> 0 THEN
+     OR (SELECT count(*) FROM notification_requests) <> 3 THEN
     RAISE EXCEPTION 'Snowflake ID timestamp prefixes or fixture row counts are incoherent';
   END IF;
 
-  IF (SELECT last_value <> 5 OR NOT is_called FROM accounts_id_seq)
-     OR (SELECT last_value <> 13 OR NOT is_called FROM statuses_id_seq)
+  IF (SELECT last_value <> 6 OR NOT is_called FROM accounts_id_seq)
+     OR (SELECT last_value <> 14 OR NOT is_called FROM statuses_id_seq)
      OR (SELECT last_value <> 1 OR NOT is_called FROM media_attachments_id_seq)
      OR (SELECT last_value <> 2 OR NOT is_called FROM quotes_id_seq)
      OR (SELECT last_value <> 1 OR NOT is_called FROM collections_id_seq)
      OR (SELECT last_value <> 1 OR NOT is_called FROM collection_items_id_seq)
-     OR (SELECT last_value <> 1 OR is_called FROM notification_requests_id_seq) THEN
+     OR (SELECT last_value <> 1 OR NOT is_called FROM notification_requests_id_seq) THEN
     RAISE EXCEPTION 'timestamp_id backing sequence state does not match invocation counts';
   END IF;
 
@@ -155,6 +156,125 @@ BEGIN
 
   IF NOT EXISTS (
     SELECT 1
+    FROM accounts a
+    LEFT JOIN users u ON u.account_id = a.id
+    WHERE a.id = -99 AND a.domain IS NULL AND a.actor_type = 'Application'
+      AND a.attribution_domains IS NULL AND u.id IS NULL
+  ) OR NOT EXISTS (
+    SELECT 1 FROM users
+    WHERE id = 101
+      AND settings = '{"default_privacy":"private","nested":{"number":9007199254740993}}'
+      AND chosen_languages = ARRAY['en']::varchar[]
+      AND otp_backup_codes = ARRAY['fixture-recovery-code']::varchar[]
+      AND sign_up_ip = '192.0.2.0/24'::inet
+      AND otp_required_for_login = false
+      AND webauthn_id = 'fixture-alice-webauthn-id'
+      AND EXISTS (SELECT 1 FROM webauthn_credentials WHERE user_id = users.id)
+  ) OR NOT EXISTS (
+    SELECT 1 FROM users
+    WHERE id = 102 AND settings IS NULL
+      AND chosen_languages = ARRAY[]::varchar[]
+      AND otp_backup_codes = ARRAY[]::varchar[]
+      AND otp_required_for_login = false
+      AND NOT EXISTS (SELECT 1 FROM webauthn_credentials WHERE user_id = users.id)
+  ) OR NOT EXISTS (
+    SELECT 1 FROM users
+    WHERE id = 103 AND settings = '' AND chosen_languages = ARRAY['en', 'fr']::varchar[]
+      AND disabled = true
+      AND otp_backup_codes IS NULL
+  ) OR NOT EXISTS (
+    SELECT 1 FROM accounts
+    WHERE id = 116844606259202001
+      AND also_known_as = ARRAY['https://alias.remote.fixture.invalid/users/bob']::varchar[]
+      AND attribution_domains = ARRAY['media.remote.fixture.invalid']::varchar[]
+      AND fields->0->>'value' = 'Exact JSONB value'
+      AND id_scheme = 1
+  ) OR NOT EXISTS (
+    SELECT 1 FROM accounts
+    WHERE id = 116844606259201001 AND id_scheme = 0
+  ) OR NOT EXISTS (
+    SELECT 1 FROM accounts
+    WHERE id = 116844606259202003 AND domain = 'remote.fixture.invalid'
+      AND suspended_at = '2026-07-01 18:30:00'
+  ) OR NOT EXISTS (
+    SELECT 1 FROM user_roles
+    WHERE id = -99 AND permissions = 1152921504606912512
+  ) THEN
+    RAISE EXCEPTION 'local account classification or raw user settings/array coverage is incomplete';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM statuses s
+    JOIN status_stats stats ON stats.status_id = s.id
+    WHERE s.id = 116846257766400501 AND s.visibility = 99 AND s.deleted_at IS NOT NULL
+      AND s.ordered_media_attachment_ids = ARRAY[]::bigint[]
+      AND s.poll_id = 8203
+  ) OR NOT EXISTS (
+    SELECT 1 FROM statuses
+    WHERE id = 116844842188805001 AND application_id = 301 AND quote_approval_policy = 2
+      AND ordered_media_attachment_ids = ARRAY[-101, 116844842188806001, -102, -103, -104]::bigint[]
+  ) OR NOT EXISTS (
+    SELECT 1 FROM statuses
+    WHERE id = 116844853985285004 AND reply = true
+      AND in_reply_to_account_id = 116844606259202001
+      AND in_reply_to_id = 116845078118405101
+  ) OR NOT EXISTS (
+    SELECT 1 FROM status_edits
+    WHERE id = 9401 AND ordered_media_attachment_ids = ARRAY[]::bigint[]
+      AND media_descriptions = ARRAY[]::text[] AND poll_options IS NULL
+  ) OR NOT EXISTS (
+    SELECT 1 FROM status_edits
+    WHERE id = 9403
+      AND ordered_media_attachment_ids = ARRAY[-101, 116844842188806001]::bigint[]
+      AND media_descriptions = ARRAY[NULL, 'Deterministic Mastodon test attachment']::text[]
+  ) OR NOT EXISTS (
+    SELECT 1 FROM tags t
+    JOIN statuses_tags st ON st.tag_id = t.id
+    WHERE t.id = 9201 AND st.status_id = 116844842188805001
+  ) OR NOT EXISTS (
+    SELECT 1 FROM accounts_tags WHERE account_id = 116844606259201001 AND tag_id = 9201
+  ) OR NOT EXISTS (
+    SELECT 1 FROM featured_tags
+    WHERE id = 9202 AND account_id = 116844606259201001 AND tag_id = 9201
+  ) OR NOT EXISTS (
+    SELECT 1 FROM conversations c
+    JOIN account_conversations ac ON ac.conversation_id = c.id
+    WHERE c.id = 9301 AND ac.id = 9302
+      AND ac.participant_account_ids = ARRAY[116844606259202001]::bigint[]
+      AND ac.status_ids = ARRAY[116844853985285004, 116846257766400501]::bigint[]
+  ) THEN
+    RAISE EXCEPTION 'status edge, edit, tag, or conversation fixtures are incomplete';
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM bookmarks WHERE id = 9501)
+     OR NOT EXISTS (SELECT 1 FROM blocks WHERE id = 9502)
+     OR NOT EXISTS (SELECT 1 FROM mutes WHERE id = 9503 AND hide_notifications = false)
+     OR NOT EXISTS (SELECT 1 FROM account_domain_blocks WHERE id = 9504)
+     OR NOT EXISTS (SELECT 1 FROM domain_allows WHERE id = 9601)
+     OR NOT EXISTS (SELECT 1 FROM domain_blocks WHERE id = 9602 AND severity = 99)
+     OR NOT EXISTS (SELECT 1 FROM notification_policies WHERE id = 9701 AND for_not_following = 99)
+     OR NOT EXISTS (SELECT 1 FROM notification_permissions WHERE id = 9702)
+     OR NOT EXISTS (SELECT 1 FROM notification_requests WHERE id = 116846261698560601)
+     OR NOT EXISTS (SELECT 1 FROM notification_requests WHERE id = -96 AND last_status_id = 116846257766400501)
+     OR NOT EXISTS (SELECT 1 FROM notification_requests WHERE id = -95 AND from_account_id = 116844606259202003)
+     OR NOT EXISTS (SELECT 1 FROM tombstones WHERE id = 9901)
+     OR NOT EXISTS (SELECT 1 FROM conversation_mutes WHERE id = 9303)
+     OR NOT EXISTS (SELECT 1 FROM status_pins WHERE id = 9505)
+     OR NOT EXISTS (SELECT 1 FROM status_pins WHERE id = 9508)
+     OR NOT EXISTS (SELECT 1 FROM favourites WHERE id = 8102)
+     OR NOT EXISTS (SELECT 1 FROM bookmarks WHERE id = 9507)
+     OR NOT EXISTS (SELECT 1 FROM custom_filter_statuses WHERE id = 9104) THEN
+    RAISE EXCEPTION 'relationship, domain, notification policy, request, or tombstone coverage is incomplete';
+  END IF;
+
+  IF (SELECT value FROM settings WHERE id = 9801) <> E'--- true\n'
+     OR (SELECT value FROM settings WHERE id = 9802)
+        <> E'--- !ruby/hash:ActiveSupport::HashWithIndifferentAccess\nfixture: value\n' THEN
+    RAISE EXCEPTION 'raw scalar/tagged Rails YAML setting bytes are incorrect';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
     FROM polls p
     JOIN poll_votes v ON v.poll_id = p.id
     JOIN statuses s ON s.poll_id = p.id AND p.status_id = s.id
@@ -164,6 +284,9 @@ BEGIN
       AND p.votes_count = 1
       AND p.voters_count = 1
       AND v.account_id = 116844606259201001
+  ) OR NOT EXISTS (
+    SELECT 1 FROM polls p JOIN poll_votes v ON v.poll_id = p.id
+    WHERE p.id = 8203 AND p.status_id = 116846257766400501 AND v.id = 8204
   ) THEN
     RAISE EXCEPTION 'historical poll/vote is missing or incoherent';
   END IF;
@@ -176,6 +299,10 @@ BEGIN
   ) OR NOT EXISTS (
     SELECT 1 FROM keypairs
     WHERE id = 8901 AND account_id = 116844606259202001 AND private_key IS NULL AND public_key <> ''
+  ) OR NOT EXISTS (
+    SELECT 1 FROM keypairs
+    WHERE id = 8902 AND account_id = 116844606259201001 AND type = 0
+      AND private_key LIKE '{"p":%'
   ) THEN
     RAISE EXCEPTION 'Mastodon 4.6.5 signing-key contract is not satisfied';
   END IF;
@@ -200,6 +327,11 @@ BEGIN
        SELECT 1 FROM quotes
        WHERE id = 116845314048008702 AND account_id = 116844606259201001 AND status_id = 116845314048005201
          AND quoted_account_id = 116844606259202001 AND quoted_status_id = 116845093847045103
+     )
+     OR NOT EXISTS (
+       SELECT 1 FROM quotes
+       WHERE id = -94 AND status_id = 116844846120965002
+         AND quoted_status_id = 116846257766400501 AND state = 4
      ) THEN
     RAISE EXCEPTION 'quote directions or cross-links are incoherent';
   END IF;
@@ -225,8 +357,24 @@ BEGIN
     RAISE EXCEPTION 'status counters are incoherent';
   END IF;
 
-  IF (SELECT count(*) FROM notifications) <> 17 THEN
-    RAISE EXCEPTION 'expected exactly 17 readable notification fixtures';
+  IF (SELECT count(*) FROM notifications WHERE filtered = false) <> 17
+     OR (SELECT count(*) FROM notifications) <> 21
+     OR NOT EXISTS (
+       SELECT 1 FROM notifications
+       WHERE id = 10018 AND type = 'future_event' AND activity_type = 'FutureActivity' AND filtered = true
+     ) OR NOT EXISTS (
+       SELECT 1 FROM notifications
+       WHERE id = 10019 AND type IS NULL AND activity_type = 'FutureActivity' AND filtered = true
+     ) OR NOT EXISTS (
+       SELECT 1 FROM notifications
+       WHERE id = 10020 AND type = 'future_deleted_status'
+         AND activity_type = 'Status' AND filtered = true
+     ) OR NOT EXISTS (
+       SELECT 1 FROM notifications
+       WHERE id = 10021 AND type = 'future_suspended'
+         AND from_account_id = 116844606259202003 AND filtered = true
+     ) THEN
+    RAISE EXCEPTION 'expected 17 readable known notifications and four filtered edge fixtures';
   END IF;
 
   IF EXISTS (

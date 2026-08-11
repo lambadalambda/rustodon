@@ -11,8 +11,9 @@ cache state.
 
 ## Status
 
-Rustodon is in its initial compatibility-harness phase. The Rust workspace and
-quality gates are established, but it is not yet usable as a Mastodon server.
+Rustodon is in its initial compatibility-harness phase. A read-only Mastodon
+4.6.5 schema library and its fixture-backed integration workflow are available,
+but Rustodon is not yet usable as a Mastodon server.
 
 The first compatibility target is Mastodon 4.6.5. Supporting one stable schema
 first keeps the initial implementation testable; additional Mastodon releases
@@ -76,6 +77,19 @@ mise run test
 mise run deny
 ```
 
+The `rustodon::mastodon` library exposes focused PostgreSQL reads for the v1
+account, status, relationship, notification, policy, setting, quote,
+collection, poll, and signing-key data. It is intentionally read-only: its
+SQLx pool is private, connections default to UTC/read-only operation, normal
+status reads exclude soft-deleted rows, and there are no save, update, callback,
+or generic ORM APIs. IDs remain signed `i64` values and open wrappers retain
+unknown enum strings/integers and permission bits.
+
+SQLx is built only for PostgreSQL with Tokio, Chrono, JSON, and `inet` support;
+compile-time query macros and unrelated database drivers are disabled. Saphyr
+parses Rails YAML safely while the library retains the original YAML and JSON
+text byte-for-byte. Token and private-key values use redacted opaque wrappers.
+
 ### Mastodon compatibility fixture
 
 The first compatibility baseline is pinned to Mastodon v4.6.5 commit
@@ -106,11 +120,17 @@ start Podman containers:
 ```console
 mise run fixture-restore-verify
 mise run fixture-repro
+mise run mastodon-schema-integration
 ```
 
 The first restores the checked dump and verifies it through SQL and Mastodon
-Rails, including all 17 notification types and Paperclip media. The second
-regenerates every artifact and performs a recursive byte-for-byte comparison.
+Rails, including all 17 known notification types, a filtered unknown type, and
+Paperclip media. The second regenerates every artifact and performs a recursive
+byte-for-byte comparison. The third publishes PostgreSQL on a random loopback
+port, creates a LOGIN role limited to database `CONNECT`, schema `USAGE`, and
+table `SELECT`, and runs the ignored Rust integration tests. Those tests also
+prove DML, `TRUNCATE`, and schema creation fail after trying to disable the
+role's default read-only setting.
 These Podman tasks currently require GNU/Linux x86-64; labeled PostgreSQL
 volumes are removed and checked after each task, and bind mounts support SELinux
 relabeling.
