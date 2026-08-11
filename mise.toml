@@ -5,6 +5,10 @@ rust = "1.97.1"
 clang = "22.1.8"
 "aqua:EmbarkStudios/cargo-deny" = "0.20.2"
 
+[env]
+AR = "{{config_root}}/tools/clang-ar"
+CC = "clang"
+
 [tasks.fmt]
 description = "Check Rust formatting"
 run = "cargo fmt --check"
@@ -44,6 +48,10 @@ run = "tools/mastodon-fixture repro"
 [tasks.mastodon-schema-integration]
 description = "Run read-only Rust schema integration against the restored fixture"
 run = "tools/mastodon-fixture schema-read-test"
+
+[tasks.preflight-integration]
+description = "Run canonical and rejection preflight cases against fixture clones"
+run = "tools/mastodon-fixture preflight-test"
 
 [tasks.differential]
 description = "Run all or one Rails-versus-Rust differential compatibility case"

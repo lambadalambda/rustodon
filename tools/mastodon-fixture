@@ -812,6 +812,201 @@ EOF
   printf 'read-only Rust schema integration passed for Mastodon %s\n' "$RELEASE"
 }
 
+grant_preflight_reader() {
+  database=$1
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres >/dev/null <<EOF
+REVOKE ALL ON DATABASE $database FROM PUBLIC;
+REVOKE ALL ON DATABASE $database FROM $DATABASE_READER;
+GRANT CONNECT ON DATABASE $database TO $DATABASE_READER;
+EOF
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$database" >/dev/null <<EOF
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON SCHEMA public FROM $DATABASE_READER;
+GRANT USAGE ON SCHEMA public TO $DATABASE_READER;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM $DATABASE_READER;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO $DATABASE_READER;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM $DATABASE_READER;
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM $DATABASE_READER;
+EOF
+}
+
+run_preflight_cli() {
+  database=$1
+  expected_code=${2:-}
+  preflight_output=$(env -i \
+    PATH="$PATH" \
+    HOME="${HOME:-/tmp}" \
+    CARGO_HOME="${CARGO_HOME:-${HOME:-/tmp}/.cargo}" \
+    RUSTUP_HOME="${RUSTUP_HOME:-${HOME:-/tmp}/.rustup}" \
+    CC='clang' \
+    AR="$ROOT/tools/clang-ar" \
+    LOCAL_DOMAIN="$LOCAL_DOMAIN" \
+    WEB_DOMAIN="$LOCAL_DOMAIN" \
+    ALTERNATE_DOMAINS='' \
+    DB_HOST='127.0.0.1' \
+    DB_PORT="$PREFLIGHT_DATABASE_PORT" \
+    DB_NAME="$database" \
+    DB_USER="$DATABASE_READER" \
+    DB_PASS="$DATABASE_READER_PASSWORD" \
+    DB_POOL='2' \
+    DB_SSLMODE='disable' \
+    PAPERCLIP_ROOT_PATH="$FIXTURE_DIR/media" \
+    PAPERCLIP_ROOT_URL='/system' \
+    TRUSTED_PROXY_IP='127.0.0.1/32,::1/128' \
+    SIDEKIQ_REDIS_HOST='127.0.0.1' \
+    SIDEKIQ_REDIS_PORT="$PREFLIGHT_REDIS_PORT" \
+    SIDEKIQ_REDIS_DB='0' \
+    SECRET_KEY_BASE='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
+    ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY='11111111111111111111111111111111' \
+    ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT='22222222222222222222222222222222' \
+    ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY='33333333333333333333333333333333' \
+    S3_ENABLED='false' \
+    SWIFT_ENABLED='false' \
+    AZURE_ENABLED='false' \
+    LDAP_ENABLED='false' \
+    PAM_ENABLED='false' \
+    CAS_ENABLED='false' \
+    SAML_ENABLED='false' \
+    OIDC_ENABLED='false' \
+    OMNIAUTH_ONLY='false' \
+    ONE_CLICK_SSO_LOGIN='false' \
+    cargo run --locked --quiet -- preflight 2>&1) && preflight_status=0 || preflight_status=$?
+
+  if [ -z "$expected_code" ]; then
+    [ "$preflight_status" -eq 0 ] || die "canonical preflight failed: $preflight_output"
+  else
+    [ "$preflight_status" -ne 0 ] || die "preflight unexpectedly accepted $expected_code case"
+    printf '%s\n' "$preflight_output" | grep -F "$expected_code" >/dev/null 2>&1 ||
+      die "preflight did not report $expected_code: $preflight_output"
+  fi
+}
+
+run_preflight_clone_case() {
+  label=$1
+  expected_code=$2
+  mutation=$3
+  database="rustodon_preflight_${label}_$$"
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres \
+    --command "CREATE DATABASE $database WITH TEMPLATE $DATABASE_NAME OWNER $DATABASE_USER" >/dev/null
+  run_podman exec "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$database" \
+    --command "$mutation" >/dev/null
+  grant_preflight_reader "$database"
+  run_preflight_cli "$database" "$expected_code"
+  run_podman exec "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres \
+    --command "DROP DATABASE $database WITH (FORCE)" >/dev/null
+}
+
+preflight_test() {
+  verify_static "$FIXTURE_DIR"
+  verify_differential_images
+  start_database publish
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$FIXTURE_DIR/database.sql" >/dev/null
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$FIXTURE_DIR/verify.sql" >/dev/null
+
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres >/dev/null <<EOF
+CREATE ROLE $DATABASE_READER LOGIN PASSWORD '$DATABASE_READER_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+ALTER ROLE $DATABASE_READER SET default_transaction_read_only = on;
+EOF
+  grant_preflight_reader "$DATABASE_NAME"
+  published_endpoint=$(run_podman port "$PG_CONTAINER" 5432/tcp)
+  PREFLIGHT_DATABASE_PORT=${published_endpoint##*:}
+  case "$PREFLIGHT_DATABASE_PORT" in
+    ''|*[!0-9]*) die "invalid published PostgreSQL endpoint: $published_endpoint" ;;
+  esac
+  start_differential_redis publish
+  published_redis=$(run_podman port "$REDIS_CONTAINER" 6379/tcp)
+  PREFLIGHT_REDIS_PORT=${published_redis##*:}
+  case "$PREFLIGHT_REDIS_PORT" in
+    ''|*[!0-9]*) die "invalid published Redis endpoint: $published_redis" ;;
+  esac
+
+  run_preflight_cli "$DATABASE_NAME"
+
+  run_preflight_clone_case missing_relation PF_DB_RELATION_MISSING \
+    'DROP TABLE generated_annual_reports CASCADE'
+  run_preflight_clone_case changed_relation PF_DB_RELATION_CHANGED \
+    'ALTER TABLE accounts ENABLE ROW LEVEL SECURITY'
+  run_preflight_clone_case missing_column PF_DB_COLUMN_MISSING \
+    'ALTER TABLE accounts DROP COLUMN requested_review_at'
+  run_preflight_clone_case changed_type PF_DB_COLUMN_TYPE_CHANGED \
+    'ALTER TABLE relays ALTER COLUMN state TYPE bigint'
+  run_preflight_clone_case changed_nullability PF_DB_COLUMN_NULLABILITY_CHANGED \
+    'ALTER TABLE accounts ALTER COLUMN username DROP NOT NULL'
+  run_preflight_clone_case changed_default PF_DB_COLUMN_DEFAULT_CHANGED \
+    'ALTER TABLE account_stats ALTER COLUMN statuses_count DROP DEFAULT'
+  run_preflight_clone_case changed_column PF_DB_COLUMN_CHANGED \
+    'ALTER TABLE accounts ALTER COLUMN username TYPE character varying COLLATE "C"'
+  run_preflight_clone_case missing_constraint PF_DB_CONSTRAINT_MISSING \
+    'ALTER TABLE polls DROP CONSTRAINT fk_rails_3e0d9f1115'
+  run_preflight_clone_case changed_constraint PF_DB_CONSTRAINT_CHANGED \
+    'ALTER TABLE polls ALTER CONSTRAINT fk_rails_3e0d9f1115 DEFERRABLE'
+  run_preflight_clone_case unexpected_constraint PF_DB_CONSTRAINT_UNEXPECTED \
+    'ALTER TABLE accounts ADD CONSTRAINT rustodon_unexpected_check CHECK (id <> 0)'
+  run_preflight_clone_case missing_index PF_DB_INDEX_MISSING \
+    'DROP INDEX index_statuses_public_20250129'
+  run_preflight_clone_case changed_index PF_DB_INDEX_CHANGED \
+    'DROP INDEX index_statuses_public_20250129; CREATE INDEX index_statuses_public_20250129 ON statuses (id)'
+  run_preflight_clone_case unexpected_column PF_DB_COLUMN_UNEXPECTED \
+    'ALTER TABLE accounts ADD COLUMN rustodon_unexpected text'
+  run_preflight_clone_case unexpected_index PF_DB_INDEX_UNEXPECTED \
+    'CREATE INDEX rustodon_unexpected_index ON accounts (updated_at)'
+  run_preflight_clone_case missing_migration PF_DB_MIGRATION_MISSING \
+    "DELETE FROM schema_migrations WHERE version = '$SCHEMA_VERSION'"
+  run_preflight_clone_case unexpected_migration PF_DB_MIGRATION_UNEXPECTED \
+    "INSERT INTO schema_migrations (version) VALUES ('99999999999999')"
+  run_preflight_clone_case function_shape PF_DB_TIMESTAMP_ID_SHAPE \
+    'ALTER FUNCTION public.timestamp_id(text) IMMUTABLE'
+  run_preflight_clone_case function_body PF_DB_TIMESTAMP_ID_BODY \
+    'CREATE OR REPLACE FUNCTION public.timestamp_id(table_name text) RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$'
+  run_preflight_clone_case changed_sequence PF_DB_SEQUENCE_CHANGED \
+    'ALTER SEQUENCE public.accounts_id_seq INCREMENT BY 2'
+  run_preflight_clone_case missing_sequence PF_DB_SEQUENCE_MISSING \
+    'DROP SEQUENCE public.accounts_id_seq CASCADE'
+  run_preflight_clone_case wrong_domain PF_DB_WEB_DOMAIN_MISMATCH \
+    "UPDATE accounts SET url = 'https://wrong.invalid/@alice' WHERE id = 116844606259201001"
+  run_preflight_clone_case scheduled PF_DB_SCHEDULED_STATUSES_PENDING \
+    "INSERT INTO scheduled_statuses (id, account_id, params, scheduled_at) VALUES (-1, 116844606259201001, '{}'::jsonb, CURRENT_TIMESTAMP + INTERVAL '1 hour')"
+  run_preflight_clone_case active_poll PF_DB_LOCAL_POLLS_ACTIVE \
+    "UPDATE statuses SET deleted_at = NULL WHERE id = 116846257766400501; UPDATE polls SET expires_at = CURRENT_TIMESTAMP + INTERVAL '1 hour' WHERE id = 8203"
+  run_preflight_clone_case account_deletion PF_DB_ACCOUNT_DELETIONS_PENDING \
+    "INSERT INTO account_deletion_requests (id, account_id, created_at, updated_at) VALUES (-1, 116844606259201001, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+  run_preflight_clone_case webauthn_only PF_DB_WEBAUTHN_ONLY_USERS \
+    'UPDATE users SET otp_required_for_login = false WHERE id = 101'
+  run_preflight_clone_case active_relay PF_DB_RELAYS_ACTIVE \
+    "INSERT INTO relays (id, inbox_url, state, created_at, updated_at) VALUES (-1, 'https://relay.invalid/inbox', 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+  run_preflight_clone_case cleanup_policy PF_DB_STATUS_CLEANUP_ENABLED \
+    "INSERT INTO account_statuses_cleanup_policies (id, account_id, enabled, created_at, updated_at) VALUES (-1, 116844606259201001, true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+  run_preflight_clone_case missing_key PF_DB_KEY_MISSING_PRIVATE \
+    'UPDATE accounts SET private_key = NULL WHERE id = 116844606259201001'
+  run_preflight_clone_case corrupt_key PF_DB_KEY_CORRUPT_PRIVATE \
+    "UPDATE accounts SET private_key = 'not-a-private-key' WHERE id = 116844606259201001"
+  run_preflight_clone_case mismatched_key PF_DB_KEY_MISMATCH \
+    "UPDATE accounts SET public_key = E'-----BEGIN PUBLIC KEY-----\\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuuYyoyfsRkYnXRotMsId\\nW3euBDDfiv9oVqOxUVC7bhel8KednIMrMCRWFAkgJhbrlzbIkjVr68o1MP9qLcn7\\nCmH/BXHp7yhuFTr4byjdJKpwB+/i2jNEsvDH5jR8WTAeTCe0x/QHg21V3F7dSI5m\\nCCZ/1dSIyOXLRTWVlfDlm3rE4ntlCo+US3/7oSWbg/4/4qEnt1HC32kvklgScxua\\n4LR5ATdoXa5bFoopPWhul7MJ6NyWCyQyScUuGdlj8EN4kmKQJvphKHrI9fvhgOuG\\nTvhTR1S5InA4azSSchY0tXEEw/VNxraeX0KPjbgr6DPcwhPd/m0nhVDq0zVyVBBD\\nMwIDAQAB\\n-----END PUBLIC KEY-----\\n' WHERE id = 116844606259201001"
+  run_preflight_clone_case plaintext_keypair PF_DB_KEY_UNDECRYPTABLE \
+    'UPDATE keypairs SET revoked = false, private_key = (SELECT private_key FROM accounts WHERE id = 116844606259201001) WHERE id = 8902'
+  run_preflight_clone_case undecryptable_key PF_DB_KEY_UNDECRYPTABLE \
+    "UPDATE keypairs SET revoked = false, private_key = '{\"p\":\"invalid\",\"h\":{\"iv\":\"invalid\",\"at\":\"invalid\"}}' WHERE id = 8902"
+
+  run_podman exec "$REDIS_CONTAINER" redis-cli SADD queues default >/dev/null
+  run_podman exec "$REDIS_CONTAINER" redis-cli LPUSH queue:default '{"fixture":true}' >/dev/null
+  run_preflight_cli "$DATABASE_NAME" PF_REDIS_SIDEKIQ_NOT_EMPTY
+
+  finish_database
+  printf 'configuration preflight integration passed for Mastodon %s\n' "$RELEASE"
+}
+
 validate_differential_case() {
   case_name=$1
   case "$case_name" in
@@ -855,13 +1050,21 @@ EOF
 }
 
 start_differential_redis() {
+  publish=${1:-false}
   REDIS_CONTAINER="rustodon-differential-v4-6-5-redis-$$"
+  publish_arguments=''
+  if [ "$publish" = 'publish' ]; then
+    publish_arguments='--publish 127.0.0.1::6379'
+  elif [ "$publish" != 'false' ]; then
+    die "unknown Redis publication mode: $publish"
+  fi
   run_podman run -d \
     --platform "$PLATFORM" \
     --name "$REDIS_CONTAINER" \
     --label 'io.rustodon.fixture=mastodon-v4.6.5' \
     --label "io.rustodon.fixture.session=$$" \
     --network "$NETWORK" \
+    $publish_arguments \
     --tmpfs /data:rw,nosuid,nodev,noexec,size=64m \
     "$REDIS_IMAGE" redis-server --save '' --appendonly no >/dev/null
 
@@ -1111,6 +1314,7 @@ Commands:
   verify [PATH]          Verify pinned metadata and artifact checksums (fast)
   restore-verify [PATH]  Restore and verify with PostgreSQL and Mastodon Rails
   schema-read-test       Run ignored Rust reads through a least-privilege role
+  preflight-test         Run canonical and rejection preflight cases
   differential-test [CASE]
                           Run all or one Rails-versus-Rust compatibility case
   repro                   Regenerate and compare every fixture byte
@@ -1150,6 +1354,10 @@ case "$command" in
   schema-read-test)
     [ "$#" -eq 0 ] || die 'schema-read-test takes no arguments'
     schema_read_test
+    ;;
+  preflight-test)
+    [ "$#" -eq 0 ] || die 'preflight-test takes no arguments'
+    preflight_test
     ;;
   differential-test)
     [ "$#" -le 1 ] || die 'differential-test accepts at most one case'

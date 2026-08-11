@@ -3,12 +3,16 @@ all-features = true
 
 [advisories]
 version = 2
-ignore = []
+ignore = [
+  # Used only by offline preflight to sign one fixed in-memory challenge. It is
+  # never used for RSA decryption or remotely observable request-time signing.
+  "RUSTSEC-2023-0071",
+]
 
 [licenses]
 version = 2
 confidence-threshold = 0.93
-allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+allow = ["Apache-2.0", "CDLA-Permissive-2.0", "ISC", "MIT", "Unicode-3.0"]
 exceptions = [
   # Shared by SQLx and Saphyr through the aligned hashbrown/hashlink stack.
   { name = "foldhash", version = "=0.1.5", allow = ["Zlib"] },
@@ -33,7 +37,10 @@ skip = [
   # SQLx's etcetera still supports the older Windows API crate line.
   { name = "windows-sys", version = "=0.48.0" },
 ]
-skip-tree = []
+skip-tree = [
+  # Ring's Windows support remains on the 0.52 platform crate family.
+  { name = "windows-sys", version = "=0.52.0" },
+]
 
 [sources]
 unknown-registry = "deny"

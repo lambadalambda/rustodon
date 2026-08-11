@@ -1,0 +1,11 @@
+#!/bin/sh
+
+set -eu
+
+clang=$(command -v clang) || exit 127
+clang_root=$(CDPATH= cd -P -- "$(dirname -- "$clang")/.." && pwd)
+target="$clang_root/bin/x86_64-conda-linux-gnu-ar"
+if [ -x "$target" ]; then
+  exec "$target" "$@"
+fi
+exec ar "$@"

@@ -107,3 +107,20 @@
   Puma. Rust receives SELECT-only clone credentials; loopback URLs, database
   comments, media markers, canonical paths, and symlink absence are validated
   before requests run.
+- Added typed loading for the v1 Mastodon environment surface: canonical
+  domains, PostgreSQL precedence, local Paperclip paths, trusted proxies, SMTP,
+  cryptographic secrets, and optional Sidekiq Redis inspection. Secret wrappers
+  zeroize on drop and redact `Debug`, `Display`, and validation failures.
+- Added Rails 8.1 Active Record AES-256-GCM key decryption with current
+  PBKDF2-SHA-256 and legacy SHA-1 read fallback, plus semantic RSA key matching
+  and an in-memory RSA-SHA256 sign/verify check.
+- Added `rustodon preflight` with stable fatal/warning codes. It compares all
+  expected migration versions and the v1-critical physical PostgreSQL catalog,
+  validates `timestamp_id()` and its seven sequences without executing them,
+  checks canonical identifiers and operational local signing keys, and rejects
+  active workflows outside v1.
+- Kept preflight on the cutover contract rather than Rails implementation
+  details. It rejects active object storage and SSO instead of parsing every
+  provider option, ignores unrelated extension tables, and checks logical
+  Sidekiq work rather than Redis's internal key layout beyond read-only queue
+  discovery.

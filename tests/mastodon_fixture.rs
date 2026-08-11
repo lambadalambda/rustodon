@@ -291,6 +291,7 @@ fn differential_command_is_documented_and_rejects_unsafe_case_names() {
         .expect("fixture help should run");
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("differential-test [CASE]"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("preflight-test"));
 
     let output = Command::new(fixture_tool())
         .args(["differential-test", "../../unsafe"])

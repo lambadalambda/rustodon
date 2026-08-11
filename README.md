@@ -121,6 +121,7 @@ start Podman containers:
 mise run fixture-restore-verify
 mise run fixture-repro
 mise run mastodon-schema-integration
+mise run preflight-integration
 mise run differential
 ```
 
@@ -153,6 +154,25 @@ tokens before replacing them. The harness compares observable contracts, not
 Rails callbacks, SQL ordering, Redis keys, or Sidekiq payload representation.
 Its databases, media roots, Redis, and HTTP ports are run-marked test resources
 under `target/`; production-looking URLs and unmarked paths are rejected.
+
+Before a cutover, run `rustodon preflight` with the Mastodon production
+environment. It exits nonzero for unsupported configuration, schema drift,
+unusable signing keys, unsafe media roots, active unsupported workflows, or
+non-empty Sidekiq work, and prints stable `PF_*` diagnostic codes with
+remediation hints. It is read-only against PostgreSQL and Redis and performs no
+media writes. The minimal environment surface is:
+
+- `LOCAL_DOMAIN`, optional `WEB_DOMAIN` and `ALTERNATE_DOMAINS`
+- `PRIMARY_DATABASE_URL`, `DATABASE_URL`, or Mastodon's `DB_*` variables
+- absolute `PAPERCLIP_ROOT_PATH` and optional `PAPERCLIP_ROOT_URL`
+- optional `TRUSTED_PROXY_IP` and SMTP variables
+- `SECRET_KEY_BASE` and the three `ACTIVE_RECORD_ENCRYPTION_*` secrets
+- optional `SIDEKIQ_REDIS_*` or `REDIS_*` settings for the queue-drain check
+
+Object storage, read replicas, LDAP/PAM/CAS/SAML/OIDC, and SSO-only login are
+reported as fatal v1 incompatibilities instead of being partially emulated.
+Secret values and connection URLs are redacted from configuration and preflight
+diagnostics.
 See the [fixture documentation](fixtures/mastodon/v4.6.5/README.md) for test
 identities, key/media provenance, normalization, and the later-release update
 process.

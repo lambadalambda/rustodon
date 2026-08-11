@@ -1,6 +1,5 @@
 # Open Issues
 
-- [ ] [Implement configuration loading and preflight checks](issues/implement-configuration-and-preflight.md)
 - [ ] [Implement existing OAuth bearer-token authentication](issues/implement-oauth-bearer-authentication.md)
 - [ ] [Implement core REST entity serializers](issues/implement-core-rest-serializers.md)
 - [ ] [Implement visibility-correct account and status reads](issues/implement-visibility-correct-account-status-reads.md)
