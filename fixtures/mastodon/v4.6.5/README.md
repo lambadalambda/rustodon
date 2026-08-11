@@ -17,9 +17,10 @@ millisecond epoch in their upper 48 bits; SQL and Rails verification decode
 every account, status, media attachment, quote, collection, collection item,
 and notification request ID and check sequence state.
 
-The fixture includes a local instance actor with signed ID `-99` and no user,
-an unavailable local user, NULL/empty/populated user arrays and raw JSON
-settings, nullable and populated account arrays, and account JSONB data. It
+The fixture includes a local instance actor with signed ID `-99`, a persisted
+deterministic signing key, and no user; an unavailable local user;
+NULL/empty/populated user arrays and raw JSON settings; Alice with both TOTP and
+WebAuthn; nullable and populated account arrays; and account JSONB data. It
 covers all five known status visibilities plus a soft-deleted unknown value,
 status history, tag joins, featured tags, a direct conversation and mute, and
 the v1 relationship and domain-policy records. Deleted-status associations are
@@ -29,8 +30,9 @@ Notification data retains the original 17 known checks and adds filtered
 unknown and NULL types, a deleted known activity, plus policy, permission,
 request, and activity-target rows.
 It also covers scalar/tagged Rails YAML without normalization, a tombstone, and
-a valid deterministic Active Record encrypted local keypair value that Rust
-treats as opaque. Existing quote, collection, collection-item, poll, remote
+a valid deterministic Active Record encrypted revoked local keypair value that
+Rust treats as opaque preservation data. Existing quote, collection,
+collection-item, poll, remote
 public keypair, OAuth, and media records remain part of the 4.6.5 baseline.
 
 ## Test identities
@@ -44,7 +46,7 @@ must never be reused outside an isolated fixture database.
 
 The RSA key is the published Mastodon test key from
 `spec/requests/signature_verification_spec.rb` at the pinned revision. Local
-accounts retain that key in both `accounts.private_key` and
+accounts, including the instance actor, retain that key in both `accounts.private_key` and
 `accounts.public_key`, matching Mastodon 4.6.5's signing-key contract. Remote
 accounts have no private key. The remote `keypairs` row is also public-only.
 
@@ -68,6 +70,7 @@ mise run fixture-verify
 mise run fixture-restore-verify
 mise run fixture-repro
 mise run mastodon-schema-integration
+mise run preflight-integration
 mise run differential
 mise run differential -- instance_v2
 ```
@@ -114,6 +117,14 @@ credentials. It rejects mismatched database comments, paths outside its exact
 `target/differential-<run-id>/` root, symlinks, and media trees without exact
 side markers before sending a request. Cleanup checks that the labeled
 PostgreSQL volume and marked run root are gone.
+
+`preflight-integration` first runs `rustodon preflight` successfully through a
+SELECT-only role against the canonical fixture. It then template-clones that
+database for migration, function, sequence, domain, signing-key, active-data,
+and every physical-schema mismatch category while leaving
+`schema_migrations` unchanged for physical drift cases. A pinned empty Redis
+must pass; a queued Sidekiq fixture job must fail. All clones and service state
+are disposable and removed with the PostgreSQL fixture volume.
 
 The only four narrow normalizations address known nondeterminism and terminal
 dump formatting: Mastodon's schema loader creates `timestamp_id()` with a random

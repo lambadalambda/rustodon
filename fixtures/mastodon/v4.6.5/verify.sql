@@ -159,7 +159,8 @@ BEGIN
     FROM accounts a
     LEFT JOIN users u ON u.account_id = a.id
     WHERE a.id = -99 AND a.domain IS NULL AND a.actor_type = 'Application'
-      AND a.attribution_domains IS NULL AND u.id IS NULL
+      AND a.attribution_domains IS NULL AND a.private_key <> '' AND a.public_key <> ''
+      AND u.id IS NULL
   ) OR NOT EXISTS (
     SELECT 1 FROM users
     WHERE id = 101
@@ -167,7 +168,7 @@ BEGIN
       AND chosen_languages = ARRAY['en']::varchar[]
       AND otp_backup_codes = ARRAY['fixture-recovery-code']::varchar[]
       AND sign_up_ip = '192.0.2.0/24'::inet
-      AND otp_required_for_login = false
+      AND otp_required_for_login = true
       AND webauthn_id = 'fixture-alice-webauthn-id'
       AND EXISTS (SELECT 1 FROM webauthn_credentials WHERE user_id = users.id)
   ) OR NOT EXISTS (
@@ -302,7 +303,7 @@ BEGIN
   ) OR NOT EXISTS (
     SELECT 1 FROM keypairs
     WHERE id = 8902 AND account_id = 116844606259201001 AND type = 0
-      AND private_key LIKE '{"p":%'
+      AND private_key LIKE '{"p":%' AND revoked = true
   ) THEN
     RAISE EXCEPTION 'Mastodon 4.6.5 signing-key contract is not satisfied';
   END IF;

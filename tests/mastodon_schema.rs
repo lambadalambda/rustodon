@@ -26,6 +26,8 @@ async fn reads_every_mapped_mastodon_4_6_5_record_losslessly() -> sqlx::Result<(
     assert_eq!(instance.kind(), AccountKind::LocalService);
     assert!(!instance.has_user);
     assert!(!instance.login_capable_user);
+    assert!(instance.private_key.as_ref().unwrap().is_present());
+    assert!(!instance.public_key.is_empty());
     assert_eq!(instance.attribution_domains, None);
     assert_eq!(
         repository.account(ALICE).await?.unwrap().kind(),
@@ -87,7 +89,7 @@ async fn reads_every_mapped_mastodon_4_6_5_record_losslessly() -> sqlx::Result<(
         Some(&["en".to_owned()][..])
     );
     assert_eq!(alice.otp_backup_codes.as_ref().unwrap().len(), 1);
-    assert!(!alice.otp_required_for_login);
+    assert!(alice.otp_required_for_login);
     assert!(alice.has_webauthn_credentials);
     assert_eq!(
         alice.webauthn_id.as_deref(),
@@ -378,6 +380,7 @@ async fn reads_every_mapped_mastodon_4_6_5_record_losslessly() -> sqlx::Result<(
     assert_eq!(keypairs.len(), 1);
     assert!(keypairs[0].private_key.as_ref().unwrap().is_present());
     assert_eq!(keypairs[0].key_type.0, 0);
+    assert!(keypairs[0].revoked);
     let remote_keypairs = repository.keypairs(BOB).await?;
     assert_eq!(remote_keypairs.len(), 1);
     assert!(remote_keypairs[0].private_key.is_none());

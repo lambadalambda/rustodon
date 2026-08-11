@@ -34,7 +34,7 @@
     "remove only trailing empty pg_dump lines and enforce exactly one terminal LF, preserving all internal blank lines"
   ],
   "artifacts": {
-    "database": { "path": "database.sql", "bytes": 317351, "sha256": "8d7f727c3da643389514922f261e86de543403b483b6a2cf4c424b4f1724ed79" },
+    "database": { "path": "database.sql", "bytes": 319511, "sha256": "4224429ee8d05c60840eb48dbd6f4f3689345265c611983b5219e7228a6cdb9f" },
     "catalog": { "path": "catalog.txt", "bytes": 512280, "sha256": "bfc3f2555f290f7fa34b636f18695e60ba3c9ed784b75b42fca9b5a092c98972" },
     "migrations": { "path": "migrations.tsv", "count": 588, "bytes": 86518, "sha256": "8c96f59b77613b25ae5ac667692d3f57253d84a03f66b9395ba2ce0a37e250ea" }
   },

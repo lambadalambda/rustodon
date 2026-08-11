@@ -254,6 +254,11 @@ WHERE id = 116844606259202001;
 
 UPDATE accounts SET attribution_domains = NULL WHERE id = -99;
 UPDATE accounts SET id_scheme = 0 WHERE id = 116844606259201001;
+UPDATE accounts
+SET public_key = source.public_key,
+    private_key = source.private_key
+FROM accounts source
+WHERE accounts.id = -99 AND source.id = 116844606259201001;
 
 INSERT INTO accounts (
   id, username, domain, display_name, note, uri, url, actor_type,
@@ -292,7 +297,9 @@ INSERT INTO users (
   (102, 116844606259201002, 'moderator@fixture.invalid', '$2a$04$eYtbMaSJeYOgS7ENqTs6vezGAQVltj68iGTiHiIsdst5LyirUp5JC', '2026-07-01 12:00:00', true, false, 'en', ARRAY[]::varchar[], ARRAY[]::varchar[], NULL, 92, '192.0.2.11', '2026-07-01 12:00:00', '2026-07-01 12:00:00'),
   (103, 116844606259201003, 'newbie@fixture.invalid', '$2a$04$eYtbMaSJeYOgS7ENqTs6vezGAQVltj68iGTiHiIsdst5LyirUp5JC', '2026-07-01 12:00:00', true, true, 'en', ARRAY['en', 'fr'], NULL, '', 91, '192.0.2.12', '2026-07-01 12:00:00', '2026-07-01 12:00:00');
 
-UPDATE users SET webauthn_id = 'fixture-alice-webauthn-id' WHERE id = 101;
+UPDATE users
+SET webauthn_id = 'fixture-alice-webauthn-id', otp_required_for_login = true
+WHERE id = 101;
 
 INSERT INTO webauthn_credentials (
   id, user_id, external_id, nickname, public_key, sign_count, created_at, updated_at
@@ -720,7 +727,7 @@ INSERT INTO keypairs (
   'https://fixture-v4-6-5.rustodon.invalid/users/alice#opaque-key',
   'opaque-public-key-material',
   '{"p":"9q4gHslWnbK8a5zNjL1ySdpX5I8wunpM6ed7whTvAnwlyUs=","h":{"iv":"jvVW4mOA+IzCBTv/","at":"Wd+qB8DnQnN2bRo/7ukJmQ=="}}',
-  false, NULL, '2026-07-01 16:11:00', '2026-07-01 16:11:00'
+  true, NULL, '2026-07-01 16:11:00', '2026-07-01 16:11:00'
 );
 
 INSERT INTO tombstones (

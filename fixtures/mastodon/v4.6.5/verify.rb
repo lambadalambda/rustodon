@@ -110,6 +110,10 @@ alice = Account.find(116_844_606_259_201_001)
 private_key = OpenSSL::PKey::RSA.new(alice.private_key)
 public_key = OpenSSL::PKey::RSA.new(alice.public_key)
 raise 'local account RSA keypair does not match' unless private_key.public_key.to_der == public_key.to_der
+instance_actor = Account.find(-99)
+instance_private_key = OpenSSL::PKey::RSA.new(instance_actor.private_key)
+instance_public_key = OpenSSL::PKey::RSA.new(instance_actor.public_key)
+raise 'instance actor RSA keypair does not match' unless instance_private_key.public_key.to_der == instance_public_key.to_der
 raise 'local account avatar is not readable from Paperclip' unless alice.avatar.exists?(:original)
 raise 'PNG avatar static URL should use original style' unless alice.avatar_static_url == alice.avatar_original_url
 
@@ -124,6 +128,7 @@ OpenSSL::PKey::RSA.new(remote_keypair.public_key)
 opaque_keypair = Keypair.find(8902)
 raise 'encrypted local keypair did not decrypt through Mastodon 4.6.5' unless opaque_keypair.private_key == 'fixture opaque private key material'
 raise 'opaque keypair fixture did not retain its raw encrypted envelope' unless opaque_keypair.attributes_before_type_cast['private_key'].start_with?('{"p":')
+raise 'opaque preservation-only keypair must stay revoked' unless opaque_keypair.revoked?
 
 attachment = MediaAttachment.find(116_844_842_188_806_001)
 raise 'status image original is not readable from Paperclip' unless attachment.file.exists?(:original)
