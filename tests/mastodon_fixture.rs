@@ -9,6 +9,7 @@ use serde_json::Value;
 const REVISION: &str = "1440d55b139e39ec722c2a3db7f60b66cd889048";
 const SCHEMA_SHA256: &str = "e7915a2fadcb1a5f4cb1c5d5fe4aeccb97ecdfaed37759d6b66873efffbde54a";
 const MASTODON_IMAGE: &str = "ghcr.io/mastodon/mastodon@sha256:77f11d1a6c674664217372d94ccdb9203524c60447827fe74ab6e11466825815";
+const REDIS_IMAGE: &str = "docker.io/library/redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2";
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -127,6 +128,11 @@ fn manifest_pins_the_exact_mastodon_baseline_and_fixture_labels() {
     assert_eq!(
         manifest["images"]["postgres"]["manifest_digest"],
         "sha256:525844ca03edbc43a4c5fb8ca09ddef2a82bd96a9b4f826542833b7183d44c60"
+    );
+    assert_eq!(manifest["images"]["redis"]["index"], REDIS_IMAGE);
+    assert_eq!(
+        manifest["images"]["redis"]["manifest_digest"],
+        "sha256:9702d01c1f10c3ea9f48211b4362e44f154ff02d063e6f7268eba804059f53bf"
     );
     assert_eq!(
         manifest["normalization"],
@@ -275,6 +281,35 @@ fn generator_rejects_database_or_domain_overrides_before_starting_podman() {
         stderr.contains("refusing unsupported fixture destination or override"),
         "unexpected error: {stderr}"
     );
+}
+
+#[test]
+fn differential_command_is_documented_and_rejects_unsafe_case_names() {
+    let help = Command::new(fixture_tool())
+        .arg("help")
+        .output()
+        .expect("fixture help should run");
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("differential-test [CASE]"));
+
+    let output = Command::new(fixture_tool())
+        .args(["differential-test", "../../unsafe"])
+        .env("DATABASE_URL", "postgresql://production.example/production")
+        .env("PAPERCLIP_ROOT_PATH", "/production/media")
+        .output()
+        .expect("unsafe differential case should be rejected");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("case must use lowercase letters, digits, or underscores")
+    );
+
+    let output = Command::new(fixture_tool())
+        .args(["differential-test", "missing_case"])
+        .output()
+        .expect("unknown differential case should be rejected");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown differential case"));
 }
 
 #[test]

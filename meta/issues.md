@@ -1,6 +1,5 @@
 # Open Issues
 
-- [ ] [Build the Rails-versus-Rust differential test harness](issues/build-differential-test-harness.md)
 - [ ] [Implement configuration loading and preflight checks](issues/implement-configuration-and-preflight.md)
 - [ ] [Implement existing OAuth bearer-token authentication](issues/implement-oauth-bearer-authentication.md)
 - [ ] [Implement core REST entity serializers](issues/implement-core-rest-serializers.md)

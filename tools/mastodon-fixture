@@ -13,11 +13,16 @@ MASTODON_IMAGE="ghcr.io/mastodon/mastodon@$MASTODON_MANIFEST_DIGEST"
 POSTGRES_INDEX_IMAGE='docker.io/library/postgres@sha256:2f439458ab6a57a925825ae14f9d06910e4fe4a41c8d4a0ae06397e65b707e1b'
 POSTGRES_MANIFEST_DIGEST='sha256:525844ca03edbc43a4c5fb8ca09ddef2a82bd96a9b4f826542833b7183d44c60'
 POSTGRES_IMAGE="docker.io/library/postgres@$POSTGRES_MANIFEST_DIGEST"
+REDIS_INDEX_IMAGE='docker.io/library/redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2'
+REDIS_MANIFEST_DIGEST='sha256:9702d01c1f10c3ea9f48211b4362e44f154ff02d063e6f7268eba804059f53bf'
+REDIS_IMAGE="docker.io/library/redis@$REDIS_MANIFEST_DIGEST"
 DATABASE_NAME='rustodon_mastodon_v4_6_5_fixture'
 DATABASE_USER='rustodon_fixture'
 DATABASE_PASSWORD='fixture-only-password-v4-6-5'
 DATABASE_READER='rustodon_reader'
 DATABASE_READER_PASSWORD='fixture-reader-password-v4-6-5'
+DIFFERENTIAL_READER='rustodon_differential_reader'
+DIFFERENTIAL_READER_PASSWORD='fixture-differential-reader-v4-6-5'
 LOCAL_DOMAIN='fixture-v4-6-5.rustodon.invalid'
 REMOTE_DOMAIN='remote.fixture.invalid'
 MIGRATION_COUNT='588'
@@ -30,6 +35,10 @@ SOURCE_DIR="$ROOT/target/mastodon-v4.6.5"
 PG_CONTAINER=''
 PG_VOLUME=''
 NETWORK=''
+REDIS_CONTAINER=''
+WEB_CONTAINER=''
+DIFFERENTIAL_ROOT=''
+DIFFERENTIAL_RUN_ID=''
 
 die() {
   printf 'mastodon-fixture: %s\n' "$*" >&2
@@ -51,6 +60,14 @@ run_podman() {
 }
 
 cleanup_containers() {
+  if [ -n "$WEB_CONTAINER" ]; then
+    run_podman rm -f --volumes "$WEB_CONTAINER" >/dev/null 2>&1 || true
+    WEB_CONTAINER=''
+  fi
+  if [ -n "$REDIS_CONTAINER" ]; then
+    run_podman rm -f --volumes "$REDIS_CONTAINER" >/dev/null 2>&1 || true
+    REDIS_CONTAINER=''
+  fi
   if [ -n "$PG_CONTAINER" ]; then
     run_podman rm -f --volumes "$PG_CONTAINER" >/dev/null 2>&1 || true
     PG_CONTAINER=''
@@ -62,6 +79,17 @@ cleanup_containers() {
   if [ -n "$NETWORK" ]; then
     run_podman network rm "$NETWORK" >/dev/null 2>&1 || true
     NETWORK=''
+  fi
+  if [ -n "$DIFFERENTIAL_ROOT" ]; then
+    expected_root="$ROOT/target/differential-$DIFFERENTIAL_RUN_ID"
+    marker="$DIFFERENTIAL_ROOT/.rustodon-differential-run"
+    if [ "$DIFFERENTIAL_ROOT" = "$expected_root" ] &&
+       [ -f "$marker" ] &&
+       [ "$(cat "$marker")" = "run=$DIFFERENTIAL_RUN_ID" ]
+    then
+      rm -rf "$DIFFERENTIAL_ROOT"
+    fi
+    DIFFERENTIAL_ROOT=''
   fi
 }
 
@@ -95,13 +123,30 @@ verify_images() {
   verify_image PostgreSQL "$POSTGRES_INDEX_IMAGE" "$POSTGRES_MANIFEST_DIGEST" "$POSTGRES_IMAGE"
 }
 
+verify_differential_images() {
+  verify_images
+  verify_image Redis "$REDIS_INDEX_IMAGE" "$REDIS_MANIFEST_DIGEST" "$REDIS_IMAGE"
+}
+
 start_database() {
   publish=${1:-false}
+  cleanup_mode=${2:-fixture}
   need_command podman
   NETWORK="rustodon-fixture-v4-6-5-network-$$"
   PG_CONTAINER="rustodon-fixture-v4-6-5-postgres-$$"
   PG_VOLUME="rustodon-fixture-v4-6-5-postgres-$$"
-  trap cleanup_containers EXIT HUP INT TERM
+  case "$cleanup_mode" in
+    fixture)
+      trap cleanup_containers EXIT HUP INT TERM
+      ;;
+    differential)
+      trap differential_exit_cleanup EXIT
+      trap 'exit 129' HUP
+      trap 'exit 130' INT
+      trap 'exit 143' TERM
+      ;;
+    *) die "unknown database cleanup mode: $cleanup_mode" ;;
+  esac
 
   run_podman network create "$NETWORK" >/dev/null
   run_podman volume create \
@@ -324,6 +369,11 @@ write_manifest() {
       "index": "$POSTGRES_INDEX_IMAGE",
       "manifest_digest": "$POSTGRES_MANIFEST_DIGEST",
       "resolved": "$POSTGRES_IMAGE"
+    },
+    "redis": {
+      "index": "$REDIS_INDEX_IMAGE",
+      "manifest_digest": "$REDIS_MANIFEST_DIGEST",
+      "resolved": "$REDIS_IMAGE"
     }
   },
   "database_name": "$DATABASE_NAME",
@@ -664,6 +714,8 @@ verify_static() {
   require_manifest_value "$manifest" "\"postgres_image\": \"$POSTGRES_INDEX_IMAGE\""
   require_manifest_value "$manifest" "\"manifest_digest\": \"$MASTODON_MANIFEST_DIGEST\""
   require_manifest_value "$manifest" "\"manifest_digest\": \"$POSTGRES_MANIFEST_DIGEST\""
+  require_manifest_value "$manifest" "\"index\": \"$REDIS_INDEX_IMAGE\""
+  require_manifest_value "$manifest" "\"manifest_digest\": \"$REDIS_MANIFEST_DIGEST\""
   require_manifest_value "$manifest" "\"database_name\": \"$DATABASE_NAME\""
   require_manifest_value "$manifest" "\"local_domain\": \"$LOCAL_DOMAIN\""
 
@@ -760,6 +812,281 @@ EOF
   printf 'read-only Rust schema integration passed for Mastodon %s\n' "$RELEASE"
 }
 
+validate_differential_case() {
+  case_name=$1
+  case "$case_name" in
+    ''|*[!a-z0-9_]*)
+      die 'differential case must use lowercase letters, digits, or underscores'
+      ;;
+  esac
+  case "$case_name" in
+    instance_v2) ;;
+    *) die "unknown differential case: $case_name" ;;
+  esac
+}
+
+prepare_differential_database() {
+  database=$1
+  side=$2
+
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres >/dev/null <<EOF
+COMMENT ON DATABASE $database IS 'rustodon differential run=$DIFFERENTIAL_RUN_ID side=$side';
+REVOKE ALL ON DATABASE $database FROM PUBLIC;
+REVOKE ALL ON DATABASE $database FROM $DIFFERENTIAL_READER;
+GRANT CONNECT ON DATABASE $database TO $DIFFERENTIAL_READER;
+EOF
+
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$database" >/dev/null <<EOF
+INSERT INTO settings (var, value, created_at, updated_at)
+VALUES ('wrapstodon', E'--- false\n', TIMESTAMP '2026-07-01 00:00:00', TIMESTAMP '2026-07-01 00:00:00')
+ON CONFLICT (var) DO UPDATE
+SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON SCHEMA public FROM $DIFFERENTIAL_READER;
+GRANT USAGE ON SCHEMA public TO $DIFFERENTIAL_READER;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM $DIFFERENTIAL_READER;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO $DIFFERENTIAL_READER;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM $DIFFERENTIAL_READER;
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM $DIFFERENTIAL_READER;
+EOF
+}
+
+start_differential_redis() {
+  REDIS_CONTAINER="rustodon-differential-v4-6-5-redis-$$"
+  run_podman run -d \
+    --platform "$PLATFORM" \
+    --name "$REDIS_CONTAINER" \
+    --label 'io.rustodon.fixture=mastodon-v4.6.5' \
+    --label "io.rustodon.fixture.session=$$" \
+    --network "$NETWORK" \
+    --tmpfs /data:rw,nosuid,nodev,noexec,size=64m \
+    "$REDIS_IMAGE" redis-server --save '' --appendonly no >/dev/null
+
+  attempts=0
+  until [ "$(run_podman exec "$REDIS_CONTAINER" redis-cli ping 2>/dev/null || true)" = 'PONG' ]
+  do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 60 ]; then
+      die 'Redis differential container did not become ready'
+    fi
+    sleep 1
+  done
+}
+
+start_differential_web() {
+  mastodon_database=$1
+  media_root=$2
+  WEB_CONTAINER="rustodon-differential-v4-6-5-web-$$"
+
+  run_podman run -d \
+    --platform "$PLATFORM" \
+    --name "$WEB_CONTAINER" \
+    --label 'io.rustodon.fixture=mastodon-v4.6.5' \
+    --label "io.rustodon.fixture.session=$$" \
+    --network "$NETWORK" \
+    --publish 127.0.0.1::3000 \
+    --volume "$media_root:/opt/mastodon/public/system:ro,Z" \
+    --env 'RAILS_ENV=production' \
+    --env 'NODE_ENV=production' \
+    --env 'TZ=Etc/UTC' \
+    --env 'BIND=0.0.0.0' \
+    --env 'PORT=3000' \
+    --env 'WEB_CONCURRENCY=0' \
+    --env 'MIN_THREADS=2' \
+    --env 'MAX_THREADS=2' \
+    --env 'DB_POOL=2' \
+    --env 'RAILS_LOG_LEVEL=warn' \
+    --env "DB_HOST=$PG_CONTAINER" \
+    --env 'DB_PORT=5432' \
+    --env "DB_NAME=$mastodon_database" \
+    --env "DB_USER=$DATABASE_USER" \
+    --env "DB_PASS=$DATABASE_PASSWORD" \
+    --env 'DB_SSLMODE=disable' \
+    --env "REDIS_HOST=$REDIS_CONTAINER" \
+    --env 'REDIS_PORT=6379' \
+    --env 'REDIS_DB=0' \
+    --env "LOCAL_DOMAIN=$LOCAL_DOMAIN" \
+    --env "WEB_DOMAIN=$LOCAL_DOMAIN" \
+    --env "STREAMING_API_BASE_URL=wss://$LOCAL_DOMAIN" \
+    --env 'DEFAULT_LOCALE=en' \
+    --env 'FORCE_DEFAULT_LOCALE=true' \
+    --env 'SINGLE_USER_MODE=false' \
+    --env 'LIMITED_FEDERATION_MODE=false' \
+    --env 'WHITELIST_MODE=false' \
+    --env 'DISALLOW_UNAUTHENTICATED_API_ACCESS=false' \
+    --env 'AUTHORIZED_FETCH=false' \
+    --env 'S3_ENABLED=false' \
+    --env 'SWIFT_ENABLED=false' \
+    --env 'AZURE_ENABLED=false' \
+    --env 'ES_ENABLED=false' \
+    --env 'PAPERCLIP_ROOT_PATH=/opt/mastodon/public/system' \
+    --env 'PAPERCLIP_ROOT_URL=/system' \
+    --env 'RAILS_SERVE_STATIC_FILES=true' \
+    --env 'SECRET_KEY_BASE=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
+    --env 'OTP_SECRET=abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789' \
+    --env 'ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY=11111111111111111111111111111111' \
+    --env 'ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT=22222222222222222222222222222222' \
+    --env 'ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY=33333333333333333333333333333333' \
+    --env 'VAPID_PUBLIC_KEY=BB37UCyc8LLX4PNQSe-04vSFvpUWGrENubUaslVFM_l5TxcGVMY0C3RXPeUJAQHKYlcOM2P4vTYmkoo0VZGZTM4=' \
+    --env 'VAPID_PRIVATE_KEY=OPrw1Sum3gRoL4-DXfSCC266r-qfFSRZrnj8MgIhRHg=' \
+    "$MASTODON_IMAGE" bundle exec puma -C config/puma.rb >/dev/null
+
+  attempts=0
+  until run_podman exec "$WEB_CONTAINER" \
+    curl -fsS --noproxy localhost http://localhost:3000/health >/dev/null 2>&1
+  do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 90 ]; then
+      run_podman logs "$WEB_CONTAINER" >&2 || true
+      die 'Mastodon differential web container did not become ready'
+    fi
+    sleep 1
+  done
+}
+
+verify_podman_resource_absent() {
+  resource_kind=$1
+  resource_name=$2
+  case "$resource_kind" in
+    container) exists_command='container' ;;
+    volume) exists_command='volume' ;;
+    network) exists_command='network' ;;
+    *) die "unknown Podman resource kind: $resource_kind" ;;
+  esac
+
+  if run_podman "$exists_command" exists "$resource_name" >/dev/null 2>&1; then
+    printf 'mastodon-fixture: differential %s leaked after cleanup: %s\n' \
+      "$resource_kind" "$resource_name" >&2
+    return 1
+  else
+    inspection_status=$?
+    if [ "$inspection_status" -ne 1 ]; then
+      printf 'mastodon-fixture: could not verify differential %s cleanup for %s (Podman exit %s)\n' \
+        "$resource_kind" "$resource_name" "$inspection_status" >&2
+      return 1
+    fi
+  fi
+}
+
+cleanup_and_verify_differential() {
+  finished_web=$WEB_CONTAINER
+  finished_redis=$REDIS_CONTAINER
+  finished_postgres=$PG_CONTAINER
+  finished_volume=$PG_VOLUME
+  finished_network=$NETWORK
+  finished_root=$DIFFERENTIAL_ROOT
+  cleanup_containers
+  cleanup_failed=false
+  for container in "$finished_web" "$finished_redis" "$finished_postgres"
+  do
+    [ -n "$container" ] || continue
+    verify_podman_resource_absent container "$container" || cleanup_failed=true
+  done
+  verify_podman_resource_absent volume "$finished_volume" || cleanup_failed=true
+  verify_podman_resource_absent network "$finished_network" || cleanup_failed=true
+  if [ -e "$finished_root" ]; then
+    printf 'mastodon-fixture: differential run root leaked after cleanup: %s\n' \
+      "$finished_root" >&2
+    cleanup_failed=true
+  fi
+  [ "$cleanup_failed" = false ]
+}
+
+differential_exit_cleanup() {
+  original_status=$?
+  trap - EXIT HUP INT TERM
+  cleanup_status=0
+  cleanup_and_verify_differential || cleanup_status=$?
+  if [ "$original_status" -ne 0 ]; then
+    exit "$original_status"
+  fi
+  exit "$cleanup_status"
+}
+
+finish_differential() {
+  cleanup_and_verify_differential || die 'differential cleanup verification failed'
+  trap - EXIT HUP INT TERM
+}
+
+differential_test() {
+  case_name=${1:-}
+  if [ -n "$case_name" ]; then
+    validate_differential_case "$case_name"
+  fi
+  verify_static "$FIXTURE_DIR"
+  verify_differential_images
+  start_database publish differential
+
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$FIXTURE_DIR/database.sql" >/dev/null
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$FIXTURE_DIR/verify.sql" >/dev/null
+
+  DIFFERENTIAL_RUN_ID="run_$$"
+  mastodon_database="rustodon_differential_${DIFFERENTIAL_RUN_ID}_mastodon"
+  rust_database="rustodon_differential_${DIFFERENTIAL_RUN_ID}_rust"
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres >/dev/null <<EOF
+CREATE ROLE $DIFFERENTIAL_READER LOGIN PASSWORD '$DIFFERENTIAL_READER_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+ALTER ROLE $DIFFERENTIAL_READER SET default_transaction_read_only = on;
+CREATE DATABASE $mastodon_database WITH TEMPLATE $DATABASE_NAME OWNER $DATABASE_USER;
+CREATE DATABASE $rust_database WITH TEMPLATE $DATABASE_NAME OWNER $DATABASE_USER;
+EOF
+  prepare_differential_database "$mastodon_database" mastodon
+  prepare_differential_database "$rust_database" rust
+
+  DIFFERENTIAL_ROOT="$ROOT/target/differential-$DIFFERENTIAL_RUN_ID"
+  [ ! -e "$DIFFERENTIAL_ROOT" ] || die "differential run root already exists: $DIFFERENTIAL_ROOT"
+  mkdir "$DIFFERENTIAL_ROOT"
+  printf 'run=%s\n' "$DIFFERENTIAL_RUN_ID" > "$DIFFERENTIAL_ROOT/.rustodon-differential-run"
+  mastodon_media="$DIFFERENTIAL_ROOT/mastodon-media"
+  rust_media="$DIFFERENTIAL_ROOT/rust-media"
+  mkdir "$mastodon_media" "$rust_media"
+  cp -a "$FIXTURE_DIR/media/." "$mastodon_media/"
+  cp -a "$FIXTURE_DIR/media/." "$rust_media/"
+  printf 'run=%s\nside=mastodon\n' "$DIFFERENTIAL_RUN_ID" > "$mastodon_media/.rustodon-differential-media-root"
+  printf 'run=%s\nside=rust\n' "$DIFFERENTIAL_RUN_ID" > "$rust_media/.rustodon-differential-media-root"
+
+  start_differential_redis
+  start_differential_web "$mastodon_database" "$mastodon_media"
+
+  published_database=$(run_podman port "$PG_CONTAINER" 5432/tcp)
+  database_port=${published_database##*:}
+  published_web=$(run_podman port "$WEB_CONTAINER" 3000/tcp)
+  web_port=${published_web##*:}
+  for port in "$database_port" "$web_port"
+  do
+    case "$port" in
+      ''|*[!0-9]*) die "invalid differential published port: $port" ;;
+    esac
+  done
+
+  mastodon_database_url="postgresql://$DIFFERENTIAL_READER:$DIFFERENTIAL_READER_PASSWORD@127.0.0.1:$database_port/$mastodon_database"
+  rust_database_url="postgresql://$DIFFERENTIAL_READER:$DIFFERENTIAL_READER_PASSWORD@127.0.0.1:$database_port/$rust_database"
+  if [ -n "$case_name" ]; then
+    RUSTODON_DIFFERENTIAL_RUN_ID="$DIFFERENTIAL_RUN_ID" \
+      RUSTODON_DIFFERENTIAL_MASTODON_HTTP_URL="http://127.0.0.1:$web_port" \
+      RUSTODON_DIFFERENTIAL_MASTODON_DATABASE_URL="$mastodon_database_url" \
+      RUSTODON_DIFFERENTIAL_RUST_DATABASE_URL="$rust_database_url" \
+      cargo test --locked --test differential "$case_name" -- --ignored --exact --nocapture
+  else
+    RUSTODON_DIFFERENTIAL_RUN_ID="$DIFFERENTIAL_RUN_ID" \
+      RUSTODON_DIFFERENTIAL_MASTODON_HTTP_URL="http://127.0.0.1:$web_port" \
+      RUSTODON_DIFFERENTIAL_MASTODON_DATABASE_URL="$mastodon_database_url" \
+      RUSTODON_DIFFERENTIAL_RUST_DATABASE_URL="$rust_database_url" \
+      cargo test --locked --test differential -- --ignored --nocapture
+  fi
+
+  finish_differential
+  printf 'differential compatibility case(s) passed against Mastodon %s\n' "$RELEASE"
+}
+
 reproducibility_check() {
   verify_static "$FIXTURE_DIR"
   candidate="$ROOT/target/mastodon-v4.6.5-repro-$$"
@@ -784,6 +1111,8 @@ Commands:
   verify [PATH]          Verify pinned metadata and artifact checksums (fast)
   restore-verify [PATH]  Restore and verify with PostgreSQL and Mastodon Rails
   schema-read-test       Run ignored Rust reads through a least-privilege role
+  differential-test [CASE]
+                          Run all or one Rails-versus-Rust compatibility case
   repro                   Regenerate and compare every fixture byte
 EOF
 }
@@ -821,6 +1150,10 @@ case "$command" in
   schema-read-test)
     [ "$#" -eq 0 ] || die 'schema-read-test takes no arguments'
     schema_read_test
+    ;;
+  differential-test)
+    [ "$#" -le 1 ] || die 'differential-test accepts at most one case'
+    differential_test "${1:-}"
     ;;
   repro)
     [ "$#" -eq 0 ] || die 'repro takes no arguments'

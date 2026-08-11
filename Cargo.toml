@@ -13,7 +13,13 @@ ipnetwork = "0.20.0"
 saphyr = { version = "=0.0.6", default-features = false }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "json", "ipnetwork", "derive"] }
-tokio = { version = "1.47", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "sync"] }
+
+[dev-dependencies]
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false }
+sha2 = "0.10"
+url = "2.5"
 
 [lints.rust]
 unsafe_code = "forbid"

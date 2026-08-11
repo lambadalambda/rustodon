@@ -91,3 +91,19 @@
   mappings needed by the first REST and federation milestones. Direct status
   reads suppress soft-deleted rows while live parent records such as
   notifications and quotes remain lossless when a referenced status is gone.
+- Added a test-only Rails-versus-Rust differential harness. It sends one typed
+  request to distinct loopback targets, compares exact statuses, declared
+  headers, canonical JSON, logical PostgreSQL snapshots, and media hashes, and
+  reports focused JSON paths, table keys, and file paths.
+- Kept the compatibility boundary on observable behavior rather than Rails
+  internals: ActivityPub documents, durable job intent, and media artifacts have
+  typed comparison slots, while callback counts, query ordering, Redis keys,
+  and Sidekiq representation are deliberately excluded.
+- Added exact, format-validating normalization rules for request IDs, generated
+  timestamps, and prefixed random test tokens. Broad key deletion, wildcard
+  paths, array reordering, and number coercion are not allowed.
+- Added guarded differential orchestration using independently marked clones of
+  the pinned database and media tree, a pinned empty Redis, and pinned Mastodon
+  Puma. Rust receives SELECT-only clone credentials; loopback URLs, database
+  comments, media markers, canonical paths, and symlink absence are validated
+  before requests run.

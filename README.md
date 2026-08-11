@@ -121,6 +121,7 @@ start Podman containers:
 mise run fixture-restore-verify
 mise run fixture-repro
 mise run mastodon-schema-integration
+mise run differential
 ```
 
 The first restores the checked dump and verifies it through SQL and Mastodon
@@ -134,6 +135,24 @@ role's default read-only setting.
 These Podman tasks currently require GNU/Linux x86-64; labeled PostgreSQL
 volumes are removed and checked after each task, and bind mounts support SELinux
 relabeling.
+
+The differential task starts pinned Mastodon 4.6.5 and a Rust fixture response
+against independent database and media clones, sends each case's exact HTTP
+request to both, and compares status, declared headers, and canonical JSON. It
+also checks logical database rows and media hashes before and after the request.
+Run one case by its Rust test name without executing the complete suite:
+
+```console
+mise run differential -- instance_v2
+```
+
+Mismatch output identifies the status, header, JSON path, table/key, or media
+path that differs. Narrow normalization rules are declared centrally and
+validate request IDs, generated RFC 3339 timestamps, or prefixed random test
+tokens before replacing them. The harness compares observable contracts, not
+Rails callbacks, SQL ordering, Redis keys, or Sidekiq payload representation.
+Its databases, media roots, Redis, and HTTP ports are run-marked test resources
+under `target/`; production-looking URLs and unmarked paths are rejected.
 See the [fixture documentation](fixtures/mastodon/v4.6.5/README.md) for test
 identities, key/media provenance, normalization, and the later-release update
 process.

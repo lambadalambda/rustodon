@@ -1,0 +1,164 @@
+{
+  "domain": "fixture-v4-6-5.rustodon.invalid",
+  "title": "Mastodon",
+  "version": "4.6.5",
+  "source_url": "https://github.com/mastodon/mastodon",
+  "description": "",
+  "usage": {
+    "users": {
+      "active_month": 0
+    }
+  },
+  "thumbnail": {
+    "url": "https://fixture-v4-6-5.rustodon.invalid/packs/assets/preview-vSUsFXid.png",
+    "description": "Two smiling cartoon mastodons (who look like elephants) toss a paper plane between them. They're surrounded by a bright blue sky and floating planets with trees and more mastodons on them."
+  },
+  "icon": [
+    {
+      "src": "https://fixture-v4-6-5.rustodon.invalid/packs/assets/android-chrome-36x36-DLiBQg3N.png",
+      "size": "36x36"
+    },
+    {
+      "src": "https://fixture-v4-6-5.rustodon.invalid/packs/assets/android-chrome-48x48-C7lKWFwX.png",
+      "size": "48x48"
+    },
+    {
+      "src": "https://fixture-v4-6-5.rustodon.invalid/packs/assets/android-chrome-72x72-9LRpA3QN.png",
+      "size": "72x72"
+    },
+    {
+      "src": "https://fixture-v4-6-5.rustodon.invalid/packs/assets/android-chrome-96x96-BKKwkkY-.png",
+      "size": "96x96"
+    },
+    {
+      "src": "https://fixture-v4-6-5.rustodon.invalid/packs/assets/android-chrome-144x144-D-ewI-KZ.png",
+      "size": "144x144"
+    },
+    {
+      "src": "https://fixture-v4-6-5.rustodon.invalid/packs/assets/android-chrome-192x192-jYKJbpas.png",
+      "size": "192x192"
+    },
+    {
+      "src": "https://fixture-v4-6-5.rustodon.invalid/packs/assets/android-chrome-256x256-DXt2vsq7.png",
+      "size": "256x256"
+    },
+    {
+      "src": "https://fixture-v4-6-5.rustodon.invalid/packs/assets/android-chrome-384x384-CbK7cG33.png",
+      "size": "384x384"
+    },
+    {
+      "src": "https://fixture-v4-6-5.rustodon.invalid/packs/assets/android-chrome-512x512-Dz2ThkhV.png",
+      "size": "512x512"
+    }
+  ],
+  "languages": [
+    "en"
+  ],
+  "configuration": {
+    "urls": {
+      "streaming": "wss://fixture-v4-6-5.rustodon.invalid",
+      "status": null,
+      "about": "https://fixture-v4-6-5.rustodon.invalid/about",
+      "privacy_policy": "https://fixture-v4-6-5.rustodon.invalid/privacy-policy",
+      "terms_of_service": null
+    },
+    "vapid": {
+      "public_key": "BB37UCyc8LLX4PNQSe-04vSFvpUWGrENubUaslVFM_l5TxcGVMY0C3RXPeUJAQHKYlcOM2P4vTYmkoo0VZGZTM4="
+    },
+    "accounts": {
+      "max_display_name_length": 40,
+      "max_note_length": 500,
+      "max_avatar_description_length": 150,
+      "max_header_description_length": 150,
+      "max_featured_tags": 10,
+      "max_pinned_statuses": 5,
+      "max_profile_fields": 4,
+      "profile_field_name_limit": 255,
+      "profile_field_value_limit": 255
+    },
+    "statuses": {
+      "max_characters": 500,
+      "max_media_attachments": 4,
+      "characters_reserved_per_url": 23
+    },
+    "media_attachments": {
+      "description_limit": 10000,
+      "image_matrix_limit": 33177600,
+      "image_size_limit": 16777216,
+      "supported_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/heic",
+        "image/heif",
+        "image/webp",
+        "image/avif",
+        "video/webm",
+        "video/mp4",
+        "video/quicktime",
+        "video/ogg",
+        "audio/wave",
+        "audio/wav",
+        "audio/x-wav",
+        "audio/x-pn-wave",
+        "audio/vnd.wave",
+        "audio/ogg",
+        "audio/vorbis",
+        "audio/mpeg",
+        "audio/mp3",
+        "audio/webm",
+        "audio/flac",
+        "audio/aac",
+        "audio/m4a",
+        "audio/x-m4a",
+        "audio/mp4",
+        "audio/3gpp",
+        "video/x-ms-asf"
+      ],
+      "video_frame_rate_limit": 120,
+      "video_matrix_limit": 8294400,
+      "video_size_limit": 103809024
+    },
+    "polls": {
+      "max_options": 4,
+      "max_characters_per_option": 50,
+      "min_expiration": 300,
+      "max_expiration": 2629746
+    },
+    "translation": {
+      "enabled": false
+    },
+    "timelines_access": {
+      "live_feeds": {
+        "local": "public",
+        "remote": "public"
+      },
+      "hashtag_feeds": {
+        "local": "public",
+        "remote": "public"
+      },
+      "trending_link_feeds": {
+        "local": "public",
+        "remote": "public"
+      }
+    },
+    "limited_federation": false
+  },
+  "registrations": {
+    "enabled": false,
+    "approval_required": false,
+    "reason_required": false,
+    "message": null,
+    "min_age": null,
+    "url": null
+  },
+  "api_versions": {
+    "mastodon": 11
+  },
+  "wrapstodon": null,
+  "contact": {
+    "email": "",
+    "account": null
+  },
+  "rules": []
+}

@@ -45,6 +45,10 @@ run = "tools/mastodon-fixture repro"
 description = "Run read-only Rust schema integration against the restored fixture"
 run = "tools/mastodon-fixture schema-read-test"
 
+[tasks.differential]
+description = "Run all or one Rails-versus-Rust differential compatibility case"
+run = "tools/mastodon-fixture differential-test"
+
 [tasks.check]
 description = "Run all local and CI checks"
 depends = ["fmt", "lint", "test", "deny", "fixture-verify"]
