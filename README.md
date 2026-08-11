@@ -76,6 +76,48 @@ mise run test
 mise run deny
 ```
 
+### Mastodon compatibility fixture
+
+The first compatibility baseline is pinned to Mastodon v4.6.5 commit
+`1440d55b139e39ec722c2a3db7f60b66cd889048`, schema version
+`20260611150940`. Its release-versioned database, catalog, migration, and local
+media artifacts live under [`fixtures/mastodon/v4.6.5/`](fixtures/mastodon/v4.6.5/).
+
+Obtain the matching source without vendoring it, generate the fixture, and run
+the fast checksum/metadata verification with:
+
+```console
+mise run fixture-obtain
+mise run fixture-generate
+mise run fixture-verify
+```
+
+The source checkout is stored under ignored `target/`. Generation rejects a
+dirty source tree, reads migration/media inputs from pinned Git blobs, and uses
+the pinned `linux/amd64` child manifests for Mastodon and PostgreSQL 14. It uses
+dedicated `.invalid` domains and the dedicated
+`rustodon_mastodon_v4_6_5_fixture` database, never project or Mastodon `.env`
+files. Redis is intentionally not started because direct Paperclip processing
+and the verified Rails schema/model/serializer paths do not require it.
+
+The following checks are intentionally separate from normal CI because they
+start Podman containers:
+
+```console
+mise run fixture-restore-verify
+mise run fixture-repro
+```
+
+The first restores the checked dump and verifies it through SQL and Mastodon
+Rails, including all 17 notification types and Paperclip media. The second
+regenerates every artifact and performs a recursive byte-for-byte comparison.
+These Podman tasks currently require GNU/Linux x86-64; labeled PostgreSQL
+volumes are removed and checked after each task, and bind mounts support SELinux
+relabeling.
+See the [fixture documentation](fixtures/mastodon/v4.6.5/README.md) for test
+identities, key/media provenance, normalization, and the later-release update
+process.
+
 Inspect the planned process modes with:
 
 ```console
@@ -103,8 +145,10 @@ Important findings and decisions are recorded in [DEVLOG.md](DEVLOG.md).
 src/           Rust application source
 tests/         Integration tests
 docs/          Project scope and design documentation
+fixtures/      Release-versioned compatibility databases and local media
 meta/          Repository-local issue tracker
 meta/issues/   Detailed issue specifications
+tools/         Reproducible fixture and development tooling
 ```
 
 ## Compatibility Philosophy

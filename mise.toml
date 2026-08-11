@@ -21,6 +21,26 @@ run = "cargo test --locked --all-targets --all-features"
 description = "Check dependency licenses, advisories, bans, and sources"
 run = "cargo deny --locked check"
 
+[tasks.fixture-obtain]
+description = "Obtain and verify the pinned Mastodon 4.6.5 source"
+run = "tools/mastodon-fixture obtain"
+
+[tasks.fixture-generate]
+description = "Generate the pinned Mastodon 4.6.5 fixture with Podman"
+run = "tools/mastodon-fixture generate"
+
+[tasks.fixture-verify]
+description = "Verify fixture metadata and checksums without Podman"
+run = "tools/mastodon-fixture verify"
+
+[tasks.fixture-restore-verify]
+description = "Restore and verify the fixture with PostgreSQL and Mastodon Rails"
+run = "tools/mastodon-fixture restore-verify"
+
+[tasks.fixture-repro]
+description = "Regenerate and byte-compare the Mastodon 4.6.5 fixture"
+run = "tools/mastodon-fixture repro"
+
 [tasks.check]
 description = "Run all local and CI checks"
-depends = ["fmt", "lint", "test", "deny"]
+depends = ["fmt", "lint", "test", "deny", "fixture-verify"]

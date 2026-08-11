@@ -1,6 +1,5 @@
 # Open Issues
 
-- [ ] [Pin Mastodon 4.6.5 compatibility fixtures](issues/pin-mastodon-4-6-5-fixtures.md)
 - [ ] [Map the Mastodon 4.6.5 schema in Rust](issues/map-mastodon-4-6-5-schema.md)
 - [ ] [Build the Rails-versus-Rust differential test harness](issues/build-differential-test-harness.md)
 - [ ] [Implement configuration loading and preflight checks](issues/implement-configuration-and-preflight.md)
