@@ -1,0 +1,26 @@
+min_version = "2026.8.4"
+
+[tools]
+rust = "1.97.1"
+clang = "22.1.8"
+"aqua:EmbarkStudios/cargo-deny" = "0.20.2"
+
+[tasks.fmt]
+description = "Check Rust formatting"
+run = "cargo fmt --check"
+
+[tasks.lint]
+description = "Run Clippy with warnings denied"
+run = "cargo clippy --locked --all-targets --all-features -- -D warnings"
+
+[tasks.test]
+description = "Run all Rust tests"
+run = "cargo test --locked --all-targets --all-features"
+
+[tasks.deny]
+description = "Check dependency licenses, advisories, bans, and sources"
+run = "cargo deny --locked check"
+
+[tasks.check]
+description = "Run all local and CI checks"
+depends = ["fmt", "lint", "test", "deny"]

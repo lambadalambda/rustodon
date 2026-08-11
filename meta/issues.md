@@ -1,6 +1,5 @@
 # Open Issues
 
-- [ ] [Bootstrap the Rust workspace and quality gates](issues/bootstrap-rust-workspace.md)
 - [ ] [Pin Mastodon 4.6.5 compatibility fixtures](issues/pin-mastodon-4-6-5-fixtures.md)
 - [ ] [Map the Mastodon 4.6.5 schema in Rust](issues/map-mastodon-4-6-5-schema.md)
 - [ ] [Build the Rails-versus-Rust differential test harness](issues/build-differential-test-harness.md)

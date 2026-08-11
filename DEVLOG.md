@@ -21,3 +21,9 @@
 - Corrected the initial scope after independent review against the pinned
   Mastodon 4.6.5 tag and tightened physical-schema, signing-key, exclusive-list,
   and read-only acceptance criteria.
+- Bootstrapped a single-crate Rust 2024 project with `web`, `worker`, and
+  `admin` command surfaces, while deliberately leaving runtime behavior
+  unimplemented.
+- Pinned Rust 1.97.1, Clang 22.1.8, and cargo-deny 0.20.2 through Mise and added
+  shared format, lint, test, dependency-policy, and aggregate check tasks.
+- Added CI with immutable action revisions and prohibited unsafe Rust.

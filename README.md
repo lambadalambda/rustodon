@@ -11,8 +11,8 @@ cache state.
 
 ## Status
 
-Rustodon is in its initial planning and compatibility-harness phase. It is not
-yet usable as a Mastodon server.
+Rustodon is in its initial compatibility-harness phase. The Rust workspace and
+quality gates are established, but it is not yet usable as a Mastodon server.
 
 The first compatibility target is Mastodon 4.6.5. Supporting one stable schema
 first keeps the initial implementation testable; additional Mastodon releases
@@ -53,9 +53,42 @@ implementation order, and acceptance criteria.
 
 ## Development
 
-Implementation has not started. The first milestones establish the Rust
-workspace, pin Mastodon 4.6.5 fixtures, map its schema, and build a differential
-test harness before any production data is written.
+Rustodon uses [Mise](https://mise.jdx.dev/) to pin Rust 1.97.1, Clang 22.1.8,
+and cargo-deny 0.20.2. Install Mise 2026.8.4 or newer, then install the project
+toolchain:
+
+```console
+mise install
+```
+
+Run every local and CI quality gate with:
+
+```console
+mise run check
+```
+
+The individual tasks are also available:
+
+```console
+mise run fmt
+mise run lint
+mise run test
+mise run deny
+```
+
+Inspect the planned process modes with:
+
+```console
+mise exec -- cargo run -- --help
+mise exec -- cargo run -- web --help
+mise exec -- cargo run -- worker --help
+mise exec -- cargo run -- admin --help
+```
+
+The first compatibility milestones pin Mastodon 4.6.5 fixtures, map its schema,
+and build a differential test harness before any production data is written.
+The initial development and CI target is `x86_64-unknown-linux-gnu`; other
+platform targets will be added when they have automated coverage.
 
 Open work is tracked in [meta/issues.md](meta/issues.md). Each entry links to a
 detailed issue under `meta/issues/`.
@@ -65,13 +98,14 @@ Important findings and decisions are recorded in [DEVLOG.md](DEVLOG.md).
 ## Repository Layout
 
 ```text
+.cargo/        Target-specific Cargo configuration
+.github/       Continuous integration workflows
+src/           Rust application source
+tests/         Integration tests
 docs/          Project scope and design documentation
 meta/          Repository-local issue tracker
 meta/issues/   Detailed issue specifications
 ```
-
-Rust source and Cargo workspace layout will be introduced by the bootstrap
-issue rather than committed speculatively.
 
 ## Compatibility Philosophy
 
