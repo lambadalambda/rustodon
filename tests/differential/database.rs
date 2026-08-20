@@ -95,6 +95,13 @@ pub(crate) struct DatabaseMismatch {
     pub(crate) rust: ObservedJson,
 }
 
+impl DatabaseMismatch {
+    fn redact_secrets(&mut self) {
+        self.mastodon = redact_observation(&self.table, &self.path, &self.mastodon);
+        self.rust = redact_observation(&self.table, &self.path, &self.rust);
+    }
+}
+
 impl fmt::Display for DatabaseMismatch {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.fmt_with_labels(formatter, "Mastodon", "Rust")
@@ -493,6 +500,8 @@ impl DatabaseMismatchCollector {
     }
 
     fn push(&mut self, mismatch: DatabaseMismatch) {
+        let mut mismatch = mismatch;
+        mismatch.redact_secrets();
         if self.mismatches.len() < self.limit {
             self.mismatches.push(mismatch);
         } else {
@@ -511,6 +520,52 @@ impl DatabaseMismatchCollector {
                 rust_label: self.rust_label,
             })
         }
+    }
+}
+
+fn redact_observation(table: &str, path: &str, observation: &ObservedJson) -> ObservedJson {
+    let secret_columns: &[&str] = match table {
+        "accounts" | "keypairs" => &["private_key"],
+        "email_subscriptions" => &["confirmation_token"],
+        "fasp_providers" => &["server_private_key_pem"],
+        "generated_annual_reports" => &["share_key"],
+        "oauth_access_grants" => &["token"],
+        "oauth_access_tokens" => &["refresh_token", "token"],
+        "oauth_applications" | "webhooks" => &["secret"],
+        "session_activations" => &["session_id"],
+        "users" => &[
+            "confirmation_token",
+            "encrypted_password",
+            "otp_backup_codes",
+            "otp_secret",
+            "reset_password_token",
+            "sign_in_token",
+        ],
+        "web_push_subscriptions" => &["data", "endpoint", "key_auth", "key_p256dh"],
+        _ => &[],
+    };
+    if secret_columns
+        .iter()
+        .any(|column| path == format!("$.{column}") || path.starts_with(&format!("$.{column}[")))
+    {
+        return match observation {
+            ObservedJson::Missing => ObservedJson::Missing,
+            ObservedJson::Value(_) => ObservedJson::Value(Value::String("[REDACTED]".to_owned())),
+        };
+    }
+
+    match observation {
+        ObservedJson::Missing => ObservedJson::Missing,
+        ObservedJson::Value(Value::Object(object)) => {
+            let mut object = object.clone();
+            for column in secret_columns {
+                if object.contains_key(*column) {
+                    object.insert((*column).to_owned(), Value::String("[REDACTED]".to_owned()));
+                }
+            }
+            ObservedJson::Value(Value::Object(object))
+        }
+        ObservedJson::Value(value) => ObservedJson::Value(value.clone()),
     }
 }
 
@@ -647,5 +702,113 @@ mod tests {
         assert!(diagnostic.contains("Mastodon before=\"before\""));
         assert!(diagnostic.contains("Mastodon after=\"after\""));
         assert!(!diagnostic.contains("Rust="));
+    }
+
+    #[test]
+    fn oauth_database_mismatches_never_render_credentials() {
+        let mastodon = database(table(
+            "oauth_access_tokens",
+            &["id"],
+            vec![
+                json!({"id": 1, "token": "fixture-changed-secret", "refresh_token": "fixture-refresh-secret"}),
+                json!({"id": 2, "token": "fixture-deleted-secret", "refresh_token": null}),
+            ],
+        ));
+        let rust = database(table(
+            "oauth_access_tokens",
+            &["id"],
+            vec![
+                json!({"id": 1, "token": "different-secret", "refresh_token": "different-refresh"}),
+                json!({"id": 3, "token": "fixture-added-secret", "refresh_token": null}),
+            ],
+        ));
+
+        let report = compare_database_snapshots(&mastodon, &rust, DEFAULT_MISMATCH_LIMIT)
+            .expect_err("OAuth rows intentionally differ");
+        let diagnostic = format!("{report:?}\n{report}");
+        assert!(diagnostic.contains("[REDACTED]"));
+        for fragment in [
+            "fixture-changed",
+            "fixture-refresh",
+            "fixture-deleted",
+            "fixture-added",
+            "different-secret",
+            "different-refresh",
+        ] {
+            assert!(!diagnostic.contains(fragment), "leaked {fragment:?}");
+        }
+    }
+
+    #[test]
+    fn all_known_credential_columns_are_redacted_from_whole_rows() {
+        for (table_name, row) in [
+            (
+                "accounts",
+                json!({"id": 1, "private_key": "fixture-sensitive-account"}),
+            ),
+            (
+                "email_subscriptions",
+                json!({"id": 1, "confirmation_token": "fixture-sensitive-email"}),
+            ),
+            (
+                "fasp_providers",
+                json!({"id": 1, "server_private_key_pem": "fixture-sensitive-fasp"}),
+            ),
+            (
+                "generated_annual_reports",
+                json!({"id": 1, "share_key": "fixture-sensitive-report"}),
+            ),
+            (
+                "keypairs",
+                json!({"id": 1, "private_key": "fixture-sensitive-keypair"}),
+            ),
+            (
+                "oauth_access_grants",
+                json!({"id": 1, "token": "fixture-sensitive-grant"}),
+            ),
+            (
+                "oauth_access_tokens",
+                json!({"id": 1, "token": "fixture-sensitive-access", "refresh_token": "fixture-sensitive-refresh"}),
+            ),
+            (
+                "oauth_applications",
+                json!({"id": 1, "secret": "fixture-sensitive-application"}),
+            ),
+            (
+                "session_activations",
+                json!({"id": 1, "session_id": "fixture-sensitive-session"}),
+            ),
+            (
+                "users",
+                json!({
+                    "id": 1,
+                    "confirmation_token": "fixture-sensitive-confirmation",
+                    "encrypted_password": "fixture-sensitive-password",
+                    "otp_backup_codes": ["fixture-sensitive-backup"],
+                    "otp_secret": "fixture-sensitive-otp",
+                    "reset_password_token": "fixture-sensitive-reset",
+                    "sign_in_token": "fixture-sensitive-sign-in"
+                }),
+            ),
+            (
+                "web_push_subscriptions",
+                json!({
+                    "id": 1,
+                    "data": {"auth": "fixture-sensitive-push-data"},
+                    "endpoint": "fixture-sensitive-push-endpoint",
+                    "key_auth": "fixture-sensitive-push-auth",
+                    "key_p256dh": "fixture-sensitive-push-key"
+                }),
+            ),
+            (
+                "webhooks",
+                json!({"id": 1, "secret": "fixture-sensitive-webhook"}),
+            ),
+        ] {
+            let redacted = redact_observation(table_name, "$", &ObservedJson::Value(row));
+            let diagnostic = format!("{redacted:?}");
+            assert!(diagnostic.contains("[REDACTED]"), "{table_name}");
+            assert!(!diagnostic.contains("fixture-sensitive"), "{table_name}");
+        }
     }
 }

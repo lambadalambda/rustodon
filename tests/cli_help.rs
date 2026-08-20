@@ -69,22 +69,46 @@ fn preflight_configuration_failure_has_machine_status_and_safe_diagnostic() {
 }
 
 #[test]
-fn unimplemented_process_modes_fail_loudly() {
-    for process_mode in ["web", "worker", "admin"] {
-        let output = rustodon()
-            .arg(process_mode)
-            .output()
-            .expect("rustodon should run");
+fn worker_requires_valid_configuration_without_exposing_secrets() {
+    let output = rustodon()
+        .arg("worker")
+        .env_clear()
+        .env("SECRET_KEY_BASE", "must-not-appear")
+        .output()
+        .expect("rustodon should run");
 
-        assert!(
-            !output.status.success(),
-            "{process_mode:?} should fail until it is implemented"
-        );
+    assert!(!output.status.success());
 
-        let stderr = String::from_utf8(output.stderr).expect("error should be UTF-8");
-        assert!(
-            stderr.contains("not implemented yet"),
-            "{process_mode:?} should explain why it failed, got:\n{stderr}"
-        );
-    }
+    let stderr = String::from_utf8(output.stderr).expect("error should be UTF-8");
+    assert!(stderr.contains("LOCAL_DOMAIN"));
+    assert!(!stderr.contains("must-not-appear"));
+    assert!(!stderr.contains("not implemented yet"));
+}
+
+#[test]
+fn admin_help_exposes_operational_schema_migration() {
+    let output = rustodon()
+        .args(["admin", "--help"])
+        .output()
+        .expect("rustodon admin help should run");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("migrate-operational-schema"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("worker-readiness"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("dead-jobs"));
+}
+
+#[test]
+fn web_requires_valid_configuration_without_exposing_secrets() {
+    let output = rustodon()
+        .arg("web")
+        .env_clear()
+        .env("SECRET_KEY_BASE", "must-not-appear")
+        .output()
+        .expect("rustodon web should run");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("error should be UTF-8");
+    assert!(stderr.contains("LOCAL_DOMAIN"));
+    assert!(!stderr.contains("must-not-appear"));
+    assert!(!stderr.contains("not implemented yet"));
 }

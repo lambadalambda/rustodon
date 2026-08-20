@@ -145,6 +145,18 @@ fn manifest_pins_the_exact_mastodon_baseline_and_fixture_labels() {
     );
 
     assert_eq!(manifest["labels"]["account.instance_actor"], -99);
+    assert_eq!(manifest["labels"]["oauth.access_token"], 401);
+    assert_eq!(manifest["labels"]["oauth.access_token.read_statuses"], 402);
+    assert_eq!(manifest["labels"]["oauth.access_token.read_accounts"], 403);
+    assert_eq!(manifest["labels"]["oauth.access_token.insufficient"], 404);
+    assert_eq!(manifest["labels"]["oauth.access_token.revoked"], 405);
+    assert_eq!(manifest["labels"]["oauth.access_token.expired"], 406);
+    assert_eq!(
+        manifest["labels"]["oauth.access_token.application_only"],
+        407
+    );
+    assert_eq!(manifest["labels"]["oauth.access_token.disabled_user"], 408);
+    assert_eq!(manifest["labels"]["oauth.access_token.missing_2fa"], 409);
 
     let expected_labels = [
         ("account.local.alice", 116_844_606_259_201_001_u64),
@@ -216,10 +228,11 @@ fn manifest_artifact_metadata_matches_checked_files() {
         );
     }
 
-    for medium in manifest["media"]
+    let media = manifest["media"]
         .as_array()
-        .expect("media metadata should be an array")
-    {
+        .expect("media metadata should be an array");
+    assert_eq!(media.len(), 9, "every generated media file must be pinned");
+    for medium in media {
         let path = medium["path"]
             .as_str()
             .expect("media path should be a string");
@@ -292,6 +305,7 @@ fn differential_command_is_documented_and_rejects_unsafe_case_names() {
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("differential-test [CASE]"));
     assert!(String::from_utf8_lossy(&help.stdout).contains("preflight-test"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("operational-schema-test"));
 
     let output = Command::new(fixture_tool())
         .args(["differential-test", "../../unsafe"])

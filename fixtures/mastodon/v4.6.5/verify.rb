@@ -27,9 +27,9 @@ expected = {
   'collection_update' => ['Collection', 116_845_549_977_608_801, 116_844_606_259_201_001, 116_844_606_259_202_001],
 }.freeze
 
-notifications = Notification.where(type: expected.keys, filtered: false).order(:id).to_a
-raise "expected 17 notifications, found #{notifications.size}" unless notifications.size == expected.size
-raise 'known notification checks no longer cover exactly the unfiltered rows' unless Notification.where(filtered: false).count == 17
+notifications = Notification.where(id: 10_001..10_017, type: expected.keys, filtered: false).order(:id).to_a
+raise "expected 17 baseline notifications, found #{notifications.size}" unless notifications.size == expected.size
+raise 'known, grouped, legacy, and stress notification rows are incomplete' unless Notification.where(filtered: false).count == 63
 unknown_notification = Notification.find(10_018)
 raise 'filtered unknown notification fixture mismatch' unless unknown_notification[:type] == 'future_event' && unknown_notification.filtered?
 suspended_notification = Notification.find(10_021)
@@ -159,6 +159,22 @@ raise 'nullable status-edit media descriptions mismatch' unless StatusEdit.find(
 
 token = Doorkeeper::AccessToken.find_by(token: 'fixture-bearer-token-v4-6-5')
 raise 'OAuth bearer token is not readable' if token.nil? || token.revoked? || token.expired?
+granular_status = Doorkeeper::AccessToken.find_by(token: 'fixture-bearer-read-statuses-v4-6-5')
+granular_account = Doorkeeper::AccessToken.find_by(token: 'fixture-bearer-read-accounts-v4-6-5')
+raise 'granular OAuth status scope is unreadable' unless granular_status&.scopes&.include?('read:statuses')
+raise 'granular OAuth account scope is unreadable' unless granular_account&.scopes&.include?('read:accounts')
+raise 'revoked OAuth fixture is not revoked' unless Doorkeeper::AccessToken.find_by(token: 'fixture-bearer-revoked-v4-6-5')&.revoked?
+raise 'expired OAuth fixture is not expired' unless Doorkeeper::AccessToken.find_by(token: 'fixture-bearer-expired-v4-6-5')&.expired?
+application_only = Doorkeeper::AccessToken.find_by(token: 'fixture-bearer-application-only-v4-6-5')
+raise 'application-only OAuth fixture has a resource owner' unless application_only&.resource_owner_id.nil?
+raise 'disabled-user OAuth fixture is not linked exactly' unless Doorkeeper::AccessToken.find_by(token: 'fixture-bearer-disabled-user-v4-6-5')&.resource_owner_id == 103
+raise 'missing-2FA OAuth fixture is not linked exactly' unless Doorkeeper::AccessToken.find_by(token: 'fixture-bearer-missing-2fa-v4-6-5')&.resource_owner_id == 102
+api_moderator_token = Doorkeeper::AccessToken.find_by(token: 'fixture-bearer-api-moderator-v4-6-5')
+raise 'functional API moderator OAuth fixture is not linked exactly' unless api_moderator_token&.resource_owner_id == 104 && User.find(104).functional?
+matrix_viewer_token = Doorkeeper::AccessToken.find_by(token: 'fixture-bearer-matrix-viewer-v4-6-5')
+raise 'functional matrix-viewer OAuth fixture is not linked exactly' unless matrix_viewer_token&.resource_owner_id == 107 && User.find(107).functional?
+raise 'pending local account fixture is not pending' unless User.find(105).pending?
+raise 'unconfirmed local account fixture is confirmed' if User.find(106).confirmed?
 
 raise 'visibility mapping mismatch' unless Status.visibilities.values.sort == [0, 1, 2, 3, 4]
 raise 'historical poll should be expired' unless Poll.find(8201).expired?
@@ -176,5 +192,14 @@ raise 'soft-deleted status is missing from unscoped raw reads' unless unknown_vi
 raise 'scalar Rails YAML setting is unreadable' unless Setting.find(9801).value == true
 tagged_setting = Setting.find(9802).value
 raise 'tagged Rails YAML setting is unreadable' unless tagged_setting.is_a?(ActiveSupport::HashWithIndifferentAccess) && tagged_setting[:fixture] == 'value'
+
+enriched_status = Status.find(116_845_105_643_525_105)
+raise 'status custom emoji is unreadable' unless enriched_status.emojis.map(&:shortcode) == ['fixtureparty']
+raise 'status preview card is unreadable' unless enriched_status.preview_card&.id == 12_002
+raise 'status tagged collection is unreadable' unless enriched_status.tagged_objects.filter_map(&:object).map(&:id) == [116_845_549_977_608_801]
+raise 'home marker is unreadable' unless Marker.find(12_004).last_read_id == 116_844_842_188_805_001
+raise 'grouped favourite notification fixture is incomplete' unless Notification.where(group_key: 'favourite-116844842188805001-495255').count == 2
+raise 'legacy null-type notification mapping is unreadable' unless Notification.find(10_025).type == :reblog
+raise 'notification grouping stress fixture is incomplete' unless Notification.where(group_key: 'follow-api-moderator-stress').count == 41
 
 puts 'fixture Rails verification passed: notifications, suspended senders, status edits, and local media are readable'

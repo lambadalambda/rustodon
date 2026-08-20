@@ -7,6 +7,7 @@ use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use futures_util::TryStreamExt;
 use rustix::fs::{Access, access};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -28,22 +29,27 @@ const MAX_PRIVATE_KEY_BYTES: usize = 64 * 1024;
 const MIGRATIONS: &str = include_str!("../fixtures/mastodon/v4.6.5/migrations.tsv");
 const CATALOG: &str = include_str!("../fixtures/mastodon/v4.6.5/catalog.txt");
 
-const V1_CRITICAL_TABLES: &[&str] = &[
+pub(crate) const V1_CRITICAL_TABLES: &[&str] = &[
     "account_conversations",
     "account_deletion_requests",
     "account_domain_blocks",
+    "account_notes",
+    "account_pins",
     "account_relationship_severance_events",
     "account_stats",
     "account_statuses_cleanup_policies",
     "account_warnings",
     "accounts",
     "accounts_tags",
+    "appeals",
     "blocks",
     "bookmarks",
     "collection_items",
+    "collection_reports",
     "collections",
     "conversation_mutes",
     "conversations",
+    "custom_emojis",
     "custom_filter_keywords",
     "custom_filter_statuses",
     "custom_filters",
@@ -54,9 +60,11 @@ const V1_CRITICAL_TABLES: &[&str] = &[
     "follow_requests",
     "follows",
     "generated_annual_reports",
+    "instances",
     "keypairs",
     "list_accounts",
     "lists",
+    "markers",
     "media_attachments",
     "mentions",
     "mutes",
@@ -68,17 +76,25 @@ const V1_CRITICAL_TABLES: &[&str] = &[
     "oauth_applications",
     "poll_votes",
     "polls",
+    "preview_card_providers",
+    "preview_cards",
+    "preview_cards_statuses",
     "quotes",
     "relays",
     "relationship_severance_events",
     "reports",
+    "rule_translations",
+    "rules",
     "scheduled_statuses",
     "settings",
+    "site_uploads",
     "status_edits",
     "status_pins",
     "status_stats",
     "statuses",
     "statuses_tags",
+    "tag_follows",
+    "tagged_objects",
     "tags",
     "tombstones",
     "user_roles",
@@ -180,6 +196,20 @@ WITH catalog_entries AS (
   JOIN pg_class index_class ON index_class.oid = idx.indexrelid
   JOIN pg_namespace ns ON ns.oid = table_class.relnamespace
   WHERE ns.nspname = 'public'
+
+  UNION ALL
+
+  SELECT
+    CASE WHEN c.relkind = 'm' THEN 'materialized_view' ELSE 'view' END,
+    c.relname,
+    json_build_object(
+      'schema', n.nspname,
+      'name', c.relname,
+      'definition', pg_get_viewdef(c.oid, true)
+    )::text
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE n.nspname = 'public' AND c.relkind IN ('v', 'm')
 )
 SELECT object_kind, object_name, definition
 FROM catalog_entries
@@ -219,6 +249,7 @@ SELECT
   p.prosecdef AS security_definer,
   p.proleakproof AS leakproof,
   p.proisstrict AS strict,
+  p.proconfig AS config,
   p.prosrc AS body
 FROM pg_proc p
 JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -283,6 +314,8 @@ SELECT
      JOIN accounts account ON account.id = status.account_id AND account.domain IS NULL
     WHERE poll.expires_at IS NULL OR poll.expires_at >= CURRENT_TIMESTAMP) AS active_local_polls,
   (SELECT count(*) FROM account_deletion_requests) AS account_deletions,
+  (SELECT CASE WHEN count(*) = 1 THEN 0::bigint ELSE 1::bigint END
+     FROM user_roles WHERE id = -99) AS invalid_everyone_role,
   (SELECT count(*)
      FROM users user_record
      JOIN accounts account ON account.id = user_record.account_id
@@ -470,6 +503,7 @@ pub enum CatalogKind {
     Constraint,
     Index,
     Sequence,
+    View,
 }
 
 impl CatalogKind {
@@ -480,6 +514,7 @@ impl CatalogKind {
             Self::Constraint => "CONSTRAINT",
             Self::Index => "INDEX",
             Self::Sequence => "SEQUENCE",
+            Self::View => "VIEW",
         }
     }
 }
@@ -570,6 +605,7 @@ fn parse_catalog(contents: &str) -> Vec<CatalogEntry> {
                 "constraint" => CatalogKind::Constraint,
                 "index" => CatalogKind::Index,
                 "sequence" => CatalogKind::Sequence,
+                "view" | "materialized_view" => CatalogKind::View,
                 _ => return None,
             };
             Some(CatalogEntry {
@@ -585,7 +621,7 @@ fn catalog_entry_is_scoped(entry: &CatalogEntry) -> bool {
     if entry.kind == CatalogKind::Sequence {
         return false;
     }
-    let relation = if entry.kind == CatalogKind::Relation {
+    let relation = if matches!(entry.kind, CatalogKind::Relation | CatalogKind::View) {
         entry.name.as_str()
     } else {
         entry
@@ -593,7 +629,31 @@ fn catalog_entry_is_scoped(entry: &CatalogEntry) -> bool {
             .split_once('.')
             .map_or("", |(relation, _)| relation)
     };
-    relation == "schema_migrations" || V1_CRITICAL_TABLES.contains(&relation)
+    relation == "schema_migrations"
+        || V1_CRITICAL_TABLES.contains(&relation)
+        || constraint_references_scoped_relation(entry)
+}
+
+fn constraint_references_scoped_relation(entry: &CatalogEntry) -> bool {
+    if entry.kind != CatalogKind::Constraint {
+        return false;
+    }
+    let Ok(definition) = serde_json::from_str::<Value>(&entry.definition) else {
+        return false;
+    };
+    let Some(definition) = definition.get("definition").and_then(Value::as_str) else {
+        return false;
+    };
+    V1_CRITICAL_TABLES.iter().any(|relation| {
+        [
+            format!("REFERENCES {relation}("),
+            format!("REFERENCES public.{relation}("),
+            format!("REFERENCES \"{relation}\"("),
+            format!("REFERENCES public.\"{relation}\"("),
+        ]
+        .iter()
+        .any(|reference| definition.contains(reference))
+    })
 }
 
 /// Compares scoped catalog entries structurally, ignoring JSON presentation whitespace.
@@ -715,6 +775,9 @@ fn catalog_diagnostic(
         (CatalogKind::Sequence, "MISSING") => "PF_DB_SEQUENCE_MISSING",
         (CatalogKind::Sequence, "UNEXPECTED") => "PF_DB_SEQUENCE_UNEXPECTED",
         (CatalogKind::Sequence, _) => "PF_DB_SEQUENCE_CHANGED",
+        (CatalogKind::View, "MISSING") => "PF_DB_VIEW_MISSING",
+        (CatalogKind::View, "UNEXPECTED") => "PF_DB_VIEW_UNEXPECTED",
+        (CatalogKind::View, _) => "PF_DB_VIEW_CHANGED",
     };
     Diagnostic::fatal(
         code,
@@ -738,6 +801,7 @@ pub struct TimestampFunction {
     pub security_definer: bool,
     pub leakproof: bool,
     pub strict: bool,
+    pub config: Option<Vec<String>>,
     pub body: String,
 }
 
@@ -753,6 +817,7 @@ pub fn validate_timestamp_function(function: &TimestampFunction) -> Vec<Diagnost
         || function.security_definer
         || function.leakproof
         || function.strict
+        || function.config.is_some()
     {
         return vec![Diagnostic::fatal(
             "PF_DB_TIMESTAMP_ID_SHAPE",
@@ -1068,16 +1133,25 @@ pub fn configuration_diagnostics(config: &Config) -> Vec<Diagnostic> {
 
 /// Runs all local and `PostgreSQL` checks without mutating Mastodon data or media.
 pub async fn run(config: &Config) -> PreflightReport {
-    let mut diagnostics = configuration_diagnostics(config);
-    diagnostics.extend(media_root_diagnostics(config));
+    let mut diagnostics = runtime_diagnostics(config).await;
     if config.sidekiq_redis.is_some() {
         diagnostics.extend(sidekiq_redis_diagnostics(config).await);
     }
+    PreflightReport::from_diagnostics(diagnostics)
+}
+
+/// Runs runtime-safe configuration, media, database, domain, key, and workflow checks.
+///
+/// Unlike cutover preflight, runtime validation does not require Mastodon's Redis to remain
+/// available after queues have been drained.
+pub async fn runtime_diagnostics(config: &Config) -> Vec<Diagnostic> {
+    let mut diagnostics = configuration_diagnostics(config);
+    diagnostics.extend(media_root_diagnostics(config));
     match database_diagnostics(config).await {
         Ok(database) => diagnostics.extend(database),
         Err(diagnostic) => diagnostics.push(diagnostic),
     }
-    PreflightReport::from_diagnostics(diagnostics)
+    diagnostics
 }
 
 #[derive(Clone)]
@@ -1366,7 +1440,7 @@ pub fn media_root_diagnostics(config: &Config) -> Vec<Diagnostic> {
 }
 
 async fn database_diagnostics(config: &Config) -> Result<Vec<Diagnostic>, Diagnostic> {
-    let options = postgres_options(config).map_err(|()| database_connection_diagnostic())?;
+    let options = postgres_options(config).map_err(|_| database_connection_diagnostic())?;
     let mut connection =
         tokio::time::timeout(CONNECTION_TIMEOUT, PgConnection::connect_with(&options))
             .await
@@ -1376,6 +1450,14 @@ async fn database_diagnostics(config: &Config) -> Result<Vec<Diagnostic>, Diagno
         .execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
         .map_err(|_| database_inspection_diagnostic())?;
+    sqlx::raw_sql(
+        "SET LOCAL search_path TO pg_catalog, public, pg_temp; \
+         SET LOCAL \"TimeZone\" TO 'UTC'; SET LOCAL lock_timeout TO '10s'; \
+         SET LOCAL statement_timeout TO '60s'",
+    )
+    .execute(&mut connection)
+    .await
+    .map_err(|_| database_inspection_diagnostic())?;
 
     let result = inspect_database(&mut connection, config).await;
     let rollback = connection.execute("ROLLBACK").await;
@@ -1385,10 +1467,26 @@ async fn database_diagnostics(config: &Config) -> Result<Vec<Diagnostic>, Diagno
     result.map_err(|()| database_inspection_diagnostic())
 }
 
-fn postgres_options(config: &Config) -> Result<PgConnectOptions, ()> {
+#[derive(Debug)]
+pub struct PostgresOptionsError;
+
+impl std::fmt::Display for PostgresOptionsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("invalid PostgreSQL connection URL")
+    }
+}
+
+impl std::error::Error for PostgresOptionsError {}
+
+/// Builds `SQLx` connection options from validated Mastodon configuration.
+///
+/// # Errors
+///
+/// Returns [`PostgresOptionsError`] when a configured `PostgreSQL` URL is invalid.
+pub fn postgres_options(config: &Config) -> Result<PgConnectOptions, PostgresOptionsError> {
     let options = match &config.database.connection {
         PostgresConnection::Url { url, .. } => {
-            PgConnectOptions::from_str(url.expose_secret()).map_err(|_| ())?
+            PgConnectOptions::from_str(url.expose_secret()).map_err(|_| PostgresOptionsError)?
         }
         PostgresConnection::Tcp {
             host,
@@ -1455,41 +1553,238 @@ async fn inspect_database(
     .collect::<BTreeSet<_>>();
     let mut diagnostics = compare_migration_versions(&migrations);
 
-    let catalog = fetch_catalog(connection, CATALOG_QUERY).await?;
+    let catalog = fetch_catalog(connection, CATALOG_QUERY)
+        .await
+        .map_err(|_| ())?;
     let catalog_diagnostics = compare_catalog(&catalog);
     let physical_schema_matches = catalog_diagnostics.is_empty();
     diagnostics.extend(catalog_diagnostics);
+    let physical_identity_diagnostics = fetch_physical_identity_diagnostics(connection)
+        .await
+        .map_err(|_| ())?;
+    let physical_schema_matches =
+        physical_schema_matches && physical_identity_diagnostics.is_empty();
+    diagnostics.extend(physical_identity_diagnostics);
 
-    let sequences = fetch_catalog(connection, SEQUENCE_QUERY).await?;
+    let sequences = fetch_catalog(connection, SEQUENCE_QUERY)
+        .await
+        .map_err(|_| ())?;
     diagnostics.extend(compare_sequences(&sequences));
     diagnostics.extend(fetch_timestamp_function_diagnostics(connection).await?);
 
     if physical_schema_matches {
-        let identifiers = fetch_identifiers(connection).await?;
-        diagnostics.extend(validate_canonical_domains(
-            &config.domains.web_domain,
-            &config.domains.local_domain,
-            &identifiers,
-        ));
+        diagnostics.extend(
+            fetch_identifier_diagnostics(
+                connection,
+                &config.domains.web_domain,
+                &config.domains.local_domain,
+            )
+            .await?,
+        );
         diagnostics.extend(fetch_key_diagnostics(connection, config).await?);
         diagnostics.extend(fetch_active_condition_diagnostics(connection).await?);
     }
     Ok(diagnostics)
 }
 
+pub(crate) async fn validate_supported_mastodon_schema_in_transaction(
+    connection: &mut PgConnection,
+) -> Result<(), String> {
+    sqlx::query(
+        "SELECT pg_catalog.set_config('search_path', 'pg_catalog, public, pg_temp', true), \
+                pg_catalog.set_config('TimeZone', 'UTC', true)",
+    )
+    .execute(&mut *connection)
+    .await
+    .map_err(|_| "could not secure the Mastodon schema inspection".to_owned())?;
+    validate_safe_migration_environment(connection).await?;
+
+    let relations = V1_CRITICAL_TABLES
+        .iter()
+        .filter(|name| **name != "instances")
+        .chain(std::iter::once(&"schema_migrations"))
+        .map(|name| format!("public.\"{}\"", name.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    sqlx::query(&format!(
+        "LOCK TABLE {} IN ACCESS SHARE MODE",
+        relations.join(", ")
+    ))
+    .execute(&mut *connection)
+    .await
+    .map_err(|error| format!("could not lock the Mastodon catalog boundary: {error}"))?;
+    for sequence in SNOWFLAKE_SEQUENCES {
+        sqlx::query(&format!(
+            "SELECT last_value FROM public.\"{}\"",
+            sequence.replace('"', "\"\"")
+        ))
+        .execute(&mut *connection)
+        .await
+        .map_err(|_| "could not lock the Mastodon sequence boundary".to_owned())?;
+    }
+
+    let migrations = sqlx::query_scalar::<_, String>(
+        "SELECT version FROM public.schema_migrations ORDER BY version COLLATE \"C\"",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(|_| "could not inspect Mastodon migrations".to_owned())?
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if !compare_migration_versions(&migrations).is_empty() {
+        return Err("unsupported Mastodon migration inventory".to_owned());
+    }
+    let catalog = fetch_catalog(connection, CATALOG_QUERY)
+        .await
+        .map_err(|error| format!("could not inspect the Mastodon catalog: {error}"))?;
+    if !compare_catalog(&catalog).is_empty() {
+        return Err("unsupported Mastodon public catalog".to_owned());
+    }
+    let physical_identity_diagnostics = fetch_physical_identity_diagnostics(connection)
+        .await
+        .map_err(|error| format!("could not inspect Mastodon physical identities: {error}"))?;
+    if !physical_identity_diagnostics.is_empty() {
+        return Err("unsupported Mastodon collation or materialized-view state".to_owned());
+    }
+    let sequences = fetch_catalog(connection, SEQUENCE_QUERY)
+        .await
+        .map_err(|error| format!("could not inspect Mastodon sequences: {error}"))?;
+    if !compare_sequences(&sequences).is_empty() {
+        return Err("unsupported Mastodon sequence definitions".to_owned());
+    }
+    let timestamp_diagnostics = fetch_timestamp_function_diagnostics(connection)
+        .await
+        .map_err(|()| "could not inspect Mastodon's timestamp_id function".to_owned())?;
+    if !timestamp_diagnostics.is_empty() {
+        return Err("unsupported Mastodon timestamp_id function".to_owned());
+    }
+    let everyone_role_count =
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM public.user_roles WHERE id = -99")
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|_| "could not inspect Mastodon's everyone role".to_owned())?;
+    if everyone_role_count != 1 {
+        return Err("Mastodon's mandatory everyone role is missing".to_owned());
+    }
+    Ok(())
+}
+
+async fn fetch_physical_identity_diagnostics(
+    connection: &mut PgConnection,
+) -> Result<Vec<Diagnostic>, sqlx::Error> {
+    let relation_names = V1_CRITICAL_TABLES
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let collations = sqlx::query_scalar::<_, String>(
+        "SELECT relation.relname || '.' || attribute.attname \
+         FROM pg_catalog.pg_attribute attribute \
+         JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid \
+         JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace \
+         JOIN pg_catalog.pg_collation collation_record \
+           ON collation_record.oid = attribute.attcollation \
+         JOIN pg_catalog.pg_namespace collation_namespace \
+           ON collation_namespace.oid = collation_record.collnamespace \
+         WHERE namespace.nspname = 'public' AND relation.relname = ANY($1) \
+           AND attribute.attnum > 0 AND NOT attribute.attisdropped \
+           AND collation_namespace.nspname <> 'pg_catalog' \
+         ORDER BY relation.relname COLLATE \"C\", attribute.attname COLLATE \"C\"",
+    )
+    .bind(&relation_names)
+    .fetch_all(&mut *connection)
+    .await?;
+    let instances_unpopulated = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS ( \
+           SELECT 1 FROM pg_catalog.pg_class relation \
+           JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace \
+           WHERE namespace.nspname = 'public' AND relation.relname = 'instances' \
+             AND relation.relkind = 'm' AND NOT relation.relispopulated)",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    let mut diagnostics = collations
+        .into_iter()
+        .map(|name| {
+            Diagnostic::fatal(
+                "PF_DB_COLUMN_CHANGED",
+                format!("COLUMN {name} does not match Mastodon v4.6.5"),
+                "restore the pinned column collation before cutover",
+            )
+        })
+        .collect::<Vec<_>>();
+    if instances_unpopulated {
+        diagnostics.push(Diagnostic::fatal(
+            "PF_DB_RELATION_CHANGED",
+            "RELATION instances does not match Mastodon v4.6.5",
+            "populate the pinned instances materialized view before cutover",
+        ));
+    }
+    Ok(diagnostics)
+}
+
+async fn validate_safe_migration_environment(connection: &mut PgConnection) -> Result<(), String> {
+    let unsafe_ddl_environment = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS ( \
+           SELECT 1 FROM pg_catalog.pg_event_trigger WHERE evtenabled <> 'D' \
+           UNION ALL \
+           SELECT 1 FROM pg_catalog.pg_publication WHERE puballtables)",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(|_| "could not inspect PostgreSQL DDL hooks".to_owned())?;
+    if unsafe_ddl_environment {
+        return Err(
+            "enabled event triggers or all-table publications are not supported".to_owned(),
+        );
+    }
+
+    let relation_names = V1_CRITICAL_TABLES
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let unsafe_relation_behavior = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS ( \
+           SELECT 1 FROM pg_catalog.pg_trigger trigger \
+           JOIN pg_catalog.pg_class relation ON relation.oid = trigger.tgrelid \
+           JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace \
+           WHERE namespace.nspname = 'public' AND relation.relname = ANY($1) \
+             AND NOT trigger.tgisinternal \
+           UNION ALL \
+           SELECT 1 FROM pg_catalog.pg_rewrite rule \
+           JOIN pg_catalog.pg_class relation ON relation.oid = rule.ev_class \
+           JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace \
+           WHERE namespace.nspname = 'public' AND relation.relname = ANY($1) \
+             AND NOT (relation.relkind IN ('v', 'm') AND rule.rulename = '_RETURN') \
+           UNION ALL \
+           SELECT 1 FROM pg_catalog.pg_policy policy \
+           JOIN pg_catalog.pg_class relation ON relation.oid = policy.polrelid \
+           JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace \
+           WHERE namespace.nspname = 'public' AND relation.relname = ANY($1))",
+    )
+    .bind(&relation_names)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(|_| "could not inspect Mastodon relation behavior".to_owned())?;
+    if unsafe_relation_behavior {
+        return Err(
+            "unsupported triggers, rules, or policies affect Mastodon relations".to_owned(),
+        );
+    }
+    Ok(())
+}
+
 async fn fetch_catalog(
     connection: &mut PgConnection,
     query: &str,
-) -> Result<Vec<CatalogEntry>, ()> {
+) -> Result<Vec<CatalogEntry>, String> {
     sqlx::query(query)
         .fetch_all(connection)
         .await
-        .map_err(|_| ())?
+        .map_err(|error| error.to_string())?
         .into_iter()
         .map(|row| {
             let kind = match row
                 .try_get::<String, _>("object_kind")
-                .map_err(|_| ())?
+                .map_err(|error| error.to_string())?
                 .as_str()
             {
                 "relation" => CatalogKind::Relation,
@@ -1497,12 +1792,17 @@ async fn fetch_catalog(
                 "constraint" => CatalogKind::Constraint,
                 "index" => CatalogKind::Index,
                 "sequence" => CatalogKind::Sequence,
-                _ => return Err(()),
+                "view" | "materialized_view" => CatalogKind::View,
+                _ => return Err("unsupported catalog entry kind".to_owned()),
             };
             Ok(CatalogEntry {
                 kind,
-                name: row.try_get("object_name").map_err(|_| ())?,
-                definition: row.try_get("definition").map_err(|_| ())?,
+                name: row
+                    .try_get("object_name")
+                    .map_err(|error| error.to_string())?,
+                definition: row
+                    .try_get("definition")
+                    .map_err(|error| error.to_string())?,
             })
         })
         .collect()
@@ -1532,26 +1832,65 @@ async fn fetch_timestamp_function_diagnostics(
         security_definer: row.try_get("security_definer").map_err(|_| ())?,
         leakproof: row.try_get("leakproof").map_err(|_| ())?,
         strict: row.try_get("strict").map_err(|_| ())?,
+        config: row.try_get("config").map_err(|_| ())?,
         body: row.try_get("body").map_err(|_| ())?,
     };
     Ok(validate_timestamp_function(&function))
 }
 
-async fn fetch_identifiers(connection: &mut PgConnection) -> Result<Vec<PersistedIdentifier>, ()> {
-    sqlx::query(IDENTIFIER_QUERY)
-        .fetch_all(connection)
-        .await
-        .map_err(|_| ())?
-        .into_iter()
-        .map(|row| {
-            Ok(PersistedIdentifier {
-                table: row.try_get("table_name").map_err(|_| ())?,
-                row_id: row.try_get("row_id").map_err(|_| ())?,
-                column: row.try_get("column_name").map_err(|_| ())?,
-                value: row.try_get("value").map_err(|_| ())?,
-            })
-        })
-        .collect()
+async fn fetch_identifier_diagnostics(
+    connection: &mut PgConnection,
+    web_domain: &str,
+    local_domain: &str,
+) -> Result<Vec<Diagnostic>, ()> {
+    let mut diagnostics = Vec::new();
+    let mut verified_local_domain = false;
+    let mut rows = sqlx::query(IDENTIFIER_QUERY).fetch(connection);
+    while let Some(row) = rows.try_next().await.map_err(|_| ())? {
+        let identifier = PersistedIdentifier {
+            table: row.try_get("table_name").map_err(|_| ())?,
+            row_id: row.try_get("row_id").map_err(|_| ())?,
+            column: row.try_get("column_name").map_err(|_| ())?,
+            value: row.try_get("value").map_err(|_| ())?,
+        };
+        match identifier_authority(&identifier.value) {
+            Some((IdentifierKind::Web, authority))
+                if authority.eq_ignore_ascii_case(web_domain) => {}
+            Some((IdentifierKind::Web, _)) if diagnostics.len() < 100 => {
+                diagnostics.push(identifier_diagnostic(
+                    "PF_DB_WEB_DOMAIN_MISMATCH",
+                    &identifier,
+                    "set WEB_DOMAIN to the persisted canonical web authority or migrate identifiers",
+                ));
+            }
+            Some((IdentifierKind::Tag, authority))
+                if authority.eq_ignore_ascii_case(local_domain) =>
+            {
+                verified_local_domain = true;
+            }
+            Some((IdentifierKind::Tag, _)) if diagnostics.len() < 100 => {
+                diagnostics.push(identifier_diagnostic(
+                    "PF_DB_LOCAL_DOMAIN_MISMATCH",
+                    &identifier,
+                    "set LOCAL_DOMAIN to the persisted tag authority or migrate identifiers",
+                ));
+            }
+            None if diagnostics.len() < 100 => diagnostics.push(identifier_diagnostic(
+                "PF_DB_CANONICAL_IDENTIFIER_INVALID",
+                &identifier,
+                "repair or remove the invalid persisted canonical identifier",
+            )),
+            Some(_) | None => {}
+        }
+    }
+    if !verified_local_domain {
+        diagnostics.push(Diagnostic::warning(
+            "PF_DB_LOCAL_DOMAIN_UNVERIFIED",
+            "no persisted tag URI verified LOCAL_DOMAIN",
+            "confirm LOCAL_DOMAIN from the previous Mastodon deployment configuration",
+        ));
+    }
+    Ok(diagnostics)
 }
 
 async fn fetch_key_diagnostics(
@@ -1559,25 +1898,25 @@ async fn fetch_key_diagnostics(
     config: &Config,
 ) -> Result<Vec<Diagnostic>, ()> {
     let mut diagnostics = Vec::new();
-    let account_rows = sqlx::query(
-        "SELECT id, private_key, public_key FROM accounts WHERE domain IS NULL ORDER BY id",
-    )
-    .fetch_all(&mut *connection)
-    .await
-    .map_err(|_| ())?;
-    for row in account_rows {
-        let row_id = row.try_get("id").map_err(|_| ())?;
-        let private_key = row
-            .try_get::<Option<String>, _>("private_key")
-            .map_err(|_| ())?
-            .map(SecretString::new);
-        let public_key = row.try_get::<String, _>("public_key").map_err(|_| ())?;
-        if let Err(error) = validate_rsa_signing_keypair(private_key.as_ref(), &public_key) {
-            diagnostics.push(key_failure_diagnostic(
-                "accounts",
-                row_id,
-                key_failure_from_rsa(error),
-            ));
+    {
+        let mut account_rows = sqlx::query(
+            "SELECT id, private_key, public_key FROM accounts WHERE domain IS NULL ORDER BY id",
+        )
+        .fetch(&mut *connection);
+        while let Some(row) = account_rows.try_next().await.map_err(|_| ())? {
+            let row_id = row.try_get("id").map_err(|_| ())?;
+            let private_key = row
+                .try_get::<Option<String>, _>("private_key")
+                .map_err(|_| ())?
+                .map(SecretString::new);
+            let public_key = row.try_get::<String, _>("public_key").map_err(|_| ())?;
+            if let Err(error) = validate_rsa_signing_keypair(private_key.as_ref(), &public_key) {
+                diagnostics.push(key_failure_diagnostic(
+                    "accounts",
+                    row_id,
+                    key_failure_from_rsa(error),
+                ));
+            }
         }
     }
 
@@ -1595,7 +1934,7 @@ async fn fetch_key_diagnostics(
             .clone(),
     )
     .map_err(|_| ())?;
-    let keypair_rows = sqlx::query(
+    let mut keypair_rows = sqlx::query(
         "SELECT keypair.id, keypair.private_key, keypair.public_key \
          FROM keypairs keypair \
          JOIN accounts account ON account.id = keypair.account_id AND account.domain IS NULL \
@@ -1603,10 +1942,8 @@ async fn fetch_key_diagnostics(
            AND (keypair.expires_at IS NULL OR keypair.expires_at > CURRENT_TIMESTAMP) \
          ORDER BY keypair.id",
     )
-    .fetch_all(&mut *connection)
-    .await
-    .map_err(|_| ())?;
-    for row in keypair_rows {
+    .fetch(&mut *connection);
+    while let Some(row) = keypair_rows.try_next().await.map_err(|_| ())? {
         let row_id = row.try_get("id").map_err(|_| ())?;
         let serialized = row
             .try_get::<Option<String>, _>("private_key")
@@ -1676,6 +2013,13 @@ async fn fetch_active_condition_diagnostics(
             "PF_DB_ACCOUNT_DELETIONS_PENDING",
             "account deletion requests are pending",
             "finish or cancel every account deletion before cutover",
+        ),
+        (
+            row.try_get::<i64, _>("invalid_everyone_role")
+                .map_err(|_| ())?,
+            "PF_DB_EVERYONE_ROLE_INVALID",
+            "the mandatory everyone role is missing",
+            "restore the Mastodon everyone role with ID -99 before cutover",
         ),
         (
             row.try_get::<i64, _>("webauthn_only_users")

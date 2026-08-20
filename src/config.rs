@@ -8,6 +8,7 @@ use ipnetwork::IpNetwork;
 use url::{Host, Url};
 use zeroize::Zeroize;
 
+use crate::jobs::Lane;
 use crate::secret::SecretString;
 
 const REPLICA_VARIABLES: &[&str] = &[
@@ -23,17 +24,6 @@ const REPLICA_VARIABLES: &[&str] = &[
     "REPLICA_DB_POOL",
     "REPLICA_PREPARED_STATEMENTS",
     "REPLICA_DB_TASKS",
-];
-
-const TRUSTED_PROXY_DEFAULTS: &[&str] = &[
-    "127.0.0.1/8",
-    "::1/128",
-    "10.0.0.0/8",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
-    "169.254.0.0/16",
-    "fe80::/10",
-    "fc00::/7",
 ];
 
 const REDIS_SENTINEL_VARIABLES: &[&str] = &[
@@ -60,6 +50,8 @@ pub struct Config {
     pub secrets: CryptographicSecrets,
     pub unsupported: UnsupportedConfiguration,
     pub sidekiq_redis: Option<RedisEndpoint>,
+    pub worker: WorkerConfig,
+    pub web: WebConfig,
 }
 
 impl Config {
@@ -80,6 +72,8 @@ impl Config {
         let secrets = parse_secrets(environment)?;
         let unsupported = parse_unsupported_configuration(environment)?;
         let sidekiq_redis = parse_sidekiq_redis(environment)?;
+        let worker = parse_worker(environment)?;
+        let web = parse_web(environment)?;
 
         Ok(Self {
             domains,
@@ -90,6 +84,8 @@ impl Config {
             secrets,
             unsupported,
             sidekiq_redis,
+            worker,
+            web,
         })
     }
 
@@ -127,6 +123,24 @@ pub struct PostgresConfig {
     pub connection: PostgresConnection,
     pub pool_size: u32,
     pub ssl_mode: PostgresSslMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerConfig {
+    pub lanes: BTreeSet<Lane>,
+    pub concurrency: u32,
+    pub remote_http_concurrency: u32,
+    pub media_concurrency: u32,
+    pub lease_seconds: u32,
+    pub poll_milliseconds: u32,
+    pub heartbeat_seconds: u32,
+    pub shutdown_seconds: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WebConfig {
+    pub bind: IpAddr,
+    pub port: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -530,6 +544,93 @@ fn parse_database(environment: &HashMap<String, String>) -> Result<PostgresConfi
     })
 }
 
+fn parse_worker(environment: &HashMap<String, String>) -> Result<WorkerConfig, ConfigError> {
+    let lanes = environment.get("WORKER_LANES").map_or_else(
+        || Ok([Lane::Maintenance].into_iter().collect()),
+        |value| {
+            if value.is_empty() {
+                return Err(ConfigError::new(
+                    &["WORKER_LANES"],
+                    "must contain at least one durable-job lane",
+                ));
+            }
+            value
+                .split(',')
+                .map(|lane| {
+                    lane.trim().parse().map_err(|_| {
+                        ConfigError::new(
+                            &["WORKER_LANES"],
+                            "must contain only ingress, core, push, pull, mail, or maintenance",
+                        )
+                    })
+                })
+                .collect::<Result<BTreeSet<_>, _>>()
+        },
+    )?;
+    let concurrency_variable = if environment.contains_key("WORKER_CONCURRENCY") {
+        "WORKER_CONCURRENCY"
+    } else if environment.contains_key("SIDEKIQ_CONCURRENCY") {
+        "SIDEKIQ_CONCURRENCY"
+    } else {
+        "WORKER_CONCURRENCY"
+    };
+    let concurrency = environment
+        .get("WORKER_CONCURRENCY")
+        .or_else(|| environment.get("SIDEKIQ_CONCURRENCY"))
+        .map_or(Ok(5), |value| {
+            parse_bounded_u32(value, concurrency_variable, 1, 1024)
+        })?;
+    Ok(WorkerConfig {
+        lanes,
+        concurrency,
+        remote_http_concurrency: environment
+            .get("WORKER_REMOTE_HTTP_CONCURRENCY")
+            .map_or(Ok(4), |value| {
+                parse_bounded_u32(value, "WORKER_REMOTE_HTTP_CONCURRENCY", 1, 1024)
+            })?,
+        media_concurrency: environment
+            .get("WORKER_MEDIA_CONCURRENCY")
+            .map_or(Ok(2), |value| {
+                parse_bounded_u32(value, "WORKER_MEDIA_CONCURRENCY", 1, 1024)
+            })?,
+        lease_seconds: environment
+            .get("WORKER_LEASE_SECONDS")
+            .map_or(Ok(60), |value| {
+                parse_bounded_u32(value, "WORKER_LEASE_SECONDS", 5, 86_400)
+            })?,
+        poll_milliseconds: environment
+            .get("WORKER_POLL_MILLISECONDS")
+            .map_or(Ok(250), |value| {
+                parse_bounded_u32(value, "WORKER_POLL_MILLISECONDS", 10, 60_000)
+            })?,
+        heartbeat_seconds: environment
+            .get("WORKER_HEARTBEAT_SECONDS")
+            .map_or(Ok(10), |value| {
+                parse_bounded_u32(value, "WORKER_HEARTBEAT_SECONDS", 1, 3600)
+            })?,
+        shutdown_seconds: environment
+            .get("WORKER_SHUTDOWN_SECONDS")
+            .map_or(Ok(15), |value| {
+                parse_bounded_u32(value, "WORKER_SHUTDOWN_SECONDS", 1, 3600)
+            })?,
+    })
+}
+
+fn parse_web(environment: &HashMap<String, String>) -> Result<WebConfig, ConfigError> {
+    let bind = environment.get("BIND").map_or_else(
+        || Ok(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        |value| {
+            value
+                .parse()
+                .map_err(|_| ConfigError::new(&["BIND"], "must be an IPv4 or IPv6 address"))
+        },
+    )?;
+    let port = environment
+        .get("PORT")
+        .map_or(Ok(3000), |value| parse_port(value, "PORT"))?;
+    Ok(WebConfig { bind, port })
+}
+
 fn parse_database_url(
     value: &str,
     variable: &'static str,
@@ -680,6 +781,7 @@ fn parse_paperclip_root_url(value: &str) -> Result<PaperclipRootUrl, ConfigError
 
 fn is_clean_root_relative_path(value: &str) -> bool {
     if value.is_empty()
+        || value == "/"
         || value.starts_with("//")
         || value.contains("//")
         || value.contains(['\\', '?', '#'])
@@ -721,7 +823,7 @@ fn parse_trusted_proxies(
         }
         entries
     } else {
-        TRUSTED_PROXY_DEFAULTS.to_vec()
+        Vec::new()
     };
 
     let mut seen = HashSet::new();
@@ -1342,6 +1444,19 @@ fn parse_positive_u32(value: &str, variable: &'static str) -> Result<u32, Config
         .ok()
         .filter(|number| *number != 0)
         .ok_or_else(|| ConfigError::new(&[variable], "must be a positive integer"))
+}
+
+fn parse_bounded_u32(
+    value: &str,
+    variable: &'static str,
+    minimum: u32,
+    maximum: u32,
+) -> Result<u32, ConfigError> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|number| (minimum..=maximum).contains(number))
+        .ok_or_else(|| ConfigError::new(&[variable], "must be an integer in the supported range"))
 }
 
 fn parse_optional_bool(

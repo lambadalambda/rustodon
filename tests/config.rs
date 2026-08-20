@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
 use rustodon::config::{
@@ -6,6 +7,7 @@ use rustodon::config::{
     PostgresConnection, PostgresSslMode, PostgresUrlSource, RedisEndpoint, SmtpAuthentication,
     SmtpConfig, SmtpDeliveryMethod, SmtpTransport, SmtpVerifyMode, StartTlsMode,
 };
+use rustodon::jobs::Lane;
 
 fn required_environment() -> HashMap<String, String> {
     HashMap::from([
@@ -72,24 +74,7 @@ fn mastodon_compatible_defaults_are_typed() {
         config.paperclip.root_url,
         PaperclipRootUrl::RootRelative("/system".into())
     );
-    let proxy_strings = config
-        .trusted_proxies
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        proxy_strings,
-        [
-            "127.0.0.0/8",
-            "::1/128",
-            "10.0.0.0/8",
-            "172.16.0.0/12",
-            "192.168.0.0/16",
-            "169.254.0.0/16",
-            "fe80::/10",
-            "fc00::/7",
-        ]
-    );
+    assert!(config.trusted_proxies.is_empty());
     assert_eq!(
         config.smtp,
         SmtpConfig::Disabled {
@@ -110,6 +95,97 @@ fn mastodon_compatible_defaults_are_typed() {
             password: None,
         }) if host == "localhost"
     ));
+    assert_eq!(
+        config.worker.lanes,
+        [Lane::Maintenance].into_iter().collect::<BTreeSet<_>>()
+    );
+    assert_eq!(config.worker.concurrency, 5);
+    assert_eq!(config.worker.remote_http_concurrency, 4);
+    assert_eq!(config.worker.media_concurrency, 2);
+    assert_eq!(config.worker.lease_seconds, 60);
+    assert_eq!(config.worker.poll_milliseconds, 250);
+    assert_eq!(config.worker.heartbeat_seconds, 10);
+    assert_eq!(config.worker.shutdown_seconds, 15);
+    assert_eq!(config.web.bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_eq!(config.web.port, 3000);
+}
+
+#[test]
+fn web_listener_is_typed_loopback_by_default_and_rejects_ambiguous_values() {
+    let mut environment = required_environment();
+    environment.insert("BIND".into(), "::1".into());
+    environment.insert("PORT".into(), "8443".into());
+    let config = Config::from_environment(&environment).unwrap();
+    assert_eq!(config.web.bind, IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+    assert_eq!(config.web.port, 8443);
+
+    for (name, value) in [
+        ("BIND", ""),
+        ("BIND", "localhost"),
+        ("BIND", "0.0.0.0/0"),
+        ("PORT", ""),
+        ("PORT", "0"),
+        ("PORT", "65536"),
+        ("PORT", "not-a-port"),
+    ] {
+        assert!(
+            error_for(name, value).to_string().contains(name),
+            "{name} error did not name its variable"
+        );
+    }
+}
+
+#[test]
+fn worker_settings_are_typed_bounded_and_use_sidekiq_concurrency_as_a_fallback() {
+    let mut environment = required_environment();
+    environment.extend([
+        ("SIDEKIQ_CONCURRENCY".into(), "7".into()),
+        ("WORKER_LANES".into(), "push,ingress,push".into()),
+        ("WORKER_REMOTE_HTTP_CONCURRENCY".into(), "3".into()),
+        ("WORKER_MEDIA_CONCURRENCY".into(), "1".into()),
+        ("WORKER_LEASE_SECONDS".into(), "90".into()),
+        ("WORKER_POLL_MILLISECONDS".into(), "100".into()),
+        ("WORKER_HEARTBEAT_SECONDS".into(), "15".into()),
+        ("WORKER_SHUTDOWN_SECONDS".into(), "20".into()),
+    ]);
+    let config = Config::from_environment(&environment).unwrap();
+    assert_eq!(config.worker.concurrency, 7);
+    assert_eq!(
+        config.worker.lanes,
+        [Lane::Ingress, Lane::Push].into_iter().collect()
+    );
+    assert_eq!(config.worker.remote_http_concurrency, 3);
+    assert_eq!(config.worker.media_concurrency, 1);
+    assert_eq!(config.worker.lease_seconds, 90);
+    assert_eq!(config.worker.poll_milliseconds, 100);
+    assert_eq!(config.worker.heartbeat_seconds, 15);
+    assert_eq!(config.worker.shutdown_seconds, 20);
+
+    environment.insert("WORKER_CONCURRENCY".into(), "9".into());
+    assert_eq!(
+        Config::from_environment(&environment)
+            .unwrap()
+            .worker
+            .concurrency,
+        9
+    );
+
+    for (name, value) in [
+        ("WORKER_LANES", "push,unknown"),
+        ("WORKER_LANES", ""),
+        ("WORKER_CONCURRENCY", "0"),
+        ("WORKER_REMOTE_HTTP_CONCURRENCY", "0"),
+        ("WORKER_MEDIA_CONCURRENCY", "0"),
+        ("WORKER_LEASE_SECONDS", "4"),
+        ("WORKER_POLL_MILLISECONDS", "9"),
+        ("WORKER_HEARTBEAT_SECONDS", "0"),
+        ("WORKER_SHUTDOWN_SECONDS", "0"),
+    ] {
+        assert!(
+            error_for(name, value).to_string().contains(name),
+            "{name} error did not name its variable"
+        );
+    }
 }
 
 #[test]
@@ -244,6 +320,7 @@ fn paperclip_paths_are_explicit_and_clean() {
     for (name, value) in [
         ("PAPERCLIP_ROOT_PATH", "relative/system"),
         ("PAPERCLIP_ROOT_URL", "system"),
+        ("PAPERCLIP_ROOT_URL", "/"),
         ("PAPERCLIP_ROOT_URL", "/system/../private"),
         ("PAPERCLIP_ROOT_URL", "/system//accounts"),
         ("PAPERCLIP_ROOT_URL", "http://media.example/system"),

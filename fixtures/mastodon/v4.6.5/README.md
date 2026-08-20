@@ -34,12 +34,19 @@ a valid deterministic Active Record encrypted revoked local keypair value that
 Rust treats as opaque preservation data. Existing quote, collection,
 collection-item, poll, remote
 public keypair, OAuth, and media records remain part of the 4.6.5 baseline.
+OAuth coverage includes broad and granular read scopes, insufficient scope,
+revoked and expired tokens, an application-only token, a disabled owner, an
+owner missing role-required 2FA, and a functional unrelated policy viewer.
+Pending and unconfirmed local accounts cover account-show suppression. Multi-row
+follow and pin collections, an edited-out media row, and blocked/domain-blocked
+thread members cover read pagination and visibility edges. A silenced local
+viewer's own reply proves context filtering retains self-authored statuses.
 
 ## Test identities
 
 All domains use the reserved `.invalid` suffix. The local instance domain is
 `fixture-v4-6-5.rustodon.invalid`; remote actors use
-`remote.fixture.invalid`. The password for all three local users is
+`remote.fixture.invalid`. The password for all four local users is
 `fixture-password`. The OAuth bearer token is
 `fixture-bearer-token-v4-6-5`. These values are public, test-only material and
 must never be reused outside an isolated fixture database.

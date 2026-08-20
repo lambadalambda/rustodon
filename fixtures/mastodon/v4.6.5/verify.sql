@@ -21,7 +21,8 @@ BEGIN
 
   IF EXISTS (
     SELECT 1 FROM accounts
-    WHERE domain IS NOT NULL AND domain <> 'remote.fixture.invalid'
+    WHERE domain IS NOT NULL
+      AND domain NOT IN ('remote.fixture.invalid', 'account-blocked.fixture.invalid')
   ) THEN
     RAISE EXCEPTION 'fixture contains an account outside its dedicated domains';
   END IF;
@@ -52,10 +53,10 @@ BEGIN
     FROM snowflake_rows
     WHERE id >= 0
       AND (id >> 16) <> floor(extract(epoch FROM created_at) * 1000)::bigint
-  ) OR (SELECT count(*) FROM accounts) <> 7
-     OR (SELECT count(*) FROM statuses) <> 14
-     OR (SELECT count(*) FROM media_attachments) <> 12
-     OR (SELECT count(*) FROM quotes) <> 4
+  ) OR (SELECT count(*) FROM accounts) <> 15
+     OR (SELECT count(*) FROM statuses) <> 48
+     OR (SELECT count(*) FROM media_attachments) <> 14
+     OR (SELECT count(*) FROM quotes) <> 9
      OR (SELECT count(*) FROM collections) <> 1
      OR (SELECT count(*) FROM collection_items) <> 1
      OR (SELECT count(*) FROM notification_requests) <> 3 THEN
@@ -127,20 +128,61 @@ BEGIN
     RAISE EXCEPTION 'processed media database state or style metadata is incoherent';
   END IF;
 
-  IF NOT EXISTS (
+  IF (SELECT count(*) FROM oauth_access_tokens WHERE id BETWEEN 401 AND 409) <> 9
+     OR NOT EXISTS (
     SELECT 1 FROM oauth_access_tokens
     WHERE id = 401
       AND token = 'fixture-bearer-token-v4-6-5'
       AND revoked_at IS NULL
       AND application_id = 301
       AND resource_owner_id = 101
+  ) OR NOT EXISTS (
+    SELECT 1 FROM oauth_access_tokens
+    WHERE id = 402 AND token = 'fixture-bearer-read-statuses-v4-6-5'
+      AND application_id = 301 AND resource_owner_id = 101
+      AND scopes = 'read:statuses' AND revoked_at IS NULL
+  ) OR NOT EXISTS (
+    SELECT 1 FROM oauth_access_tokens
+    WHERE id = 403 AND token = 'fixture-bearer-read-accounts-v4-6-5'
+      AND application_id = 301 AND resource_owner_id = 101
+      AND scopes = 'read:accounts' AND revoked_at IS NULL
+  ) OR NOT EXISTS (
+    SELECT 1 FROM oauth_access_tokens
+    WHERE id = 404 AND token = 'fixture-bearer-insufficient-v4-6-5'
+      AND application_id = 301 AND resource_owner_id = 101
+      AND scopes = 'push' AND revoked_at IS NULL
+  ) OR NOT EXISTS (
+    SELECT 1 FROM oauth_access_tokens
+    WHERE id = 405 AND token = 'fixture-bearer-revoked-v4-6-5'
+      AND application_id = 301 AND resource_owner_id = 101
+      AND revoked_at = TIMESTAMP '2026-07-01 12:45:00'
+  ) OR NOT EXISTS (
+    SELECT 1 FROM oauth_access_tokens
+    WHERE id = 406 AND token = 'fixture-bearer-expired-v4-6-5'
+      AND application_id = 301 AND resource_owner_id = 101
+      AND expires_in = 60 AND created_at = TIMESTAMP '2000-01-01 00:00:00'
+  ) OR NOT EXISTS (
+    SELECT 1 FROM oauth_access_tokens
+    WHERE id = 407 AND token = 'fixture-bearer-application-only-v4-6-5'
+      AND resource_owner_id IS NULL AND application_id = 301
+  ) OR NOT EXISTS (
+    SELECT 1 FROM oauth_access_tokens
+    WHERE id = 408 AND token = 'fixture-bearer-disabled-user-v4-6-5'
+      AND application_id = 301 AND resource_owner_id = 103
+  ) OR NOT EXISTS (
+    SELECT 1 FROM oauth_access_tokens
+    WHERE id = 409 AND token = 'fixture-bearer-missing-2fa-v4-6-5'
+      AND application_id = 301 AND resource_owner_id = 102
   ) THEN
-    RAISE EXCEPTION 'fixture OAuth application/token is missing or incoherent';
+    RAISE EXCEPTION 'fixture OAuth authentication matrix is missing or incoherent';
   END IF;
 
-  IF (SELECT count(*) FROM lists WHERE account_id = 116844606259201001) <> 2
+  IF (SELECT count(*) FROM lists WHERE account_id = 116844606259201001) <> 3
      OR NOT EXISTS (SELECT 1 FROM lists WHERE id = 9001 AND exclusive = false)
-     OR NOT EXISTS (SELECT 1 FROM lists WHERE id = 9002 AND exclusive = true) THEN
+     OR NOT EXISTS (SELECT 1 FROM lists WHERE id = 9002 AND exclusive = true)
+     OR NOT EXISTS (SELECT 1 FROM lists WHERE id = 9005 AND replies_policy = 2)
+     OR NOT EXISTS (SELECT 1 FROM tag_follows WHERE id = 9206)
+     OR NOT EXISTS (SELECT 1 FROM follows WHERE id = 8012 AND show_reblogs = false) THEN
     RAISE EXCEPTION 'normal/exclusive list coverage is incomplete';
   END IF;
 
@@ -184,6 +226,16 @@ BEGIN
       AND disabled = true
       AND otp_backup_codes IS NULL
   ) OR NOT EXISTS (
+    SELECT 1 FROM users
+    WHERE id = 105 AND account_id = -321 AND confirmed_at IS NOT NULL AND approved = false
+  ) OR NOT EXISTS (
+    SELECT 1 FROM users
+    WHERE id = 106 AND account_id = -322 AND confirmed_at IS NULL AND approved = true
+  ) OR NOT EXISTS (
+    SELECT 1 FROM users
+    WHERE id = 107 AND account_id = -323 AND confirmed_at IS NOT NULL
+      AND approved = true AND disabled = false AND otp_required_for_login = true
+  ) OR NOT EXISTS (
     SELECT 1 FROM accounts
     WHERE id = 116844606259202001
       AND also_known_as = ARRAY['https://alias.remote.fixture.invalid/users/bob']::varchar[]
@@ -220,6 +272,10 @@ BEGIN
       AND in_reply_to_account_id = 116844606259202001
       AND in_reply_to_id = 116845078118405101
   ) OR NOT EXISTS (
+    SELECT 1 FROM statuses
+    WHERE id = 116845314048005201 AND ordered_media_attachment_ids = ARRAY[]::bigint[]
+      AND EXISTS (SELECT 1 FROM media_attachments WHERE id = -106 AND status_id = statuses.id)
+  ) OR NOT EXISTS (
     SELECT 1 FROM status_edits
     WHERE id = 9401 AND ordered_media_attachment_ids = ARRAY[]::bigint[]
       AND media_descriptions = ARRAY[]::text[] AND poll_options IS NULL
@@ -247,6 +303,37 @@ BEGIN
     RAISE EXCEPTION 'status edge, edit, tag, or conversation fixtures are incomplete';
   END IF;
 
+  IF NOT EXISTS (
+    SELECT 1 FROM statuses
+    WHERE id = 116844846120965002 AND in_reply_to_id = 116844842188805001
+      AND in_reply_to_account_id = 116844606259201001
+  ) OR NOT EXISTS (
+    SELECT 1 FROM statuses
+    WHERE id = 116844850053125003 AND in_reply_to_id = 116844846120965002
+      AND in_reply_to_account_id = 116844606259201001
+  ) THEN
+    RAISE EXCEPTION 'status context fixture chain is incomplete';
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM mentions WHERE id = 7004 AND silent = true)
+     OR NOT EXISTS (SELECT 1 FROM mentions WHERE id = 7005 AND silent = true)
+     OR NOT EXISTS (SELECT 1 FROM mentions WHERE id = 7006 AND silent = false)
+     OR NOT EXISTS (SELECT 1 FROM follows WHERE id = 8007)
+     OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = -310 AND account_id = 116844606259202003)
+     OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = -311 AND visibility = 2)
+     OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = -312 AND visibility = 2)
+     OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = -313 AND visibility = 0
+       AND in_reply_to_id = 116844842188805001)
+     OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = -314 AND account_id = -320)
+     OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = -315
+       AND account_id = 116844606259201004 AND in_reply_to_id = 116844842188805001)
+     OR NOT EXISTS (SELECT 1 FROM accounts WHERE id = 116844606259201004
+       AND silenced_at = '2026-07-01 18:25:00')
+     OR NOT EXISTS (SELECT 1 FROM accounts WHERE id = -320 AND domain = 'account-blocked.fixture.invalid')
+     OR NOT EXISTS (SELECT 1 FROM blocks WHERE id = 9509) THEN
+    RAISE EXCEPTION 'status authorization matrix fixtures are incomplete';
+  END IF;
+
   IF NOT EXISTS (SELECT 1 FROM bookmarks WHERE id = 9501)
      OR NOT EXISTS (SELECT 1 FROM blocks WHERE id = 9502)
      OR NOT EXISTS (SELECT 1 FROM mutes WHERE id = 9503 AND hide_notifications = false)
@@ -261,17 +348,88 @@ BEGIN
      OR NOT EXISTS (SELECT 1 FROM tombstones WHERE id = 9901)
      OR NOT EXISTS (SELECT 1 FROM conversation_mutes WHERE id = 9303)
      OR NOT EXISTS (SELECT 1 FROM status_pins WHERE id = 9505)
+     OR NOT EXISTS (SELECT 1 FROM status_pins WHERE id = 9506)
      OR NOT EXISTS (SELECT 1 FROM status_pins WHERE id = 9508)
      OR NOT EXISTS (SELECT 1 FROM favourites WHERE id = 8102)
      OR NOT EXISTS (SELECT 1 FROM bookmarks WHERE id = 9507)
-     OR NOT EXISTS (SELECT 1 FROM custom_filter_statuses WHERE id = 9104) THEN
+     OR NOT EXISTS (SELECT 1 FROM custom_filter_statuses WHERE id = 9104)
+     OR NOT EXISTS (SELECT 1 FROM custom_emojis WHERE id = 12001 AND shortcode = 'fixtureparty')
+      OR NOT EXISTS (SELECT 1 FROM preview_cards WHERE id = 12002 AND type = 3)
+      OR NOT EXISTS (SELECT 1 FROM preview_cards_statuses WHERE preview_card_id = 12002 AND status_id = 116845105643525105)
+      OR NOT EXISTS (SELECT 1 FROM tagged_objects WHERE id = 12003 AND object_id = 116845549977608801)
+      OR NOT EXISTS (SELECT 1 FROM markers WHERE id = 12004 AND user_id = 101 AND lock_version = 7)
+      OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = 116844846120965002 AND local IS NULL AND uri IS NULL)
+      OR NOT EXISTS (SELECT 1 FROM notifications WHERE id = 10025 AND type IS NULL AND activity_type = 'Status') THEN
     RAISE EXCEPTION 'relationship, domain, notification policy, request, or tombstone coverage is incomplete';
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM statuses WHERE id = -400 AND account_id = -330
+       AND visibility = 0 AND language = 'en' AND reply = false AND reblog_of_id IS NULL)
+     OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = -401 AND account_id = -330
+       AND visibility = 0 AND language = 'fr')
+     OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = -404 AND reply = true
+       AND in_reply_to_account_id = account_id)
+     OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = -408 AND reply = true
+       AND in_reply_to_account_id = 116844606259202002)
+     OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = -409 AND reblog_of_id = -415)
+     OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = -414 AND account_id = -323
+       AND visibility = 0 AND local = true)
+     OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = -416
+       AND account_id = 116844606259201001 AND reblog_of_id = -417)
+     OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = -417 AND account_id = -323)
+     OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = -418 AND EXISTS (
+       SELECT 1 FROM mentions WHERE status_id = -418 AND account_id = 116844606259202002))
+     OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = -420 AND EXISTS (
+       SELECT 1 FROM custom_filter_statuses WHERE status_id = -420 AND custom_filter_id = 9101))
+     OR NOT EXISTS (SELECT 1 FROM custom_filter_statuses
+       WHERE id = 9106 AND status_id = -416 AND custom_filter_id = 9101)
+     OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = -421 AND account_id = 116844606259201001
+       AND visibility = 3)
+     OR NOT EXISTS (SELECT 1 FROM statuses WHERE id = -423 AND language = 'fr' AND EXISTS (
+       SELECT 1 FROM statuses_tags WHERE status_id = -423 AND tag_id = 9201))
+     OR NOT EXISTS (SELECT 1 FROM follows WHERE id = 8010 AND languages = ARRAY['en']::varchar[])
+     OR NOT EXISTS (SELECT 1 FROM follows WHERE id = 8012 AND show_reblogs = false)
+     OR NOT EXISTS (SELECT 1 FROM list_accounts WHERE id = 9013 AND list_id = 9002 AND follow_id = 8011)
+     OR NOT EXISTS (SELECT 1 FROM list_accounts WHERE id = 9015 AND list_id = 9001
+       AND account_id = 116844606259201001 AND follow_id IS NULL)
+     OR NOT EXISTS (SELECT 1 FROM favourites WHERE id = 8111 AND status_id = -412)
+     OR NOT EXISTS (SELECT 1 FROM bookmarks WHERE id = 9511 AND status_id = -412)
+     OR NOT EXISTS (SELECT 1 FROM statuses_tags WHERE status_id = 116845314048005201 AND tag_id = 9201)
+     OR NOT EXISTS (SELECT 1 FROM oauth_access_tokens WHERE id = 412 AND scopes = 'read:lists')
+     OR NOT EXISTS (SELECT 1 FROM oauth_access_tokens WHERE id = 416 AND scopes = 'read:mutes')
+     OR NOT EXISTS (SELECT 1 FROM oauth_access_tokens WHERE id = 417 AND scopes = 'follow') THEN
+    RAISE EXCEPTION 'timeline and collection compatibility controls are incomplete';
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM quotes WHERE id = -94 AND legacy = true AND state = 4)
+     OR NOT EXISTS (
+       SELECT 1 FROM quotes q JOIN statuses target ON target.id = q.quoted_status_id
+       WHERE q.id = -93 AND target.reblog_of_id IS NOT NULL AND q.state = 1
+     )
+     OR jsonb_array_length((SELECT fields FROM accounts WHERE id = 116844606259201001)) <> 3 THEN
+    RAISE EXCEPTION 'legacy quote and local profile mention coverage is incomplete';
   END IF;
 
   IF (SELECT value FROM settings WHERE id = 9801) <> E'--- true\n'
      OR (SELECT value FROM settings WHERE id = 9802)
-        <> E'--- !ruby/hash:ActiveSupport::HashWithIndifferentAccess\nfixture: value\n' THEN
+        <> E'--- !ruby/hash:ActiveSupport::HashWithIndifferentAccess\nfixture: value\n'
+     OR (SELECT value FROM settings WHERE id = 9803) <> E'--- public\n'
+     OR (SELECT value FROM settings WHERE id = 9804) <> E'--- authenticated\n'
+     OR (SELECT value FROM settings WHERE id = 9805) <> E'--- public\n'
+     OR (SELECT value FROM settings WHERE id = 9806) <> E'--- disabled\n' THEN
     RAISE EXCEPTION 'raw scalar/tagged Rails YAML setting bytes are incorrect';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM users u JOIN accounts a ON a.id = u.account_id
+    WHERE u.id = 104 AND a.id = 116844606259201004
+      AND u.otp_required_for_login = true AND u.disabled = false
+  ) OR NOT EXISTS (
+    SELECT 1 FROM oauth_access_tokens
+    WHERE id = 410 AND resource_owner_id = 104 AND revoked_at IS NULL
+  ) OR (SELECT count(*) FROM notifications WHERE account_id = 116844606259201004) <> 44
+     OR (SELECT count(*) FROM notifications WHERE group_key = 'follow-api-moderator-stress') <> 41 THEN
+    RAISE EXCEPTION 'functional API moderator notification coverage is incomplete';
   END IF;
 
   IF NOT EXISTS (
@@ -318,7 +476,12 @@ BEGIN
     RAISE EXCEPTION 'collection/item cross-links or counters are incoherent';
   END IF;
 
-  IF (SELECT count(*) FROM quotes WHERE state = 1) <> 2
+  IF (SELECT count(*) FROM quotes WHERE state = 1) <> 6
+     OR NOT EXISTS (
+       SELECT 1 FROM quotes
+       WHERE id = 116845078118408703 AND status_id = 116845078118405101
+         AND quoted_status_id = 116844850053125003 AND state = 1
+     )
      OR NOT EXISTS (
        SELECT 1 FROM quotes
        WHERE id = 116845317980168701 AND account_id = 116844606259202001 AND status_id = 116845317980165202
@@ -333,6 +496,20 @@ BEGIN
        SELECT 1 FROM quotes
        WHERE id = -94 AND status_id = 116844846120965002
          AND quoted_status_id = 116846257766400501 AND state = 4
+     )
+     OR NOT EXISTS (
+       SELECT 1 FROM quotes
+       WHERE id = -92 AND status_id = 116845105643525105
+         AND quoted_status_id = 116844850053125003 AND state = 0
+     )
+     OR NOT EXISTS (
+       SELECT 1 FROM quotes
+       WHERE id = -91 AND status_id = 116844842188805001
+         AND quoted_status_id = 116845321912325301 AND state = 1
+     )
+     OR NOT EXISTS (
+       SELECT 1 FROM quotes
+       WHERE id = -90 AND status_id = quoted_status_id AND state = 1
      ) THEN
     RAISE EXCEPTION 'quote directions or cross-links are incoherent';
   END IF;
@@ -358,8 +535,8 @@ BEGIN
     RAISE EXCEPTION 'status counters are incoherent';
   END IF;
 
-  IF (SELECT count(*) FROM notifications WHERE filtered = false) <> 17
-     OR (SELECT count(*) FROM notifications) <> 21
+  IF (SELECT count(*) FROM notifications WHERE filtered = false) <> 63
+     OR (SELECT count(*) FROM notifications) <> 67
      OR NOT EXISTS (
        SELECT 1 FROM notifications
        WHERE id = 10018 AND type = 'future_event' AND activity_type = 'FutureActivity' AND filtered = true
@@ -375,7 +552,7 @@ BEGIN
        WHERE id = 10021 AND type = 'future_suspended'
          AND from_account_id = 116844606259202003 AND filtered = true
      ) THEN
-    RAISE EXCEPTION 'expected 17 readable known notifications and four filtered edge fixtures';
+    RAISE EXCEPTION 'expected 63 readable known/legacy/stress notifications and four filtered edge fixtures';
   END IF;
 
   IF EXISTS (
@@ -388,7 +565,7 @@ BEGIN
     )
     SELECT 1
     FROM expected
-    LEFT JOIN notifications n USING (type)
+    LEFT JOIN notifications n ON n.type = expected.type AND n.id <= 10017
     WHERE n.group_key IS DISTINCT FROM expected.group_key
   ) THEN
     RAISE EXCEPTION 'groupable notification key does not match v4.6.5 target/hour format';
@@ -417,7 +594,7 @@ BEGIN
     )
     SELECT 1
     FROM expected
-    LEFT JOIN notifications n USING (type)
+    LEFT JOIN notifications n ON n.type = expected.type AND n.id <= 10017
     WHERE n.id IS NULL
        OR n.activity_type <> expected.activity_type
        OR n.activity_id <> expected.activity_id

@@ -124,3 +124,228 @@
   provider option, ignores unrelated extension tables, and checks logical
   Sidekiq work rather than Redis's internal key layout beyond read-only queue
   discovery.
+- Added read-only authentication for existing Mastodon OAuth bearer tokens with
+  exact Doorkeeper revocation and expiration boundaries, endpoint-specific
+  broad/granular scope alternatives, application-only principals, and Mastodon
+  user/account functional-state ordering. The joined lookup never selects the
+  bearer or refresh token, application secret, password, OTP material, or
+  recovery codes.
+- Deliberately omitted Mastodon's once-per-day access-token and user sign-in
+  metadata writes. They remain deferred to the authenticated-write phase; the
+  OAuth fixture and differential tests prove Rust authentication leaves every
+  row unchanged. Differential setup refreshes that metadata only in its
+  transient template before cloning so Rails does not introduce an expected
+  tracking write during read-only response comparison.
+- Added database-free REST serializers backed by batched read-only projections
+  for Mastodon 4.6.5 accounts, credentials, relationships, statuses, media,
+  polls, quotes, collections, filters, markers, notifications, and instance
+  v1/v2 responses. IDs, dates, nullable fields, rendered HTML, authenticated
+  state, and all 17 known notification types are differentially verified.
+- Expanded compatibility fixtures for cached Paperclip media, profile mentions,
+  historical null-local statuses, legacy null-type notifications, notification
+  pagination/grouping stress, and authorization-sensitive quote states. Quote
+  expansion is explicitly bounded and self-quote coverage proves cyclic data
+  cannot recurse indefinitely.
+- Promoted the first REST read surface to the production Axum web process:
+  instance v1/v2 and rules, disabled translation languages, account show,
+  lookup, verify-credentials, relationships, statuses, followers/following,
+  status show, and context now read directly from PostgreSQL.
+- Kept root `StatusPolicy` authorization, account-status selection, and context
+  member filtering as distinct selectors. Current follows, active and silent
+  mentions, author blocks and domain blocks, viewer blocks/mutes/domain blocks,
+  suspended or silenced authors, and soft deletion are covered independently.
+- Added stable Mastodon-compatible pagination for account statuses and follow
+  collections, including `max_id`, `min_id`, `since_id`, endpoint limits, exact
+  `Link` ordering, pin-time ordering, self-replies, and edited-out media.
+- Expanded the deterministic fixture with pending/unconfirmed local accounts, a
+  functional unrelated OAuth viewer, multiple follows and pins, blocked and
+  domain-blocked thread members, and a silenced viewer's own reply. Dedicated
+  SQL and HTTP authorization matrices prove private, direct, and limited status
+  denial across show, account-status, and context endpoints.
+- Hardened quote projection boundaries after independent review: unauthorized
+  targets, including targets hidden by an author-side domain block, no longer
+  enter nested status or target-link projections before serialization.
+- Replaced Redis-derived home and list reads with direct PostgreSQL selectors
+  and added public, hashtag, list, favourites, bookmarks, blocks, and mutes
+  routes with endpoint-specific OAuth scopes and cursor contracts.
+- Matched Mastodon timeline filtering for feed-access settings, follows and
+  chosen languages, replies, boosts, exclusive lists, blocks, mutes, domain
+  blocks, custom filters, hashtag normalization, and edited-out media.
+- Expanded deterministic Rails feed materialization for followed tags and
+  owner self-membership, then proved the timeline fixture byte-for-byte
+  reproducible and all read responses differentially compatible with 4.6.5.
+- Centralized shared REST protocol behavior around an explicit 21-route
+  inventory, including CORS/preflight, trailing slashes, cache and `Vary`
+  headers, Rails-compatible errors, request-size enforcement, and pagination
+  contracts without advertising unsupported routes.
+- Added database-referenced local Paperclip serving for accounts, media files
+  and thumbnails, custom emoji, preview cards and provider icons, and site
+  uploads, including existing processed audio/video paths. REST serializers and
+  request authorization share cache-prefix, ID-partition, style, filename, and
+  URL-escaping rules.
+- Added Mastodon-compatible `GET`, `HEAD`, conditional, single-range, and
+  streaming multipart-range responses with immutable cache, CSP, MIME,
+  Last-Modified, and Rails-visible error behavior verified against pinned
+  Mastodon 4.6.5.
+- Hardened filesystem reads with a startup-retained `openat2` root descriptor,
+  no symlink traversal, clean decoded components, regular-file checks, and
+  best-effort no-atime reads. Differential snapshots now compare media mode,
+  owner, group, and modification time in addition to bytes and hashes.
+- Added bounded Rack-compatible query/form parsing and registered JSON body
+  parsing with scalar, null, array, hash, collision, depth, count, byte-limit,
+  numeric coercion, and body/query merge semantics verified directly against
+  Mastodon 4.6.5.
+- Closed the REST protocol milestone after independent review and sequential
+  `check`, fixture restore/reproducibility, schema, preflight, and complete
+  five-case differential gates all passed.
+- Added an explicit, transactional `rustodon admin migrate-operational-schema`
+  command for the separately owned `rustodon` namespace. Version 1 stores
+  durable jobs, outbox events, idempotency keys, ordering markers, domain
+  health, and worker/scheduler heartbeats without foreign keys or changes to
+  Mastodon's `public` schema.
+- Serialized operational DDL with both Rustodon and Active Record 8.1 migration
+  locks, validated all 71 relations read by current Rustodon code plus the
+  Snowflake sequences and `timestamp_id()` before and after DDL, and rejected
+  event triggers, all-table publications, behavior hooks, unsafe collations,
+  unpopulated materialized views, and unsupported Mastodon schema versions.
+- Pinned an OID-independent operational catalog fingerprint that records the
+  original schema owner, complete ACLs, schema-qualified collations, comments,
+  dependencies, extension membership, triggers, rules, policies, and other
+  PostgreSQL 14 namespace object classes. Fresh, repeat, concurrent absent and
+  empty-schema creation, owner reassignment, grants, and attached-object drift
+  are covered by the isolated integration gate.
+- Closed the operational-schema milestone after independent review and
+  sequential `check`, operational/preflight integration, fixture
+  restore/reproducibility, schema integration, and all six differential cases
+  passed. Before/after catalog, schema, data, owner, and ACL snapshots plus
+  pinned Rails verification prove Mastodon rollback remains possible.
+- Added PostgreSQL durable jobs and transactional outbox dispatch with delayed
+  execution, fenced renewable leases, final-attempt crash recovery, logical-key
+  deduplication/cancellation, bounded deterministic jitter, dead letters, and
+  worker/scheduler heartbeats. Dispatch and cancellation serialize on keyed
+  outbox rows so a committed cancellation cannot leave runnable work behind.
+- Added a handler registry with explicit lane capability and independent remote
+  HTTP/media semaphores. Leases renew while waiting for permits; stale handlers
+  cannot acknowledge expired or replaced leases. Infrastructure currently
+  registers only maintenance cleanup, making `maintenance` the truthful default
+  and rejecting configured lanes without handlers.
+- Required a distinct `NOINHERIT` runtime database login with exact operational
+  DML/sequence grants and read-only Mastodon access. Startup rejects schema
+  owners, memberships, database/schema creation, direct or `PUBLIC` Mastodon
+  writes, operational ACL drift, and unsupported schemas.
+- Added readiness and bounded dead-letter administration, poll-cadence outbox
+  draining independent of heartbeat cadence, and scheduler/handler shutdown
+  separation. Shutdown joins the sole heartbeat writer, withdraws readiness,
+  drains handlers within one absolute deadline, and never acknowledges aborted
+  work.
+- Closed the durable-worker milestone after independent review and sequential
+  `check`, worker/operational/preflight integration, fixture restore and
+  reproducibility, least-privilege schema integration, and all six differential
+  cases passed. Eight PostgreSQL integration cases cover queue concurrency,
+  final-attempt crashes, duplicate effects, permit-wait renewal, dispatch versus
+  cancellation, retries/dead letters, runtime privileges, readiness, and
+  shutdown.
+- Added shared production startup validation before web bind or worker claims.
+  The bounded, read-only checks cover configuration, media, the pinned Mastodon
+  schema, signing keys, canonical domains, active workflows, the operational
+  schema, the direct runtime role, and its required Mastodon and operational
+  privileges. Operational migrations remain explicit and perform no runtime DDL.
+- Added strict listener parsing, graceful serving, dependency-free `/health`,
+  and bounded `/ready` checks for database availability plus `SELECT` on every
+  v1-critical Mastodon relation. Worker startup publishes initial worker and
+  scheduler heartbeats before claim loops begin.
+- Added explicit trusted-proxy handling: forwarding metadata is ignored unless
+  `TRUSTED_PROXY_IP` trusts the peer, malformed trusted forwarding fails closed,
+  and effective authorities are constrained to configured canonical and media
+  hosts. Absolute Paperclip media uses the sanitized effective authority.
+- Closed production startup safety after independent review and sequential
+  `check`, startup, worker, operational/preflight integration, fixture restore
+  and reproducibility, least-privilege schema integration, and all six
+  differential cases passed. Real-process tests prove fatal startup has no web
+  bind or worker side effects and readiness degrades after database or required
+  relation privilege loss without affecting liveness.
+- Began the cross-surface policy foundation with typed, pure status audience and
+  context decisions shared by root reads, context filtering, and quote targets.
+  Unknown visibility, deletion, and suspension fail closed before owner
+  exemptions; private/direct audiences preserve Mastodon 4.6.5 semantics.
+- Made raw status graph loading private so public root reads must authorize
+  first. Added an isolated database mutation regression proving an undeleted
+  unknown visibility cannot appear as a root, context member, quote target, or
+  shallow target ID. Seven schema integration cases and the focused Mastodon
+  differential authorization matrix passed, and independent review found no
+  blocker in this slice.
+- Added exact Mastodon 4.6.5 local-role semantics for all 23 permission bits,
+  including EVERYONE inheritance, direct administrator expansion, any-of
+  permission checks, strict position hierarchy, and highlighted moderation block
+  bypass. Raw and effective masks are distinct types so action policy cannot
+  accidentally skip inheritance.
+- Keyed credential and restricted-feed permission loading to the exact OAuth
+  resource-owner user/account pair. Crossed identities fail closed, and exact
+  owner settings and role now drive both flattened account fields and top-level
+  credentials. Startup and preflight reject a missing mandatory EVERYONE role.
+  Eight schema integration cases, preflight clone rejection, Clippy, and an
+  independent role-policy review passed.
+- Added typed account lifecycle decisions for limited, moved, memorial,
+  temporary suspension, and permanent unavailability. Browser authentication
+  is intentionally distinct from functional API access; OAuth reads deletion
+  requests and keeps the instance-actor suspension exemption.
+- Added reusable global-domain decisions with Mastodon-compatible transitional
+  IDNA normalization, exact label boundaries, longest-parent precedence,
+  silence/suspend/noop and media/report controls, and fail-closed unknown or
+  NULL severity. Independent comparison against the pinned Mastodon lifecycle
+  and domain models found no blocker; federation call sites remain owned by the
+  later signature, fetch, inbox, and delivery slices.
+- Began the public federation discovery slice with WebFinger, host-meta, NodeInfo
+  2.0, local actors, public Notes, outbox, followers, and following collections.
+  Local ActivityPub URLs derive from the account ID scheme, local endpoint fields
+  are derived when legacy rows are blank, accepted quote targets flow through the
+  existing HTML formatter, and browser requests preserve Mastodon's absolute
+  HTML redirects instead of returning JSON-LD.
+ - Added a guarded `federation_discovery` Rails-versus-Rust differential case for
+   malformed and unknown WebFinger resources, discovery documents, actor and
+   Note fields, collection totals, pagination identifiers, and HTML redirects.
+   The case passes against the pinned Mastodon 4.6.5 fixture. The fixture's
+   `/actor` request currently returns HTTP 500 despite the pinned upstream request
+   spec requiring 200, so that inconsistent instance-actor request remains a
+   separate follow-up rather than weakening the supported discovery gate.
+- Hardened the discovery slice after source review: unavailable actors mask
+  profile fields, WebFinger authorities preserve explicit ports, local quote
+  URIs respect numeric account IDs, suspended collection members remain
+  representable, collection page presence matches Rails, ActivityPub Accept
+  negotiation honors quality values, and outbox data errors fail closed.
+- Restored Rails prefix coercion for REST route IDs while keeping ActivityPub
+  account IDs constrained, and added the encoded-ID regression to the guarded
+  federation case. Formatting, Clippy, 42 unit tests, all 7 differential cases,
+  and startup integration pass.
+ - Moved `GET /api/v1/collections/:id` from a differential-only fixture route
+   into production routing, reusing the visibility-aware collection projection.
+   Added exact status-source serialization and status-history snapshots, including
+   historical media ordering/descriptions, polls, legacy quote states, and strict
+   token handling. The core REST differential now exercises all three production
+   endpoints and remains compatible with Mastodon 4.6.5.
+ - Added reverse status actor reads for favourites and boosts. Their selectors
+   preserve Rails association/status cursor IDs, public/unlisted root policy,
+   suspended-account exclusion, viewer block/mute filtering, application-only
+   token behavior, and ordered pagination links.
+ - Added production account search with required user authentication, exact
+   stored local/remote handle matches, PostgreSQL full-text ranking, following
+   filtering, and Rails-compatible limit/offset behavior. `resolve=true` is
+   explicit for complete remote handles, keeping network resolution isolated
+   behind the later safe remote-fetch milestone.
+ - Moved `GET /api/v1/markers` into production routing. It preserves
+   user-scoped marker ownership, scalar/array/unknown timeline semantics,
+   private cache/Vary behavior, and the existing Rails differential/auth matrix;
+   marker writes remain deferred.
+ - Moved `GET /api/v2/filters` into production routing, reusing the existing
+   account-scoped filter, keyword, and status projections. The endpoint now
+   participates in the production protocol path; filter writes remain deferred.
+ - Added production `GET /api/v1/lists` using the existing account-owned list
+   query. The four-field response, replies-policy mapping, trailing slash,
+   private headers, and auth/owner-isolation cases are differentially covered;
+   list writes remain deferred.
+ - Added production `GET /api/v1/featured_tags` with account-owned tag joins,
+   tag-name fallback, account-tag URLs, string counts/date serialization, and
+   broad/granular/owner-isolation differential coverage.
+ - Added public production `GET /api/v1/accounts/:id/featured_tags` with
+  unavailable/suspended-account handling, public access independent of token
+  scopes, account-tag URLs, and anonymous/trailing/missing-target coverage.

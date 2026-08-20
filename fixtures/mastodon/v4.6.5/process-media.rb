@@ -5,6 +5,7 @@ require 'fastimage'
 
 FIXED_AVATAR_TIME = Time.utc(2026, 7, 1, 12, 0, 0)
 FIXED_MEDIA_TIME = Time.utc(2026, 7, 1, 13, 0, 0)
+FIXED_REMOTE_TIME = Time.utc(2026, 7, 1, 14, 7, 0)
 
 Stoplight.configure { |config| config.data_store = Stoplight::DataStore::Memory.new }
 
@@ -44,15 +45,91 @@ attachment.update_columns(
   updated_at: FIXED_MEDIA_TIME
 )
 
+bob = Account.find(116_844_606_259_202_001)
+bob.update_column(:avatar_storage_schema_version, 1)
+File.open('/fixture/media-source/avatar.png', 'rb') do |source|
+  bob.avatar.assign(source)
+  bob.avatar.send(:post_process)
+  bob.avatar.instance_write(:file_name, 'bob.png')
+  bob.avatar.save
+end
+bob.update_columns(
+  avatar_content_type: bob.avatar_content_type,
+  avatar_file_name: bob.avatar_file_name,
+  avatar_file_size: File.size(bob.avatar.path(:original)),
+  avatar_storage_schema_version: 1,
+  avatar_updated_at: FIXED_REMOTE_TIME,
+  updated_at: FIXED_REMOTE_TIME
+)
+
+remote_attachment = MediaAttachment.find(116_845_105_643_526_106)
+File.open('/fixture/media-source/status.jpg', 'rb') do |source|
+  remote_attachment.file.assign(source)
+  remote_attachment.file.send(:post_process)
+  remote_attachment.file.instance_write(:file_name, 'cached.jpg')
+  remote_attachment.file.save
+end
+remote_attachment.update_columns(
+  blurhash: remote_attachment.blurhash,
+  file_content_type: remote_attachment.file_content_type,
+  file_file_name: remote_attachment.file_file_name,
+  file_file_size: File.size(remote_attachment.file.path(:original)),
+  file_meta: remote_attachment.file_meta,
+  file_storage_schema_version: 1,
+  file_updated_at: FIXED_REMOTE_TIME,
+  processing: MediaAttachment.processings.fetch('complete'),
+  type: MediaAttachment.types.fetch('image'),
+  updated_at: FIXED_REMOTE_TIME
+)
+
+emoji = CustomEmoji.find(12_001)
+File.open('/fixture/media-source/avatar.png', 'rb') do |source|
+  emoji.image.assign(source)
+  emoji.image.send(:post_process)
+  emoji.image.instance_write(:file_name, 'fixtureparty.png')
+  emoji.image.save
+end
+emoji.update_columns(
+  image_content_type: emoji.image_content_type,
+  image_file_name: emoji.image_file_name,
+  image_file_size: File.size(emoji.image.path(:original)),
+  image_storage_schema_version: 1,
+  image_updated_at: FIXED_REMOTE_TIME,
+  updated_at: FIXED_REMOTE_TIME
+)
+
+card = PreviewCard.find(12_002)
+File.open('/fixture/media-source/avatar.png', 'rb') do |source|
+  card.image.assign(source)
+  card.image.send(:post_process)
+  card.image.instance_write(:file_name, 'preview.png')
+  card.image.save
+end
+card.update_columns(
+  image_content_type: card.image_content_type,
+  image_file_name: card.image_file_name,
+  image_file_size: File.size(card.image.path(:original)),
+  image_storage_schema_version: 1,
+  image_updated_at: FIXED_REMOTE_TIME,
+  updated_at: FIXED_REMOTE_TIME
+)
+
 expected_files = {
   alice.avatar.path(:original) => [400, 400],
+  bob.avatar.path(:original) => [400, 400],
   attachment.file.path(:original) => [600, 400],
   attachment.file.path(:small) => [588, 392],
+  remote_attachment.file.path(:original) => [600, 400],
+  remote_attachment.file.path(:small) => [588, 392],
+  emoji.image.path(:original) => [128, 125],
+  emoji.image.path(:static) => [128, 125],
+  card.image.path(:original) => [128, 125],
 }.freeze
 
 expected_files.each do |path, dimensions|
   raise "processed media is missing: #{path}" unless File.file?(path)
-  raise "processed media dimensions mismatch for #{path}" unless FastImage.size(path) == dimensions
+  actual_dimensions = FastImage.size(path)
+  raise "processed media dimensions mismatch for #{path}: expected #{dimensions.inspect}, got #{actual_dimensions.inspect}" unless actual_dimensions == dimensions
 end
 
 raise 'PNG avatar should use original as its static representation' unless alice.avatar_static_url == alice.avatar_original_url

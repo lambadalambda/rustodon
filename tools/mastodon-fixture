@@ -23,6 +23,10 @@ DATABASE_READER='rustodon_reader'
 DATABASE_READER_PASSWORD='fixture-reader-password-v4-6-5'
 DIFFERENTIAL_READER='rustodon_differential_reader'
 DIFFERENTIAL_READER_PASSWORD='fixture-differential-reader-v4-6-5'
+OPERATIONAL_MIGRATOR='rustodon_schema_migrator'
+OPERATIONAL_MIGRATOR_PASSWORD='fixture-schema-migrator-v4-6-5'
+WORKER_RUNTIME='rustodon_worker_runtime'
+WORKER_RUNTIME_PASSWORD='fixture-worker-runtime-v4-6-5'
 LOCAL_DOMAIN='fixture-v4-6-5.rustodon.invalid'
 REMOTE_DOMAIN='remote.fixture.invalid'
 MIGRATION_COUNT='588'
@@ -340,14 +344,32 @@ write_manifest() {
   migrations_sha=$(file_sha256 "$output_dir/migrations.tsv")
   migrations_bytes=$(file_bytes "$output_dir/migrations.tsv")
   avatar_path='media/accounts/avatars/116/844/606/259/201/001/original/0112603425bb49c1.png'
+  remote_avatar_path='media/cache/accounts/avatars/116/844/606/259/202/001/original/bob.png'
   image_original_path='media/media_attachments/files/116/844/842/188/806/001/original/cd63911ad76f4d5d.jpg'
   image_small_path='media/media_attachments/files/116/844/842/188/806/001/small/cd63911ad76f4d5d.jpg'
+  remote_image_original_path='media/cache/media_attachments/files/116/845/105/643/526/106/original/cached.jpg'
+  remote_image_small_path='media/cache/media_attachments/files/116/845/105/643/526/106/small/cached.jpg'
+  emoji_original_path='media/cache/custom_emojis/images/000/012/001/original/fixtureparty.png'
+  emoji_static_path='media/cache/custom_emojis/images/000/012/001/static/fixtureparty.png'
+  preview_card_path='media/cache/preview_cards/images/000/012/002/original/preview.png'
   avatar_sha=$(file_sha256 "$output_dir/$avatar_path")
   avatar_bytes=$(file_bytes "$output_dir/$avatar_path")
+  remote_avatar_sha=$(file_sha256 "$output_dir/$remote_avatar_path")
+  remote_avatar_bytes=$(file_bytes "$output_dir/$remote_avatar_path")
   image_original_sha=$(file_sha256 "$output_dir/$image_original_path")
   image_original_bytes=$(file_bytes "$output_dir/$image_original_path")
   image_small_sha=$(file_sha256 "$output_dir/$image_small_path")
   image_small_bytes=$(file_bytes "$output_dir/$image_small_path")
+  remote_image_original_sha=$(file_sha256 "$output_dir/$remote_image_original_path")
+  remote_image_original_bytes=$(file_bytes "$output_dir/$remote_image_original_path")
+  remote_image_small_sha=$(file_sha256 "$output_dir/$remote_image_small_path")
+  remote_image_small_bytes=$(file_bytes "$output_dir/$remote_image_small_path")
+  emoji_original_sha=$(file_sha256 "$output_dir/$emoji_original_path")
+  emoji_original_bytes=$(file_bytes "$output_dir/$emoji_original_path")
+  emoji_static_sha=$(file_sha256 "$output_dir/$emoji_static_path")
+  emoji_static_bytes=$(file_bytes "$output_dir/$emoji_static_path")
+  preview_card_sha=$(file_sha256 "$output_dir/$preview_card_path")
+  preview_card_bytes=$(file_bytes "$output_dir/$preview_card_path")
 
   cat > "$output_dir/manifest.json" <<EOF
 {
@@ -426,6 +448,78 @@ write_manifest() {
       "dimensions": "588x392",
       "bytes": $image_small_bytes,
       "sha256": "$image_small_sha"
+    },
+    {
+      "label": "remote_account.cached_avatar",
+      "path": "$remote_avatar_path",
+      "source": "spec/fixtures/files/emojo.png",
+      "source_sha256": "0112603425bb49c1f6a453f1d35678919b61aa1b020f5b18a99cdfc83b12f5bb",
+      "processor": "Mastodon v4.6.5 Account avatar_styles via process-media.rb",
+      "style": "original cached remote avatar",
+      "content_type": "image/png",
+      "dimensions": "400x400",
+      "bytes": $remote_avatar_bytes,
+      "sha256": "$remote_avatar_sha"
+    },
+    {
+      "label": "remote_status.cached_image",
+      "path": "$remote_image_original_path",
+      "source": "spec/fixtures/files/attachment.jpg",
+      "source_sha256": "cd63911ad76f4d5dd509c4d73bf3640d6ea7183337f3032ef96fd705309c3845",
+      "processor": "Mastodon v4.6.5 MediaAttachment IMAGE_STYLES via process-media.rb",
+      "style": "original cached remote media",
+      "content_type": "image/jpeg",
+      "dimensions": "600x400",
+      "bytes": $remote_image_original_bytes,
+      "sha256": "$remote_image_original_sha"
+    },
+    {
+      "label": "remote_status.cached_image.small",
+      "path": "$remote_image_small_path",
+      "source": "spec/fixtures/files/attachment.jpg",
+      "source_sha256": "cd63911ad76f4d5dd509c4d73bf3640d6ea7183337f3032ef96fd705309c3845",
+      "processor": "Mastodon v4.6.5 MediaAttachment IMAGE_STYLES via process-media.rb",
+      "style": "small cached remote media",
+      "content_type": "image/jpeg",
+      "dimensions": "588x392",
+      "bytes": $remote_image_small_bytes,
+      "sha256": "$remote_image_small_sha"
+    },
+    {
+      "label": "custom_emoji.cached_image",
+      "path": "$emoji_original_path",
+      "source": "spec/fixtures/files/emojo.png",
+      "source_sha256": "0112603425bb49c1f6a453f1d35678919b61aa1b020f5b18a99cdfc83b12f5bb",
+      "processor": "Mastodon v4.6.5 CustomEmoji image_styles via process-media.rb",
+      "style": "original cached custom emoji",
+      "content_type": "image/png",
+      "dimensions": "128x125",
+      "bytes": $emoji_original_bytes,
+      "sha256": "$emoji_original_sha"
+    },
+    {
+      "label": "custom_emoji.cached_image.static",
+      "path": "$emoji_static_path",
+      "source": "spec/fixtures/files/emojo.png",
+      "source_sha256": "0112603425bb49c1f6a453f1d35678919b61aa1b020f5b18a99cdfc83b12f5bb",
+      "processor": "Mastodon v4.6.5 CustomEmoji image_styles via process-media.rb",
+      "style": "static cached custom emoji",
+      "content_type": "image/png",
+      "dimensions": "128x125",
+      "bytes": $emoji_static_bytes,
+      "sha256": "$emoji_static_sha"
+    },
+    {
+      "label": "preview_card.cached_image",
+      "path": "$preview_card_path",
+      "source": "spec/fixtures/files/emojo.png",
+      "source_sha256": "0112603425bb49c1f6a453f1d35678919b61aa1b020f5b18a99cdfc83b12f5bb",
+      "processor": "Mastodon v4.6.5 PreviewCard image_styles via process-media.rb",
+      "style": "original cached preview card",
+      "content_type": "image/png",
+      "dimensions": "128x125",
+      "bytes": $preview_card_bytes,
+      "sha256": "$preview_card_sha"
     }
   ],
   "test_credentials": {
@@ -444,17 +538,41 @@ write_manifest() {
     "account.local.alice": 116844606259201001,
     "account.local.moderator": 116844606259201002,
     "account.local.newbie": 116844606259201003,
+    "account.local.api_moderator": 116844606259201004,
+    "account.local.pending": -321,
+    "account.local.unconfirmed": -322,
+    "account.local.matrix_viewer": -323,
     "account.remote.bob": 116844606259202001,
     "account.remote.carol": 116844606259202002,
     "account.remote.suspended": 116844606259202003,
     "user.alice": 101,
     "user.moderator": 102,
     "user.newbie": 103,
+    "user.api_moderator": 104,
+    "user.pending": 105,
+    "user.unconfirmed": 106,
+    "user.matrix_viewer": 107,
     "role.user": 91,
     "role.moderator": 92,
     "role.everyone": -99,
     "oauth.application": 301,
     "oauth.access_token": 401,
+    "oauth.access_token.read_statuses": 402,
+    "oauth.access_token.read_accounts": 403,
+    "oauth.access_token.insufficient": 404,
+    "oauth.access_token.revoked": 405,
+    "oauth.access_token.expired": 406,
+    "oauth.access_token.application_only": 407,
+    "oauth.access_token.disabled_user": 408,
+    "oauth.access_token.missing_2fa": 409,
+    "oauth.access_token.api_moderator": 410,
+    "oauth.access_token.matrix_viewer": 411,
+    "oauth.access_token.read_lists": 412,
+    "oauth.access_token.read_favourites": 413,
+    "oauth.access_token.read_bookmarks": 414,
+    "oauth.access_token.read_blocks": 415,
+    "oauth.access_token.read_mutes": 416,
+    "oauth.access_token.follow": 417,
     "status.visibility.public": 116844842188805001,
     "status.visibility.unlisted": 116844846120965002,
     "status.visibility.private": 116844850053125003,
@@ -469,16 +587,45 @@ write_manifest() {
     "status.quote.remote": 116845317980165202,
     "status.reblog": 116845321912325301,
     "status.visibility.unknown_deleted": 116846257766400501,
+    "status.context.silenced_viewer_own": -315,
+    "status.timeline.ordinary": -400,
+    "status.timeline.follow_language_excluded": -401,
+    "status.timeline.unlisted": -402,
+    "status.timeline.private": -403,
+    "status.timeline.self_reply": -404,
+    "status.timeline.owner_reply": -405,
+    "status.timeline.exclusive_member": -406,
+    "status.timeline.list_reply": -407,
+    "status.timeline.tag_reply": -408,
+    "status.timeline.boost": -409,
+    "status.timeline.saved_muted_author": -412,
+    "status.timeline.followed_tag_only": -414,
+    "status.timeline.boost_source": -415,
+    "status.timeline.owner_boost": -416,
+    "status.timeline.owner_boost_source": -417,
+    "status.timeline.blocked_mention": -418,
+    "status.timeline.visible_mention": -419,
+    "status.timeline.custom_filter": -420,
+    "status.timeline.own_direct": -421,
+    "status.timeline.followed_tag_language": -423,
+    "status.timeline.exclusive_reply": -424,
+    "status.timeline.no_reblogs_boost": -425,
+    "status.timeline.no_reblogs_post": -426,
+    "status.timeline.no_reblogs_reply": -427,
+    "status.timeline.tag_any_all": -430,
+    "status.timeline.tag_excluded": -431,
     "status_edit.remote_updated": 9401,
     "status_edit.deleted": 9402,
     "status_edit.nullable_media_descriptions": 9403,
     "media.status.image": 116844842188806001,
+    "media.status.remote_cached": 116845105643526106,
     "media.status.deleted": -98,
     "media.status.ordered_first": -101,
     "media.status.ordered_third": -102,
     "media.status.ordered_fourth": -103,
     "media.status.ordered_over_limit": -104,
     "media.status.stale_unordered": -105,
+    "media.status.edited_out": -106,
     "media.status.null_order_first": -210,
     "media.status.null_order_second": -209,
     "media.status.null_order_third": -208,
@@ -487,14 +634,27 @@ write_manifest() {
     "mention.remote_to_alice": 7001,
     "mention.direct_to_bob": 7002,
     "mention.deleted": 7003,
+    "mention.direct_to_api_moderator": 7006,
     "relationship.following": 8001,
     "relationship.follower": 8002,
+    "relationship.following.second": 8005,
+    "relationship.follower.second": 8006,
+    "relationship.follower.api_moderator": 8007,
+    "relationship.following.timeline_author": 8010,
+    "relationship.following.exclusive_author": 8011,
+    "relationship.following.no_reblogs": 8012,
     "relationship.follow_request": 8003,
+    "relationship.follow_request.outgoing_options": 8004,
     "relationship.favourite": 8101,
     "relationship.favourite.deleted": 8102,
     "relationship.bookmark": 9501,
     "relationship.bookmark.deleted": 9507,
+    "relationship.favourite.timeline": 8110,
+    "relationship.favourite.saved_muted_author": 8111,
+    "relationship.bookmark.timeline": 9510,
+    "relationship.bookmark.saved_muted_author": 9511,
     "relationship.status_pin": 9505,
+    "relationship.status_pin.second": 9506,
     "relationship.status_pin.deleted": 9508,
     "relationship.block": 9502,
     "relationship.mute": 9503,
@@ -511,6 +671,7 @@ write_manifest() {
     "admin.report": 8601,
     "quote.remote_quotes_local": 116845317980168701,
     "quote.local_quotes_remote": 116845314048008702,
+    "quote.remote_private_target": 116845078118408703,
     "quote.deleted": -97,
     "quote.deleted_target": -94,
     "collection.remote": 116845549977608801,
@@ -526,6 +687,10 @@ write_manifest() {
     "filter.keyword": 9102,
     "filter.status": 9103,
     "filter.status.deleted": 9104,
+    "emoji.remote.fixtureparty": 12001,
+    "preview_card.fixture": 12002,
+    "tagged_object.collection": 12003,
+    "marker.home.alice": 12004,
     "tag.fixture": 9201,
     "tag.featured": 9202,
     "conversation.direct": 9301,
@@ -562,9 +727,17 @@ write_manifest() {
     "notification.null_filtered": 10019,
     "notification.deleted_status_filtered": 10020,
     "notification.suspended_sender_filtered": 10021,
+    "notification.api_moderator.admin.sign_up": 10022,
+    "notification.api_moderator.admin.report": 10023,
+    "notification.favourite.grouped_second_sender": 10024,
+    "notification.legacy_null_type_reblog": 10025,
+    "notification.api_moderator.pre_limit_reblog": 10026,
+    "notification.api_moderator.group_stress_latest": 10140,
+    "relationship.favourite.grouped_second_sender": 8103,
     "account_stat.alice": 11001,
     "account_stat.moderator": 11002,
     "account_stat.newbie": 11003,
+    "account_stat.api_moderator": 11008,
     "account_stat.bob": 11004,
     "account_stat.carol": 11005,
     "account_stat.instance_actor": 11006,
@@ -582,7 +755,8 @@ write_manifest() {
     "status_stat.local_quote": 12011,
     "status_stat.remote_quote": 12012,
     "status_stat.reblog": 12013,
-    "status_stat.unknown_deleted": 12014
+    "status_stat.unknown_deleted": 12014,
+    "status_stat.context.silenced_viewer_own": 12020
   }
 }
 EOF
@@ -681,6 +855,12 @@ generate_fixture() {
       verify.rb \
       verify.sql \
       media/accounts/avatars/116/844/606/259/201/001/original/0112603425bb49c1.png \
+      media/cache/accounts/avatars/116/844/606/259/202/001/original/bob.png \
+      media/cache/custom_emojis/images/000/012/001/original/fixtureparty.png \
+      media/cache/custom_emojis/images/000/012/001/static/fixtureparty.png \
+      media/cache/media_attachments/files/116/845/105/643/526/106/original/cached.jpg \
+      media/cache/media_attachments/files/116/845/105/643/526/106/small/cached.jpg \
+      media/cache/preview_cards/images/000/012/002/original/preview.png \
       media/media_attachments/files/116/844/842/188/806/001/original/cd63911ad76f4d5d.jpg \
       media/media_attachments/files/116/844/842/188/806/001/small/cd63911ad76f4d5d.jpg \
       > SHA256SUMS
@@ -804,12 +984,356 @@ EOF
     ''|*[!0-9]*) die "invalid published PostgreSQL endpoint: $published_endpoint" ;;
   esac
   database_url="postgresql://$DATABASE_READER:$DATABASE_READER_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
+  owner_url="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
 
   RUSTODON_MASTODON_DATABASE_URL="$database_url" \
-    cargo test --locked --test mastodon_schema -- --ignored --nocapture
+  RUSTODON_MASTODON_OWNER_DATABASE_URL="$owner_url" \
+    cargo test --locked --test mastodon_schema -- --ignored --nocapture --test-threads=1
 
   finish_database
   printf 'read-only Rust schema integration passed for Mastodon %s\n' "$RELEASE"
+}
+
+operational_schema_test() {
+  fixture=$FIXTURE_DIR
+  verify_static "$fixture"
+  verify_images
+  start_database publish
+
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$fixture/database.sql" >/dev/null
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$fixture/verify.sql" >/dev/null
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres >/dev/null <<EOF
+CREATE ROLE $OPERATIONAL_MIGRATOR LOGIN PASSWORD '$OPERATIONAL_MIGRATOR_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+CREATE ROLE rustodon_displaced_owner NOLOGIN
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+GRANT CONNECT, CREATE ON DATABASE $DATABASE_NAME TO $OPERATIONAL_MIGRATOR;
+EOF
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" >/dev/null <<EOF
+GRANT USAGE ON SCHEMA public TO $OPERATIONAL_MIGRATOR;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO $OPERATIONAL_MIGRATOR;
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO $OPERATIONAL_MIGRATOR;
+EOF
+
+  before_catalog="$ROOT/target/operational-before-catalog-$$.txt"
+  after_catalog="$ROOT/target/operational-after-catalog-$$.txt"
+  before_schema="$ROOT/target/operational-before-schema-$$.sql"
+  after_schema="$ROOT/target/operational-after-schema-$$.sql"
+  before_data="$ROOT/target/operational-before-data-$$.sql"
+  after_data="$ROOT/target/operational-after-data-$$.sql"
+  before_access="$ROOT/target/operational-before-access-$$.txt"
+  after_access="$ROOT/target/operational-after-access-$$.txt"
+
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --tuples-only --no-align \
+    --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$fixture/catalog-query.sql" > "$before_catalog"
+  run_podman exec --env LC_ALL=C "$PG_CONTAINER" pg_dump \
+    --format=plain --encoding=UTF8 --no-owner --no-privileges --no-comments \
+    --schema=public --schema-only --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    > "$before_schema"
+  run_podman exec --env LC_ALL=C "$PG_CONTAINER" pg_dump \
+    --format=plain --encoding=UTF8 --no-owner --no-privileges --no-comments \
+    --schema=public --data-only --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    > "$before_data"
+  sed -i \
+    -e 's/^\\restrict .*/\\restrict rustodonOperationalSchemaTest/' \
+    -e 's/^\\unrestrict .*/\\unrestrict rustodonOperationalSchemaTest/' \
+    "$before_schema" "$before_data"
+  run_podman exec "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --tuples-only --no-align \
+    --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    --command "SELECT kind || E'\t' || name || E'\t' || owner || E'\t' || acl FROM (SELECT 'schema' AS kind, n.nspname::text AS name, pg_get_userbyid(n.nspowner) AS owner, COALESCE(n.nspacl::text, '') AS acl FROM pg_namespace n WHERE n.nspname = 'public' UNION ALL SELECT 'relation', c.relname::text, pg_get_userbyid(c.relowner), COALESCE(c.relacl::text, '') FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' UNION ALL SELECT 'column', c.relname || '.' || a.attname, '', COALESCE(a.attacl::text, '') FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND a.attnum > 0 AND NOT a.attisdropped UNION ALL SELECT 'function', p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')', pg_get_userbyid(p.proowner), COALESCE(p.proacl::text, '') FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' UNION ALL SELECT 'type', t.typname, pg_get_userbyid(t.typowner), COALESCE(t.typacl::text, '') FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = 'public' UNION ALL SELECT 'default_acl', d.defaclobjtype || ':' || pg_get_userbyid(d.defaclrole), pg_get_userbyid(d.defaclrole), d.defaclacl::text FROM pg_default_acl d JOIN pg_namespace n ON n.oid = d.defaclnamespace WHERE n.nspname = 'public') entries ORDER BY kind COLLATE \"C\", name COLLATE \"C\"" \
+    > "$before_access"
+
+  published_endpoint=$(run_podman port "$PG_CONTAINER" 5432/tcp)
+  published_port=${published_endpoint##*:}
+  case "$published_port" in
+    ''|*[!0-9]*) die "invalid published PostgreSQL endpoint: $published_endpoint" ;;
+  esac
+  database_url="postgresql://$OPERATIONAL_MIGRATOR:$OPERATIONAL_MIGRATOR_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
+  env -i \
+    PATH="$PATH" HOME="${HOME:-/tmp}" \
+    CARGO_HOME="${CARGO_HOME:-${HOME:-/tmp}/.cargo}" \
+    RUSTUP_HOME="${RUSTUP_HOME:-${HOME:-/tmp}/.rustup}" \
+    RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.97.1}" \
+    CC='clang' AR="$ROOT/tools/clang-ar" \
+    LOCAL_DOMAIN="$LOCAL_DOMAIN" WEB_DOMAIN="$LOCAL_DOMAIN" \
+    DATABASE_URL="$database_url" PAPERCLIP_ROOT_PATH="$FIXTURE_DIR/media" \
+    SECRET_KEY_BASE='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
+    ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY='11111111111111111111111111111111' \
+    ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT='22222222222222222222222222222222' \
+    ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY='33333333333333333333333333333333' \
+    cargo run --locked --quiet -- admin migrate-operational-schema
+  RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
+    cargo test --locked --test operational_schema \
+      operational_schema_lifecycle_is_isolated_and_idempotent \
+      -- --ignored --exact --nocapture
+  RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
+  RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+    cargo test --locked --test operational_schema \
+      operational_schema_rejects_namespace_and_access_drift \
+      -- --ignored --exact --nocapture
+
+  unsupported_database="rustodon_operational_unsupported_$$"
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres >/dev/null <<EOF
+CREATE DATABASE $unsupported_database OWNER $DATABASE_USER;
+GRANT CONNECT, CREATE ON DATABASE $unsupported_database TO $OPERATIONAL_MIGRATOR;
+EOF
+  if env -i \
+    PATH="$PATH" HOME="${HOME:-/tmp}" \
+    CARGO_HOME="${CARGO_HOME:-${HOME:-/tmp}/.cargo}" \
+    RUSTUP_HOME="${RUSTUP_HOME:-${HOME:-/tmp}/.rustup}" \
+    RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.97.1}" \
+    CC='clang' AR="$ROOT/tools/clang-ar" \
+    LOCAL_DOMAIN="$LOCAL_DOMAIN" WEB_DOMAIN="$LOCAL_DOMAIN" \
+    DATABASE_URL="postgresql://$OPERATIONAL_MIGRATOR:$OPERATIONAL_MIGRATOR_PASSWORD@127.0.0.1:$published_port/$unsupported_database" \
+    PAPERCLIP_ROOT_PATH="$FIXTURE_DIR/media" \
+    SECRET_KEY_BASE='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
+    ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY='11111111111111111111111111111111' \
+    ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT='22222222222222222222222222222222' \
+    ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY='33333333333333333333333333333333' \
+    cargo run --locked --quiet -- admin migrate-operational-schema >/dev/null 2>&1
+  then
+    die 'operational migration accepted an unsupported Mastodon database'
+  fi
+  unexpected_schema=$(run_podman exec "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --tuples-only --no-align \
+    --username "$DATABASE_USER" --dbname "$unsupported_database" \
+    --command "SELECT count(*) FROM pg_namespace WHERE nspname = 'rustodon'")
+  [ "$unexpected_schema" = '0' ] || die 'rejected database received a rustodon schema'
+  run_podman exec "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres \
+    --command "DROP DATABASE $unsupported_database WITH (FORCE)" >/dev/null
+
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --tuples-only --no-align \
+    --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$fixture/catalog-query.sql" > "$after_catalog"
+  run_podman exec --env LC_ALL=C "$PG_CONTAINER" pg_dump \
+    --format=plain --encoding=UTF8 --no-owner --no-privileges --no-comments \
+    --schema=public --schema-only --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    > "$after_schema"
+  run_podman exec --env LC_ALL=C "$PG_CONTAINER" pg_dump \
+    --format=plain --encoding=UTF8 --no-owner --no-privileges --no-comments \
+    --schema=public --data-only --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    > "$after_data"
+  sed -i \
+    -e 's/^\\restrict .*/\\restrict rustodonOperationalSchemaTest/' \
+    -e 's/^\\unrestrict .*/\\unrestrict rustodonOperationalSchemaTest/' \
+    "$after_schema" "$after_data"
+  run_podman exec "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --tuples-only --no-align \
+    --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    --command "SELECT kind || E'\t' || name || E'\t' || owner || E'\t' || acl FROM (SELECT 'schema' AS kind, n.nspname::text AS name, pg_get_userbyid(n.nspowner) AS owner, COALESCE(n.nspacl::text, '') AS acl FROM pg_namespace n WHERE n.nspname = 'public' UNION ALL SELECT 'relation', c.relname::text, pg_get_userbyid(c.relowner), COALESCE(c.relacl::text, '') FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' UNION ALL SELECT 'column', c.relname || '.' || a.attname, '', COALESCE(a.attacl::text, '') FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND a.attnum > 0 AND NOT a.attisdropped UNION ALL SELECT 'function', p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')', pg_get_userbyid(p.proowner), COALESCE(p.proacl::text, '') FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' UNION ALL SELECT 'type', t.typname, pg_get_userbyid(t.typowner), COALESCE(t.typacl::text, '') FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = 'public' UNION ALL SELECT 'default_acl', d.defaclobjtype || ':' || pg_get_userbyid(d.defaclrole), pg_get_userbyid(d.defaclrole), d.defaclacl::text FROM pg_default_acl d JOIN pg_namespace n ON n.oid = d.defaclnamespace WHERE n.nspname = 'public') entries ORDER BY kind COLLATE \"C\", name COLLATE \"C\"" \
+    > "$after_access"
+
+  cmp -s "$before_catalog" "$after_catalog" || die 'operational migration changed the public catalog'
+  cmp -s "$before_schema" "$after_schema" || die 'operational migration changed the public schema dump'
+  cmp -s "$before_data" "$after_data" || die 'operational migration changed the public data dump'
+  cmp -s "$before_access" "$after_access" || die 'operational migration changed public ownership or privileges'
+  rm "$before_catalog" "$after_catalog" "$before_schema" "$after_schema" "$before_data" "$after_data" "$before_access" "$after_access"
+
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$fixture/verify.sql" >/dev/null
+  run_rails "$fixture" 'bundle exec rails runner /fixture/verify.rb'
+  finish_database
+  printf 'operational schema integration passed for Mastodon %s\n' "$RELEASE"
+}
+
+worker_test() {
+  fixture=$FIXTURE_DIR
+  verify_static "$fixture"
+  verify_images
+  start_database publish
+
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$fixture/database.sql" >/dev/null
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres >/dev/null <<EOF
+CREATE ROLE $OPERATIONAL_MIGRATOR LOGIN PASSWORD '$OPERATIONAL_MIGRATOR_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+CREATE ROLE $WORKER_RUNTIME LOGIN NOINHERIT PASSWORD '$WORKER_RUNTIME_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+GRANT CONNECT, CREATE ON DATABASE $DATABASE_NAME TO $OPERATIONAL_MIGRATOR;
+REVOKE ALL ON DATABASE $DATABASE_NAME FROM PUBLIC;
+REVOKE ALL ON DATABASE $DATABASE_NAME FROM $WORKER_RUNTIME;
+GRANT CONNECT ON DATABASE $DATABASE_NAME TO $WORKER_RUNTIME;
+EOF
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" >/dev/null <<EOF
+GRANT USAGE ON SCHEMA public TO $OPERATIONAL_MIGRATOR;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO $OPERATIONAL_MIGRATOR;
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO $OPERATIONAL_MIGRATOR;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO $WORKER_RUNTIME;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO $WORKER_RUNTIME;
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO $WORKER_RUNTIME;
+EOF
+  published_endpoint=$(run_podman port "$PG_CONTAINER" 5432/tcp)
+  published_port=${published_endpoint##*:}
+  case "$published_port" in
+    ''|*[!0-9]*) die "invalid published PostgreSQL endpoint: $published_endpoint" ;;
+  esac
+  migrator_url="postgresql://$OPERATIONAL_MIGRATOR:$OPERATIONAL_MIGRATOR_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
+  runtime_url="postgresql://$WORKER_RUNTIME:$WORKER_RUNTIME_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
+  worker_log="$ROOT/target/worker-log-$$"
+  cargo build --locked --quiet --bin rustodon
+  run_worker_cli "$migrator_url" admin migrate-operational-schema
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" >/dev/null <<EOF
+GRANT USAGE ON SCHEMA rustodon TO $WORKER_RUNTIME;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
+  rustodon.durable_jobs, rustodon.outbox_events, rustodon.idempotency_keys,
+  rustodon.ordering_markers, rustodon.domain_health, rustodon.heartbeats
+  TO $WORKER_RUNTIME;
+GRANT SELECT ON TABLE rustodon.schema_migrations TO $WORKER_RUNTIME;
+GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq
+  TO $WORKER_RUNTIME;
+EOF
+  run_worker_cli "$migrator_url" admin migrate-operational-schema
+  RUSTODON_WORKER_DATABASE_URL="$runtime_url" \
+  RUSTODON_WORKER_ADMIN_DATABASE_URL="$migrator_url" \
+  RUSTODON_WORKER_OWNER_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+    cargo test --locked --test workers -- --ignored --nocapture --test-threads=1
+
+  start_worker_cli "$runtime_url" "$worker_log" &
+  worker_pid=$!
+  ready=false
+  for _ in $(seq 1 60); do
+    if run_worker_cli "$runtime_url" admin worker-readiness >/dev/null 2>&1
+    then
+      ready=true
+      break
+    fi
+    sleep 0.1
+  done
+  if [ "$ready" != true ]; then
+    kill -TERM "$worker_pid" >/dev/null 2>&1 || true
+    wait "$worker_pid" >/dev/null 2>&1 || true
+    die "worker did not become ready; inspect $worker_log"
+  fi
+  run_worker_cli "$runtime_url" admin dead-jobs --limit 10 >/dev/null
+  kill -TERM "$worker_pid"
+  wait "$worker_pid" || die "worker did not stop successfully; inspect $worker_log"
+  remaining_heartbeats=$(run_podman exec "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --tuples-only --no-align \
+    --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    --command "SELECT count(*) FROM rustodon.heartbeats")
+  [ "$remaining_heartbeats" = '0' ] || die 'worker left stale heartbeats after shutdown'
+  rm "$worker_log"
+  finish_database
+  printf 'durable worker integration passed for Mastodon %s\n' "$RELEASE"
+}
+
+startup_test() {
+  fixture=$FIXTURE_DIR
+  verify_static "$fixture"
+  verify_images
+  start_database publish
+
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$fixture/database.sql" >/dev/null
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres >/dev/null <<EOF
+CREATE ROLE $OPERATIONAL_MIGRATOR LOGIN PASSWORD '$OPERATIONAL_MIGRATOR_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+CREATE ROLE $WORKER_RUNTIME LOGIN NOINHERIT PASSWORD '$WORKER_RUNTIME_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+GRANT CONNECT, CREATE ON DATABASE $DATABASE_NAME TO $OPERATIONAL_MIGRATOR;
+REVOKE ALL ON DATABASE $DATABASE_NAME FROM PUBLIC;
+REVOKE ALL ON DATABASE $DATABASE_NAME FROM $WORKER_RUNTIME;
+GRANT CONNECT ON DATABASE $DATABASE_NAME TO $WORKER_RUNTIME;
+EOF
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" >/dev/null <<EOF
+GRANT USAGE ON SCHEMA public TO $OPERATIONAL_MIGRATOR;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO $OPERATIONAL_MIGRATOR;
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO $OPERATIONAL_MIGRATOR;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO $WORKER_RUNTIME;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO $WORKER_RUNTIME;
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO $WORKER_RUNTIME;
+EOF
+  published_endpoint=$(run_podman port "$PG_CONTAINER" 5432/tcp)
+  published_port=${published_endpoint##*:}
+  case "$published_port" in
+    ''|*[!0-9]*) die "invalid published PostgreSQL endpoint: $published_endpoint" ;;
+  esac
+  migrator_url="postgresql://$OPERATIONAL_MIGRATOR:$OPERATIONAL_MIGRATOR_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
+  runtime_url="postgresql://$WORKER_RUNTIME:$WORKER_RUNTIME_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
+  owner_url="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
+  cargo build --locked --quiet --bin rustodon
+  run_worker_cli "$migrator_url" admin migrate-operational-schema
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" >/dev/null <<EOF
+GRANT USAGE ON SCHEMA rustodon TO $WORKER_RUNTIME;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
+  rustodon.durable_jobs, rustodon.outbox_events, rustodon.idempotency_keys,
+  rustodon.ordering_markers, rustodon.domain_health, rustodon.heartbeats
+  TO $WORKER_RUNTIME;
+GRANT SELECT ON TABLE rustodon.schema_migrations TO $WORKER_RUNTIME;
+GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq
+  TO $WORKER_RUNTIME;
+EOF
+  run_worker_cli "$migrator_url" admin migrate-operational-schema
+  RUSTODON_STARTUP_DATABASE_URL="$runtime_url" \
+  RUSTODON_STARTUP_OWNER_DATABASE_URL="$owner_url" \
+  RUSTODON_STARTUP_MEDIA_ROOT="$FIXTURE_DIR/media" \
+    cargo test --locked --test startup -- --ignored --nocapture --test-threads=1
+
+  finish_database
+  printf 'production startup safety integration passed for Mastodon %s\n' "$RELEASE"
+}
+
+run_worker_cli() {
+  database_url=$1
+  shift
+  env -i \
+    PATH="$PATH" HOME="${HOME:-/tmp}" \
+    CARGO_HOME="${CARGO_HOME:-${HOME:-/tmp}/.cargo}" \
+    RUSTUP_HOME="${RUSTUP_HOME:-${HOME:-/tmp}/.rustup}" \
+    RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.97.1}" \
+    CC='clang' AR="$ROOT/tools/clang-ar" \
+    LOCAL_DOMAIN="$LOCAL_DOMAIN" WEB_DOMAIN="$LOCAL_DOMAIN" \
+    DATABASE_URL="$database_url" PAPERCLIP_ROOT_PATH="$FIXTURE_DIR/media" \
+    SECRET_KEY_BASE='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
+    ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY='11111111111111111111111111111111' \
+    ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT='22222222222222222222222222222222' \
+    ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY='33333333333333333333333333333333' \
+    WORKER_LANES='maintenance' WORKER_CONCURRENCY='2' WORKER_HEARTBEAT_SECONDS='1' \
+    WORKER_POLL_MILLISECONDS='25' WORKER_SHUTDOWN_SECONDS='5' \
+    "$ROOT/target/debug/rustodon" "$@"
+}
+
+start_worker_cli() {
+  database_url=$1
+  worker_log=$2
+  exec env -i \
+    PATH="$PATH" HOME="${HOME:-/tmp}" \
+    CARGO_HOME="${CARGO_HOME:-${HOME:-/tmp}/.cargo}" \
+    RUSTUP_HOME="${RUSTUP_HOME:-${HOME:-/tmp}/.rustup}" \
+    RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.97.1}" \
+    CC='clang' AR="$ROOT/tools/clang-ar" \
+    LOCAL_DOMAIN="$LOCAL_DOMAIN" WEB_DOMAIN="$LOCAL_DOMAIN" \
+    DATABASE_URL="$database_url" PAPERCLIP_ROOT_PATH="$FIXTURE_DIR/media" \
+    SECRET_KEY_BASE='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
+    ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY='11111111111111111111111111111111' \
+    ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT='22222222222222222222222222222222' \
+    ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY='33333333333333333333333333333333' \
+    WORKER_LANES='maintenance' WORKER_CONCURRENCY='2' WORKER_HEARTBEAT_SECONDS='1' \
+    WORKER_POLL_MILLISECONDS='25' WORKER_SHUTDOWN_SECONDS='5' \
+    "$ROOT/target/debug/rustodon" worker >"$worker_log" 2>&1
 }
 
 grant_preflight_reader() {
@@ -841,6 +1365,7 @@ run_preflight_cli() {
     HOME="${HOME:-/tmp}" \
     CARGO_HOME="${CARGO_HOME:-${HOME:-/tmp}/.cargo}" \
     RUSTUP_HOME="${RUSTUP_HOME:-${HOME:-/tmp}/.rustup}" \
+    RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.97.1}" \
     CC='clang' \
     AR="$ROOT/tools/clang-ar" \
     LOCAL_DOMAIN="$LOCAL_DOMAIN" \
@@ -948,6 +1473,10 @@ EOF
     'ALTER TABLE account_stats ALTER COLUMN statuses_count DROP DEFAULT'
   run_preflight_clone_case changed_column PF_DB_COLUMN_CHANGED \
     'ALTER TABLE accounts ALTER COLUMN username TYPE character varying COLLATE "C"'
+  run_preflight_clone_case unpopulated_view PF_DB_RELATION_CHANGED \
+    'REFRESH MATERIALIZED VIEW instances WITH NO DATA'
+  run_preflight_clone_case same_name_collation PF_DB_COLUMN_CHANGED \
+    'CREATE SCHEMA rustodon_collation_test; CREATE COLLATION rustodon_collation_test."default" FROM pg_catalog."C"; ALTER TABLE accounts ALTER COLUMN username TYPE character varying COLLATE rustodon_collation_test."default"'
   run_preflight_clone_case missing_constraint PF_DB_CONSTRAINT_MISSING \
     'ALTER TABLE polls DROP CONSTRAINT fk_rails_3e0d9f1115'
   run_preflight_clone_case changed_constraint PF_DB_CONSTRAINT_CHANGED \
@@ -970,6 +1499,8 @@ EOF
     'ALTER FUNCTION public.timestamp_id(text) IMMUTABLE'
   run_preflight_clone_case function_body PF_DB_TIMESTAMP_ID_BODY \
     'CREATE OR REPLACE FUNCTION public.timestamp_id(table_name text) RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$'
+  run_preflight_clone_case function_config PF_DB_TIMESTAMP_ID_SHAPE \
+    'ALTER FUNCTION public.timestamp_id(text) SET search_path = public'
   run_preflight_clone_case changed_sequence PF_DB_SEQUENCE_CHANGED \
     'ALTER SEQUENCE public.accounts_id_seq INCREMENT BY 2'
   run_preflight_clone_case missing_sequence PF_DB_SEQUENCE_MISSING \
@@ -982,6 +1513,8 @@ EOF
     "UPDATE statuses SET deleted_at = NULL WHERE id = 116846257766400501; UPDATE polls SET expires_at = CURRENT_TIMESTAMP + INTERVAL '1 hour' WHERE id = 8203"
   run_preflight_clone_case account_deletion PF_DB_ACCOUNT_DELETIONS_PENDING \
     "INSERT INTO account_deletion_requests (id, account_id, created_at, updated_at) VALUES (-1, 116844606259201001, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+  run_preflight_clone_case everyone_role PF_DB_EVERYONE_ROLE_INVALID \
+    'UPDATE users SET role_id = 91 WHERE role_id IS NULL; DELETE FROM user_roles WHERE id = -99'
   run_preflight_clone_case webauthn_only PF_DB_WEBAUTHN_ONLY_USERS \
     'UPDATE users SET otp_required_for_login = false WHERE id = 101'
   run_preflight_clone_case active_relay PF_DB_RELAYS_ACTIVE \
@@ -1015,7 +1548,7 @@ validate_differential_case() {
       ;;
   esac
   case "$case_name" in
-    instance_v2) ;;
+    core_rest_serializers|federation_discovery|instance_v2|local_paperclip_media|oauth_bearer_authentication|rest_protocol_contracts|status_authorization_matrix) ;;
     *) die "unknown differential case: $case_name" ;;
   esac
 }
@@ -1148,6 +1681,9 @@ start_differential_web() {
     fi
     sleep 1
   done
+
+  run_podman exec "$WEB_CONTAINER" bundle exec rails runner \
+    'account = Account.find(116844606259201001); PrecomputeFeedService.new.call(account); account.owned_lists.each { |list| ListAccount.where(list: list, account: account, follow_id: nil).find_each { |member| account.statuses.list_eligible_visibility.find_each { |status| FeedInsertWorker.new.perform(status.id, member.list_id, "list") } } }; tag_ids = TagFollow.where(account_id: account.id).select(:tag_id); Status.public_visibility.without_reblogs.joins(:account, :tags).merge(Account.without_suspended.without_silenced).where(tags: { id: tag_ids }).distinct.find_each { |status| FeedInsertWorker.new.perform(status.id, account.id, "tags") }' >/dev/null
 }
 
 verify_podman_resource_absent() {
@@ -1229,6 +1765,20 @@ differential_test() {
   run_podman exec -i "$PG_CONTAINER" psql \
     --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
     < "$FIXTURE_DIR/verify.sql" >/dev/null
+
+  # Mastodon tracks known tokens and their owners before authorization. Keep
+  # this transient template fresh so read-only differential cases do not
+  # trigger either once-per-day metadata write.
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" >/dev/null <<EOF
+UPDATE oauth_access_tokens
+SET last_used_at = CURRENT_TIMESTAMP
+WHERE id BETWEEN 401 AND 417;
+UPDATE users
+SET current_sign_in_at = CURRENT_TIMESTAMP,
+    last_sign_in_at = CURRENT_TIMESTAMP
+WHERE id BETWEEN 101 AND 107;
+EOF
 
   DIFFERENTIAL_RUN_ID="run_$$"
   mastodon_database="rustodon_differential_${DIFFERENTIAL_RUN_ID}_mastodon"
@@ -1314,6 +1864,10 @@ Commands:
   verify [PATH]          Verify pinned metadata and artifact checksums (fast)
   restore-verify [PATH]  Restore and verify with PostgreSQL and Mastodon Rails
   schema-read-test       Run ignored Rust reads through a least-privilege role
+  operational-schema-test
+                           Verify isolated, idempotent Rustodon schema creation
+  worker-test              Exercise durable jobs and worker process lifecycle
+  startup-test             Prove web and worker fail closed before readiness
   preflight-test         Run canonical and rejection preflight cases
   differential-test [CASE]
                           Run all or one Rails-versus-Rust compatibility case
@@ -1354,6 +1908,18 @@ case "$command" in
   schema-read-test)
     [ "$#" -eq 0 ] || die 'schema-read-test takes no arguments'
     schema_read_test
+    ;;
+  operational-schema-test)
+    [ "$#" -eq 0 ] || die 'operational-schema-test takes no arguments'
+    operational_schema_test
+    ;;
+  worker-test)
+    [ "$#" -eq 0 ] || die 'worker-test takes no arguments'
+    worker_test
+    ;;
+  startup-test)
+    [ "$#" -eq 0 ] || die 'startup-test takes no arguments'
+    startup_test
     ;;
   preflight-test)
     [ "$#" -eq 0 ] || die 'preflight-test takes no arguments'

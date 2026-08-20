@@ -11,9 +11,10 @@ cache state.
 
 ## Status
 
-Rustodon is in its initial compatibility-harness phase. A read-only Mastodon
-4.6.5 schema library and its fixture-backed integration workflow are available,
-but Rustodon is not yet usable as a Mastodon server.
+Rustodon is in its initial read-only compatibility phase. A production Axum web
+process now serves Mastodon 4.6.5 account, status, relationship, timeline,
+collection, and instance reads directly from PostgreSQL, but writes,
+federation, workers, and operations are not complete enough for a cutover.
 
 The first compatibility target is Mastodon 4.6.5. Supporting one stable schema
 first keeps the initial implementation testable; additional Mastodon releases
@@ -90,6 +91,50 @@ compile-time query macros and unrelated database drivers are disabled. Saphyr
 parses Rails YAML safely while the library retains the original YAML and JSON
 text byte-for-byte. Token and private-key values use redacted opaque wrappers.
 
+The library also authenticates existing OAuth bearer tokens through one
+secret-minimizing joined read. It preserves Mastodon's exact revocation,
+expiration, application-only, owner-state, and endpoint-specific scope
+semantics while returning Mastodon-compatible HTTP authentication failures.
+This read-only milestone intentionally does not update token last-used or user
+sign-in metadata; those writes are deferred to the authenticated-write phase.
+
+The library also exposes synchronous, database-free Mastodon 4.6.5 REST
+serializers fed by batched read-only projections. Current coverage includes
+instance v1/v2, accounts, credentials, relationships, statuses and nested
+entities, collections, filters, markers, and every known notification type.
+Rails-versus-Rust differential tests verify exact JSON behavior while keeping
+root status authorization in the dedicated read-endpoint milestone.
+
+The production web router currently serves instance v1/v2, instance rules,
+disabled translation languages, account show/lookup/search/credentials/
+relationships, account statuses/followers/following, markers, status
+show/source/history/context, reverse favourite/boost actor reads,
+account filters/lists/featured tags, public account featured tags,
+PostgreSQL-backed home/public/tag/list timelines, and
+favourites/bookmarks/blocks/mutes. Root status authorization is kept separate
+from account-status and context filtering;
+public, unlisted, private, direct, and limited visibility is checked against
+current follows, active or silent mentions, blocks, domain blocks, suspended
+authors, and soft deletion. Pagination and authorization are differentially
+checked against Mastodon 4.6.5 through dedicated fixture cases.
+
+The router also centralizes Mastodon-compatible REST protocol behavior for its
+ explicit 32-route inventory: CORS and preflight handling, trailing slashes,
+cache and `Vary` headers, JSON error envelopes, the 99 MiB body limit, and
+endpoint cursor contracts. Query, form, and registered JSON request bodies use
+bounded Rack-compatible scalar/array/hash parsing, including Rails parameter
+limits and malformed-shape behavior. Unsupported routes are never advertised
+by preflight responses.
+
+The web process also serves database-referenced local Paperclip media from the
+existing filesystem tree. Account avatars and headers, media files and
+thumbnails, custom emoji, preview cards and provider icons, site uploads, and
+existing processed audio/video use one shared path contract with REST
+serializers. `GET`, `HEAD`, conditional requests, and bounded streaming byte
+ranges match the pinned Rails/Rack behavior. Startup retains a securely opened
+media-root descriptor; requests reject traversal, invalid styles and metadata,
+and symlinks without mutating the database or media tree.
+
 ### Mastodon compatibility fixture
 
 The first compatibility baseline is pinned to Mastodon v4.6.5 commit
@@ -121,6 +166,8 @@ start Podman containers:
 mise run fixture-restore-verify
 mise run fixture-repro
 mise run mastodon-schema-integration
+mise run operational-schema-integration
+mise run worker-integration
 mise run preflight-integration
 mise run differential
 ```
@@ -133,6 +180,15 @@ port, creates a LOGIN role limited to database `CONNECT`, schema `USAGE`, and
 table `SELECT`, and runs the ignored Rust integration tests. Those tests also
 prove DML, `TRUNCATE`, and schema creation fail after trying to disable the
 role's default read-only setting.
+The operational-schema task invokes the real admin command through a dedicated
+non-superuser migrator, exercises repeat and concurrent creation from absent and
+empty schemas, rejects catalog and ownership drift, and proves Mastodon's
+`public` catalog, data, ownership, and privileges remain unchanged before Rails
+re-verifies the fixture.
+The worker task uses a separate `NOINHERIT` runtime login, proves its exact
+operational grants and inability to mutate Mastodon objects, and exercises
+transactional enqueue/outbox dispatch, crash recovery, leases, cancellation,
+retries, dead letters, resource limits, readiness, and bounded shutdown.
 These Podman tasks currently require GNU/Linux x86-64; labeled PostgreSQL
 volumes are removed and checked after each task, and bind mounts support SELinux
 relabeling.
@@ -140,11 +196,19 @@ relabeling.
 The differential task starts pinned Mastodon 4.6.5 and a Rust fixture response
 against independent database and media clones, sends each case's exact HTTP
 request to both, and compares status, declared headers, and canonical JSON. It
-also checks logical database rows and media hashes before and after the request.
+also checks logical database rows and media contents and metadata before and
+after the request. Its media case exercises all nine checked fixture files,
+`GET`, `HEAD`, single and multipart ranges, conditionals, and hardened rejection
+paths.
 Run one case by its Rust test name without executing the complete suite:
 
 ```console
 mise run differential -- instance_v2
+mise run differential -- oauth_bearer_authentication
+mise run differential -- status_authorization_matrix
+mise run differential -- core_rest_serializers
+mise run differential -- rest_protocol_contracts
+mise run differential -- federation_discovery
 ```
 
 Mismatch output identifies the status, header, JSON path, table/key, or media
@@ -165,7 +229,8 @@ media writes. The minimal environment surface is:
 - `LOCAL_DOMAIN`, optional `WEB_DOMAIN` and `ALTERNATE_DOMAINS`
 - `PRIMARY_DATABASE_URL`, `DATABASE_URL`, or Mastodon's `DB_*` variables
 - absolute `PAPERCLIP_ROOT_PATH` and optional `PAPERCLIP_ROOT_URL`
-- optional `TRUSTED_PROXY_IP` and SMTP variables
+- optional explicit `TRUSTED_PROXY_IP` CIDRs and SMTP variables; forwarded
+  metadata is ignored when no trusted proxies are configured
 - `SECRET_KEY_BASE` and the three `ACTIVE_RECORD_ENCRYPTION_*` secrets
 - optional `SIDEKIQ_REDIS_*` or `REDIS_*` settings for the queue-drain check
 
@@ -173,6 +238,45 @@ Object storage, read replicas, LDAP/PAM/CAS/SAML/OIDC, and SSO-only login are
 reported as fatal v1 incompatibilities instead of being partially emulated.
 Secret values and connection URLs are redacted from configuration and preflight
 diagnostics.
+
+Create or upgrade Rustodon's separately versioned operational schema explicitly
+after preflight and while Mastodon application processes are stopped:
+
+```console
+rustodon admin migrate-operational-schema
+```
+
+The command is transactional and idempotent. It serializes with Rustodon and
+Active Record migrations, validates the pinned Mastodon schema before and after
+DDL, and creates only `rustodon.schema_migrations` plus the six operational
+tables for durable jobs, outbox events, idempotency keys, ordering markers,
+domain health, and process heartbeats. It never performs automatic web-startup
+DDL or changes objects under `public`. The migration role needs database
+`CONNECT` and `CREATE`, `USAGE` on `public`, and `SELECT` on its tables and
+sequences; it does not need superuser, role-management, or Mastodon write
+privileges.
+
+Run workers through a dedicated `NOINHERIT` login, not the schema owner. After
+migration, an administrator must revoke inherited database/schema creation
+rights and grant the runtime role only Mastodon reads plus Rustodon's operational
+DML and identity-sequence use. Worker startup validates that exact boundary,
+including direct and `PUBLIC` grants, and refuses privileged or drifted roles.
+The built-in process currently registers only the maintenance handler, so
+`WORKER_LANES` defaults to `maintenance`; configuring a lane without a registered
+handler fails startup rather than publishing false readiness. Later feature
+milestones register ingress, core, push, pull, and mail handlers with their
+corresponding lanes.
+
+Operational inspection is available through:
+
+```console
+rustodon admin worker-readiness
+rustodon admin dead-jobs --limit 50
+```
+
+Worker execution is at least once. Handlers must make externally visible effects
+idempotent because a crash after an effect but before fenced acknowledgement can
+repeat the job.
 See the [fixture documentation](fixtures/mastodon/v4.6.5/README.md) for test
 identities, key/media provenance, normalization, and the later-release update
 process.

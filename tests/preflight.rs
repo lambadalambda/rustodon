@@ -134,7 +134,14 @@ fn every_expected_physical_catalog_entry_is_required_and_compared() {
             .iter()
             .filter(|entry| entry.kind == CatalogKind::Relation)
             .count(),
-        56
+        71
+    );
+    assert_eq!(
+        expected
+            .iter()
+            .filter(|entry| entry.kind == CatalogKind::View)
+            .count(),
+        1
     );
     assert!(compare_catalog(expected).is_empty());
 
@@ -292,6 +299,7 @@ fn canonical_timestamp_function() -> TimestampFunction {
         security_definer: false,
         leakproof: false,
         strict: false,
+        config: None,
         body: r"
           DECLARE
             time_part bigint;
@@ -324,6 +332,12 @@ fn timestamp_function_allows_only_salt_and_formatting_variation() {
     assert!(validate_timestamp_function(&function).is_empty());
 
     function.result = "integer".to_owned();
+    assert_eq!(
+        validate_timestamp_function(&function)[0].code(),
+        "PF_DB_TIMESTAMP_ID_SHAPE"
+    );
+    function = canonical_timestamp_function();
+    function.config = Some(vec!["search_path=public".to_owned()]);
     assert_eq!(
         validate_timestamp_function(&function)[0].code(),
         "PF_DB_TIMESTAMP_ID_SHAPE"

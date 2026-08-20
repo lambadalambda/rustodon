@@ -1,7 +1,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use reqwest::header::{HOST, HeaderMap};
+use reqwest::header::{AUTHORIZATION, HOST, HeaderMap};
 use reqwest::{Client, Method, redirect::Policy};
 use url::Url;
 
@@ -13,13 +13,40 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct RequestSpec {
     method: Method,
     path: String,
     query: Option<String>,
     headers: HeaderMap,
     body: Vec<u8>,
+}
+
+impl fmt::Debug for RequestSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let headers = self
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str(),
+                    if name == AUTHORIZATION {
+                        "[REDACTED]".to_owned()
+                    } else {
+                        value.to_str().unwrap_or("[NON-UTF8]").to_owned()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("RequestSpec")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("query", &self.query)
+            .field("headers", &headers)
+            .field("body_bytes", &self.body.len())
+            .finish()
+    }
 }
 
 impl RequestSpec {
@@ -375,5 +402,30 @@ mod tests {
         let error = RequestSpec::new(Method::GET, "/", None, HeaderMap::new(), Vec::new())
             .expect_err("transport-derived Host values would differ by target");
         assert!(error.to_string().contains("Host"));
+    }
+
+    #[test]
+    fn request_diagnostics_redact_authorization_and_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("fixture.invalid"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer fixture-sensitive-token"),
+        );
+        headers.insert("x-probe", HeaderValue::from_static("visible"));
+        let request = RequestSpec::new(
+            Method::POST,
+            "/api/test",
+            None,
+            headers,
+            b"fixture-sensitive-body".to_vec(),
+        )
+        .expect("test request is valid");
+
+        let diagnostic = format!("{request:?}");
+        assert!(diagnostic.contains("[REDACTED]"));
+        assert!(diagnostic.contains("visible"));
+        assert!(!diagnostic.contains("fixture-sensitive-token"));
+        assert!(!diagnostic.contains("fixture-sensitive-body"));
     }
 }

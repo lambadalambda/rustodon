@@ -8,27 +8,37 @@ publish = false
 
 [dependencies]
 aes-gcm = "0.10.3"
+ammonia = "4.1"
+axum = "0.8"
 base64 = "0.22.1"
 chrono = { version = "0.4.41", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive"] }
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+http = "1.5"
+httpdate = "1.0.3"
+idna = "1.1"
+html-escape = "0.2"
 ipnetwork = "0.20.0"
+linkify = "0.10"
 pbkdf2 = "0.12.2"
+percent-encoding = "2.3"
 rsa = { version = "0.9.10", features = ["pem", "sha2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustix = { version = "1.1", features = ["fs"] }
 saphyr = { version = "=0.0.6", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 sha1 = "0.10.7"
 sha2 = { version = "0.10.9", features = ["oid"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "chrono", "json", "ipnetwork", "derive"] }
-tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "sync"] }
+tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 url = "2.5"
+unicode-normalization = "0.1"
 webpki-roots = "0.26.11"
 zeroize = "1.9"
 
 [dev-dependencies]
-axum = "0.8"
 reqwest = { version = "0.12", default-features = false }
 
 [lints.rust]

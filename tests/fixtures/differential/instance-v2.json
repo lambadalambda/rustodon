@@ -131,15 +131,15 @@
     "timelines_access": {
       "live_feeds": {
         "local": "public",
-        "remote": "public"
+        "remote": "authenticated"
       },
       "hashtag_feeds": {
         "local": "public",
-        "remote": "public"
+        "remote": "disabled"
       },
       "trending_link_feeds": {
         "local": "public",
-        "remote": "public"
+        "remote": "disabled"
       }
     },
     "limited_federation": false

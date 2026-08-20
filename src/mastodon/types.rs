@@ -226,6 +226,126 @@ pub struct RawString(pub String);
 #[sqlx(transparent)]
 pub struct PermissionBits(pub i64);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum UserPermission {
+    Administrator = 0,
+    ViewDevops = 1,
+    ViewAuditLog = 2,
+    ViewDashboard = 3,
+    ManageReports = 4,
+    ManageFederation = 5,
+    ManageSettings = 6,
+    ManageBlocks = 7,
+    ManageTaxonomies = 8,
+    ManageAppeals = 9,
+    ManageUsers = 10,
+    ManageInvites = 11,
+    ManageRules = 12,
+    ManageAnnouncements = 13,
+    ManageCustomEmojis = 14,
+    ManageWebhooks = 15,
+    InviteUsers = 16,
+    ManageRoles = 17,
+    ManageUserAccess = 18,
+    DeleteUserData = 19,
+    ViewFeeds = 20,
+    InviteBypassApproval = 21,
+    ManageEmailSubscriptions = 22,
+}
+
+impl UserPermission {
+    #[must_use]
+    pub const fn bit(self) -> i64 {
+        1_i64 << (self as u8)
+    }
+}
+
+impl PermissionBits {
+    pub const NONE: Self = Self(0);
+    pub const ALL: Self = Self((1_i64 << 23) - 1);
+
+    const MODERATION: [UserPermission; 12] = [
+        UserPermission::ViewDashboard,
+        UserPermission::ViewAuditLog,
+        UserPermission::ManageUsers,
+        UserPermission::ManageUserAccess,
+        UserPermission::DeleteUserData,
+        UserPermission::ManageReports,
+        UserPermission::ManageAppeals,
+        UserPermission::ManageFederation,
+        UserPermission::ManageBlocks,
+        UserPermission::ManageTaxonomies,
+        UserPermission::ManageInvites,
+        UserPermission::ViewFeeds,
+    ];
+
+    #[must_use]
+    pub const fn raw(self) -> i64 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn contains(self, permission: UserPermission) -> bool {
+        self.0 & permission.bit() == permission.bit()
+    }
+
+    #[must_use]
+    pub fn can_any(self, permissions: &[UserPermission]) -> bool {
+        permissions
+            .iter()
+            .any(|permission| self.contains(*permission))
+    }
+
+    #[must_use]
+    pub const fn effective(role_id: i64, role: Self, everyone: Self) -> EffectivePermissionBits {
+        if role_id == -99 {
+            EffectivePermissionBits(role)
+        } else if role.contains(UserPermission::Administrator) {
+            EffectivePermissionBits(Self::ALL)
+        } else {
+            EffectivePermissionBits(Self(role.0 | everyone.0))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EffectivePermissionBits(PermissionBits);
+
+impl EffectivePermissionBits {
+    #[must_use]
+    pub const fn raw(self) -> i64 {
+        self.0.raw()
+    }
+
+    #[must_use]
+    pub const fn contains(self, permission: UserPermission) -> bool {
+        self.0.contains(permission)
+    }
+
+    #[must_use]
+    pub fn can_any(self, permissions: &[UserPermission]) -> bool {
+        self.0.can_any(permissions)
+    }
+
+    #[must_use]
+    pub fn can_moderate(self) -> bool {
+        self.can_any(&PermissionBits::MODERATION)
+    }
+
+    #[must_use]
+    pub fn bypasses_block(
+        self,
+        highlighted: bool,
+        position: i32,
+        target_position: Option<i32>,
+    ) -> bool {
+        highlighted
+            && self.can_moderate()
+            && target_position.is_none_or(|target_position| position > target_position)
+    }
+}
+
 #[derive(Clone, Eq, PartialEq, sqlx::Type)]
 #[sqlx(transparent)]
 pub struct SecretText(String);
@@ -245,5 +365,109 @@ impl SecretText {
 impl fmt::Debug for SecretText {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SecretText([REDACTED])")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PermissionBits, UserPermission};
+
+    #[test]
+    fn user_permissions_match_mastodon_4_6_5_bits() {
+        let permissions = [
+            UserPermission::Administrator,
+            UserPermission::ViewDevops,
+            UserPermission::ViewAuditLog,
+            UserPermission::ViewDashboard,
+            UserPermission::ManageReports,
+            UserPermission::ManageFederation,
+            UserPermission::ManageSettings,
+            UserPermission::ManageBlocks,
+            UserPermission::ManageTaxonomies,
+            UserPermission::ManageAppeals,
+            UserPermission::ManageUsers,
+            UserPermission::ManageInvites,
+            UserPermission::ManageRules,
+            UserPermission::ManageAnnouncements,
+            UserPermission::ManageCustomEmojis,
+            UserPermission::ManageWebhooks,
+            UserPermission::InviteUsers,
+            UserPermission::ManageRoles,
+            UserPermission::ManageUserAccess,
+            UserPermission::DeleteUserData,
+            UserPermission::ViewFeeds,
+            UserPermission::InviteBypassApproval,
+            UserPermission::ManageEmailSubscriptions,
+        ];
+        for (position, permission) in permissions.into_iter().enumerate() {
+            assert_eq!(permission.bit(), 1_i64 << position);
+        }
+        assert_eq!(PermissionBits::ALL.raw(), (1 << 23) - 1);
+    }
+
+    #[test]
+    fn effective_permissions_preserve_everyone_and_expand_direct_administrators() {
+        let everyone = PermissionBits(UserPermission::InviteUsers.bit() | (1_i64 << 60));
+        assert_eq!(
+            PermissionBits::effective(-99, everyone, everyone).raw(),
+            everyone.raw()
+        );
+
+        let moderator = PermissionBits(UserPermission::ManageReports.bit());
+        let effective = PermissionBits::effective(7, moderator, everyone);
+        assert!(effective.contains(UserPermission::ManageReports));
+        assert!(effective.contains(UserPermission::InviteUsers));
+        assert_eq!(effective.raw() & (1_i64 << 60), 1_i64 << 60);
+
+        let inherited_administrator = PermissionBits(UserPermission::Administrator.bit());
+        assert_eq!(
+            PermissionBits::effective(7, PermissionBits::NONE, inherited_administrator).raw(),
+            inherited_administrator.raw()
+        );
+        assert_eq!(
+            PermissionBits::effective(
+                7,
+                PermissionBits(UserPermission::Administrator.bit()),
+                everyone
+            )
+            .raw(),
+            PermissionBits::ALL.raw()
+        );
+        assert!(
+            PermissionBits::effective(
+                7,
+                PermissionBits(UserPermission::Administrator.bit()),
+                PermissionBits::NONE,
+            )
+            .bypasses_block(true, 10, Some(9))
+        );
+        assert!(
+            PermissionBits::effective(
+                7,
+                PermissionBits::NONE,
+                PermissionBits(UserPermission::ManageReports.bit()),
+            )
+            .bypasses_block(true, 10, Some(9))
+        );
+    }
+
+    #[test]
+    fn permission_queries_use_any_semantics_and_role_hierarchy_is_strict() {
+        let permissions =
+            PermissionBits(UserPermission::ManageReports.bit() | UserPermission::ManageUsers.bit());
+        assert!(permissions.can_any(&[
+            UserPermission::ManageFederation,
+            UserPermission::ManageReports,
+        ]));
+        assert!(!permissions.can_any(&[
+            UserPermission::ManageFederation,
+            UserPermission::ManageSettings,
+        ]));
+        let effective = PermissionBits::effective(7, permissions, PermissionBits::NONE);
+        assert!(effective.can_moderate());
+        assert!(effective.bypasses_block(true, 10, Some(9)));
+        assert!(effective.bypasses_block(true, 10, None));
+        assert!(!effective.bypasses_block(true, 10, Some(10)));
+        assert!(!effective.bypasses_block(false, 10, Some(9)));
     }
 }

@@ -66,6 +66,8 @@ pub struct Account {
     pub updated_at: NaiveDateTime,
     pub has_user: bool,
     pub login_capable_user: bool,
+    pub has_pending_user: bool,
+    pub has_unconfirmed_user: bool,
 }
 
 impl Account {
@@ -76,6 +78,18 @@ impl Account {
             self.has_user,
             self.login_capable_user,
         )
+    }
+}
+
+impl DomainBlock {
+    #[must_use]
+    pub fn policy_rule(&self) -> super::policy::GlobalDomainRule {
+        super::policy::GlobalDomainRule {
+            domain: self.domain.clone(),
+            severity: super::policy::DomainSeverity::from(self.severity.map(|value| value.0)),
+            reject_media: self.reject_media,
+            reject_reports: self.reject_reports,
+        }
     }
 }
 
@@ -150,6 +164,32 @@ pub struct OAuthAccessToken {
     pub revoked_at: Option<NaiveDateTime>,
     pub last_used_at: Option<NaiveDateTime>,
     pub last_used_ip: Option<IpNetwork>,
+}
+
+#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+#[allow(clippy::struct_excessive_bools)]
+pub(crate) struct OAuthBearerCandidate {
+    pub token_id: i64,
+    pub resource_owner_id: Option<i64>,
+    pub application_id: Option<i64>,
+    pub scopes: Option<String>,
+    pub expires_in: Option<i32>,
+    pub created_at: NaiveDateTime,
+    pub revoked_at: Option<NaiveDateTime>,
+    pub application_exists: bool,
+    pub user_id: Option<i64>,
+    pub user_account_id: Option<i64>,
+    pub confirmed_at: Option<NaiveDateTime>,
+    pub approved: Option<bool>,
+    pub disabled: Option<bool>,
+    pub otp_required_for_login: Option<bool>,
+    pub role_requires_2fa: Option<bool>,
+    pub has_webauthn_credentials: bool,
+    pub account_id: Option<i64>,
+    pub suspended_at: Option<NaiveDateTime>,
+    pub has_deletion_request: bool,
+    pub memorial: Option<bool>,
+    pub moved_to_account_id: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
@@ -415,6 +455,14 @@ pub struct CustomFilterStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
+pub struct Marker {
+    pub timeline: String,
+    pub last_read_id: i64,
+    pub lock_version: i32,
+    pub updated_at: NaiveDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
 pub struct Notification {
     pub id: i64,
     pub account_id: i64,
@@ -572,6 +620,8 @@ pub struct Collection {
     pub uri: Option<String>,
     pub url: Option<String>,
     pub tag_id: Option<i64>,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
 }
 
 #[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
@@ -585,6 +635,8 @@ pub struct CollectionItem {
     pub approval_uri: Option<String>,
     pub object_uri: Option<String>,
     pub uri: Option<String>,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
 }
 
 #[derive(Clone, Debug, PartialEq, sqlx::FromRow)]

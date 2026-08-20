@@ -49,6 +49,18 @@ run = "tools/mastodon-fixture repro"
 description = "Run read-only Rust schema integration against the restored fixture"
 run = "tools/mastodon-fixture schema-read-test"
 
+[tasks.operational-schema-integration]
+description = "Create and verify the isolated Rustodon operational schema"
+run = "tools/mastodon-fixture operational-schema-test"
+
+[tasks.worker-integration]
+description = "Exercise durable jobs, scheduler readiness, and worker shutdown"
+run = "tools/mastodon-fixture worker-test"
+
+[tasks.startup-integration]
+description = "Prove production web and worker startup fail closed"
+run = "tools/mastodon-fixture startup-test"
+
 [tasks.preflight-integration]
 description = "Run canonical and rejection preflight cases against fixture clones"
 run = "tools/mastodon-fixture preflight-test"

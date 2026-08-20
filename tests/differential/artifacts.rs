@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -64,6 +65,11 @@ pub(crate) struct MediaFile {
     pub(crate) path: String,
     pub(crate) bytes: u64,
     pub(crate) sha256: String,
+    pub(crate) mode: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) modified_seconds: i64,
+    pub(crate) modified_nanoseconds: i64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -279,24 +285,21 @@ pub(crate) fn compare_media_with_labels(
     for path in paths {
         match (mastodon.files.get(path), rust.files.get(path)) {
             (Some(mastodon), Some(rust)) => {
-                if mastodon.bytes != rust.bytes {
+                let (differences, omitted) = json_differences(
+                    &media_value(mastodon),
+                    &media_value(rust),
+                    limit.saturating_sub(collector.mismatches.len()),
+                );
+                for difference in differences {
                     collector.push(ArtifactMismatch {
                         kind: ArtifactKind::Media,
                         identity: path.clone(),
-                        path: "$.bytes".to_owned(),
-                        mastodon: Some(Value::from(mastodon.bytes)),
-                        rust: Some(Value::from(rust.bytes)),
+                        path: difference.path,
+                        mastodon: observed_value(difference.mastodon),
+                        rust: observed_value(difference.rust),
                     });
                 }
-                if mastodon.sha256 != rust.sha256 {
-                    collector.push(ArtifactMismatch {
-                        kind: ArtifactKind::Media,
-                        identity: path.clone(),
-                        path: "$.sha256".to_owned(),
-                        mastodon: Some(Value::String(mastodon.sha256.clone())),
-                        rust: Some(Value::String(rust.sha256.clone())),
-                    });
-                }
+                collector.omitted += omitted;
             }
             (Some(mastodon), None) => collector.push(ArtifactMismatch {
                 kind: ArtifactKind::Media,
@@ -340,7 +343,8 @@ fn capture_directory(
             if relative == SAFETY_MARKER {
                 continue;
             }
-            let bytes = entry.metadata().map_err(ArtifactError::from)?.len();
+            let metadata = entry.metadata().map_err(ArtifactError::from)?;
+            let bytes = metadata.len();
             let sha256 = sha256_file(&entry.path())?;
             files.insert(
                 relative.clone(),
@@ -348,6 +352,11 @@ fn capture_directory(
                     path: relative,
                     bytes,
                     sha256,
+                    mode: metadata.mode(),
+                    uid: metadata.uid(),
+                    gid: metadata.gid(),
+                    modified_seconds: metadata.mtime(),
+                    modified_nanoseconds: metadata.mtime_nsec(),
                 },
             );
         } else {
@@ -415,6 +424,11 @@ fn media_value(file: &MediaFile) -> Value {
         "path": file.path,
         "bytes": file.bytes,
         "sha256": file.sha256,
+        "mode": file.mode,
+        "uid": file.uid,
+        "gid": file.gid,
+        "modified_seconds": file.modified_seconds,
+        "modified_nanoseconds": file.modified_nanoseconds,
     })
 }
 
@@ -570,6 +584,11 @@ mod tests {
                     path: "image.png".to_owned(),
                     bytes: 3,
                     sha256: "aaa".to_owned(),
+                    mode: 0,
+                    uid: 0,
+                    gid: 0,
+                    modified_seconds: 0,
+                    modified_nanoseconds: 0,
                 },
             )]),
         };
@@ -580,6 +599,11 @@ mod tests {
                     path: "image.png".to_owned(),
                     bytes: 4,
                     sha256: "bbb".to_owned(),
+                    mode: 0,
+                    uid: 0,
+                    gid: 0,
+                    modified_seconds: 0,
+                    modified_nanoseconds: 0,
                 },
             )]),
         };
@@ -601,6 +625,11 @@ mod tests {
                     path: "image.png".to_owned(),
                     bytes: 3,
                     sha256: "aaa".to_owned(),
+                    mode: 0,
+                    uid: 0,
+                    gid: 0,
+                    modified_seconds: 0,
+                    modified_nanoseconds: 0,
                 },
             )]),
         };
@@ -611,6 +640,11 @@ mod tests {
                     path: "image.png".to_owned(),
                     bytes: 4,
                     sha256: "bbb".to_owned(),
+                    mode: 0,
+                    uid: 0,
+                    gid: 0,
+                    modified_seconds: 0,
+                    modified_nanoseconds: 0,
                 },
             )]),
         };

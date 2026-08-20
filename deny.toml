@@ -14,10 +14,15 @@ version = 2
 confidence-threshold = 0.93
 allow = ["Apache-2.0", "CDLA-Permissive-2.0", "ISC", "MIT", "Unicode-3.0"]
 exceptions = [
+  # Ammonia's standards-compliant CSS parsing stack is MPL-2.0.
+  { name = "cssparser", version = "=0.37.0", allow = ["MPL-2.0"] },
+  { name = "dtoa-short", version = "=0.3.5", allow = ["MPL-2.0"] },
   # Shared by SQLx and Saphyr through the aligned hashbrown/hashlink stack.
   { name = "foldhash", version = "=0.1.5", allow = ["Zlib"] },
   # SQLx PostgreSQL authentication reaches this through the digest stack.
   { name = "subtle", version = "=2.6.1", allow = ["BSD-3-Clause"] },
+  # Axum's route matcher is dual-licensed as MIT AND BSD-3-Clause.
+  { name = "matchit", version = "=0.8.4", allow = ["BSD-3-Clause"] },
 ]
 
 [licenses.private]
