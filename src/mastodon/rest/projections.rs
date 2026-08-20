@@ -379,6 +379,18 @@ pub struct RestCustomEmojiRow {
     pub visible_in_picker: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, sqlx::FromRow)]
+pub struct RestListedCustomEmojiRow {
+    pub id: i64,
+    pub shortcode: String,
+    pub domain: Option<String>,
+    pub image_file_name: String,
+    pub image_storage_schema_version: Option<i32>,
+    pub visible_in_picker: bool,
+    pub category: Option<String>,
+    pub featured: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
 pub struct RestPreviewCardRow {
     pub status_id: i64,

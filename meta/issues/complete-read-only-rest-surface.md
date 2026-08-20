@@ -59,3 +59,6 @@ Expose remaining in-scope read APIs and preserved optional data.
   unavailable/suspended-account handling, public access despite unrelated token
   scopes, account-tag URLs, and anonymous/trailing/missing-target differential
   coverage.
+- Added public production `GET /api/v1/custom_emojis` with the Rails `listed`
+  scope, category/featured metadata, Paperclip URLs, public cache behavior,
+  trailing-slash support, and anonymous/authenticated differential coverage.

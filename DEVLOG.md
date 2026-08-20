@@ -348,4 +348,8 @@
    broad/granular/owner-isolation differential coverage.
  - Added public production `GET /api/v1/accounts/:id/featured_tags` with
   unavailable/suspended-account handling, public access independent of token
-  scopes, account-tag URLs, and anonymous/trailing/missing-target coverage.
+   scopes, account-tag URLs, and anonymous/trailing/missing-target coverage.
+ - Added public production `GET /api/v1/custom_emojis` using the Rails `listed`
+   scope: local, enabled, picker-visible emojis only, with category/featured
+   metadata and Paperclip URLs. Anonymous and authenticated trailing-slash
+   responses are covered by the Rails differential suite.

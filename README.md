@@ -119,7 +119,7 @@ authors, and soft deletion. Pagination and authorization are differentially
 checked against Mastodon 4.6.5 through dedicated fixture cases.
 
 The router also centralizes Mastodon-compatible REST protocol behavior for its
- explicit 32-route inventory: CORS and preflight handling, trailing slashes,
+ explicit 33-route inventory: CORS and preflight handling, trailing slashes,
 cache and `Vary` headers, JSON error envelopes, the 99 MiB body limit, and
 endpoint cursor contracts. Query, form, and registered JSON request bodies use
 bounded Rack-compatible scalar/array/hash parsing, including Rails parameter

@@ -1960,6 +1960,32 @@ async fn run_core_rest_serializers_case(
         .map_err(|error| format!("{label}: {error}"))?;
     }
     for (label, path, token) in [
+        ("custom emojis anonymous", "/api/v1/custom_emojis", None),
+        (
+            "custom emojis authenticated trailing",
+            "/api/v1/custom_emojis/",
+            Some("fixture-bearer-read-statuses-v4-6-5"),
+        ),
+    ] {
+        let mut headers = stable_request_headers();
+        if let Some(token) = token {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {token}"))?,
+            );
+        }
+        let request = RequestSpec::new(Method::GET, path, None, headers, Vec::new())?;
+        let responses = guard.send(&request).await?;
+        compare_responses(
+            &responses.mastodon,
+            &responses.rust,
+            &[CONTENT_TYPE, CACHE_CONTROL, VARY],
+            &[],
+            DEFAULT_MISMATCH_LIMIT,
+        )
+        .map_err(|error| format!("{label}: {error}"))?;
+    }
+    for (label, path, token) in [
         (
             "account featured tags anonymous",
             "/api/v1/accounts/116844606259201001/featured_tags",

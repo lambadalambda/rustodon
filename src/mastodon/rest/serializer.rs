@@ -1648,7 +1648,8 @@ impl<'a> RestSerializer<'a> {
         }
     }
 
-    fn custom_emoji(&self, emoji: &CustomEmojiProjection) -> RestCustomEmoji {
+    #[must_use]
+    pub fn custom_emoji(&self, emoji: &CustomEmojiProjection) -> RestCustomEmoji {
         let metadata = PaperclipMetadata {
             attachment: PaperclipAttachment::CustomEmojiImage,
             id: emoji.id,

@@ -1508,6 +1508,33 @@ impl RestProjectionLoader {
             .collect())
     }
 
+    /// Loads the locally listed custom emojis for the public picker endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when the listed emoji query fails.
+    pub async fn custom_emojis(&self) -> sqlx::Result<Vec<CustomEmojiProjection>> {
+        Ok(self
+            .repository
+            .rest_listed_custom_emojis()
+            .await?
+            .into_iter()
+            .map(|emoji| {
+                let category = emoji.category;
+                CustomEmojiProjection {
+                    id: emoji.id,
+                    shortcode: emoji.shortcode,
+                    domain: emoji.domain,
+                    file_name: emoji.image_file_name,
+                    storage_schema_version: emoji.image_storage_schema_version,
+                    visible_in_picker: emoji.visible_in_picker,
+                    featured: category.as_ref().map(|_| emoji.featured),
+                    category,
+                }
+            })
+            .collect())
+    }
+
     /// Loads the shared database-backed instance projection for v1 and v2 serializers.
     ///
     /// # Errors

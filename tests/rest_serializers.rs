@@ -1,9 +1,9 @@
 use chrono::NaiveDateTime;
 use rustodon::mastodon::rest::{
-    AccountFieldProjection, AccountProjection, MediaAttachmentProjection, NotificationProjection,
-    PollOptionProjection, PollProjection, QuoteProjection, QuoteTargetAccess,
-    QuoteTargetLinkProjection, RestSerializer, StatusApplicationProjection, StatusProjection,
-    StatusShape, StatusViewerProjection, TagHistoryProjection, TagProjection,
+    AccountFieldProjection, AccountProjection, CustomEmojiProjection, MediaAttachmentProjection,
+    NotificationProjection, PollOptionProjection, PollProjection, QuoteProjection,
+    QuoteTargetAccess, QuoteTargetLinkProjection, RestSerializer, StatusApplicationProjection,
+    StatusProjection, StatusShape, StatusViewerProjection, TagHistoryProjection, TagProjection,
 };
 use rustodon::mastodon::{AccountIdScheme, NotificationType};
 use serde_json::{Value, json};
@@ -152,6 +152,49 @@ fn local_account_serialization_matches_canonical_urls_dates_and_nulls() {
     assert_eq!(value["noindex"], false);
     assert_eq!(value["roles"], json!([]));
     assert!(value.get("suspended").is_none());
+}
+
+#[test]
+fn custom_emoji_serialization_preserves_category_metadata_and_media_urls() {
+    let value = serde_json::to_value(serializer().custom_emoji(&CustomEmojiProjection {
+        id: 12_001,
+        shortcode: "fixtureparty".to_owned(),
+        domain: Some("remote.fixture.invalid".to_owned()),
+        file_name: "fixtureparty.png".to_owned(),
+        storage_schema_version: Some(1),
+        visible_in_picker: true,
+        category: Some("Fixture".to_owned()),
+        featured: Some(true),
+    }))
+    .unwrap();
+    assert_eq!(
+        value["url"],
+        "https://fixture-v4-6-5.rustodon.invalid/system/cache/custom_emojis/images/000/012/001/original/fixtureparty.png"
+    );
+    assert_eq!(
+        value["static_url"],
+        "https://fixture-v4-6-5.rustodon.invalid/system/cache/custom_emojis/images/000/012/001/static/fixtureparty.png"
+    );
+    assert_eq!(value["category"], "Fixture");
+    assert_eq!(value["featured"], true);
+    assert_eq!(value["visible_in_picker"], true);
+}
+
+#[test]
+fn custom_emoji_without_category_omits_optional_category_fields() {
+    let value = serde_json::to_value(serializer().custom_emoji(&CustomEmojiProjection {
+        id: 12_001,
+        shortcode: "fixtureparty".to_owned(),
+        domain: Some("remote.fixture.invalid".to_owned()),
+        file_name: "fixtureparty.png".to_owned(),
+        storage_schema_version: Some(1),
+        visible_in_picker: true,
+        category: None,
+        featured: None,
+    }))
+    .unwrap();
+    assert!(value.get("category").is_none());
+    assert!(value.get("featured").is_none());
 }
 
 #[test]

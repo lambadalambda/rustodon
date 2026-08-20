@@ -102,11 +102,11 @@ use super::rest::{
     AccountListKind, AccountListOptions, AccountStatusesOptions, FollowCollectionKind,
     FollowCollectionOptions, RestAccountHandleRow, RestAccountListRow, RestAccountRow,
     RestAccountWarningRow, RestCredentialRow, RestCustomEmojiRow, RestFeaturedTagRow,
-    RestFollowCollectionRow, RestInstanceCountsRow, RestMentionRow, RestNotificationGroupRow,
-    RestNotificationTargetRow, RestPollVoteRow, RestPreviewCardRow, RestRelationshipRow,
-    RestRuleRow, RestSavedStatusRow, RestSeveranceEventRow, RestStatusRow, RestStatusTagRow,
-    RestTaggedCollectionRow, SavedStatusKind, SavedStatusesOptions, TagTimelineOptions,
-    TimelineOptions,
+    RestFollowCollectionRow, RestInstanceCountsRow, RestListedCustomEmojiRow, RestMentionRow,
+    RestNotificationGroupRow, RestNotificationTargetRow, RestPollVoteRow, RestPreviewCardRow,
+    RestRelationshipRow, RestRuleRow, RestSavedStatusRow, RestSeveranceEventRow, RestStatusRow,
+    RestStatusTagRow, RestTaggedCollectionRow, SavedStatusKind, SavedStatusesOptions,
+    TagTimelineOptions, TimelineOptions,
 };
 
 const REST_LIST_TIMELINE_SQL: &str = "WITH authorized AS ( \
@@ -2612,6 +2612,24 @@ impl Repository {
         .bind(shortcodes)
         .bind(domains)
         .bind(include_local)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn rest_listed_custom_emojis(
+        &self,
+    ) -> sqlx::Result<Vec<RestListedCustomEmojiRow>> {
+        sqlx::query_as::<_, RestListedCustomEmojiRow>(
+            "SELECT emoji.id, emoji.shortcode, emoji.domain, emoji.image_file_name, \
+                    emoji.image_storage_schema_version, emoji.visible_in_picker, \
+                    category.name AS category, \
+                    COALESCE(category.featured_emoji_id = emoji.id, false) AS featured \
+             FROM custom_emojis emoji \
+             LEFT JOIN custom_emoji_categories category ON category.id = emoji.category_id \
+             WHERE emoji.domain IS NULL AND emoji.disabled = false \
+               AND emoji.visible_in_picker = true \
+             ORDER BY emoji.id",
+        )
         .fetch_all(&self.pool)
         .await
     }

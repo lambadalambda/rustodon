@@ -235,6 +235,13 @@ pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
         Public
     ),
     route!(
+        "/api/v1/custom_emojis",
+        Implemented,
+        ApiAuthentication::Public,
+        None,
+        Public
+    ),
+    route!(
         "/api/v1/accounts/lookup",
         Implemented,
         ApiAuthentication::Optional(READ_ACCOUNTS.as_slice()),
@@ -562,6 +569,7 @@ pub fn router(state: WebState) -> Router {
             "/api/v1/instance/translation_languages",
             get(translation_languages),
         )
+        .route("/api/v1/custom_emojis", get(custom_emojis))
         .route("/api/v1/accounts/lookup", get(account_lookup))
         .route("/api/v1/accounts/search", get(account_search))
         .route("/api/v1/markers", get(markers))
@@ -603,6 +611,7 @@ pub fn router(state: WebState) -> Router {
             "/api/v1/instance/translation_languages/",
             get(translation_languages),
         )
+        .route("/api/v1/custom_emojis/", get(custom_emojis))
         .route("/api/v1/accounts/lookup/", get(account_lookup))
         .route("/api/v1/accounts/search/", get(account_search))
         .route("/api/v1/markers/", get(markers))
@@ -3013,6 +3022,21 @@ async fn translation_languages() -> Response<Body> {
     json_response(StatusCode::OK, b"{}".to_vec())
 }
 
+async fn custom_emojis(State(state): State<WebState>) -> Response<Body> {
+    let Ok(emojis) = state.loader(None).custom_emojis().await else {
+        return internal_error();
+    };
+    let serializer = state.serializer();
+    let values = emojis
+        .iter()
+        .map(|emoji| serializer.custom_emoji(emoji))
+        .collect::<Vec<_>>();
+    match serde_json::to_vec(&values) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(_) => internal_error(),
+    }
+}
+
 async fn account_show(
     State(state): State<WebState>,
     uri: Uri,
@@ -5039,7 +5063,7 @@ mod tests {
 
     #[test]
     fn api_route_inventory_is_unique_and_declares_protocol_contracts() {
-        assert_eq!(API_ROUTE_INVENTORY.len(), 32);
+        assert_eq!(API_ROUTE_INVENTORY.len(), 33);
         assert_eq!(REST_BODY_LIMIT_BYTES, 103_809_024);
         assert_eq!(
             API_ROUTE_INVENTORY
