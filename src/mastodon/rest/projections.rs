@@ -704,6 +704,14 @@ pub(crate) struct RestFeaturedTagRow {
     pub domain: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, sqlx::FromRow)]
+pub(crate) struct RestTagSuggestionRow {
+    pub id: i64,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub following: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FeaturedTagProjection {
     pub id: i64,

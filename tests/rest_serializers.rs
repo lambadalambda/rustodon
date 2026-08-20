@@ -198,6 +198,32 @@ fn custom_emoji_without_category_omits_optional_category_fields() {
 }
 
 #[test]
+fn tag_serialization_preserves_display_name_history_and_relationships() {
+    let value = serde_json::to_value(serializer().tag(&TagProjection {
+        id: 9_201,
+        name: "fixturetag".to_owned(),
+        display_name: Some("FixtureTag".to_owned()),
+        history: vec![TagHistoryProjection {
+            day: "1782864000".to_owned(),
+            accounts: "2".to_owned(),
+            uses: "3".to_owned(),
+        }],
+        following: Some(true),
+        featuring: Some(false),
+    }))
+    .unwrap();
+    assert_eq!(value["id"], "9201");
+    assert_eq!(value["name"], "FixtureTag");
+    assert_eq!(
+        value["url"],
+        "https://fixture-v4-6-5.rustodon.invalid/tags/fixturetag"
+    );
+    assert_eq!(value["history"][0]["uses"], "3");
+    assert_eq!(value["following"], true);
+    assert_eq!(value["featuring"], false);
+}
+
+#[test]
 fn remote_and_suspended_account_rules_are_explicit() {
     let mut remote = alice();
     remote.id = 116_844_606_259_202_001;

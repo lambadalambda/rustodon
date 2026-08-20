@@ -62,3 +62,7 @@ Expose remaining in-scope read APIs and preserved optional data.
 - Added public production `GET /api/v1/custom_emojis` with the Rails `listed`
   scope, category/featured metadata, Paperclip URLs, public cache behavior,
   trailing-slash support, and anonymous/authenticated differential coverage.
+- Added production `GET /api/v1/featured_tags/suggestions` with required
+  account-read authentication, recent-status tag ranking, featured-tag
+  exclusion, relationship booleans, trailing-slash support, and differential
+  coverage.

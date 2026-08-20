@@ -42,7 +42,7 @@ use rustodon::mastodon::rest::{
 };
 use rustodon::mastodon::{
     BearerAuthenticator, OAuthAuthenticationError, READ_ACCOUNTS, READ_FOLLOWS, READ_NOTIFICATIONS,
-    READ_STATUSES, Repository, RequiredScopes,
+    READ_STATUSES, Repository,
 };
 use rustodon::web::{WebState, router as web_router};
 use serde_json::Value;
@@ -80,7 +80,6 @@ async fn oauth_bearer_authentication() -> Result<(), Box<dyn std::error::Error>>
     let config = DifferentialConfig::from_process_environment(&repository_root)?;
     config.validate_database_comments().await?;
     let repository = Repository::connect(config.rust_database.url()).await?;
-    let authenticator = BearerAuthenticator::new(repository.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let rust_url = Url::parse(&format!("http://{}", listener.local_addr()?))?;
     let production_state = WebState::new(
@@ -93,14 +92,7 @@ async fn oauth_bearer_authentication() -> Result<(), Box<dyn std::error::Error>>
         Vec::new(),
         vec!["fixture-v4-6-5.rustodon.invalid".to_owned()],
     )?;
-    let app = web_router(production_state).merge(
-        Router::new()
-            .route(
-                "/api/v1/featured_tags/suggestions",
-                get(fixture_featured_tag_suggestions),
-            )
-            .with_state(authenticator),
-    );
+    let app = web_router(production_state);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -309,42 +301,6 @@ async fn fixture_instance(State(body): State<Arc<Vec<u8>>>) -> Response {
         .header(CONTENT_TYPE, "application/json; charset=utf-8")
         .body(Body::from(body.as_ref().clone()))
         .expect("the checked fixture response is valid")
-}
-
-async fn fixture_featured_tag_suggestions(
-    State(authenticator): State<BearerAuthenticator>,
-    headers: AxumHeaderMap,
-) -> Response {
-    fixture_authenticated_response(authenticator, headers, READ_ACCOUNTS, b"[]").await
-}
-
-async fn fixture_authenticated_response(
-    authenticator: BearerAuthenticator,
-    headers: AxumHeaderMap,
-    required: RequiredScopes,
-    success_body: &'static [u8],
-) -> Response {
-    let mut response = match authenticator.authenticate(&headers, required).await {
-        Ok(authenticated) => match authenticated.require_user() {
-            Ok(_) => Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/json; charset=utf-8")
-                .header(CACHE_CONTROL, "private, no-store")
-                .body(Body::from(success_body))
-                .expect("static OAuth fixture response is valid"),
-            Err(error) => error.into_http_response().map(Body::from),
-        },
-        Err(OAuthAuthenticationError::OAuth(error)) => error.into_http_response().map(Body::from),
-        Err(OAuthAuthenticationError::Repository(_)) => Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .header(CONTENT_TYPE, "application/json; charset=utf-8")
-            .body(Body::from(r#"{"error":"OAuth token lookup failed"}"#))
-            .expect("static OAuth fixture error is valid"),
-    };
-    response
-        .headers_mut()
-        .insert(VARY, HeaderValue::from_static("Authorization, Origin"));
-    response
 }
 
 #[allow(dead_code)]
@@ -1939,6 +1895,41 @@ async fn run_core_rest_serializers_case(
             "featured tags application-only",
             "/api/v1/featured_tags",
             Some("fixture-bearer-application-only-v4-6-5"),
+        ),
+    ] {
+        let mut headers = stable_request_headers();
+        if let Some(token) = token {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {token}"))?,
+            );
+        }
+        let request = RequestSpec::new(Method::GET, path, None, headers, Vec::new())?;
+        let responses = guard.send(&request).await?;
+        compare_responses(
+            &responses.mastodon,
+            &responses.rust,
+            &[CONTENT_TYPE, CACHE_CONTROL, VARY, WWW_AUTHENTICATE],
+            &[],
+            DEFAULT_MISMATCH_LIMIT,
+        )
+        .map_err(|error| format!("{label}: {error}"))?;
+    }
+    for (label, path, token) in [
+        (
+            "featured tag suggestions broad scope",
+            "/api/v1/featured_tags/suggestions",
+            Some("fixture-bearer-token-v4-6-5"),
+        ),
+        (
+            "featured tag suggestions granular trailing",
+            "/api/v1/featured_tags/suggestions/",
+            Some("fixture-bearer-read-accounts-v4-6-5"),
+        ),
+        (
+            "featured tag suggestions missing token",
+            "/api/v1/featured_tags/suggestions",
+            None,
         ),
     ] {
         let mut headers = stable_request_headers();

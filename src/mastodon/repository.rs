@@ -105,8 +105,8 @@ use super::rest::{
     RestFollowCollectionRow, RestInstanceCountsRow, RestListedCustomEmojiRow, RestMentionRow,
     RestNotificationGroupRow, RestNotificationTargetRow, RestPollVoteRow, RestPreviewCardRow,
     RestRelationshipRow, RestRuleRow, RestSavedStatusRow, RestSeveranceEventRow, RestStatusRow,
-    RestStatusTagRow, RestTaggedCollectionRow, SavedStatusKind, SavedStatusesOptions,
-    TagTimelineOptions, TimelineOptions,
+    RestStatusTagRow, RestTagSuggestionRow, RestTaggedCollectionRow, SavedStatusKind,
+    SavedStatusesOptions, TagTimelineOptions, TimelineOptions,
 };
 
 const REST_LIST_TIMELINE_SQL: &str = "WITH authorized AS ( \
@@ -1861,6 +1861,31 @@ impl Repository {
              JOIN accounts account ON account.id = featured.account_id \
              JOIN tags tag ON tag.id = featured.tag_id \
              WHERE featured.account_id = $1 ORDER BY featured.statuses_count DESC",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn rest_featured_tag_suggestions(
+        &self,
+        account_id: i64,
+    ) -> sqlx::Result<Vec<RestTagSuggestionRow>> {
+        sqlx::query_as::<_, RestTagSuggestionRow>(
+            "WITH recent_statuses AS ( \
+               SELECT status.id FROM statuses status \
+               WHERE status.account_id = $1 AND status.deleted_at IS NULL \
+               ORDER BY status.id DESC LIMIT 1000 \
+             ) SELECT tag.id, tag.name, tag.display_name, \
+                    EXISTS (SELECT 1 FROM tag_follows follow \
+                     WHERE follow.account_id = $1 AND follow.tag_id = tag.id) AS following \
+             FROM tags tag \
+             JOIN statuses_tags status_tag ON status_tag.tag_id = tag.id \
+             JOIN recent_statuses status ON status.id = status_tag.status_id \
+             WHERE NOT EXISTS (SELECT 1 FROM featured_tags featured \
+               WHERE featured.account_id = $1 AND featured.tag_id = tag.id) \
+             GROUP BY tag.id, tag.name, tag.display_name \
+             ORDER BY count(*) DESC LIMIT 10",
         )
         .bind(account_id)
         .fetch_all(&self.pool)

@@ -284,6 +284,13 @@ pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
         Private
     ),
     route!(
+        "/api/v1/featured_tags/suggestions",
+        Implemented,
+        ApiAuthentication::Required(READ_ACCOUNTS.as_slice()),
+        None,
+        Private
+    ),
+    route!(
         "/api/v1/accounts/{id}/featured_tags",
         Implemented,
         ApiAuthentication::Public,
@@ -577,6 +584,10 @@ pub fn router(state: WebState) -> Router {
         .route("/api/v1/lists", get(lists))
         .route("/api/v1/featured_tags", get(featured_tags))
         .route(
+            "/api/v1/featured_tags/suggestions",
+            get(featured_tag_suggestions),
+        )
+        .route(
             "/api/v1/accounts/{id}/featured_tags",
             get(account_featured_tags),
         )
@@ -618,6 +629,10 @@ pub fn router(state: WebState) -> Router {
         .route("/api/v2/filters/", get(filters))
         .route("/api/v1/lists/", get(lists))
         .route("/api/v1/featured_tags/", get(featured_tags))
+        .route(
+            "/api/v1/featured_tags/suggestions/",
+            get(featured_tag_suggestions),
+        )
         .route(
             "/api/v1/accounts/{id}/featured_tags/",
             get(account_featured_tags),
@@ -3276,6 +3291,32 @@ async fn featured_tags(State(state): State<WebState>, headers: HeaderMap) -> Res
     }
 }
 
+async fn featured_tag_suggestions(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let owner = match required_viewer(&state, &headers, READ_ACCOUNTS).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let Ok(tags) = state
+        .loader(Some(owner))
+        .featured_tag_suggestions(owner)
+        .await
+    else {
+        return internal_error();
+    };
+    let serializer = state.serializer();
+    let values = tags
+        .iter()
+        .map(|tag| serializer.tag(tag))
+        .collect::<Vec<_>>();
+    match serde_json::to_vec(&values) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(_) => internal_error(),
+    }
+}
+
 async fn account_featured_tags(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -5063,7 +5104,7 @@ mod tests {
 
     #[test]
     fn api_route_inventory_is_unique_and_declares_protocol_contracts() {
-        assert_eq!(API_ROUTE_INVENTORY.len(), 33);
+        assert_eq!(API_ROUTE_INVENTORY.len(), 34);
         assert_eq!(REST_BODY_LIMIT_BYTES, 103_809_024);
         assert_eq!(
             API_ROUTE_INVENTORY

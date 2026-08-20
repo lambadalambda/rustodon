@@ -353,3 +353,7 @@
    scope: local, enabled, picker-visible emojis only, with category/featured
    metadata and Paperclip URLs. Anonymous and authenticated trailing-slash
    responses are covered by the Rails differential suite.
+ - Added production `GET /api/v1/featured_tags/suggestions` with required
+   account-read authentication, Rails recent-status ranking, featured-tag
+   exclusion, relationship booleans, trailing-slash support, and differential
+   coverage. The old fixture-only authentication route was removed.

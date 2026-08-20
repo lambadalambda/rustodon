@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, NaiveDateTime};
+use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use serde_json::Value;
 
 use super::{
@@ -13,7 +13,8 @@ use super::{
     NotificationGroupProjection, NotificationProjection, PollOptionProjection, PollProjection,
     PreviewCardProjection, QuoteProjection, QuoteTargetAccess, ReportProjection, RestAccountRow,
     RestStatusRow, RuleProjection, SeveranceEventProjection, StatusApplicationProjection,
-    StatusEditProjection, StatusProjection, StatusViewerProjection, TagProjection,
+    StatusEditProjection, StatusProjection, StatusViewerProjection, TagHistoryProjection,
+    TagProjection,
 };
 use crate::mastodon::StatusVisibility;
 use crate::mastodon::policy::{
@@ -1508,6 +1509,31 @@ impl RestProjectionLoader {
             .collect())
     }
 
+    /// Loads recently used, not-yet-featured tags for one authenticated account.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when the suggestion query fails.
+    pub async fn featured_tag_suggestions(
+        &self,
+        account_id: i64,
+    ) -> sqlx::Result<Vec<TagProjection>> {
+        Ok(self
+            .repository
+            .rest_featured_tag_suggestions(account_id)
+            .await?
+            .into_iter()
+            .map(|tag| TagProjection {
+                id: tag.id,
+                name: tag.name,
+                display_name: tag.display_name,
+                history: recent_tag_history(),
+                following: Some(tag.following),
+                featuring: Some(false),
+            })
+            .collect())
+    }
+
     /// Loads the locally listed custom emojis for the public picker endpoint.
     ///
     /// # Errors
@@ -2060,6 +2086,23 @@ impl RestProjectionLoader {
             })
             .collect())
     }
+}
+
+fn recent_tag_history() -> Vec<TagHistoryProjection> {
+    let today = Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is always a valid UTC time");
+    (0..7)
+        .map(|days| TagHistoryProjection {
+            day: (today - Duration::days(days))
+                .and_utc()
+                .timestamp()
+                .to_string(),
+            accounts: "0".to_owned(),
+            uses: "0".to_owned(),
+        })
+        .collect()
 }
 
 fn effective_notification_type(
