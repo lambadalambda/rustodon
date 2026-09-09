@@ -1,0 +1,2 @@
+import{o as e}from"./chunk-CMxvf4Kt.js";import{n as t,t as n}from"./jsx-runtime-SsSjplwM.js";import{t as r}from"./locales-BuoYIVCV.js";var i=e(t()),a=n(),o=class extends i.PureComponent{render(){let{children:e}=this.props;return(0,a.jsx)(r,{children:e})}};export{o as default};
+//# sourceMappingURL=admin_component-Fyt3YIoK.js.map

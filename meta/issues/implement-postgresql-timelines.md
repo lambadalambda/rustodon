@@ -7,9 +7,9 @@ queries for the first timeline and user-collection API surface.
 
 ## Requirements
 
-- Implement home, public/local, hashtag, and account timelines.
-- Implement favourites, bookmarks, blocks, mutes, conversations,
-  notifications, and markers as read-only endpoints where applicable.
+- Implement home, public/local, hashtag, and list timelines, and preserve the
+  existing account timeline as a regression-tested read.
+- Implement favourites, bookmarks, blocks, and mutes as read-only endpoints.
 - Apply status authorization before timeline-specific filtering.
 - Apply blocks, domain blocks, mutes, silenced or suspended account state,
   follow language selection, chosen languages, reply rules, boost preferences,
@@ -19,6 +19,8 @@ queries for the first timeline and user-collection API surface.
   relationship.
 - Support endpoint-appropriate `max_id`, `min_id`, `since_id`, `limit`, and
   compatible `Link` pagination.
+- Expose every completed selector through the production web router with exact
+  endpoint-specific OAuth scopes.
 
 ## Acceptance Criteria
 
@@ -37,3 +39,8 @@ queries for the first timeline and user-collection API surface.
 - Depends on `implement-visibility-correct-account-status-reads.md`.
 - Exact Redis feed history and boost aggregation are not compatibility
   requirements; visibility and selection behavior are.
+- Account-status selection now rejects boosts whose source status is missing or
+  soft-deleted before pagination, matching Mastodon's `kept` scope. The restored
+  fixture covers the soft-deleted-source regression.
+- Conversations, notifications, and markers are tracked separately because
+  their read contracts are coupled to v1 mutations and grouped state.

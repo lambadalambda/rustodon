@@ -1,0 +1,2 @@
+import{t as e}from"./jsx-runtime-SsSjplwM.js";import{a as t}from"./react-intl-Cop388b4.js";var n=e(),r=()=>(0,n.jsx)(`div`,{className:`scrollable scrollable--flex`,children:(0,n.jsx)(`div`,{className:`empty-column-indicator`,children:(0,n.jsx)(t,{id:`not_signed_in_indicator.not_signed_in`,defaultMessage:`You need to login to access this resource.`,tagName:`span`})})});export{r as t};
+//# sourceMappingURL=not_signed_in_indicator-DCvbcXhc.js.map

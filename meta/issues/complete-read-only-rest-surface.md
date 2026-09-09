@@ -66,3 +66,39 @@ Expose remaining in-scope read APIs and preserved optional data.
   account-read authentication, recent-status tag ranking, featured-tag
   exclusion, relationship booleans, trailing-slash support, and differential
   coverage.
+- Added production `GET /api/v1/followed_tags` with account-owned tag-follow
+  loading, `follow`/`read`/`read:follows` authentication, seven-day empty
+  history, featured relationships, cursor pagination, trailing-slash support,
+  and guarded differential coverage.
+- Added production `GET /api/v1/follow_requests` with suspended-requester
+  filtering, account serialization, `follow`/`read`/`read:follows` authentication,
+  cursor pagination, trailing-slash support, and guarded differential coverage.
+- Added production `GET /api/v1/preferences` with exact user/account ownership,
+  Rails settings defaults, locale fallback, private protocol headers, and
+  guarded authentication/trailing-slash differential coverage.
+- Added production list detail, list-member, and account-list reads with
+  owner-scoped `read:lists` authorization, suspended-member filtering,
+  max/since cursor pagination, Rails' unlimited-list ordering, trailing-slash
+  routes, and guarded differential coverage.
+- Added direct `GET /api/v1/media/:id` differential coverage alongside media
+  create/update/delete coverage, including normalized generated IDs and the
+  exact media response contract.
+- Added production account collection and featured-in-collection reads with
+  optional versus required authentication matching Rails, discoverability and
+  suspension handling, offset pagination, collection serialization, link
+  headers, trailing-slash routes, and guarded differential coverage.
+- Added production notification-request list/show reads with account/status
+  graphs, owner scope enforcement, cursor pagination, trailing-slash routes,
+  and guarded differential coverage.
+- Added production `GET /api/v1/statuses/:id/quotes` with required
+   `read:statuses` authentication, root-status authorization, accepted-quote
+   filtering, quote-ID pagination, visibility-aware source status loading,
+   trailing-slash routing, and guarded differential coverage.
+- Quote pagination now excludes authors who block the requesting account before
+  applying the limit, matching Rails' `not_excluded_by_account` scope and
+  preventing hidden rows from leaking pagination cursors. Schema integration
+  covers the blocked-author case.
+- The listed read-only REST endpoints and preserved-data responses now have
+  production handlers and guarded Rails-versus-Rust coverage. The full 14-case
+  differential suite passes against the pinned Mastodon 4.6.5 fixture; remote
+  fetching and remaining write APIs stay in their owning issues.

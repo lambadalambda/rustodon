@@ -10,7 +10,10 @@ use url::Url;
 const RUN_ID_ENV: &str = "RUSTODON_DIFFERENTIAL_RUN_ID";
 const MASTODON_HTTP_ENV: &str = "RUSTODON_DIFFERENTIAL_MASTODON_HTTP_URL";
 const MASTODON_DATABASE_ENV: &str = "RUSTODON_DIFFERENTIAL_MASTODON_DATABASE_URL";
+const MASTODON_OWNER_DATABASE_ENV: &str = "RUSTODON_DIFFERENTIAL_MASTODON_OWNER_DATABASE_URL";
 const RUST_DATABASE_ENV: &str = "RUSTODON_DIFFERENTIAL_RUST_DATABASE_URL";
+const RUST_WRITE_DATABASE_ENV: &str = "RUSTODON_DIFFERENTIAL_RUST_WRITE_DATABASE_URL";
+const RUST_OWNER_DATABASE_ENV: &str = "RUSTODON_DIFFERENTIAL_RUST_OWNER_DATABASE_URL";
 const MEDIA_MARKER: &str = ".rustodon-differential-media-root";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,7 +74,10 @@ pub(crate) struct DifferentialConfig {
     pub(crate) run_id: String,
     pub(crate) mastodon_http: Url,
     pub(crate) mastodon_database: DatabaseTarget,
+    pub(crate) mastodon_owner_database: Option<DatabaseTarget>,
     pub(crate) rust_database: DatabaseTarget,
+    pub(crate) rust_write_database: Option<DatabaseTarget>,
+    pub(crate) rust_owner_database: Option<DatabaseTarget>,
     pub(crate) mastodon_media: PathBuf,
     pub(crate) rust_media: PathBuf,
 }
@@ -94,29 +100,81 @@ impl DifferentialConfig {
             run_id,
             Side::Mastodon,
         )?;
+        let mastodon_owner_database = optional_database_url(
+            environment,
+            MASTODON_OWNER_DATABASE_ENV,
+            run_id,
+            Side::Mastodon,
+        )?;
         let rust_database = validate_database_url(
             required(environment, RUST_DATABASE_ENV)?,
             run_id,
             Side::Rust,
         )?;
+        let rust_write_database =
+            optional_database_url(environment, RUST_WRITE_DATABASE_ENV, run_id, Side::Rust)?;
+        let rust_owner_database =
+            optional_database_url(environment, RUST_OWNER_DATABASE_ENV, run_id, Side::Rust)?;
+        if mastodon_owner_database.is_some() != rust_write_database.is_some() {
+            return Err(SafetyError(
+                "differential writer targets must be provided together".to_owned(),
+            ));
+        }
         if mastodon_database.url == rust_database.url
             || mastodon_database.name == rust_database.name
         {
             return Err(SafetyError("database targets must be distinct".to_owned()));
+        }
+        if let Some(owner) = &mastodon_owner_database
+            && (owner.url == mastodon_database.url || owner.name != mastodon_database.name)
+        {
+            return Err(SafetyError(
+                "Mastodon writer target must use the marked Mastodon database with distinct credentials"
+                    .to_owned(),
+            ));
+        }
+        if let Some(writer) = &rust_write_database
+            && (writer.url == rust_database.url || writer.name != rust_database.name)
+        {
+            return Err(SafetyError(
+                "Rust writer target must use the marked Rust database with distinct credentials"
+                    .to_owned(),
+            ));
+        }
+        if let Some(owner) = &rust_owner_database
+            && (owner.url == rust_database.url || owner.name != rust_database.name)
+        {
+            return Err(SafetyError(
+                "Rust owner target must use the marked Rust database with distinct credentials"
+                    .to_owned(),
+            ));
         }
         let (mastodon_media, rust_media) = validate_media_roots(repository, run_id)?;
         Ok(Self {
             run_id: run_id.to_owned(),
             mastodon_http,
             mastodon_database,
+            mastodon_owner_database,
             rust_database,
+            rust_write_database,
+            rust_owner_database,
             mastodon_media,
             rust_media,
         })
     }
 
     pub(crate) async fn validate_database_comments(&self) -> Result<(), SafetyError> {
-        for target in [&self.mastodon_database, &self.rust_database] {
+        let mut targets = vec![&self.mastodon_database, &self.rust_database];
+        if let Some(target) = &self.mastodon_owner_database {
+            targets.push(target);
+        }
+        if let Some(target) = &self.rust_write_database {
+            targets.push(target);
+        }
+        if let Some(target) = &self.rust_owner_database {
+            targets.push(target);
+        }
+        for target in targets {
             let mut connection = PgConnection::connect(target.url()).await.map_err(|error| {
                 SafetyError(format!("database marker connection failed: {error}"))
             })?;
@@ -219,6 +277,18 @@ fn validate_database_url(
         )));
     }
     Ok(DatabaseTarget { url, name, side })
+}
+
+fn optional_database_url(
+    environment: &HashMap<String, String>,
+    variable: &str,
+    run_id: &str,
+    side: Side,
+) -> Result<Option<DatabaseTarget>, SafetyError> {
+    environment
+        .get(variable)
+        .map(|value| validate_database_url(value, run_id, side))
+        .transpose()
 }
 
 fn validate_media_roots(

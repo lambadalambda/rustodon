@@ -1,10 +1,25 @@
 use std::fs::File;
+use std::io::{self, Cursor, Read, Write};
 use std::path::{Component, Path};
 use std::sync::Arc;
+#[cfg(feature = "test-support")]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use image::codecs::gif::{GifDecoder, GifEncoder};
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::FilterType;
+use image::{
+    AnimationDecoder, Delay, Frame, GenericImageView, ImageDecoder, ImageFormat, ImageReader,
+    Limits,
+};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use rustix::fd::OwnedFd;
-use rustix::fs::{FileType, Mode, OFlags, ResolveFlags, fstat, open, openat2};
+use rustix::fs::{
+    AtFlags, FileType, Mode, OFlags, ResolveFlags, fchmod, fstat, mkdirat, open, openat2, unlinkat,
+};
+use rustix::io::Errno;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const IMAGE_MIME_TYPES: &[&str] = &[
     "image/jpeg",
@@ -23,6 +38,11 @@ const APP_ICON_STYLES: &[&str] = &[
 ];
 const FAVICON_STYLES: &[&str] = &["16", "32", "48"];
 const THUMBNAIL_STYLES: &[&str] = &["@1x", "@2x"];
+const ACCOUNT_MEDIA_LIMIT: usize = 8 * 1024 * 1024;
+const MAX_MATRIX_LIMIT: u64 = 33_177_600;
+const GIF_MATRIX_LIMIT: u64 = 921_600;
+const MEDIA_MATRIX_LIMIT: u64 = 8_294_400;
+const IMAGE_MAX_ALLOC: u64 = 256 * 1024 * 1024;
 const URL_PATH_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'!')
     .remove(b'$')
@@ -88,6 +108,504 @@ pub struct PaperclipMetadata {
     pub content_type: Option<String>,
     /// Attachment-specific discriminator, currently the `site_uploads.var` value.
     pub variant: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedAccountMedia {
+    pub file_name: String,
+    pub content_type: String,
+    pub file_size: i32,
+    pub original_bytes: Vec<u8>,
+    pub static_file_name: Option<String>,
+    pub static_bytes: Option<Vec<u8>>,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedMediaAttachment {
+    pub file_name: String,
+    pub content_type: String,
+    pub file_size: i32,
+    pub original_bytes: Vec<u8>,
+    pub small_file_name: String,
+    pub small_content_type: String,
+    pub small_bytes: Vec<u8>,
+    pub file_meta: Value,
+    pub blurhash: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub small_width: u32,
+    pub small_height: u32,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+pub struct PaperclipWriteFault {
+    successful_writes_before_failure: AtomicUsize,
+    injected: AtomicBool,
+}
+
+#[cfg(feature = "test-support")]
+impl PaperclipWriteFault {
+    #[must_use]
+    pub fn storage_full_after(successful_writes: usize) -> Self {
+        Self {
+            successful_writes_before_failure: AtomicUsize::new(successful_writes),
+            injected: AtomicBool::new(false),
+        }
+    }
+
+    fn should_fail(&self) -> bool {
+        loop {
+            if self.injected.load(Ordering::Acquire) {
+                return false;
+            }
+            let remaining = self
+                .successful_writes_before_failure
+                .load(Ordering::Relaxed);
+            if remaining == 0 {
+                return self
+                    .injected
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok();
+            }
+            if self
+                .successful_writes_before_failure
+                .compare_exchange_weak(
+                    remaining,
+                    remaining - 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return false;
+            }
+        }
+    }
+}
+
+type ProcessedGif = (Vec<u8>, Option<Vec<u8>>, u32, u32);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountMediaError {
+    UnsupportedAttachment,
+    UnsupportedContentType,
+    TooLarge,
+    InvalidImage,
+    SizeOverflow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaAttachmentError {
+    UnsupportedContentType,
+    TooLarge,
+    InvalidImage,
+    SizeOverflow,
+}
+
+impl std::fmt::Display for MediaAttachmentError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedContentType => "unsupported media image content type",
+            Self::TooLarge => "media image is too large",
+            Self::InvalidImage => "media image is invalid",
+            Self::SizeOverflow => "media image size is too large",
+        })
+    }
+}
+
+impl std::error::Error for MediaAttachmentError {}
+
+impl std::fmt::Display for AccountMediaError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedAttachment => "unsupported account media attachment",
+            Self::UnsupportedContentType => "unsupported account image content type",
+            Self::TooLarge => "account image is too large",
+            Self::InvalidImage => "account image is invalid",
+            Self::SizeOverflow => "account image size is too large",
+        })
+    }
+}
+
+impl std::error::Error for AccountMediaError {}
+
+/// Validates and processes a local avatar or header using Mastodon's profile styles.
+///
+/// The returned bytes are ready to be stored beneath the account's Paperclip paths. The source
+/// image is processed using Mastodon's avatar/header styles; animated GIFs also receive the static
+/// PNG derivative used by REST serializers.
+///
+/// # Errors
+///
+/// Returns an error when the attachment, content type, image dimensions, encoded size, or image
+/// bytes are not accepted by Mastodon's profile media contract.
+pub fn prepare_account_media(
+    attachment: PaperclipAttachment,
+    account_id: i64,
+    file_name: &str,
+    content_type: &str,
+    bytes: &[u8],
+) -> Result<PreparedAccountMedia, AccountMediaError> {
+    if !matches!(
+        attachment,
+        PaperclipAttachment::AccountAvatar | PaperclipAttachment::AccountHeader
+    ) {
+        return Err(AccountMediaError::UnsupportedAttachment);
+    }
+    if !matches!(
+        content_type,
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+    ) {
+        return Err(AccountMediaError::UnsupportedContentType);
+    }
+    if bytes.len() >= ACCOUNT_MEDIA_LIMIT {
+        return Err(AccountMediaError::TooLarge);
+    }
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| AccountMediaError::InvalidImage)?;
+    let format = reader.format().ok_or(AccountMediaError::InvalidImage)?;
+    if image_format_for_content_type(content_type) != Some(format) {
+        return Err(AccountMediaError::InvalidImage);
+    }
+    let (input_width, input_height) = reader
+        .into_dimensions()
+        .map_err(|_| AccountMediaError::InvalidImage)?;
+    validate_image_matrix(content_type, input_width, input_height)?;
+    let file_name = media_file_name(file_name, content_type, account_id, bytes);
+    let (original_bytes, static_bytes, width, height) = if format == ImageFormat::Gif {
+        process_gif(bytes, attachment, input_width, input_height)?
+    } else {
+        let mut reader = ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|_| AccountMediaError::InvalidImage)?;
+        reader.limits(image_limits());
+        let image = reader
+            .decode()
+            .map_err(|_| AccountMediaError::InvalidImage)?;
+        let image = transform_profile_image(image, attachment, input_width, input_height);
+        let (width, height) = image.dimensions();
+        let output_format = image_format_for_content_type(content_type)
+            .ok_or(AccountMediaError::UnsupportedContentType)?;
+        (encode_image(&image, output_format)?, None, width, height)
+    };
+    let static_file_name = static_bytes
+        .as_ref()
+        .and_then(|_| derivative_file_name(&file_name, "png"));
+    let file_size =
+        i32::try_from(original_bytes.len()).map_err(|_| AccountMediaError::SizeOverflow)?;
+    Ok(PreparedAccountMedia {
+        file_name,
+        content_type: content_type.to_owned(),
+        file_size,
+        original_bytes,
+        static_file_name,
+        static_bytes,
+        width,
+        height,
+    })
+}
+
+/// Validates and prepares a local image media attachment using Mastodon's image styles.
+///
+/// The original upload is retained byte-for-byte. The small style is encoded using the input
+/// image format, except animated GIFs which use a PNG preview as in Paperclip.
+///
+/// # Errors
+///
+/// Returns an error when the image type, encoded size, dimensions, or image bytes are rejected.
+pub fn prepare_media_attachment(
+    account_id: i64,
+    file_name: &str,
+    content_type: &str,
+    bytes: &[u8],
+) -> Result<PreparedMediaAttachment, MediaAttachmentError> {
+    if !matches!(
+        content_type,
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+    ) {
+        return Err(MediaAttachmentError::UnsupportedContentType);
+    }
+    if bytes.len() >= 16 * 1024 * 1024 {
+        return Err(MediaAttachmentError::TooLarge);
+    }
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| MediaAttachmentError::InvalidImage)?;
+    let format = reader.format().ok_or(MediaAttachmentError::InvalidImage)?;
+    if image_format_for_content_type(content_type) != Some(format) {
+        return Err(MediaAttachmentError::InvalidImage);
+    }
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|_| MediaAttachmentError::InvalidImage)?;
+    validate_image_matrix(content_type, width, height)
+        .map_err(|_| MediaAttachmentError::InvalidImage)?;
+
+    let image = if format == ImageFormat::Gif {
+        let mut decoder =
+            GifDecoder::new(Cursor::new(bytes)).map_err(|_| MediaAttachmentError::InvalidImage)?;
+        decoder
+            .set_limits(image_limits())
+            .map_err(|_| MediaAttachmentError::InvalidImage)?;
+        let frame = decoder
+            .into_frames()
+            .next()
+            .ok_or(MediaAttachmentError::InvalidImage)?
+            .map_err(|_| MediaAttachmentError::InvalidImage)?;
+        image::DynamicImage::ImageRgba8(frame.into_buffer())
+    } else {
+        let mut reader = ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|_| MediaAttachmentError::InvalidImage)?;
+        reader.limits(image_limits());
+        reader
+            .decode()
+            .map_err(|_| MediaAttachmentError::InvalidImage)?
+    };
+    let original_image = resize_media_image_to_limit(image, width, height, MEDIA_MATRIX_LIMIT);
+    let (original_width, original_height) = original_image.dimensions();
+    let original_bytes = if format == ImageFormat::Gif {
+        bytes.to_vec()
+    } else {
+        encode_image(&original_image, format).map_err(|_| MediaAttachmentError::InvalidImage)?
+    };
+    let small = resize_media_image(original_image, original_width, original_height);
+    let (small_width, small_height) = small.dimensions();
+    let small_format = if format == ImageFormat::Gif {
+        ImageFormat::Png
+    } else {
+        format
+    };
+    let small_bytes =
+        encode_image(&small, small_format).map_err(|_| MediaAttachmentError::InvalidImage)?;
+    let blurhash = media_blurhash(&small);
+    let file_name = media_file_name(file_name, content_type, account_id, bytes);
+    let small_file_name = if format == ImageFormat::Gif {
+        derivative_file_name(&file_name, "png").ok_or(MediaAttachmentError::InvalidImage)?
+    } else {
+        file_name.clone()
+    };
+    let file_size =
+        i32::try_from(original_bytes.len()).map_err(|_| MediaAttachmentError::SizeOverflow)?;
+    Ok(PreparedMediaAttachment {
+        file_name,
+        content_type: content_type.to_owned(),
+        file_size,
+        original_bytes,
+        small_file_name,
+        small_content_type: if format == ImageFormat::Gif {
+            "image/png".to_owned()
+        } else {
+            content_type.to_owned()
+        },
+        small_bytes,
+        file_meta: json!({
+            "original": image_geometry(original_width, original_height),
+            "small": image_geometry(small_width, small_height),
+        }),
+        blurhash,
+        width: original_width,
+        height: original_height,
+        small_width,
+        small_height,
+    })
+}
+
+fn media_blurhash(image: &image::DynamicImage) -> Option<String> {
+    let thumbnail = image.resize(100, 100, FilterType::Lanczos3).to_rgba8();
+    let (width, height) = thumbnail.dimensions();
+    blurhash::encode(4, 4, width, height, thumbnail.as_raw()).ok()
+}
+
+fn resize_media_image(
+    image: image::DynamicImage,
+    input_width: u32,
+    input_height: u32,
+) -> image::DynamicImage {
+    resize_media_image_to_limit(image, input_width, input_height, 230_400)
+}
+
+fn resize_media_image_to_limit(
+    image: image::DynamicImage,
+    input_width: u32,
+    input_height: u32,
+    pixel_limit: u64,
+) -> image::DynamicImage {
+    let matrix = u64::from(input_width) * u64::from(input_height);
+    if matrix <= pixel_limit {
+        return image;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let scale = (pixel_limit as f64 / matrix as f64).sqrt();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let width = (f64::from(input_width) * scale).round().max(1.0) as u32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let height = (f64::from(input_height) * scale).round().max(1.0) as u32;
+    image.resize_exact(width, height, FilterType::Lanczos3)
+}
+
+fn image_geometry(width: u32, height: u32) -> Value {
+    json!({
+        "width": width,
+        "height": height,
+        "size": format!("{width}x{height}"),
+        "aspect": f64::from(width) / f64::from(height),
+    })
+}
+
+fn image_limits() -> Limits {
+    let mut limits = Limits::default();
+    limits.max_alloc = Some(IMAGE_MAX_ALLOC);
+    limits
+}
+
+fn validate_image_matrix(
+    content_type: &str,
+    width: u32,
+    height: u32,
+) -> Result<(), AccountMediaError> {
+    let matrix = u64::from(width) * u64::from(height);
+    let limit = if content_type == "image/gif" {
+        GIF_MATRIX_LIMIT
+    } else {
+        MAX_MATRIX_LIMIT
+    };
+    (matrix <= limit)
+        .then_some(())
+        .ok_or(AccountMediaError::InvalidImage)
+}
+
+fn transform_profile_image(
+    image: image::DynamicImage,
+    attachment: PaperclipAttachment,
+    input_width: u32,
+    input_height: u32,
+) -> image::DynamicImage {
+    match attachment {
+        PaperclipAttachment::AccountAvatar => image.resize_to_fill(400, 400, FilterType::Lanczos3),
+        PaperclipAttachment::AccountHeader => {
+            let matrix = u64::from(input_width) * u64::from(input_height);
+            if matrix <= 750_000 {
+                image
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                let scale = (750_000_f64 / matrix as f64).sqrt();
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let width = (f64::from(input_width) * scale).round().max(1.0) as u32;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let height = (f64::from(input_height) * scale).round().max(1.0) as u32;
+                image.resize_exact(width, height, FilterType::Lanczos3)
+            }
+        }
+        _ => image,
+    }
+}
+
+fn process_gif(
+    bytes: &[u8],
+    attachment: PaperclipAttachment,
+    input_width: u32,
+    input_height: u32,
+) -> Result<ProcessedGif, AccountMediaError> {
+    let mut first_decoder =
+        GifDecoder::new(Cursor::new(bytes)).map_err(|_| AccountMediaError::InvalidImage)?;
+    first_decoder
+        .set_limits(image_limits())
+        .map_err(|_| AccountMediaError::InvalidImage)?;
+    let first = first_decoder
+        .into_frames()
+        .next()
+        .ok_or(AccountMediaError::InvalidImage)?
+        .map_err(|_| AccountMediaError::InvalidImage)?;
+    let first = transform_gif_frame(first, attachment, input_width, input_height);
+    let (width, height) = first.buffer().dimensions();
+    let static_bytes = encode_image(
+        &image::DynamicImage::ImageRgba8(first.buffer().clone()),
+        ImageFormat::Png,
+    )?;
+
+    let mut decoder =
+        GifDecoder::new(Cursor::new(bytes)).map_err(|_| AccountMediaError::InvalidImage)?;
+    decoder
+        .set_limits(image_limits())
+        .map_err(|_| AccountMediaError::InvalidImage)?;
+    let mut original_bytes = Vec::new();
+    {
+        let mut encoder = GifEncoder::new(&mut original_bytes);
+        for frame in decoder.into_frames().take(3000) {
+            let frame = frame.map_err(|_| AccountMediaError::InvalidImage)?;
+            let frame = transform_gif_frame(frame, attachment, input_width, input_height);
+            encoder
+                .encode_frame(frame)
+                .map_err(|_| AccountMediaError::InvalidImage)?;
+        }
+    }
+    Ok((original_bytes, Some(static_bytes), width, height))
+}
+
+fn transform_gif_frame(
+    frame: Frame,
+    attachment: PaperclipAttachment,
+    input_width: u32,
+    input_height: u32,
+) -> Frame {
+    let delay: Delay = frame.delay();
+    let image = image::DynamicImage::ImageRgba8(frame.into_buffer());
+    let image = transform_profile_image(image, attachment, input_width, input_height);
+    Frame::from_parts(image.into_rgba8(), 0, 0, delay)
+}
+
+fn image_format_for_content_type(content_type: &str) -> Option<ImageFormat> {
+    match content_type {
+        "image/jpeg" => Some(ImageFormat::Jpeg),
+        "image/png" => Some(ImageFormat::Png),
+        "image/gif" => Some(ImageFormat::Gif),
+        "image/webp" => Some(ImageFormat::WebP),
+        _ => None,
+    }
+}
+
+fn encode_image(
+    image: &image::DynamicImage,
+    format: ImageFormat,
+) -> Result<Vec<u8>, AccountMediaError> {
+    let mut output = Cursor::new(Vec::new());
+    if format == ImageFormat::Jpeg {
+        image
+            .write_with_encoder(JpegEncoder::new_with_quality(&mut output, 90))
+            .map_err(|_| AccountMediaError::InvalidImage)?;
+    } else {
+        image
+            .write_to(&mut output, format)
+            .map_err(|_| AccountMediaError::InvalidImage)?;
+    }
+    Ok(output.into_inner())
+}
+
+fn media_file_name(file_name: &str, content_type: &str, account_id: i64, bytes: &[u8]) -> String {
+    let candidate = file_name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let original_extension = candidate
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    let extension = match content_type {
+        "image/jpeg" => match original_extension.as_deref() {
+            Some("jpg" | "jpeg") => original_extension.unwrap(),
+            _ => "jpg".to_owned(),
+        },
+        "image/png" => "png".to_owned(),
+        "image/gif" => "gif".to_owned(),
+        "image/webp" => "webp".to_owned(),
+        _ => "bin".to_owned(),
+    };
+    let mut digest = Sha256::new();
+    digest.update(account_id.to_le_bytes());
+    digest.update(bytes);
+    let digest = format!("{:x}", digest.finalize());
+    format!("{}.{extension}", &digest[..16])
 }
 
 impl PaperclipMetadata {
@@ -165,6 +683,8 @@ pub struct PaperclipPath {
 #[derive(Clone, Debug)]
 pub struct PaperclipRoot {
     directory: Arc<OwnedFd>,
+    #[cfg(feature = "test-support")]
+    write_fault: Option<Arc<PaperclipWriteFault>>,
 }
 
 impl PaperclipRoot {
@@ -207,7 +727,16 @@ impl PaperclipRoot {
         }
         Ok(Self {
             directory: Arc::new(directory),
+            #[cfg(feature = "test-support")]
+            write_fault: None,
         })
+    }
+
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_write_fault(mut self, fault: PaperclipWriteFault) -> Self {
+        self.write_fault = Some(Arc::new(fault));
+        self
     }
 
     /// Opens a regular file beneath this root without following any symlink component or updating
@@ -255,6 +784,176 @@ impl PaperclipRoot {
             ));
         }
         Ok(File::from(file))
+    }
+
+    /// Writes a regular file beneath this root without following any symlink component.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the path is unsafe, its parent cannot be created securely, or the
+    /// file cannot be written.
+    pub fn write_file(&self, relative_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        if !safe_relative_path(relative_path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Paperclip paths must be clean and relative",
+            ));
+        }
+        #[cfg(feature = "test-support")]
+        if self
+            .write_fault
+            .as_ref()
+            .is_some_and(|fault| fault.should_fail())
+        {
+            return Err(io::Error::from(io::ErrorKind::StorageFull));
+        }
+        let file_name = relative_path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Paperclip file name is missing",
+            )
+        })?;
+        let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
+        let directory = self.open_directory(parent, true)?;
+        let file = match openat2(
+            &directory,
+            file_name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::from_bits_retain(0o644),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        ) {
+            Ok(file) => file,
+            Err(Errno::EXIST) => return self.open_file(relative_path).map(|_| ()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut file = File::from(file);
+        let result = fchmod(&file, Mode::from_bits_retain(0o644))
+            .map_err(io::Error::from)
+            .and_then(|()| file.write_all(bytes))
+            .and_then(|()| file.sync_all());
+        if let Err(error) = result {
+            drop(file);
+            let _ = unlinkat(&directory, file_name, AtFlags::empty());
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Removes a regular file beneath this root without following any symlink component.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the path is unsafe or its parent cannot be opened securely.
+    pub fn remove_file(&self, relative_path: &Path) -> std::io::Result<()> {
+        if !safe_relative_path(relative_path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Paperclip paths must be clean and relative",
+            ));
+        }
+        let file_name = relative_path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Paperclip file name is missing",
+            )
+        })?;
+        let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
+        let directory = match self.open_directory(parent, false) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        match unlinkat(&directory, file_name, AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn open_directory(&self, relative_path: &Path, create: bool) -> std::io::Result<OwnedFd> {
+        if !safe_relative_path(relative_path) && !relative_path.as_os_str().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Paperclip paths must be clean and relative",
+            ));
+        }
+        let mut directory = self.directory.try_clone()?;
+        for component in relative_path.components() {
+            let Component::Normal(component) = component else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Paperclip paths must be clean and relative",
+                ));
+            };
+            if create {
+                match mkdirat(&directory, component, Mode::from_bits_retain(0o755)) {
+                    Ok(()) | Err(Errno::EXIST) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            directory = openat2(
+                &directory,
+                component,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+            )?;
+            if !FileType::from_raw_mode(fstat(&directory)?.st_mode).is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Paperclip parent is not a directory",
+                ));
+            }
+        }
+        Ok(directory)
+    }
+}
+
+/// Writes a prepared media attachment beneath its exact Paperclip paths.
+///
+/// The original is removed when writing the derivative fails, so callers can safely retry the
+/// database update without exposing a half-written attachment.
+///
+/// # Errors
+///
+/// Returns an I/O error when the generated Paperclip paths cannot be created or written safely.
+pub fn write_prepared_media(
+    root: &PaperclipRoot,
+    metadata: &PaperclipMetadata,
+    prepared: &PreparedMediaAttachment,
+) -> std::io::Result<Vec<String>> {
+    let original = metadata.relative_path("original").ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid media path")
+    })?;
+    let small = metadata.relative_path("small").ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid media path")
+    })?;
+    write_prepared_file(root, Path::new(&original), &prepared.original_bytes)?;
+    if let Err(error) = write_prepared_file(root, Path::new(&small), &prepared.small_bytes) {
+        let _ = root.remove_file(Path::new(&original));
+        let _ = root.remove_file(Path::new(&small));
+        return Err(error);
+    }
+    Ok(vec![original, small])
+}
+
+fn write_prepared_file(root: &PaperclipRoot, relative_path: &Path, bytes: &[u8]) -> io::Result<()> {
+    root.write_file(relative_path, bytes)?;
+    let mut existing = Vec::new();
+    root.open_file(relative_path)?.read_to_end(&mut existing)?;
+    if existing == bytes {
+        return Ok(());
+    }
+    root.remove_file(relative_path)?;
+    root.write_file(relative_path, bytes)?;
+    let mut rewritten = Vec::new();
+    root.open_file(relative_path)?.read_to_end(&mut rewritten)?;
+    if rewritten == bytes {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Paperclip file contents changed while writing",
+        ))
     }
 }
 

@@ -1,0 +1,2 @@
+import{t as e}from"./jsx-runtime-SsSjplwM.js";import{t}from"./react-intl-Cop388b4.js";var n=e(),r=e=>(0,n.jsx)(t,{...e,children:t=>(0,n.jsx)(`time`,{dateTime:i(e.value),className:e.className,children:t})}),i=e=>{if(!e)return``;try{return new Date(e).toISOString()}catch{return e.toString()}};export{r as t};
+//# sourceMappingURL=formatted_date-BMWzXdl7.js.map

@@ -17,10 +17,11 @@ use sqlx::{Connection, Executor, PgConnection, Row};
 use url::{Host, Url};
 
 use crate::config::{
-    Config, ExternalAuthProvider, ObjectStorageProvider, PostgresConnection, PostgresSslMode,
-    RedisEndpoint, SmtpConfig,
+    Config, ExternalAuthProvider, ObjectStorageProvider, PostgresConfig, PostgresConnection,
+    PostgresSslMode, RedisEndpoint, SmtpConfig,
 };
 use crate::crypto::{ActiveRecordEncryptionConfig, RsaKeyError, validate_rsa_signing_keypair};
+use crate::operational_schema;
 use crate::secret::SecretString;
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -30,9 +31,11 @@ const MIGRATIONS: &str = include_str!("../fixtures/mastodon/v4.6.5/migrations.ts
 const CATALOG: &str = include_str!("../fixtures/mastodon/v4.6.5/catalog.txt");
 
 pub(crate) const V1_CRITICAL_TABLES: &[&str] = &[
+    "account_aliases",
     "account_conversations",
     "account_deletion_requests",
     "account_domain_blocks",
+    "account_migrations",
     "account_notes",
     "account_pins",
     "account_relationship_severance_events",
@@ -44,6 +47,7 @@ pub(crate) const V1_CRITICAL_TABLES: &[&str] = &[
     "appeals",
     "blocks",
     "bookmarks",
+    "canonical_email_blocks",
     "collection_items",
     "collection_reports",
     "collections",
@@ -82,6 +86,7 @@ pub(crate) const V1_CRITICAL_TABLES: &[&str] = &[
     "quotes",
     "relays",
     "relationship_severance_events",
+    "report_notes",
     "reports",
     "rule_translations",
     "rules",
@@ -99,7 +104,9 @@ pub(crate) const V1_CRITICAL_TABLES: &[&str] = &[
     "tombstones",
     "user_roles",
     "users",
+    "invites",
     "webauthn_credentials",
+    "web_push_subscriptions",
 ];
 
 const SNOWFLAKE_SEQUENCES: &[&str] = &[
@@ -303,6 +310,991 @@ FROM (
 ) source
 WHERE source.value IS NOT NULL AND source.value <> ''
 ORDER BY source.table_name COLLATE "C", source.row_id, source.column_name COLLATE "C"
+"#;
+
+const WRITER_PRIVILEGE_QUERY: &str = r#"
+SELECT
+  role.rolcanlogin
+  AND (role.rolvaliduntil IS NULL OR role.rolvaliduntil > clock_timestamp())
+  AND NOT role.rolsuper
+  AND NOT role.rolcreaterole
+  AND NOT role.rolcreatedb
+  AND NOT role.rolreplication
+   AND NOT role.rolbypassrls
+   AND current_user = session_user
+   AND current_setting('transaction_read_only') = 'off'
+   AND current_setting('lo_compat_privileges') = 'off'
+   AND role.oid <> database_record.datdba
+  AND NOT pg_catalog.pg_has_role(role.oid, database_record.datdba, 'MEMBER')
+  AND NOT pg_catalog.has_database_privilege(role.oid, current_database(), 'CREATE')
+  AND NOT pg_catalog.has_database_privilege(role.oid, current_database(), 'TEMP')
+  AND pg_catalog.has_database_privilege(role.oid, current_database(), 'CONNECT')
+      AND pg_catalog.has_schema_privilege(role.oid, 'public', 'USAGE')
+      AND pg_catalog.has_schema_privilege(role.oid, 'rustodon', 'USAGE')
+       AND pg_catalog.has_function_privilege(
+         role.oid, 'public.rustodon_refresh_instances()'::regprocedure, 'EXECUTE'
+       )
+       AND EXISTS (
+         SELECT 1
+           FROM pg_catalog.pg_proc refresh_function
+           JOIN pg_catalog.pg_class instances_view
+             ON instances_view.oid = 'public.instances'::regclass
+          WHERE refresh_function.oid = 'public.rustodon_refresh_instances()'::regprocedure
+             AND refresh_function.proowner = instances_view.relowner
+             AND refresh_function.prokind = 'f'
+             AND refresh_function.prosecdef
+             AND refresh_function.prolang = (
+               SELECT language.oid
+               FROM pg_catalog.pg_language language
+               WHERE language.lanname = 'plpgsql'
+             )
+             AND refresh_function.prorettype = 'void'::regtype
+             AND pg_catalog.btrim(refresh_function.prosrc, E' \t\r\n') = E'BEGIN\n  REFRESH MATERIALIZED VIEW CONCURRENTLY public.instances;\nEND'
+             AND refresh_function.proconfig = ARRAY['search_path=pg_catalog, public']::text[]
+       )
+       AND NOT pg_catalog.has_schema_privilege(role.oid, 'public', 'CREATE')
+     AND NOT pg_catalog.has_schema_privilege(role.oid, 'rustodon', 'CREATE')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.accounts', 'SELECT')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.accounts', 'DELETE')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.account_aliases', 'SELECT')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.account_aliases', 'DELETE')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.account_deletion_requests', 'SELECT')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.account_deletion_requests', 'INSERT')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.account_deletion_requests', 'UPDATE')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.account_deletion_requests', 'DELETE')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.account_domain_blocks', 'DELETE')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.account_migrations', 'SELECT')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.account_migrations', 'DELETE')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.account_notes', 'SELECT')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.account_notes', 'DELETE')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.account_pins', 'SELECT')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.account_pins', 'DELETE')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.account_warnings', 'SELECT')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.account_warnings', 'INSERT')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.canonical_email_blocks', 'SELECT')
+    AND pg_catalog.has_table_privilege(role.oid, 'public.canonical_email_blocks', 'INSERT')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.canonical_email_blocks', 'DELETE')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.domain_blocks', 'SELECT')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.domain_allows', 'SELECT')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.domain_blocks', 'INSERT')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.domain_blocks', 'UPDATE')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.domain_blocks', 'DELETE')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.relationship_severance_events', 'SELECT')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.relationship_severance_events', 'INSERT')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.relationship_severance_events', 'UPDATE')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.severed_relationships', 'SELECT')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.severed_relationships', 'INSERT')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.account_relationship_severance_events', 'SELECT')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.account_relationship_severance_events', 'INSERT')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.account_relationship_severance_events', 'UPDATE')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.admin_action_logs', 'SELECT')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.admin_action_logs', 'INSERT')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.reports', 'SELECT')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.reports', 'INSERT')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.reports', 'UPDATE')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.reports', 'DELETE')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.collection_items', 'SELECT')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.collection_items', 'DELETE')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.collections', 'SELECT')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.collections', 'DELETE')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.custom_emojis', 'SELECT')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.custom_emojis', 'DELETE')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.custom_filters', 'SELECT')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.custom_filters', 'DELETE')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.featured_tags', 'SELECT')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.featured_tags', 'UPDATE')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.featured_tags', 'DELETE')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.invites', 'SELECT')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.invites', 'DELETE')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.list_accounts', 'SELECT')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.list_accounts', 'DELETE')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.lists', 'SELECT')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.lists', 'DELETE')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.poll_votes', 'SELECT')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.poll_votes', 'DELETE')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.polls', 'SELECT')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.quotes', 'SELECT')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.polls', 'UPDATE')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.polls', 'DELETE')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.report_notes', 'SELECT')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.report_notes', 'DELETE')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.scheduled_statuses', 'SELECT')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.scheduled_statuses', 'DELETE')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.tag_follows', 'SELECT')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.tag_follows', 'DELETE')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.tombstones', 'SELECT')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.tombstones', 'INSERT')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.rules', 'SELECT')
+      AND pg_catalog.has_table_privilege(role.oid, 'public.collection_reports', 'SELECT')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.collection_reports', 'INSERT')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.user_roles', 'SELECT')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.generated_annual_reports', 'SELECT')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.generated_annual_reports', 'DELETE')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.fasp_follow_recommendations', 'SELECT')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.fasp_follow_recommendations', 'DELETE')
+         AND pg_catalog.has_table_privilege(role.oid, 'public.webauthn_credentials', 'SELECT')
+         AND pg_catalog.has_table_privilege(role.oid, 'public.webauthn_credentials', 'DELETE')
+   AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'username', 'INSERT')
+   AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'domain', 'INSERT')
+   AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'actor_type', 'INSERT')
+   AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'display_name', 'INSERT')
+   AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'note', 'INSERT')
+   AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'uri', 'INSERT')
+   AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'url', 'INSERT')
+   AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'inbox_url', 'INSERT')
+   AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'shared_inbox_url', 'INSERT')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'protocol', 'INSERT')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'public_key', 'INSERT')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'private_key', 'INSERT')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'last_webfingered_at', 'INSERT')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'created_at', 'INSERT')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'updated_at', 'INSERT')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'username', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'domain', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'actor_type', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'also_known_as', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'display_name', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'discoverable', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'fields', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'locked', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'memorial', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'moved_to_account_id', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'note', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'requested_review_at', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'reviewed_at', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'hide_collections', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'indexable', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'attribution_domains', 'UPDATE')
+   AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'uri', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'url', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'inbox_url', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'outbox_url', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'followers_url', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'following_url', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'shared_inbox_url', 'UPDATE')
+   AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'protocol', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'public_key', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'last_webfingered_at', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'silenced_at', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'suspended_at', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'suspension_origin', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'trendable', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'avatar_content_type', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'avatar_description', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'avatar_file_name', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'avatar_file_size', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'avatar_remote_url', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'avatar_storage_schema_version', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'avatar_updated_at', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'header_content_type', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'header_description', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'header_file_name', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'header_file_size', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'header_remote_url', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'header_storage_schema_version', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'header_updated_at', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.accounts', 'updated_at', 'UPDATE')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.account_stats', 'SELECT')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.account_stats', 'INSERT')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.account_stats', 'UPDATE')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.account_stats', 'DELETE')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.keypairs', 'SELECT')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.keypairs', 'INSERT')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.keypairs', 'UPDATE')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.keypairs', 'DELETE')
+    AND pg_catalog.has_sequence_privilege(role.oid, 'public.accounts_id_seq', 'USAGE')
+     AND pg_catalog.has_sequence_privilege(role.oid, 'public.account_deletion_requests_id_seq', 'USAGE')
+     AND pg_catalog.has_sequence_privilege(role.oid, 'public.account_warnings_id_seq', 'USAGE')
+     AND pg_catalog.has_sequence_privilege(role.oid, 'public.account_stats_id_seq', 'USAGE')
+    AND pg_catalog.has_sequence_privilege(role.oid, 'public.canonical_email_blocks_id_seq', 'USAGE')
+      AND pg_catalog.has_sequence_privilege(role.oid, 'public.domain_blocks_id_seq', 'USAGE')
+      AND pg_catalog.has_sequence_privilege(role.oid, 'public.relationship_severance_events_id_seq', 'USAGE')
+      AND pg_catalog.has_sequence_privilege(role.oid, 'public.severed_relationships_id_seq', 'USAGE')
+      AND pg_catalog.has_sequence_privilege(role.oid, 'public.account_relationship_severance_events_id_seq', 'USAGE')
+      AND pg_catalog.has_sequence_privilege(role.oid, 'public.admin_action_logs_id_seq', 'USAGE')
+     AND pg_catalog.has_sequence_privilege(role.oid, 'public.reports_id_seq', 'USAGE')
+     AND pg_catalog.has_sequence_privilege(role.oid, 'public.collection_reports_id_seq', 'USAGE')
+      AND pg_catalog.has_sequence_privilege(role.oid, 'public.keypairs_id_seq', 'USAGE')
+      AND pg_catalog.has_sequence_privilege(role.oid, 'public.users_id_seq', 'USAGE')
+    AND pg_catalog.has_function_privilege(
+      role.oid, 'public.timestamp_id(text)'::regprocedure, 'EXECUTE'
+    )
+    AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'account_id', 'INSERT')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'email', 'INSERT')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'encrypted_password', 'INSERT')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'approved', 'INSERT')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'confirmed_at', 'INSERT')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'confirmation_token', 'INSERT')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'confirmation_sent_at', 'INSERT')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'created_at', 'INSERT')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'updated_at', 'INSERT')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'settings', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'consumed_timestep', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'otp_backup_codes', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'otp_required_for_login', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'otp_secret', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'current_sign_in_at', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'last_sign_in_at', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'sign_in_count', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'encrypted_password', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'reset_password_token', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'reset_password_sent_at', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'sign_in_token', 'UPDATE')
+    AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'sign_in_token_sent_at', 'UPDATE')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'confirmed_at', 'UPDATE')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'confirmation_token', 'UPDATE')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'confirmation_sent_at', 'UPDATE')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'updated_at', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'disabled', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.users', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.statuses', 'SELECT')
+  AND pg_catalog.has_table_privilege(role.oid, 'public.statuses', 'INSERT')
+  AND pg_catalog.has_table_privilege(role.oid, 'public.statuses', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.statuses', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.follows', 'SELECT')
+    AND pg_catalog.has_table_privilege(role.oid, 'public.follows', 'INSERT')
+    AND pg_catalog.has_table_privilege(role.oid, 'public.follows', 'UPDATE')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.follows', 'DELETE')
+    AND pg_catalog.has_table_privilege(role.oid, 'public.follow_requests', 'SELECT')
+    AND pg_catalog.has_table_privilege(role.oid, 'public.follow_requests', 'INSERT')
+    AND pg_catalog.has_table_privilege(role.oid, 'public.follow_requests', 'UPDATE')
+    AND pg_catalog.has_table_privilege(role.oid, 'public.follow_requests', 'DELETE')
+    AND pg_catalog.has_table_privilege(role.oid, 'public.account_domain_blocks', 'SELECT')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.blocks', 'SELECT')
+    AND pg_catalog.has_table_privilege(role.oid, 'public.blocks', 'INSERT')
+    AND pg_catalog.has_table_privilege(role.oid, 'public.blocks', 'UPDATE')
+    AND pg_catalog.has_table_privilege(role.oid, 'public.blocks', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.mutes', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.mutes', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.mutes', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.mutes', 'DELETE')
+    AND pg_catalog.has_table_privilege(role.oid, 'public.mentions', 'SELECT')
+    AND pg_catalog.has_table_privilege(role.oid, 'public.mentions', 'INSERT')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.mentions', 'DELETE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.mentions', 'silent', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.mentions', 'updated_at', 'UPDATE')
+    AND pg_catalog.has_table_privilege(role.oid, 'public.relays', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.notification_permissions', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.notification_permissions', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.notification_permissions', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.notifications', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.notifications', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.notifications', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.notifications', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.notification_requests', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.notification_requests', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.notification_requests', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.notification_requests', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.notification_policies', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.notification_policies', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.notification_policies', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.notification_policies', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.status_stats', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.status_stats', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.status_stats', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.status_stats', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.status_edits', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.status_edits', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.statuses_tags', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.statuses_tags', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.statuses_tags', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.accounts_tags', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.accounts_tags', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.accounts_tags', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.accounts_tags', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.tags', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.tags', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.tags', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.media_attachments', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.media_attachments', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.media_attachments', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.media_attachments', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.conversations', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.conversations', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.conversations', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.conversations', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.account_conversations', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.account_conversations', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.account_conversations', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.account_conversations', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.conversation_mutes', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.conversation_mutes', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.conversation_mutes', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.conversation_mutes', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.bookmarks', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.bookmarks', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.bookmarks', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.bookmarks', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.favourites', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.favourites', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.favourites', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.favourites', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.status_pins', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.status_pins', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.status_pins', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.status_pins', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.markers', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.markers', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.markers', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.login_activities', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.login_activities', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.login_activities', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.session_activations', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.session_activations', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.session_activations', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.session_activations', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.web_push_subscriptions', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.web_push_subscriptions', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.oauth_applications', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.oauth_applications', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.oauth_applications', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.oauth_access_grants', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.oauth_access_grants', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.oauth_access_grants', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.oauth_access_grants', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.oauth_access_tokens', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.oauth_access_tokens', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.oauth_access_tokens', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'public.oauth_access_tokens', 'DELETE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.statuses_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.notifications_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.notification_requests_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.notification_permissions_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.notification_policies_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.markers_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.status_stats_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.status_pins_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.bookmarks_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.favourites_id_seq', 'USAGE')
+    AND pg_catalog.has_sequence_privilege(role.oid, 'public.conversations_id_seq', 'USAGE')
+    AND pg_catalog.has_sequence_privilege(role.oid, 'public.account_conversations_id_seq', 'USAGE')
+    AND pg_catalog.has_sequence_privilege(role.oid, 'public.follows_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.follow_requests_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.blocks_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.mutes_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.media_attachments_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.login_activities_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.session_activations_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.oauth_applications_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.oauth_access_grants_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.oauth_access_tokens_id_seq', 'USAGE')
+   AND pg_catalog.has_sequence_privilege(role.oid, 'public.tags_id_seq', 'USAGE')
+    AND pg_catalog.has_sequence_privilege(role.oid, 'public.mentions_id_seq', 'USAGE')
+    AND pg_catalog.has_sequence_privilege(role.oid, 'public.status_edits_id_seq', 'USAGE')
+    AND pg_catalog.has_sequence_privilege(role.oid, 'public.tombstones_id_seq', 'USAGE')
+   AND pg_catalog.has_table_privilege(role.oid, 'rustodon.outbox_events', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'rustodon.outbox_events', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'rustodon.outbox_events', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'rustodon.outbox_events', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'rustodon.durable_jobs', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'rustodon.durable_jobs', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'rustodon.idempotency_keys', 'SELECT')
+   AND pg_catalog.has_table_privilege(role.oid, 'rustodon.idempotency_keys', 'INSERT')
+   AND pg_catalog.has_table_privilege(role.oid, 'rustodon.idempotency_keys', 'UPDATE')
+   AND pg_catalog.has_table_privilege(role.oid, 'rustodon.idempotency_keys', 'DELETE')
+   AND pg_catalog.has_table_privilege(role.oid, 'rustodon.ordering_markers', 'SELECT')
+    AND pg_catalog.has_table_privilege(role.oid, 'rustodon.ordering_markers', 'INSERT')
+    AND pg_catalog.has_table_privilege(role.oid, 'rustodon.ordering_markers', 'UPDATE')
+    AND pg_catalog.has_table_privilege(role.oid, 'rustodon.ordering_markers', 'DELETE')
+     AND pg_catalog.has_table_privilege(role.oid, 'rustodon.rate_limit_windows', 'SELECT')
+     AND pg_catalog.has_table_privilege(role.oid, 'rustodon.rate_limit_windows', 'INSERT')
+     AND pg_catalog.has_table_privilege(role.oid, 'rustodon.rate_limit_windows', 'UPDATE')
+     AND pg_catalog.has_table_privilege(role.oid, 'rustodon.rate_limit_windows', 'DELETE')
+      AND pg_catalog.has_sequence_privilege(role.oid, 'rustodon.outbox_events_id_seq', 'USAGE')
+  AND NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_auth_members membership
+    WHERE membership.member = role.oid OR membership.roleid = role.oid
+  )
+   AND NOT EXISTS (
+     SELECT 1
+     FROM pg_catalog.pg_namespace namespace
+      WHERE namespace.nspowner = role.oid
+   )
+    AND NOT EXISTS (
+      SELECT 1
+     FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+     WHERE relation.relowner = role.oid
+  )
+  AND NOT EXISTS (
+    SELECT 1
+     FROM pg_catalog.pg_proc function_record
+     JOIN pg_catalog.pg_namespace namespace ON namespace.oid = function_record.pronamespace
+     WHERE function_record.proowner = role.oid
+  )
+     AND NOT EXISTS (
+       SELECT 1
+      FROM pg_catalog.pg_type type_record
+      JOIN pg_catalog.pg_namespace namespace ON namespace.oid = type_record.typnamespace
+      WHERE type_record.typowner = role.oid
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM (
+        SELECT extension_record.extowner AS owner_oid
+        FROM pg_catalog.pg_extension extension_record
+        UNION ALL
+        SELECT collation_record.collowner
+        FROM pg_catalog.pg_collation collation_record
+        UNION ALL
+        SELECT conversion_record.conowner
+        FROM pg_catalog.pg_conversion conversion_record
+        UNION ALL
+        SELECT operator_record.oprowner
+        FROM pg_catalog.pg_operator operator_record
+        UNION ALL
+        SELECT operator_class_record.opcowner
+        FROM pg_catalog.pg_opclass operator_class_record
+        UNION ALL
+        SELECT operator_family_record.opfowner
+        FROM pg_catalog.pg_opfamily operator_family_record
+        UNION ALL
+        SELECT statistics_record.stxowner
+        FROM pg_catalog.pg_statistic_ext statistics_record
+        UNION ALL
+        SELECT dictionary_record.dictowner
+        FROM pg_catalog.pg_ts_dict dictionary_record
+        UNION ALL
+        SELECT configuration_record.cfgowner
+        FROM pg_catalog.pg_ts_config configuration_record
+        UNION ALL
+        SELECT event_trigger_record.evtowner
+        FROM pg_catalog.pg_event_trigger event_trigger_record
+      ) owned
+      WHERE owned.owner_oid = role.oid
+    )
+    AND NOT EXISTS (
+      SELECT 1
+       FROM pg_catalog.pg_type type_record
+       CROSS JOIN LATERAL pg_catalog.aclexplode(
+         COALESCE(type_record.typacl, pg_catalog.acldefault('T', type_record.typowner))
+       ) acl
+       WHERE acl.grantee = role.oid
+          OR (
+            acl.grantee = 0
+            AND NOT EXISTS (
+              SELECT 1
+              FROM pg_catalog.aclexplode(pg_catalog.acldefault('T', type_record.typowner)) default_acl
+              WHERE default_acl.grantee = acl.grantee
+                AND default_acl.privilege_type = acl.privilege_type
+                AND default_acl.is_grantable = acl.is_grantable
+            )
+          )
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_language language
+      WHERE language.lanowner = role.oid
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_language language
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(language.lanacl, pg_catalog.acldefault('l', language.lanowner))
+      ) acl
+      WHERE acl.grantee = role.oid
+         OR (
+           acl.grantee = 0
+           AND NOT EXISTS (
+             SELECT 1
+             FROM pg_catalog.aclexplode(pg_catalog.acldefault('l', language.lanowner)) default_acl
+             WHERE default_acl.grantee = acl.grantee
+               AND default_acl.privilege_type = acl.privilege_type
+               AND default_acl.is_grantable = acl.is_grantable
+           )
+         )
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_foreign_data_wrapper wrapper
+      WHERE wrapper.fdwowner = role.oid
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_foreign_data_wrapper wrapper
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(wrapper.fdwacl, pg_catalog.acldefault('F', wrapper.fdwowner))
+      ) acl
+      WHERE acl.grantee IN (0, role.oid)
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_foreign_server server
+      WHERE server.srvowner = role.oid
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_foreign_server server
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(server.srvacl, pg_catalog.acldefault('S', server.srvowner))
+      ) acl
+      WHERE acl.grantee IN (0, role.oid)
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_tablespace tablespace
+      WHERE tablespace.spcowner = role.oid
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_tablespace tablespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(tablespace.spcacl, pg_catalog.acldefault('t', tablespace.spcowner))
+      ) acl
+      WHERE acl.grantee IN (0, role.oid)
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_publication publication
+      WHERE publication.pubowner = role.oid
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_subscription subscription
+      WHERE subscription.subowner = role.oid
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_largeobject_metadata large_object
+      WHERE large_object.lomowner = role.oid
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_largeobject_metadata large_object
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(
+          large_object.lomacl,
+          pg_catalog.acldefault('L', large_object.lomowner)
+        )
+      ) acl
+      WHERE acl.grantee IN (0, role.oid)
+    )
+     AND NOT EXISTS (
+       SELECT 1
+       FROM pg_catalog.pg_default_acl default_acl
+    CROSS JOIN LATERAL pg_catalog.aclexplode(default_acl.defaclacl) acl
+    WHERE acl.grantee IN (0, role.oid)
+      AND acl.privilege_type IN (
+         'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN', 'CREATE', 'USAGE', 'EXECUTE'
+       )
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_database database_acl
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(database_acl.datacl, pg_catalog.acldefault('d', database_acl.datdba))
+      ) acl
+      WHERE database_acl.oid = database_record.oid
+        AND acl.grantee IN (0, role.oid)
+        AND (
+          acl.grantee = 0
+          OR acl.is_grantable
+          OR acl.privilege_type <> 'CONNECT'
+        )
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_namespace namespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(namespace.nspacl, pg_catalog.acldefault('n', namespace.nspowner))
+      ) acl
+      WHERE acl.grantee IN (0, role.oid)
+        AND (
+          (acl.grantee = role.oid
+           AND namespace.nspname NOT IN ('public', 'rustodon'))
+              OR (
+                namespace.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
+                AND (
+                  namespace.nspname NOT IN ('public', 'rustodon')
+                  OR acl.grantee = 0
+                  OR acl.is_grantable
+                  OR acl.privilege_type <> 'USAGE'
+                )
+              )
+              OR (
+                acl.grantee = 0
+                AND namespace.nspname IN ('pg_catalog', 'pg_toast', 'information_schema')
+                AND (acl.is_grantable OR acl.privilege_type <> 'USAGE')
+              )
+            )
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_class relation
+      JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(relation.relacl, pg_catalog.acldefault(
+          CASE WHEN relation.relkind = 'S' THEN 's'::"char" ELSE 'r'::"char" END,
+          relation.relowner))
+      ) acl
+      WHERE namespace.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
+        AND namespace.nspname <> 'information_schema'
+        AND acl.grantee = 0
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_attribute attribute
+      JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid
+      JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) acl
+      WHERE namespace.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
+        AND namespace.nspname <> 'information_schema'
+        AND acl.grantee = 0
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_proc function_record
+      JOIN pg_catalog.pg_namespace namespace ON namespace.oid = function_record.pronamespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(function_record.proacl, pg_catalog.acldefault('f', function_record.proowner))
+      ) acl
+      WHERE namespace.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
+        AND namespace.nspname <> 'information_schema'
+        AND acl.grantee = 0
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_class relation
+      JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(relation.relacl, pg_catalog.acldefault(
+          CASE WHEN relation.relkind = 'S' THEN 's'::"char" ELSE 'r'::"char" END,
+          relation.relowner))
+      ) acl
+      WHERE namespace.nspname IN ('pg_catalog', 'pg_toast', 'information_schema')
+        AND (
+          acl.grantee = role.oid
+          OR (
+            acl.grantee = 0
+            AND (
+              acl.is_grantable
+              OR (
+                NOT (
+                  namespace.nspname = 'information_schema'
+                  AND relation.oid < 16384
+                  AND acl.privilege_type = 'SELECT'
+                  AND NOT acl.is_grantable
+                )
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM pg_catalog.pg_init_privs initial_privilege
+                  CROSS JOIN LATERAL pg_catalog.aclexplode(initial_privilege.initprivs) initial_acl
+                  WHERE initial_privilege.classoid = 'pg_catalog.pg_class'::regclass
+                    AND initial_privilege.objoid = relation.oid
+                    AND initial_privilege.objsubid = 0
+                    AND initial_acl.grantor = acl.grantor
+                    AND initial_acl.grantee = acl.grantee
+                    AND initial_acl.privilege_type = acl.privilege_type
+                    AND initial_acl.is_grantable = acl.is_grantable
+                )
+              )
+            )
+          )
+        )
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_attribute attribute
+      JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid
+      JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) acl
+      WHERE namespace.nspname IN ('pg_catalog', 'pg_toast', 'information_schema')
+        AND (
+          acl.grantee = role.oid
+          OR (
+            acl.grantee = 0
+            AND (
+              acl.is_grantable
+              OR acl.privilege_type <> 'SELECT'
+              OR (
+                NOT (
+                  namespace.nspname = 'pg_catalog'
+                  AND relation.relname = 'pg_subscription'
+                  AND attribute.attname IN (
+                    'oid', 'subdbid', 'subname', 'subowner', 'subenabled',
+                    'subbinary', 'substream', 'subslotname', 'subsynccommit',
+                    'subpublications'
+                  )
+                  AND NOT acl.is_grantable
+                )
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM pg_catalog.pg_init_privs initial_privilege
+                  CROSS JOIN LATERAL pg_catalog.aclexplode(initial_privilege.initprivs) initial_acl
+                  WHERE initial_privilege.classoid = 'pg_catalog.pg_attribute'::regclass
+                    AND initial_privilege.objoid = relation.oid
+                    AND initial_privilege.objsubid = attribute.attnum
+                    AND initial_acl.grantor = acl.grantor
+                    AND initial_acl.grantee = acl.grantee
+                    AND initial_acl.privilege_type = acl.privilege_type
+                    AND initial_acl.is_grantable = acl.is_grantable
+                )
+              )
+            )
+          )
+        )
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_proc function_record
+      JOIN pg_catalog.pg_namespace namespace ON namespace.oid = function_record.pronamespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(function_record.proacl, pg_catalog.acldefault('f', function_record.proowner))
+      ) acl
+      WHERE namespace.nspname IN ('pg_catalog', 'pg_toast', 'information_schema')
+        AND (
+          acl.grantee = role.oid
+          OR (
+            acl.grantee = 0
+            AND (
+              acl.is_grantable
+              OR acl.privilege_type <> 'EXECUTE'
+              OR (
+                (function_record.proacl IS NOT NULL OR function_record.oid >= 16384)
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM pg_catalog.pg_init_privs initial_privilege
+                  CROSS JOIN LATERAL pg_catalog.aclexplode(initial_privilege.initprivs) initial_acl
+                  WHERE initial_privilege.classoid = 'pg_catalog.pg_proc'::regclass
+                    AND initial_privilege.objoid = function_record.oid
+                    AND initial_privilege.objsubid = 0
+                    AND initial_acl.grantor = acl.grantor
+                    AND initial_acl.grantee = acl.grantee
+                    AND initial_acl.privilege_type = acl.privilege_type
+                    AND initial_acl.is_grantable = acl.is_grantable
+                )
+              )
+            )
+          )
+        )
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_class relation
+      JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(relation.relacl, pg_catalog.acldefault(
+          CASE WHEN relation.relkind = 'S' THEN 's'::"char" ELSE 'r'::"char" END,
+          relation.relowner))
+      ) acl
+       WHERE namespace.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
+         AND namespace.nspname <> 'information_schema'
+         AND relation.relkind <> 'S'
+         AND acl.grantee IN (0, role.oid)
+         AND acl.privilege_type NOT IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE')
+   )
+   AND NOT EXISTS (
+     SELECT 1
+     FROM pg_catalog.pg_class relation
+     JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+     CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(relation.relacl, pg_catalog.acldefault('s', relation.relowner))
+     ) acl
+        WHERE namespace.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
+          AND namespace.nspname <> 'information_schema'
+          AND relation.relkind = 'S'
+          AND acl.grantee IN (0, role.oid)
+          AND (
+            acl.is_grantable
+            OR acl.privilege_type NOT IN ('SELECT', 'USAGE')
+            OR acl.privilege_type = 'UPDATE'
+           OR (
+             acl.privilege_type IN ('SELECT', 'USAGE')
+             AND NOT (
+               (namespace.nspname = 'public' AND relation.relname IN (
+                 'account_conversations_id_seq', 'account_deletion_requests_id_seq',
+                 'account_relationship_severance_events_id_seq', 'account_stats_id_seq',
+                 'account_warnings_id_seq', 'accounts_id_seq', 'admin_action_logs_id_seq',
+                 'blocks_id_seq', 'bookmarks_id_seq', 'canonical_email_blocks_id_seq',
+                 'collection_reports_id_seq', 'conversations_id_seq', 'domain_blocks_id_seq',
+                 'favourites_id_seq', 'follows_id_seq', 'follow_requests_id_seq',
+                 'keypairs_id_seq', 'login_activities_id_seq', 'markers_id_seq',
+                 'media_attachments_id_seq', 'mentions_id_seq', 'mutes_id_seq',
+                 'notification_permissions_id_seq', 'notification_policies_id_seq',
+                 'notification_requests_id_seq', 'notifications_id_seq',
+                 'oauth_access_grants_id_seq', 'oauth_access_tokens_id_seq',
+                 'oauth_applications_id_seq', 'reports_id_seq',
+                 'relationship_severance_events_id_seq', 'severed_relationships_id_seq',
+                 'session_activations_id_seq', 'status_edits_id_seq', 'status_pins_id_seq',
+                 'status_stats_id_seq', 'statuses_id_seq', 'tags_id_seq', 'tombstones_id_seq',
+                 'users_id_seq'))
+               OR (namespace.nspname = 'rustodon' AND relation.relname = 'outbox_events_id_seq')
+             )
+           )
+         )
+   )
+   AND NOT EXISTS (
+     SELECT 1
+      FROM pg_catalog.pg_class relation
+      JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(relation.relacl, pg_catalog.acldefault(
+          CASE WHEN relation.relkind = 'S' THEN 's'::"char" ELSE 'r'::"char" END,
+          relation.relowner))
+      ) acl
+        WHERE namespace.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
+         AND namespace.nspname <> 'information_schema'
+         AND acl.grantee IN (0, role.oid)
+         AND (
+           acl.is_grantable
+           OR
+           (acl.privilege_type = 'SELECT' AND relation.relkind <> 'S' AND NOT (
+             (namespace.nspname = 'public' AND relation.relname IN (
+               'account_aliases', 'account_conversations', 'account_deletion_requests',
+               'account_domain_blocks', 'account_migrations', 'account_notes', 'account_pins',
+               'account_relationship_severance_events', 'account_stats', 'account_warnings',
+               'accounts', 'accounts_tags', 'admin_action_logs', 'blocks', 'bookmarks',
+               'canonical_email_blocks', 'collection_items', 'collection_reports', 'collections',
+               'conversation_mutes', 'conversations', 'custom_emojis', 'custom_filters',
+               'domain_allows', 'domain_blocks', 'fasp_follow_recommendations', 'favourites',
+               'featured_tags', 'follow_requests', 'follows', 'generated_annual_reports',
+               'invites', 'keypairs', 'list_accounts', 'lists', 'login_activities', 'markers',
+               'media_attachments', 'mentions', 'mutes', 'notification_permissions',
+               'notification_policies', 'notification_requests', 'notifications',
+               'oauth_access_grants', 'oauth_access_tokens', 'oauth_applications', 'poll_votes',
+               'polls', 'quotes', 'relationship_severance_events', 'relays', 'report_notes',
+               'reports', 'rules', 'scheduled_statuses', 'session_activations',
+               'severed_relationships', 'status_edits', 'status_pins', 'status_stats', 'statuses',
+               'statuses_tags', 'tag_follows', 'tags', 'tombstones', 'user_roles', 'users',
+               'web_push_subscriptions', 'webauthn_credentials'))
+              OR (namespace.nspname = 'rustodon' AND relation.relname IN (
+                 'durable_jobs', 'idempotency_keys', 'ordering_markers', 'outbox_events',
+                 'rate_limit_windows'))
+           ))
+           OR
+           (acl.privilege_type = 'INSERT' AND NOT (
+             (namespace.nspname = 'public' AND relation.relname IN (
+                'account_conversations', 'account_deletion_requests',
+                'account_relationship_severance_events', 'account_stats',
+                'account_warnings', 'accounts_tags', 'admin_action_logs',
+                'blocks', 'bookmarks', 'canonical_email_blocks', 'collection_reports',
+                'conversations', 'conversation_mutes', 'domain_blocks', 'favourites',
+                'follows', 'follow_requests', 'keypairs', 'login_activities', 'markers',
+                'media_attachments', 'mentions', 'mutes', 'notification_permissions',
+                'notification_policies', 'notification_requests', 'notifications',
+                'oauth_access_grants', 'oauth_access_tokens', 'oauth_applications',
+                'reports', 'relationship_severance_events', 'severed_relationships',
+                'session_activations', 'status_edits', 'status_pins', 'status_stats',
+                'statuses', 'statuses_tags', 'tags', 'tombstones'))
+             OR (namespace.nspname = 'rustodon' AND relation.relname IN (
+                 'idempotency_keys', 'ordering_markers', 'outbox_events', 'rate_limit_windows'))
+          ))
+          OR
+          (acl.privilege_type = 'UPDATE' AND NOT (
+             (namespace.nspname = 'public' AND relation.relname IN (
+                'account_stats', 'accounts_tags', 'account_conversations',
+                'account_deletion_requests', 'polls', 'bookmarks',
+               'conversations', 'conversation_mutes', 'domain_blocks', 'favourites',
+               'featured_tags', 'follows', 'follow_requests', 'keypairs', 'markers', 'media_attachments',
+               'mutes', 'notifications', 'notification_policies', 'notification_requests',
+               'oauth_access_grants', 'oauth_access_tokens',
+               'blocks', 'reports', 'relationship_severance_events',
+              'account_relationship_severance_events', 'session_activations', 'status_pins',
+              'status_stats', 'statuses', 'tags'))
+            OR (namespace.nspname = 'rustodon' AND relation.relname IN (
+                 'idempotency_keys', 'ordering_markers', 'outbox_events', 'rate_limit_windows'))
+         ))
+         OR (acl.privilege_type = 'DELETE' AND NOT (
+            (namespace.nspname = 'public' AND relation.relname IN (
+               'account_aliases', 'account_conversations', 'account_deletion_requests',
+               'account_domain_blocks', 'account_migrations', 'account_notes', 'account_pins',
+               'accounts', 'account_stats', 'accounts_tags',
+              'blocks', 'bookmarks', 'canonical_email_blocks', 'conversations',
+               'collection_items', 'collections', 'conversation_mutes', 'custom_emojis', 'custom_filters',
+              'domain_blocks', 'favourites', 'featured_tags', 'follows', 'follow_requests',
+              'invites', 'keypairs', 'list_accounts', 'lists',
+              'login_activities', 'media_attachments', 'mentions', 'mutes', 'notifications',
+              'notification_permissions', 'notification_policies', 'notification_requests',
+              'oauth_applications', 'oauth_access_grants', 'oauth_access_tokens', 'reports',
+               'poll_votes', 'polls', 'report_notes', 'scheduled_statuses', 'session_activations',
+               'status_pins', 'status_stats', 'statuses', 'statuses_tags', 'tag_follows',
+                'web_push_subscriptions', 'webauthn_credentials', 'generated_annual_reports',
+               'fasp_follow_recommendations'))
+            OR (namespace.nspname = 'rustodon' AND relation.relname IN (
+                 'durable_jobs', 'idempotency_keys', 'ordering_markers', 'outbox_events',
+                 'rate_limit_windows'))
+         ))
+        )
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_attribute attribute
+      JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid
+      JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) acl
+      WHERE attribute.attnum > 0
+         AND NOT attribute.attisdropped
+          AND namespace.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
+          AND namespace.nspname <> 'information_schema'
+          AND acl.grantee IN (0, role.oid)
+         AND (
+           acl.is_grantable
+           OR acl.privilege_type NOT IN ('INSERT', 'UPDATE')
+           OR (acl.privilege_type = 'INSERT' AND NOT (
+            (namespace.nspname = 'public' AND relation.relname = 'accounts'
+             AND attribute.attname IN (
+               'username', 'private_key', 'public_key', 'created_at', 'updated_at', 'domain',
+               'actor_type', 'display_name', 'note', 'uri', 'url', 'inbox_url',
+               'shared_inbox_url', 'protocol', 'last_webfingered_at'))
+            OR (namespace.nspname = 'public' AND relation.relname = 'users'
+                AND attribute.attname IN (
+                  'account_id', 'email', 'encrypted_password', 'approved', 'confirmed_at',
+                  'confirmation_token', 'confirmation_sent_at', 'created_at', 'updated_at'))
+          ))
+          OR (acl.privilege_type = 'UPDATE' AND NOT (
+            (namespace.nspname = 'public' AND relation.relname = 'accounts'
+             AND attribute.attname IN (
+               'username', 'domain', 'display_name', 'note', 'actor_type', 'locked', 'memorial',
+               'discoverable', 'trendable', 'also_known_as', 'moved_to_account_id',
+               'reviewed_at', 'requested_review_at', 'hide_collections', 'indexable',
+               'attribution_domains', 'fields', 'avatar_content_type', 'avatar_description',
+               'avatar_file_name', 'avatar_file_size', 'avatar_remote_url',
+               'avatar_storage_schema_version', 'avatar_updated_at', 'header_content_type',
+               'header_description', 'header_file_name', 'header_file_size', 'header_remote_url',
+               'header_storage_schema_version', 'header_updated_at', 'silenced_at',
+               'suspended_at', 'suspension_origin', 'uri', 'url', 'inbox_url', 'outbox_url',
+               'followers_url', 'following_url', 'shared_inbox_url', 'protocol', 'public_key',
+               'last_webfingered_at', 'updated_at'))
+            OR (namespace.nspname = 'public' AND relation.relname = 'users'
+                AND attribute.attname IN (
+                   'settings', 'consumed_timestep', 'otp_backup_codes', 'otp_required_for_login',
+                   'otp_secret', 'current_sign_in_at',
+                  'last_sign_in_at', 'sign_in_count', 'encrypted_password',
+                  'reset_password_token', 'reset_password_sent_at', 'sign_in_token',
+                   'sign_in_token_sent_at', 'confirmed_at', 'confirmation_token',
+                   'confirmation_sent_at', 'disabled',
+                  'updated_at'))
+            OR (namespace.nspname = 'public' AND relation.relname = 'mentions'
+                AND attribute.attname IN ('silent', 'updated_at'))
+          ))
+        )
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_proc function_record
+      JOIN pg_catalog.pg_namespace namespace ON namespace.oid = function_record.pronamespace
+      CROSS JOIN LATERAL pg_catalog.aclexplode(
+        COALESCE(function_record.proacl, pg_catalog.acldefault('f', function_record.proowner))
+      ) acl
+      WHERE namespace.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema')
+        AND namespace.nspname <> 'information_schema'
+        AND acl.grantee IN (0, role.oid)
+        AND (
+          acl.is_grantable
+          OR (
+            acl.privilege_type = 'EXECUTE'
+            AND function_record.oid NOT IN (
+              'public.timestamp_id(text)'::regprocedure,
+              'public.rustodon_refresh_instances()'::regprocedure
+            )
+          )
+        )
+    )
+ FROM pg_catalog.pg_roles role
+JOIN pg_catalog.pg_database database_record
+  ON database_record.datname = pg_catalog.current_database()
+WHERE role.rolname = current_user
 "#;
 
 const ACTIVE_CONDITIONS_QUERY: &str = r"
@@ -567,7 +1559,7 @@ pub fn compare_migration_versions(actual: &BTreeSet<String>) -> Vec<Diagnostic> 
     missing.chain(unexpected).collect()
 }
 
-/// Returns the physical fingerprint for the 55 v1 tables and `schema_migrations`.
+/// Returns the physical fingerprint for the v1 tables and `schema_migrations`.
 #[must_use]
 pub fn expected_catalog() -> &'static [CatalogEntry] {
     static EXPECTED: OnceLock<Vec<CatalogEntry>> = OnceLock::new();
@@ -1134,6 +2126,8 @@ pub fn configuration_diagnostics(config: &Config) -> Vec<Diagnostic> {
 /// Runs all local and `PostgreSQL` checks without mutating Mastodon data or media.
 pub async fn run(config: &Config) -> PreflightReport {
     let mut diagnostics = runtime_diagnostics(config).await;
+    diagnostics.extend(writer_diagnostics(config).await);
+    diagnostics.extend(operational_schema_diagnostics(config).await);
     if config.sidekiq_redis.is_some() {
         diagnostics.extend(sidekiq_redis_diagnostics(config).await);
     }
@@ -1152,6 +2146,159 @@ pub async fn runtime_diagnostics(config: &Config) -> Vec<Diagnostic> {
         Err(diagnostic) => diagnostics.push(diagnostic),
     }
     diagnostics
+}
+
+/// Validates the optional Mastodon writer connection without mutating either database.
+pub async fn writer_diagnostics(config: &Config) -> Vec<Diagnostic> {
+    let Some(database) = config.write_database.as_ref() else {
+        return Vec::new();
+    };
+    let Ok(options) = postgres_options_for(database) else {
+        return vec![writer_configuration_diagnostic()];
+    };
+    let Ok(primary_options) = postgres_options(config) else {
+        return vec![writer_configuration_diagnostic()];
+    };
+    let inspected = tokio::time::timeout(CONNECTION_TIMEOUT, async {
+        let mut connection = PgConnection::connect_with(&options)
+            .await
+            .map_err(|_| WriterInspectionError::Connection)?;
+        let writer_target = sqlx::query_scalar::<_, String>(
+            "SELECT current_database() || ':'
+                    || EXTRACT(EPOCH FROM pg_catalog.pg_postmaster_start_time())::text",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .map_err(|_| WriterInspectionError::Connection)?;
+        let mut primary_connection = PgConnection::connect_with(&primary_options)
+            .await
+            .map_err(|_| WriterInspectionError::Connection)?;
+        let primary_target = sqlx::query_scalar::<_, String>(
+            "SELECT current_database() || ':'
+                    || EXTRACT(EPOCH FROM pg_catalog.pg_postmaster_start_time())::text",
+        )
+        .fetch_one(&mut primary_connection)
+        .await
+        .map_err(|_| WriterInspectionError::Connection)?;
+        if writer_target != primary_target {
+            return Err(WriterInspectionError::DatabaseMismatch);
+        }
+        sqlx::query_scalar::<_, bool>(WRITER_PRIVILEGE_QUERY)
+            .fetch_one(&mut connection)
+            .await
+            .map_err(|_| WriterInspectionError::Privileges)
+    })
+    .await;
+    match inspected {
+        Ok(Ok(true)) => Vec::new(),
+        Ok(Ok(false) | Err(WriterInspectionError::Privileges)) => {
+            vec![writer_privilege_diagnostic()]
+        }
+        Ok(Err(WriterInspectionError::DatabaseMismatch)) => {
+            vec![writer_database_diagnostic()]
+        }
+        Err(_) | Ok(Err(WriterInspectionError::Connection)) => {
+            vec![writer_connection_diagnostic()]
+        }
+    }
+}
+
+/// Validates the operational schema when it has been provisioned, while allowing the
+/// pre-migration cutover check to run before that schema exists.
+pub async fn operational_schema_diagnostics(config: &Config) -> Vec<Diagnostic> {
+    let Ok(options) = postgres_options(config) else {
+        return vec![operational_schema_diagnostic()];
+    };
+    let inspected = tokio::time::timeout(CONNECTION_TIMEOUT, async {
+        let mut connection = PgConnection::connect_with(&options)
+            .await
+            .map_err(|error| error.to_string())?;
+        let schema_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT pg_catalog.to_regnamespace('rustodon') IS NOT NULL",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .map_err(|error| error.to_string())?;
+        if !schema_exists {
+            return Ok::<bool, String>(false);
+        }
+        if let Some(writer) = config
+            .write_database
+            .as_ref()
+            .and_then(postgres_username_for)
+        {
+            sqlx::query("SELECT pg_catalog.set_config('rustodon.writer_role', $1, false)")
+                .bind(writer)
+                .execute(&mut connection)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        operational_schema::validate(&mut connection)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok::<bool, String>(true)
+    })
+    .await;
+    match inspected {
+        Ok(Ok(_)) => Vec::new(),
+        Ok(Err(detail)) => vec![operational_schema_diagnostic_with_detail(&detail)],
+        Err(_) => vec![operational_schema_diagnostic()],
+    }
+}
+
+fn operational_schema_diagnostic() -> Diagnostic {
+    Diagnostic::fatal(
+        "PF_OPERATIONAL_SCHEMA",
+        "the Rustodon operational schema or runtime database role is not ready",
+        "run the explicit operational migration and grant the documented runtime privileges",
+    )
+}
+
+fn operational_schema_diagnostic_with_detail(detail: &str) -> Diagnostic {
+    Diagnostic::fatal(
+        "PF_OPERATIONAL_SCHEMA",
+        format!("the Rustodon operational schema or runtime database role is not ready: {detail}"),
+        "run the explicit operational migration and grant the documented runtime privileges",
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriterInspectionError {
+    Connection,
+    DatabaseMismatch,
+    Privileges,
+}
+
+fn writer_configuration_diagnostic() -> Diagnostic {
+    Diagnostic::fatal(
+        "PF_WRITE_DATABASE_CONFIG",
+        "the configured Mastodon writer database is invalid",
+        "correct WRITE_DATABASE_URL before enabling Mastodon writes",
+    )
+}
+
+fn writer_connection_diagnostic() -> Diagnostic {
+    Diagnostic::fatal(
+        "PF_WRITE_DATABASE_CONNECT",
+        "the configured Mastodon writer database is unavailable",
+        "verify WRITE_DATABASE_URL and the writer role's CONNECT privilege",
+    )
+}
+
+fn writer_privilege_diagnostic() -> Diagnostic {
+    Diagnostic::fatal(
+        "PF_WRITE_DATABASE_PRIVILEGES",
+        "the configured Mastodon writer role is missing required privileges or is not least privileged",
+        "use a dedicated non-owner Mastodon writer role with only the documented table and sequence grants",
+    )
+}
+
+fn writer_database_diagnostic() -> Diagnostic {
+    Diagnostic::fatal(
+        "PF_WRITE_DATABASE_TARGET",
+        "WRITE_DATABASE_URL points to a different PostgreSQL database or server than DATABASE_URL",
+        "point WRITE_DATABASE_URL at the primary Mastodon database and server, using only a dedicated writer role",
+    )
 }
 
 #[derive(Clone)]
@@ -1484,7 +2631,18 @@ impl std::error::Error for PostgresOptionsError {}
 ///
 /// Returns [`PostgresOptionsError`] when a configured `PostgreSQL` URL is invalid.
 pub fn postgres_options(config: &Config) -> Result<PgConnectOptions, PostgresOptionsError> {
-    let options = match &config.database.connection {
+    postgres_options_for(&config.database)
+}
+
+/// Builds `SQLx` connection options from a validated `PostgreSQL` endpoint.
+///
+/// # Errors
+///
+/// Returns [`PostgresOptionsError`] when the configured `PostgreSQL` URL is invalid.
+pub fn postgres_options_for(
+    database: &PostgresConfig,
+) -> Result<PgConnectOptions, PostgresOptionsError> {
+    let options = match &database.connection {
         PostgresConnection::Url { url, .. } => {
             PgConnectOptions::from_str(url.expose_secret()).map_err(|_| PostgresOptionsError)?
         }
@@ -1513,7 +2671,7 @@ pub fn postgres_options(config: &Config) -> Result<PgConnectOptions, PostgresOpt
             .username(username)
             .password(password.expose_secret()),
     };
-    Ok(options.ssl_mode(match config.database.ssl_mode {
+    Ok(options.ssl_mode(match database.ssl_mode {
         PostgresSslMode::Disable => PgSslMode::Disable,
         PostgresSslMode::Allow => PgSslMode::Allow,
         PostgresSslMode::Prefer => PgSslMode::Prefer,
@@ -1521,6 +2679,14 @@ pub fn postgres_options(config: &Config) -> Result<PgConnectOptions, PostgresOpt
         PostgresSslMode::VerifyCa => PgSslMode::VerifyCa,
         PostgresSslMode::VerifyFull => PgSslMode::VerifyFull,
     }))
+}
+
+/// Returns the role selected by a validated `PostgreSQL` endpoint without exposing its secret.
+#[must_use]
+pub fn postgres_username_for(database: &PostgresConfig) -> Option<String> {
+    postgres_options_for(database)
+        .ok()
+        .map(|options| options.get_username().to_owned())
 }
 
 fn database_connection_diagnostic() -> Diagnostic {

@@ -360,6 +360,10 @@ impl SecretText {
     pub fn is_present(&self) -> bool {
         !self.0.is_empty()
     }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Debug for SecretText {

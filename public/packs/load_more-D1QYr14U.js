@@ -1,0 +1,2 @@
+import{t as e}from"./jsx-runtime-SsSjplwM.js";import{a as t}from"./react-intl-Cop388b4.js";import{nt as n}from"./poll-jQ-MWCuw.js";var r=e(),i=({onClick:e,disabled:i,visible:a=!0,loading:o=!1})=>(0,r.jsx)(`button`,{type:`button`,className:`load-more`,disabled:i||o||!a,style:{visibility:a?`visible`:`hidden`},onClick:e,children:o?(0,r.jsx)(n,{}):(0,r.jsx)(t,{id:`status.load_more`,defaultMessage:`Load more`})});export{i as t};
+//# sourceMappingURL=load_more-D1QYr14U.js.map

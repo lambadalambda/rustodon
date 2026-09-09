@@ -1,0 +1,2 @@
+import{o as e}from"./chunk-CMxvf4Kt.js";import{n as t}from"./jsx-runtime-SsSjplwM.js";import{Ca as n}from"./render-CoSj8P7u.js";var r=e(t());function i(e,t){return(0,r.useCallback)((n,i,o,s)=>{if(n instanceof HTMLAnchorElement)return e?(0,r.createElement)(`span`,{...a(i),key:i.key},o):t?.(n,i,o,s)},[t,e])}function a(e){let t={};for(let r of Object.keys(e))r in n.tags.span.attributes&&(t[r]=e[r]);return t}export{i as t};
+//# sourceMappingURL=useFieldHtml-D4bPMj1L.js.map

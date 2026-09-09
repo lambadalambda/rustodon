@@ -134,7 +134,7 @@ fn every_expected_physical_catalog_entry_is_required_and_compared() {
             .iter()
             .filter(|entry| entry.kind == CatalogKind::Relation)
             .count(),
-        71
+        77
     );
     assert_eq!(
         expected

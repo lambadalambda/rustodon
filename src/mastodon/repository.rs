@@ -1,27 +1,32 @@
 use std::time::Duration;
 
+use chrono::NaiveDateTime;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use unicode_normalization::UnicodeNormalization;
+use url::Url;
 
+use crate::crypto::ActiveRecordEncryptionConfig;
 use crate::paperclip::{PaperclipAttachment, PaperclipMetadata};
 use crate::preflight::V1_CRITICAL_TABLES;
+use crate::remote::canonical_remote_host;
 
 use super::policy::{
     AuthenticatedViewerFacts, AuthorRestriction, StatusAccessFacts, StatusAvailability,
-    StatusContextFacts, ViewerFacts, ViewerRestriction, status_access, status_context_access,
+    StatusContextFacts, ViewerFacts, ViewerRestriction, global_domain_policy, status_access,
+    status_context_access,
 };
 use super::records::{
     Account, AccountConversation, AccountDomainBlock, AccountRelationshipSeveranceEvent,
-    AccountStat, AccountTag, AccountWarning, Block, Bookmark, Collection, CollectionItem,
-    Conversation, ConversationMute, CustomFilter, CustomFilterKeyword, CustomFilterStatus,
-    DomainAllow, DomainBlock, Favourite, FeaturedTag, Follow, FollowRequest, GeneratedAnnualReport,
-    Keypair, List, ListAccount, Marker, MediaAttachment, Mention, Mute, Notification,
-    NotificationPermission, NotificationPolicy, NotificationRequest, OAuthAccessToken,
-    OAuthApplication, OAuthBearerCandidate, Poll, PollVote, Quote, RelationshipSeveranceEvent,
-    Report, Setting, Status, StatusEdit, StatusPin, StatusStat, StatusTag, Tag, Tombstone, User,
-    UserRole,
+    AccountStat, AccountTag, AccountWarning, ActivityPubSignatureKey, Block, Bookmark,
+    BrowserSession, Collection, CollectionItem, Conversation, ConversationMute, CustomFilter,
+    CustomFilterKeyword, CustomFilterStatus, DomainAllow, DomainBlock, Favourite, FeaturedTag,
+    Follow, FollowRequest, GeneratedAnnualReport, Keypair, List, ListAccount, Marker,
+    MediaAttachment, Mention, Mute, Notification, NotificationPermission, NotificationPolicy,
+    NotificationRequest, OAuthAccessToken, OAuthApplication, OAuthBearerCandidate, Poll, PollVote,
+    Quote, RelationshipSeveranceEvent, Report, Setting, Status, StatusEdit, StatusPin, StatusStat,
+    StatusTag, Tag, Tombstone, User, UserRole,
 };
-use super::types::{PermissionBits, StatusVisibility, UserPermission};
+use super::types::{PermissionBits, SecretText, StatusVisibility, UserPermission};
 
 #[derive(sqlx::FromRow)]
 #[allow(clippy::struct_excessive_bools)]
@@ -41,15 +46,45 @@ struct StatusPolicyRow {
     viewer_mutes_author: bool,
 }
 
+#[derive(sqlx::FromRow)]
+struct SignatureAccountRow {
+    id: i64,
+    #[allow(dead_code)]
+    username: String,
+    #[allow(dead_code)]
+    domain: Option<String>,
+    #[allow(dead_code)]
+    uri: String,
+    #[allow(dead_code)]
+    id_scheme: Option<i32>,
+    public_key: String,
+}
+
+fn parse_acct_key_id(key_id: &str) -> Option<(&str, &str)> {
+    let value = key_id.strip_prefix("acct:")?;
+    let (username, domain) = value.rsplit_once('@')?;
+    if username.is_empty()
+        || domain.is_empty()
+        || username.bytes().any(|byte| byte.is_ascii_whitespace())
+        || domain.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    Some((username, domain))
+}
+
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct ActivityPubQuoteTarget {
+    pub(crate) quote_id: i64,
     pub(crate) id: i64,
     pub(crate) account_id: i64,
     pub(crate) local: bool,
+    pub(crate) quoted_account_local: bool,
     pub(crate) id_scheme: Option<super::types::AccountIdScheme>,
     pub(crate) username: String,
     pub(crate) uri: Option<String>,
     pub(crate) url: Option<String>,
+    pub(crate) approval_uri: Option<String>,
 }
 
 impl StatusPolicyRow {
@@ -100,13 +135,15 @@ impl StatusPolicyRow {
 }
 use super::rest::{
     AccountListKind, AccountListOptions, AccountStatusesOptions, FollowCollectionKind,
-    FollowCollectionOptions, RestAccountHandleRow, RestAccountListRow, RestAccountRow,
-    RestAccountWarningRow, RestCredentialRow, RestCustomEmojiRow, RestFeaturedTagRow,
-    RestFollowCollectionRow, RestInstanceCountsRow, RestListedCustomEmojiRow, RestMentionRow,
-    RestNotificationGroupRow, RestNotificationTargetRow, RestPollVoteRow, RestPreviewCardRow,
-    RestRelationshipRow, RestRuleRow, RestSavedStatusRow, RestSeveranceEventRow, RestStatusRow,
-    RestStatusTagRow, RestTagSuggestionRow, RestTaggedCollectionRow, SavedStatusKind,
-    SavedStatusesOptions, TagTimelineOptions, TimelineOptions,
+    FollowCollectionOptions, FollowedTagsOptions, NotificationOptions, RestAccountHandleRow,
+    RestAccountListRow, RestAccountRow, RestAccountWarningRow, RestCredentialRow,
+    RestCustomEmojiRow, RestFeaturedTagRow, RestFollowCollectionRow, RestFollowedTagRow,
+    RestInstanceCountsRow, RestListedCustomEmojiRow, RestMentionRow, RestNotificationGroupRow,
+    RestNotificationTargetRow, RestPollVoteRow, RestPreferencesRow, RestPreviewCardRow,
+    RestRelationshipRow, RestRuleRow, RestSavedStatusRow, RestSeveranceEventRow,
+    RestStatusQuoteRow, RestStatusRow, RestStatusTagRow, RestTagSuggestionRow,
+    RestTaggedCollectionRow, SavedStatusKind, SavedStatusesOptions, TagTimelineOptions,
+    TimelineOptions, grouped_notification_types, notification_type_filter_with_exclusions,
 };
 
 const REST_LIST_TIMELINE_SQL: &str = "WITH authorized AS ( \
@@ -150,19 +187,19 @@ const REST_LIST_TIMELINE_SQL: &str = "WITH authorized AS ( \
      WHERE viewer_block.account_id = $1 AND viewer_block.target_account_id = status.account_id)) \
    AND (status.account_id = $1 OR NOT EXISTS (SELECT 1 FROM blocks author_block \
      WHERE author_block.account_id = status.account_id AND author_block.target_account_id = $1)) \
-   AND (status.account_id = $1 OR NOT EXISTS (SELECT 1 FROM mutes viewer_mute \
-     WHERE viewer_mute.account_id = $1 AND viewer_mute.target_account_id = status.account_id)) \
+    AND (status.account_id = $1 OR NOT EXISTS (SELECT 1 FROM mutes viewer_mute \
+      WHERE viewer_mute.account_id = $1 AND viewer_mute.target_account_id = status.account_id)) \
    AND (status.account_id = $1 OR NOT EXISTS (SELECT 1 FROM mentions mention \
      WHERE mention.status_id IN (status.id, status.reblog_of_id) AND NOT mention.silent \
        AND (EXISTS (SELECT 1 FROM blocks mention_block WHERE mention_block.account_id = $1 \
          AND mention_block.target_account_id = mention.account_id) \
-       OR EXISTS (SELECT 1 FROM mutes mention_mute WHERE mention_mute.account_id = $1 \
-         AND mention_mute.target_account_id = mention.account_id)))) \
+        OR EXISTS (SELECT 1 FROM mutes mention_mute WHERE mention_mute.account_id = $1 \
+          AND mention_mute.target_account_id = mention.account_id)))) \
    AND (status.account_id = $1 OR status.source_account_id IS NULL OR ( \
      NOT EXISTS (SELECT 1 FROM blocks source_block WHERE source_block.account_id = $1 \
        AND source_block.target_account_id = status.source_account_id) \
-     AND NOT EXISTS (SELECT 1 FROM mutes source_mute WHERE source_mute.account_id = $1 \
-       AND source_mute.target_account_id = status.source_account_id) \
+      AND NOT EXISTS (SELECT 1 FROM mutes source_mute WHERE source_mute.account_id = $1 \
+        AND source_mute.target_account_id = status.source_account_id) \
      AND NOT EXISTS (SELECT 1 FROM blocks source_author_block \
        WHERE source_author_block.account_id = status.source_account_id \
          AND source_author_block.target_account_id = $1) \
@@ -181,10 +218,38 @@ const REST_LIST_TIMELINE_SQL: &str = "WITH authorized AS ( \
 #[derive(Clone)]
 pub struct Repository {
     pool: PgPool,
+    active_record_encryption: Option<ActiveRecordEncryptionConfig>,
+}
+
+fn decrypt_otp_secret(
+    encryption: Option<&ActiveRecordEncryptionConfig>,
+    secret: Option<SecretText>,
+) -> sqlx::Result<Option<SecretText>> {
+    let Some(secret) = secret else {
+        return Ok(None);
+    };
+    let Some(encryption) = encryption else {
+        return Ok(Some(secret));
+    };
+    if !secret.as_str().trim_start().starts_with('{') {
+        return Ok(Some(secret));
+    }
+    let plaintext = encryption
+        .decrypt_string(secret.as_str(), 256)
+        .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+    Ok(Some(SecretText::new(plaintext.expose_secret().to_owned())))
 }
 
 #[allow(clippy::missing_errors_doc)]
 impl Repository {
+    #[must_use]
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self {
+            pool,
+            active_record_encryption: None,
+        }
+    }
+
     pub async fn connect(database_url: &str) -> sqlx::Result<Self> {
         let options = database_url.parse::<PgConnectOptions>()?;
         Self::connect_with(options).await
@@ -210,7 +275,19 @@ impl Repository {
             })
             .connect_with(options)
             .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            active_record_encryption: None,
+        })
+    }
+
+    #[must_use]
+    pub fn with_active_record_encryption(
+        mut self,
+        encryption: ActiveRecordEncryptionConfig,
+    ) -> Self {
+        self.active_record_encryption = Some(encryption);
+        self
     }
 
     pub async fn ready(&self) -> bool {
@@ -289,15 +366,51 @@ impl Repository {
     }
 
     pub async fn user(&self, id: i64) -> sqlx::Result<Option<User>> {
-        sqlx::query_as::<_, User>(
-            "SELECT id, account_id, email, encrypted_password, chosen_languages, \
+        let Some(mut user) = sqlx::query_as::<_, User>(
+            "SELECT users.id, users.account_id, users.email, users.encrypted_password, users.chosen_languages, \
               otp_backup_codes::text[] AS otp_backup_codes, otp_required_for_login, otp_secret, \
-              settings, sign_up_ip, role_id, approved, disabled, confirmed_at, locale, webauthn_id, \
+              settings, sign_up_ip, role_id, COALESCE(role.require_2fa, false) AS role_requires_2fa, \
+              approved, disabled, confirmed_at, locale, webauthn_id, \
               EXISTS (SELECT 1 FROM webauthn_credentials credential \
                       WHERE credential.user_id = users.id) AS has_webauthn_credentials \
-              FROM users WHERE id = $1",
+              FROM users LEFT JOIN user_roles role ON role.id = users.role_id WHERE users.id = $1",
         )
         .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        user.otp_secret =
+            decrypt_otp_secret(self.active_record_encryption.as_ref(), user.otp_secret)?;
+        Ok(Some(user))
+    }
+
+    pub async fn browser_session(&self, session_id: &str) -> sqlx::Result<Option<BrowserSession>> {
+        sqlx::query_as::<_, BrowserSession>(
+            "SELECT session.user_id, user_record.account_id, access_token.token AS access_token, session.updated_at, \
+                (user_record.confirmed_at IS NOT NULL \
+                 AND user_record.approved = true \
+                 AND user_record.disabled = false \
+                 AND account.suspended_at IS NULL \
+                 AND account.moved_to_account_id IS NULL \
+                 AND (COALESCE(role.require_2fa, false) = false \
+                   OR user_record.otp_required_for_login = true \
+                   OR EXISTS (SELECT 1 FROM webauthn_credentials credential \
+                              WHERE credential.user_id = user_record.id))) AS functional \
+              FROM session_activations session \
+              JOIN oauth_access_tokens access_token ON access_token.id = session.access_token_id \
+              JOIN users user_record ON user_record.id = session.user_id \
+              JOIN accounts account ON account.id = user_record.account_id \
+              LEFT JOIN user_roles role ON role.id = COALESCE(user_record.role_id, -99) \
+             WHERE session.session_id = $1 \
+               AND session.updated_at > clock_timestamp() - INTERVAL '30 days' \
+               AND access_token.revoked_at IS NULL \
+                AND (access_token.expires_in IS NULL OR \
+                     access_token.created_at + access_token.expires_in * INTERVAL '1 second' > clock_timestamp()) \
+                AND account.memorial = false",
+        )
+        .bind(session_id)
         .fetch_optional(&self.pool)
         .await
     }
@@ -318,6 +431,19 @@ impl Repository {
              FROM oauth_applications WHERE id = $1",
         )
         .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn oauth_application_by_uid(
+        &self,
+        uid: &str,
+    ) -> sqlx::Result<Option<OAuthApplication>> {
+        sqlx::query_as::<_, OAuthApplication>(
+            "SELECT id, name, uid, secret, redirect_uri, scopes, confidential, owner_id, owner_type, website \
+             FROM oauth_applications WHERE uid = $1",
+        )
+        .bind(uid)
         .fetch_optional(&self.pool)
         .await
     }
@@ -432,6 +558,23 @@ impl Repository {
             "SELECT id FROM accounts WHERE lower(username) = lower($1) \
              AND (($2::text IS NULL AND domain IS NULL) OR lower(domain) = lower($2)) \
              ORDER BY id LIMIT 1",
+        )
+        .bind(username)
+        .bind(domain)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn rest_account_last_webfingered_at(
+        &self,
+        username: &str,
+        domain: &str,
+    ) -> sqlx::Result<Option<NaiveDateTime>> {
+        sqlx::query_scalar(
+            "SELECT last_webfingered_at FROM accounts
+             WHERE lower(username) = lower($1) AND lower(domain) = lower($2)
+             ORDER BY id
+             LIMIT 1",
         )
         .bind(username)
         .bind(domain)
@@ -597,6 +740,22 @@ impl Repository {
         .await
     }
 
+    pub(crate) async fn rest_preferences_row(
+        &self,
+        user_id: i64,
+        account_id: i64,
+    ) -> sqlx::Result<Option<RestPreferencesRow>> {
+        sqlx::query_as::<_, RestPreferencesRow>(
+            "SELECT account_user.settings, account_user.locale, account.locked \
+             FROM users account_user JOIN accounts account ON account.id = account_user.account_id \
+             WHERE account_user.id = $1 AND account_user.account_id = $2",
+        )
+        .bind(user_id)
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     pub async fn user_can_view_feeds(&self, user_id: i64, account_id: i64) -> sqlx::Result<bool> {
         sqlx::query_as::<_, (i64, i64, i64)>(
             "SELECT role.id, role.permissions, everyone.permissions \
@@ -645,8 +804,8 @@ impl Repository {
                AND viewer_block.target_account_id = target.id \
              LEFT JOIN blocks target_block ON target_block.account_id = target.id \
                AND target_block.target_account_id = $1 \
-             LEFT JOIN mutes mute ON mute.account_id = $1 \
-               AND mute.target_account_id = target.id \
+              LEFT JOIN mutes mute ON mute.account_id = $1 \
+                AND mute.target_account_id = target.id \
              LEFT JOIN follow_requests viewer_request ON viewer_request.account_id = $1 \
                AND viewer_request.target_account_id = target.id \
              LEFT JOIN follow_requests target_request ON target_request.account_id = target.id \
@@ -697,16 +856,17 @@ impl Repository {
                AND viewer_block.target_account_id = status.account_id) AS viewer_blocks_author, \
              EXISTS (SELECT 1 FROM account_domain_blocks domain_block WHERE domain_block.account_id = $2 \
                AND domain_block.domain = author.domain) AS viewer_domain_blocks_author, \
-             EXISTS (SELECT 1 FROM mutes viewer_mute WHERE viewer_mute.account_id = $2 \
-               AND viewer_mute.target_account_id = status.account_id) AS viewer_mutes_author, \
-             EXISTS (SELECT 1 FROM favourites favourite WHERE favourite.account_id = $2 \
-               AND favourite.status_id = status.id) AS favourited, \
-             EXISTS (SELECT 1 FROM statuses boost WHERE boost.account_id = $2 \
-               AND boost.reblog_of_id = status.id AND boost.deleted_at IS NULL) AS reblogged, \
+               EXISTS (SELECT 1 FROM mutes viewer_mute WHERE viewer_mute.account_id = $2 \
+                 AND viewer_mute.target_account_id = status.account_id) AS viewer_mutes_author, \
+               EXISTS (SELECT 1 FROM favourites favourite WHERE favourite.account_id = $2 \
+                AND favourite.status_id = status.id) AS favourited, \
+               EXISTS (SELECT 1 FROM statuses boost WHERE boost.account_id = $2 \
+                AND boost.reblog_of_id = status.id \
+                AND boost.deleted_at IS NULL) AS reblogged, \
              EXISTS (SELECT 1 FROM conversation_mutes mute WHERE mute.account_id = $2 \
                AND mute.conversation_id = status.conversation_id) AS muted, \
-             EXISTS (SELECT 1 FROM bookmarks bookmark WHERE bookmark.account_id = $2 \
-               AND bookmark.status_id = status.id) AS bookmarked, \
+               EXISTS (SELECT 1 FROM bookmarks bookmark WHERE bookmark.account_id = $2 \
+                AND bookmark.status_id = status.id) AS bookmarked, \
              EXISTS (SELECT 1 FROM status_pins pin WHERE pin.account_id = $2 \
                AND pin.status_id = status.id) AS pinned \
              FROM statuses status \
@@ -744,6 +904,8 @@ impl Repository {
         options: &AccountStatusesOptions,
     ) -> sqlx::Result<Vec<i64>> {
         let tagged = options.tagged.as_deref().map(normalize_hashtag);
+        let filter_reblog_sources =
+            !options.exclude_reblogs && !options.only_media && tagged.is_none();
         let ordering = if options.min_id.is_some() {
             "status.id ASC"
         } else if options.pinned {
@@ -787,20 +949,23 @@ impl Repository {
                     WHERE media.status_id = status.id))) \
                 AND (NOT $7 OR status.reply = false \
                   OR status.in_reply_to_account_id = status.account_id) \
-               AND (NOT $8 OR status.reblog_of_id IS NULL) \
-               AND ($9::bigint IS NULL OR status.id < $9) \
-               AND (($10::bigint IS NOT NULL AND status.id > $10) \
-                 OR ($10 IS NULL AND ($11::bigint IS NULL OR status.id > $11))) \
-               AND (status.reblog_of_id IS NULL OR $2 IS NULL OR NOT EXISTS ( \
-                 SELECT 1 FROM statuses source \
+                AND (NOT $8 OR status.reblog_of_id IS NULL) \
+                AND ($9::bigint IS NULL OR status.id < $9) \
+                AND (($10::bigint IS NOT NULL AND status.id > $10) \
+                  OR ($10 IS NULL AND ($11::bigint IS NULL OR status.id > $11))) \
+                AND (status.reblog_of_id IS NULL OR EXISTS ( \
+                  SELECT 1 FROM statuses source \
+                  WHERE source.id = status.reblog_of_id AND source.deleted_at IS NULL)) \
+                AND (NOT $13 OR $2 = $1 OR status.reblog_of_id IS NULL OR $2 IS NULL OR NOT EXISTS ( \
+                  SELECT 1 FROM statuses source \
                  JOIN accounts source_author ON source_author.id = source.account_id \
                  WHERE source.id = status.reblog_of_id AND ( \
                    EXISTS (SELECT 1 FROM blocks block WHERE block.account_id = $2 \
                      AND block.target_account_id = source.account_id) \
                    OR EXISTS (SELECT 1 FROM blocks block WHERE block.account_id = source.account_id \
                      AND block.target_account_id = $2) \
-                   OR EXISTS (SELECT 1 FROM mutes mute WHERE mute.account_id = $2 \
-                     AND mute.target_account_id = source.account_id) \
+                    OR EXISTS (SELECT 1 FROM mutes mute WHERE mute.account_id = $2 \
+                      AND mute.target_account_id = source.account_id) \
                    OR (source_author.domain IS NOT NULL AND EXISTS ( \
                      SELECT 1 FROM account_domain_blocks domain_block \
                      WHERE domain_block.account_id = $2 \
@@ -820,6 +985,7 @@ impl Repository {
             .bind(options.min_id)
             .bind(options.since_id)
             .bind(options.limit.clamp(0, 40))
+            .bind(filter_reblog_sources)
             .fetch_all(&self.pool)
             .await?;
         if options.min_id.is_some() {
@@ -854,8 +1020,8 @@ impl Repository {
                    AND viewer_block.target_account_id = status.account_id) \
                  AND NOT EXISTS (SELECT 1 FROM blocks author_block WHERE author_block.account_id = status.account_id \
                    AND author_block.target_account_id = $1) \
-                 AND NOT EXISTS (SELECT 1 FROM mutes viewer_mute WHERE viewer_mute.account_id = $1 \
-                   AND viewer_mute.target_account_id = status.account_id) \
+                  AND NOT EXISTS (SELECT 1 FROM mutes viewer_mute WHERE viewer_mute.account_id = $1 \
+                    AND viewer_mute.target_account_id = status.account_id) \
                  AND (author.domain IS NULL OR NOT EXISTS ( \
                    SELECT 1 FROM account_domain_blocks domain_block WHERE domain_block.account_id = $1 \
                      AND domain_block.domain = author.domain)) \
@@ -954,10 +1120,10 @@ impl Repository {
                    AND viewer_block.target_account_id = status.account_id) \
                  AND NOT EXISTS (SELECT 1 FROM blocks author_block WHERE author_block.account_id = status.account_id \
                    AND author_block.target_account_id = $1) \
-                 AND NOT EXISTS (SELECT 1 FROM mutes viewer_mute WHERE viewer_mute.account_id = $1 \
-                   AND viewer_mute.target_account_id = status.account_id) \
-                 AND (author.domain IS NULL OR NOT EXISTS (SELECT 1 FROM account_domain_blocks domain_block \
-                   WHERE domain_block.account_id = $1 AND domain_block.domain = author.domain)))) \
+                  AND NOT EXISTS (SELECT 1 FROM mutes viewer_mute WHERE viewer_mute.account_id = $1 \
+                    AND viewer_mute.target_account_id = status.account_id) \
+                  AND (author.domain IS NULL OR NOT EXISTS (SELECT 1 FROM account_domain_blocks domain_block \
+                    WHERE domain_block.account_id = $1 AND domain_block.domain = author.domain)))) \
                AND ($8::bigint IS NULL OR status.id < $8) \
                AND (($9::bigint IS NOT NULL AND status.id > $9) \
                  OR ($9 IS NULL AND ($10::bigint IS NULL OR status.id > $10))) \
@@ -1053,19 +1219,19 @@ impl Repository {
                     WHERE viewer_block.account_id = $1 AND viewer_block.target_account_id = status.account_id)) \
                   AND (status.account_id = $1 OR NOT EXISTS (SELECT 1 FROM blocks author_block \
                     WHERE author_block.account_id = status.account_id AND author_block.target_account_id = $1)) \
-                  AND (status.account_id = $1 OR NOT EXISTS (SELECT 1 FROM mutes viewer_mute \
-                   WHERE viewer_mute.account_id = $1 AND viewer_mute.target_account_id = status.account_id)) \
+                   AND (status.account_id = $1 OR NOT EXISTS (SELECT 1 FROM mutes viewer_mute \
+                    WHERE viewer_mute.account_id = $1 AND viewer_mute.target_account_id = status.account_id)) \
                  AND (status.account_id = $1 OR NOT EXISTS (SELECT 1 FROM mentions mention \
                    WHERE mention.status_id IN (status.id, status.reblog_of_id) AND NOT mention.silent \
                      AND (EXISTS (SELECT 1 FROM blocks mention_block WHERE mention_block.account_id = $1 \
                        AND mention_block.target_account_id = mention.account_id) \
-                     OR EXISTS (SELECT 1 FROM mutes mention_mute WHERE mention_mute.account_id = $1 \
-                       AND mention_mute.target_account_id = mention.account_id)))) \
+                      OR EXISTS (SELECT 1 FROM mutes mention_mute WHERE mention_mute.account_id = $1 \
+                        AND mention_mute.target_account_id = mention.account_id)))) \
                  AND (status.account_id = $1 OR status.source_account_id IS NULL OR ( \
                    NOT EXISTS (SELECT 1 FROM blocks source_block WHERE source_block.account_id = $1 \
                      AND source_block.target_account_id = status.source_account_id) \
-                   AND NOT EXISTS (SELECT 1 FROM mutes source_mute WHERE source_mute.account_id = $1 \
-                     AND source_mute.target_account_id = status.source_account_id) \
+                    AND NOT EXISTS (SELECT 1 FROM mutes source_mute WHERE source_mute.account_id = $1 \
+                      AND source_mute.target_account_id = status.source_account_id) \
                    AND NOT EXISTS (SELECT 1 FROM blocks source_author_block \
                      WHERE source_author_block.account_id = status.source_account_id \
                        AND source_author_block.target_account_id = $1) \
@@ -1086,13 +1252,13 @@ impl Repository {
                    WHERE status_tag.status_id = status.id AND tag_follow.account_id = $1) \
                  AND NOT EXISTS (SELECT 1 FROM blocks viewer_block WHERE viewer_block.account_id = $1 \
                    AND viewer_block.target_account_id = status.account_id) \
-                 AND NOT EXISTS (SELECT 1 FROM mutes viewer_mute WHERE viewer_mute.account_id = $1 \
-                   AND viewer_mute.target_account_id = status.account_id) \
+                  AND NOT EXISTS (SELECT 1 FROM mutes viewer_mute WHERE viewer_mute.account_id = $1 \
+                    AND viewer_mute.target_account_id = status.account_id) \
                  AND NOT EXISTS (SELECT 1 FROM mentions mention WHERE mention.status_id = status.id \
                    AND NOT mention.silent AND (EXISTS (SELECT 1 FROM blocks mention_block \
                      WHERE mention_block.account_id = $1 AND mention_block.target_account_id = mention.account_id) \
-                   OR EXISTS (SELECT 1 FROM mutes mention_mute WHERE mention_mute.account_id = $1 \
-                     AND mention_mute.target_account_id = mention.account_id))) \
+                    OR EXISTS (SELECT 1 FROM mutes mention_mute WHERE mention_mute.account_id = $1 \
+                      AND mention_mute.target_account_id = mention.account_id))) \
                  AND (status.author_domain IS NULL OR NOT EXISTS (SELECT 1 FROM account_domain_blocks domain_block \
                    WHERE domain_block.account_id = $1 AND domain_block.domain = status.author_domain)) \
              ) SELECT status.id FROM feed status \
@@ -1256,8 +1422,8 @@ impl Repository {
                    AND viewer_block.target_account_id = {result_column}) \
                  AND NOT EXISTS (SELECT 1 FROM blocks result_block WHERE result_block.account_id = {result_column} \
                    AND result_block.target_account_id = $2) \
-                 AND NOT EXISTS (SELECT 1 FROM mutes viewer_mute WHERE viewer_mute.account_id = $2 \
-                   AND viewer_mute.target_account_id = {result_column}))) \
+                  AND NOT EXISTS (SELECT 1 FROM mutes viewer_mute WHERE viewer_mute.account_id = $2 \
+                    AND viewer_mute.target_account_id = {result_column}))) \
                AND ($3::bigint IS NULL OR follow.id < $3) \
                AND ($4::bigint IS NULL OR follow.id > $4) \
              ORDER BY follow.id DESC LIMIT $5"
@@ -1270,6 +1436,28 @@ impl Repository {
             .bind(options.limit.clamp(0, 80))
             .fetch_all(&self.pool)
             .await
+    }
+
+    pub(crate) async fn rest_follow_request_rows(
+        &self,
+        account_id: i64,
+        options: &FollowCollectionOptions,
+    ) -> sqlx::Result<Vec<RestFollowCollectionRow>> {
+        sqlx::query_as(
+            "SELECT request.id AS follow_id, request.account_id \
+             FROM follow_requests request \
+             JOIN accounts requester ON requester.id = request.account_id \
+             WHERE request.target_account_id = $1 AND requester.suspended_at IS NULL \
+               AND ($2::bigint IS NULL OR request.id < $2) \
+               AND ($3::bigint IS NULL OR request.id > $3) \
+             ORDER BY request.id DESC LIMIT $4",
+        )
+        .bind(account_id)
+        .bind(options.max_id)
+        .bind(options.since_id)
+        .bind(options.limit.clamp(0, 80))
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub(crate) async fn rest_favourited_by_rows(
@@ -1286,8 +1474,8 @@ impl Repository {
                  WHERE viewer_block.account_id = $2 AND viewer_block.target_account_id = favourite.account_id)) \
                AND ($2::bigint IS NULL OR NOT EXISTS (SELECT 1 FROM blocks account_block \
                  WHERE account_block.account_id = favourite.account_id AND account_block.target_account_id = $2)) \
-               AND ($2::bigint IS NULL OR NOT EXISTS (SELECT 1 FROM mutes viewer_mute \
-                 WHERE viewer_mute.account_id = $2 AND viewer_mute.target_account_id = favourite.account_id)) \
+                AND ($2::bigint IS NULL OR NOT EXISTS (SELECT 1 FROM mutes viewer_mute \
+                  WHERE viewer_mute.account_id = $2 AND viewer_mute.target_account_id = favourite.account_id)) \
                AND ($3::bigint IS NULL OR favourite.id < $3) \
                AND ($4::bigint IS NULL OR favourite.id > $4) \
              ORDER BY favourite.id DESC LIMIT $5",
@@ -1316,8 +1504,8 @@ impl Repository {
                  WHERE viewer_block.account_id = $2 AND viewer_block.target_account_id = reblog.account_id)) \
                AND ($2::bigint IS NULL OR NOT EXISTS (SELECT 1 FROM blocks account_block \
                  WHERE account_block.account_id = reblog.account_id AND account_block.target_account_id = $2)) \
-               AND ($2::bigint IS NULL OR NOT EXISTS (SELECT 1 FROM mutes viewer_mute \
-                 WHERE viewer_mute.account_id = $2 AND viewer_mute.target_account_id = reblog.account_id)) \
+                AND ($2::bigint IS NULL OR NOT EXISTS (SELECT 1 FROM mutes viewer_mute \
+                  WHERE viewer_mute.account_id = $2 AND viewer_mute.target_account_id = reblog.account_id)) \
                AND ($3::bigint IS NULL OR reblog.id < $3) \
                AND ($4::bigint IS NULL OR reblog.id > $4) \
              ORDER BY reblog.id DESC LIMIT $5",
@@ -1430,8 +1618,8 @@ impl Repository {
                EXISTS (SELECT 1 FROM account_domain_blocks domain_block \
                  WHERE domain_block.account_id = $2 \
                    AND domain_block.domain = author.domain) AS viewer_domain_blocks_author, \
-               EXISTS (SELECT 1 FROM mutes mute WHERE mute.account_id = $2 \
-                 AND mute.target_account_id = status.account_id) AS viewer_mutes_author \
+                EXISTS (SELECT 1 FROM mutes mute WHERE mute.account_id = $2 \
+                  AND mute.target_account_id = status.account_id) AS viewer_mutes_author \
              FROM statuses status JOIN accounts author ON author.id = status.account_id \
              WHERE status.id = ANY($1) ORDER BY status.id",
         )
@@ -1579,6 +1767,64 @@ impl Repository {
         .await
     }
 
+    pub(crate) async fn rest_status_quote_rows(
+        &self,
+        status_id: i64,
+        viewer_account_id: Option<i64>,
+        options: &FollowCollectionOptions,
+    ) -> sqlx::Result<Vec<RestStatusQuoteRow>> {
+        sqlx::query_as::<_, RestStatusQuoteRow>(
+            "SELECT quote.id AS quote_id, quote.status_id \
+             FROM quotes quote \
+             JOIN statuses status ON status.id = quote.status_id \
+               AND status.deleted_at IS NULL \
+             WHERE quote.quoted_status_id = $1 AND quote.state = 1 \
+                AND ($2::bigint IS NULL OR status.account_id = $2 OR ( \
+                  NOT EXISTS (SELECT 1 FROM blocks block \
+                    WHERE block.account_id = $2 AND block.target_account_id = status.account_id) \
+                  AND NOT EXISTS (SELECT 1 FROM blocks author_block \
+                    WHERE author_block.account_id = status.account_id \
+                      AND author_block.target_account_id = $2) \
+                  AND NOT EXISTS (SELECT 1 FROM mutes mute \
+                    WHERE mute.account_id = $2 AND mute.target_account_id = status.account_id) \
+                )) \
+               AND ($3::bigint IS NULL OR quote.id < $3) \
+               AND ($4::bigint IS NULL OR quote.id > $4) \
+             ORDER BY status.id DESC, quote.id DESC LIMIT $5",
+        )
+        .bind(status_id)
+        .bind(viewer_account_id)
+        .bind(options.max_id)
+        .bind(options.since_id)
+        .bind(options.limit.clamp(0, 40))
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn rest_status_quote_visible_ids(
+        &self,
+        status_ids: &[i64],
+        viewer_account_id: Option<i64>,
+    ) -> sqlx::Result<Vec<i64>> {
+        sqlx::query_scalar(
+            "SELECT status.id \
+             FROM statuses status JOIN accounts author ON author.id = status.account_id \
+             WHERE status.id = ANY($1) \
+               AND (status.account_id = $2 OR ( \
+                 ($2::bigint IS NULL OR NOT EXISTS ( \
+                   SELECT 1 FROM account_domain_blocks domain_block \
+                   WHERE domain_block.account_id = $2 AND domain_block.domain = author.domain)) \
+                 AND (author.silenced_at IS NULL OR EXISTS ( \
+                   SELECT 1 FROM follows follow \
+                   WHERE follow.account_id = $2 AND follow.target_account_id = status.account_id)) \
+               )) ORDER BY status.id",
+        )
+        .bind(status_ids)
+        .bind(viewer_account_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     pub async fn status(&self, id: i64) -> sqlx::Result<Option<Status>> {
         sqlx::query_as::<_, Status>(
             "SELECT id, account_id, application_id, text, spoiler_text, visibility, local, uri, url, language, \
@@ -1608,35 +1854,263 @@ impl Repository {
     pub(crate) async fn activitypub_outbox_statuses(
         &self,
         account_id: i64,
+        viewer_account_id: Option<i64>,
         limit: i64,
         max_id: Option<i64>,
         min_id: Option<i64>,
         since_id: Option<i64>,
     ) -> sqlx::Result<Vec<Status>> {
-        let order = if min_id.is_some() { "ASC" } else { "DESC" };
-        let query = format!(
+        let ids = self
+            .rest_account_status_ids(
+                account_id,
+                viewer_account_id,
+                &AccountStatusesOptions {
+                    max_id,
+                    min_id,
+                    since_id,
+                    limit: limit.clamp(1, 20),
+                    ..AccountStatusesOptions::default()
+                },
+            )
+            .await?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as::<_, Status>(
             "SELECT id, account_id, application_id, text, spoiler_text, visibility, local, uri, url, language, \
              sensitive, reply, ordered_media_attachment_ids, conversation_id, in_reply_to_id, \
              in_reply_to_account_id, reblog_of_id, poll_id, quote_approval_policy, deleted_at, \
              edited_at, created_at, updated_at FROM statuses \
-             WHERE account_id = $1 AND deleted_at IS NULL AND visibility IN (0, 1) \
-               AND ($2::bigint IS NULL OR id < $2) \
-               AND ($3::bigint IS NULL OR id > $3) \
-               AND ($4::bigint IS NULL OR id > $4) \
-             ORDER BY id {order} LIMIT $5"
-        );
-        let mut statuses = sqlx::query_as::<_, Status>(&query)
-            .bind(account_id)
-            .bind(max_id)
-            .bind(min_id)
-            .bind(since_id)
-            .bind(limit.clamp(1, 20))
+             WHERE id = ANY($1::bigint[]) AND deleted_at IS NULL \
+             ORDER BY array_position($1::bigint[], id)",
+        )
+            .bind(&ids)
             .fetch_all(&self.pool)
-            .await?;
-        if min_id.is_some() {
-            statuses.reverse();
-        }
-        Ok(statuses)
+            .await
+    }
+
+    pub(crate) async fn activitypub_remote_follower_ids(
+        &self,
+        account_id: i64,
+        include_suspended: bool,
+    ) -> sqlx::Result<Vec<i64>> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT follow.account_id FROM follows follow \
+             JOIN accounts follower ON follower.id = follow.account_id \
+             WHERE follow.target_account_id = $1 AND follower.domain IS NOT NULL \
+               AND follower.protocol = 1 AND ($2 OR follower.suspended_at IS NULL) \
+             ORDER BY follow.account_id",
+        )
+        .bind(account_id)
+        .bind(include_suspended)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn activitypub_account_reach_account_ids(
+        &self,
+        account_id: i64,
+    ) -> sqlx::Result<Vec<i64>> {
+        sqlx::query_scalar(
+            "WITH reach_cutoff AS (
+                 SELECT CASE
+                          WHEN suspended_at IS NOT NULL AND suspension_origin = 0
+                            THEN suspended_at - interval '2 days'
+                          ELSE clock_timestamp() - interval '2 days'
+                        END AS cutoff
+                   FROM accounts
+                  WHERE id = $1
+              ), recent_statuses AS (
+                 SELECT status.id FROM statuses status
+                 CROSS JOIN reach_cutoff
+                  WHERE status.account_id = $1 AND status.deleted_at IS NULL
+                    AND status.created_at >= reach_cutoff.cutoff
+                    ORDER BY id DESC LIMIT 200
+               ), recent_mentions AS (
+                  SELECT DISTINCT ON (
+                      COALESCE(NULLIF(account.shared_inbox_url, ''), account.inbox_url)
+                  ) account.id AS account_id
+                    FROM mentions mention
+                    JOIN recent_statuses status ON status.id = mention.status_id
+                    JOIN accounts account ON account.id = mention.account_id
+                   WHERE account.domain IS NOT NULL AND account.protocol = 1
+                     AND COALESCE(NULLIF(account.shared_inbox_url, ''), account.inbox_url) <> ''
+                   ORDER BY COALESCE(NULLIF(account.shared_inbox_url, ''), account.inbox_url), account.id
+                   LIMIT 2000
+                 ), recent_follows AS (
+                   SELECT DISTINCT ON (
+                       COALESCE(NULLIF(account.shared_inbox_url, ''), account.inbox_url)
+                   ) account.id AS account_id
+                     FROM follows follow
+                     JOIN accounts account ON account.id = follow.target_account_id
+                     CROSS JOIN reach_cutoff
+                    WHERE follow.account_id = $1
+                      AND follow.created_at >= reach_cutoff.cutoff
+                      AND account.domain IS NOT NULL AND account.protocol = 1
+                     AND COALESCE(NULLIF(account.shared_inbox_url, ''), account.inbox_url) <> ''
+                   ORDER BY COALESCE(NULLIF(account.shared_inbox_url, ''), account.inbox_url), account.id
+                   LIMIT 2000
+              ), recent_requests AS (
+                  SELECT DISTINCT ON (
+                      COALESCE(NULLIF(account.shared_inbox_url, ''), account.inbox_url)
+                   ) account.id AS account_id
+                     FROM follow_requests request
+                     JOIN accounts account ON account.id = request.target_account_id
+                     CROSS JOIN reach_cutoff
+                    WHERE request.account_id = $1
+                      AND request.created_at >= reach_cutoff.cutoff
+                     AND account.domain IS NOT NULL AND account.protocol = 1
+                     AND COALESCE(NULLIF(account.shared_inbox_url, ''), account.inbox_url) <> ''
+                   ORDER BY COALESCE(NULLIF(account.shared_inbox_url, ''), account.inbox_url), account.id
+                   LIMIT 2000
+             ), reach AS (
+                 SELECT follow.account_id
+                   FROM follows follow
+                  WHERE follow.target_account_id = $1
+                 UNION ALL
+                 SELECT report.account_id
+                   FROM reports report
+                  WHERE report.target_account_id = $1
+                 UNION ALL SELECT account_id FROM recent_mentions
+                 UNION ALL SELECT account_id FROM recent_follows
+                 UNION ALL SELECT account_id FROM recent_requests
+             )
+             SELECT DISTINCT account.id
+               FROM reach
+               JOIN accounts account ON account.id = reach.account_id
+               WHERE account.domain IS NOT NULL
+                 AND account.protocol = 1
+               ORDER BY account.id",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn activitypub_relay_inboxes(&self) -> sqlx::Result<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT inbox_url FROM relays
+              WHERE state = 2 AND inbox_url <> ''
+              ORDER BY inbox_url",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn activitypub_remote_inboxes(&self) -> sqlx::Result<Vec<(String, String)>> {
+        sqlx::query_as(
+            "SELECT DISTINCT ON (remote.inbox_url) remote.inbox_url, remote.domain
+               FROM (
+                 SELECT account.id, account.domain,
+                        COALESCE(NULLIF(account.shared_inbox_url, ''), account.inbox_url) AS inbox_url
+                   FROM accounts account
+                  WHERE account.domain IS NOT NULL
+                    AND account.protocol = 1
+                ) remote
+              WHERE remote.inbox_url <> ''
+              ORDER BY remote.inbox_url, remote.id",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn activitypub_status_reach_account_ids(
+        &self,
+        status_id: i64,
+        include_unsafe: bool,
+    ) -> sqlx::Result<Vec<i64>> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT reach.account_id FROM (
+                 SELECT favourite.account_id
+                   FROM favourites favourite
+                    JOIN accounts account ON account.id = favourite.account_id
+                    JOIN statuses status ON status.id = favourite.status_id
+                   WHERE favourite.status_id = $1 AND ($2 OR status.visibility IN (0, 1))
+                      AND account.domain IS NOT NULL AND account.protocol = 1
+                      AND ($2 OR account.suspended_at IS NULL)
+                   UNION ALL
+                   SELECT reblog.account_id
+                    FROM statuses reblog
+                    JOIN accounts account ON account.id = reblog.account_id
+                    JOIN statuses status ON status.id = reblog.reblog_of_id
+                   WHERE reblog.reblog_of_id = $1 AND ($2 OR status.visibility IN (0, 1))
+                     AND (reblog.deleted_at IS NULL OR ($2 AND reblog.deleted_at = status.deleted_at))
+                      AND account.domain IS NOT NULL AND account.protocol = 1
+                      AND ($2 OR account.suspended_at IS NULL)
+                   UNION ALL
+                   SELECT quote.account_id
+                    FROM quotes quote
+                    JOIN accounts account ON account.id = quote.account_id
+                    JOIN statuses status ON status.id = quote.quoted_status_id
+                   WHERE quote.quoted_status_id = $1 AND ($2 OR status.visibility IN (0, 1))
+                      AND account.domain IS NOT NULL AND account.protocol = 1
+                      AND ($2 OR account.suspended_at IS NULL)
+                   UNION ALL
+                   SELECT reply.account_id
+                     FROM statuses reply
+                     JOIN accounts account ON account.id = reply.account_id
+                     JOIN statuses status ON status.id = reply.in_reply_to_id
+                    WHERE reply.in_reply_to_id = $1 AND ($2 OR status.visibility IN (0, 1))
+                      AND reply.deleted_at IS NULL
+                      AND account.domain IS NOT NULL AND account.protocol = 1
+                      AND ($2 OR account.suspended_at IS NULL)
+                   UNION ALL
+                    SELECT status.in_reply_to_account_id
+                      FROM statuses status
+                      JOIN accounts account ON account.id = status.in_reply_to_account_id
+                      WHERE status.id = $1 AND status.visibility IN (0, 1)
+                        AND status.in_reply_to_account_id IS NOT NULL
+                        AND account.domain IS NOT NULL AND account.protocol = 1
+                        AND ($2 OR account.suspended_at IS NULL)
+                   UNION ALL
+                    SELECT follow.account_id
+                     FROM statuses status
+                      JOIN accounts parent_author ON parent_author.id = status.in_reply_to_account_id
+                                                   AND parent_author.domain IS NULL
+                      JOIN follows follow ON follow.target_account_id = status.in_reply_to_account_id
+                      JOIN accounts account ON account.id = follow.account_id
+                      WHERE status.id = $1 AND status.visibility IN (0, 1)
+                        AND status.in_reply_to_account_id IS NOT NULL
+                        AND account.domain IS NOT NULL AND account.protocol = 1
+                       AND ($2 OR account.suspended_at IS NULL)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM account_domain_blocks domain_block
+                            WHERE domain_block.account_id = status.account_id
+                              AND domain_block.domain = account.domain)
+                   UNION ALL
+                   SELECT account.id
+                    FROM quotes quote
+                     JOIN accounts account ON account.id = quote.quoted_account_id
+                    WHERE quote.status_id = $1 AND quote.quoted_account_id IS NOT NULL
+                      AND account.domain IS NOT NULL AND account.protocol = 1
+                      AND ($2 OR account.suspended_at IS NULL)
+               ) reach
+              ORDER BY reach.account_id",
+        )
+        .bind(status_id)
+        .bind(include_unsafe)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn activitypub_reblog_target_account_ids(
+        &self,
+        status_id: i64,
+        include_unsafe: bool,
+    ) -> sqlx::Result<Vec<i64>> {
+        sqlx::query_scalar(
+            "SELECT target.account_id
+               FROM statuses status
+               JOIN statuses target ON target.id = status.reblog_of_id
+               JOIN accounts account ON account.id = target.account_id
+              WHERE status.id = $1 AND status.reblog_of_id IS NOT NULL
+                AND account.domain IS NOT NULL AND account.protocol = 1
+                AND ($2 OR account.suspended_at IS NULL)",
+        )
+        .bind(status_id)
+        .bind(include_unsafe)
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub(crate) async fn activitypub_outbox_count(&self, account_id: i64) -> sqlx::Result<i64> {
@@ -1651,13 +2125,26 @@ impl Repository {
         .await
     }
 
+    pub(crate) async fn activitypub_status_has_pending_quote(
+        &self,
+        status_id: i64,
+    ) -> sqlx::Result<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM quotes WHERE status_id = $1 AND state = 0)",
+        )
+        .bind(status_id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
     pub(crate) async fn activitypub_quote_target(
         &self,
         status_id: i64,
     ) -> sqlx::Result<Option<ActivityPubQuoteTarget>> {
         sqlx::query_as::<_, ActivityPubQuoteTarget>(
-            "SELECT quoted.id, quoted_account.id AS account_id, (quoted.local IS TRUE OR quoted.uri IS NULL) AS local, \
-             quoted_account.id_scheme, quoted_account.username, quoted.uri, quoted.url \
+            "SELECT quote.id AS quote_id, quoted.id, quoted_account.id AS account_id, \
+             (quoted.local IS TRUE OR quoted.uri IS NULL) AS local, quoted_account.domain IS NULL AS quoted_account_local, \
+             quoted_account.id_scheme, quoted_account.username, quoted.uri, quoted.url, quote.approval_uri \
              FROM quotes quote \
              JOIN statuses status ON status.id = quote.status_id AND status.deleted_at IS NULL \
              JOIN statuses quoted ON quoted.id = quote.quoted_status_id AND quoted.deleted_at IS NULL \
@@ -1670,23 +2157,53 @@ impl Repository {
         .await
     }
 
+    pub(crate) async fn activitypub_quote_authorization(
+        &self,
+        quoted_account_id: i64,
+        quote_id: i64,
+    ) -> sqlx::Result<Option<Quote>> {
+        sqlx::query_as::<_, Quote>(
+            "SELECT quote.id, quote.account_id, quote.status_id, quote.quoted_account_id, \
+             quote.quoted_status_id, quote.state, quote.activity_uri, quote.approval_uri, quote.legacy \
+             FROM quotes quote \
+             JOIN statuses status ON status.id = quote.status_id AND status.deleted_at IS NULL \
+             JOIN statuses quoted ON quoted.id = quote.quoted_status_id AND quoted.deleted_at IS NULL \
+             WHERE quote.id = $1 AND quote.quoted_account_id = $2 AND quote.state = 1",
+        )
+        .bind(quote_id)
+        .bind(quoted_account_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     pub(crate) async fn activitypub_reply_statuses(
         &self,
         account_id: i64,
         status_id: i64,
+        only_other_accounts: bool,
+        min_id: Option<i64>,
         limit: i64,
     ) -> sqlx::Result<Vec<Status>> {
         sqlx::query_as::<_, Status>(
-            "SELECT id, account_id, application_id, text, spoiler_text, visibility, local, uri, url, language, \
-             sensitive, reply, ordered_media_attachment_ids, conversation_id, in_reply_to_id, \
-             in_reply_to_account_id, reblog_of_id, poll_id, quote_approval_policy, deleted_at, \
-             edited_at, created_at, updated_at FROM statuses \
-             WHERE account_id = $1 AND in_reply_to_id = $2 AND deleted_at IS NULL \
-               AND visibility IN (0, 1) ORDER BY id ASC LIMIT $3",
+            "SELECT reply.id, reply.account_id, reply.application_id, reply.text, reply.spoiler_text, \
+             reply.visibility, reply.local, reply.uri, reply.url, reply.language, reply.sensitive, \
+             reply.reply, reply.ordered_media_attachment_ids, reply.conversation_id, reply.in_reply_to_id, \
+             reply.in_reply_to_account_id, reply.reblog_of_id, reply.poll_id, reply.quote_approval_policy, \
+             reply.deleted_at, reply.edited_at, reply.created_at, reply.updated_at FROM statuses reply \
+             JOIN accounts author ON author.id = reply.account_id \
+             WHERE reply.in_reply_to_id = $2 AND reply.deleted_at IS NULL \
+               AND reply.visibility IN (0, 1) \
+               AND ($3 OR reply.account_id = $1) \
+               AND (NOT $3 OR reply.account_id <> $1) \
+               AND (NOT $3 OR author.suspended_at IS NULL) \
+               AND ($4::bigint IS NULL OR reply.id > $4) \
+             ORDER BY reply.id ASC LIMIT $5",
         )
         .bind(account_id)
         .bind(status_id)
-        .bind(limit.clamp(1, 5))
+        .bind(only_other_accounts)
+        .bind(min_id)
+        .bind(limit.clamp(1, 60))
         .fetch_all(&self.pool)
         .await
     }
@@ -1795,6 +2312,85 @@ impl Repository {
         .await
     }
 
+    pub async fn media_attachment(
+        &self,
+        account_id: i64,
+        id: i64,
+    ) -> sqlx::Result<Option<MediaAttachment>> {
+        sqlx::query_as::<_, MediaAttachment>(
+            "SELECT media.id, media.account_id, media.status_id, media.type AS media_type, \
+             media.processing, media.description, media.remote_url, media.file_content_type, \
+             media.file_file_name, media.file_file_size, media.file_meta, \
+             media.file_storage_schema_version, media.file_updated_at, media.scheduled_status_id, \
+             media.shortcode, media.thumbnail_content_type, media.thumbnail_file_name, \
+             media.thumbnail_file_size, media.thumbnail_remote_url, \
+             media.thumbnail_storage_schema_version, media.thumbnail_updated_at, media.blurhash, \
+             media.created_at, media.updated_at FROM media_attachments media \
+             WHERE media.id = $1 AND media.account_id = $2 AND media.status_id IS NULL",
+        )
+        .bind(id)
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn media_attachment_status(
+        &self,
+        id: i64,
+    ) -> sqlx::Result<Option<(i64, bool)>> {
+        sqlx::query_as::<_, (i64, bool)>(
+            "SELECT media.status_id, status.id IS NULL OR status.deleted_at IS NOT NULL AS discarded \
+             FROM media_attachments media \
+             LEFT JOIN statuses status ON status.id = media.status_id \
+             WHERE media.id = $1 AND media.status_id IS NOT NULL",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn user_can_manage_reports(&self, account_id: i64) -> sqlx::Result<bool> {
+        let permissions = sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT role.id, role.permissions, everyone.permissions \
+             FROM users account_user \
+             JOIN accounts account ON account.id = account_user.account_id \
+             JOIN user_roles role ON role.id = COALESCE(account_user.role_id, -99) \
+             JOIN user_roles everyone ON everyone.id = -99 \
+             WHERE account.id = $1 AND account.domain IS NULL \
+               AND account.suspended_at IS NULL \
+               AND account_user.confirmed_at IS NOT NULL \
+               AND account_user.approved = true AND account_user.disabled = false",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(permissions.is_some_and(|(role_id, role, everyone)| {
+            PermissionBits::effective(role_id, PermissionBits(role), PermissionBits(everyone))
+                .contains(UserPermission::ManageReports)
+        }))
+    }
+
+    pub(crate) async fn remote_media_attachment(
+        &self,
+        id: i64,
+    ) -> sqlx::Result<Option<MediaAttachment>> {
+        sqlx::query_as::<_, MediaAttachment>(
+            "SELECT media.id, media.account_id, media.status_id, media.type AS media_type, \
+             media.processing, media.description, media.remote_url, media.file_content_type, \
+             media.file_file_name, media.file_file_size, media.file_meta, \
+             media.file_storage_schema_version, media.file_updated_at, media.scheduled_status_id, \
+             media.shortcode, media.thumbnail_content_type, media.thumbnail_file_name, \
+             media.thumbnail_file_size, media.thumbnail_remote_url, \
+             media.thumbnail_storage_schema_version, media.thumbnail_updated_at, media.blurhash, \
+             media.created_at, media.updated_at FROM media_attachments media \
+             JOIN statuses status ON status.id = media.status_id AND status.deleted_at IS NULL \
+             WHERE media.id = $1 AND media.remote_url <> ''",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     pub async fn mentions(&self, status_id: i64) -> sqlx::Result<Vec<Mention>> {
         sqlx::query_as::<_, Mention>(
             "SELECT mention.id, mention.account_id, mention.status_id, mention.silent \
@@ -1892,6 +2488,31 @@ impl Repository {
         .await
     }
 
+    pub(crate) async fn rest_followed_tags(
+        &self,
+        account_id: i64,
+        options: &FollowedTagsOptions,
+    ) -> sqlx::Result<Vec<RestFollowedTagRow>> {
+        sqlx::query_as::<_, RestFollowedTagRow>(
+            "SELECT tag_follow.id AS tag_follow_id, tag.id, tag.name, tag.display_name, \
+                    EXISTS (SELECT 1 FROM featured_tags featured \
+                      WHERE featured.account_id = $1 AND featured.tag_id = tag.id) AS featuring \
+             FROM tag_follows tag_follow JOIN tags tag ON tag.id = tag_follow.tag_id \
+             WHERE tag_follow.account_id = $1 \
+               AND ($2::bigint IS NULL OR tag_follow.id < $2) \
+               AND ($3::bigint IS NULL OR tag_follow.id > $3) \
+               AND ($4::bigint IS NULL OR tag_follow.id > $4) \
+             ORDER BY tag_follow.id DESC LIMIT $5",
+        )
+        .bind(account_id)
+        .bind(options.max_id)
+        .bind(options.min_id)
+        .bind(options.since_id)
+        .bind(options.limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     pub async fn conversation(&self, id: i64) -> sqlx::Result<Option<Conversation>> {
         sqlx::query_as::<_, Conversation>(
             "SELECT conversation.id, conversation.uri, conversation.parent_account_id, \
@@ -1927,6 +2548,64 @@ impl Repository {
         .bind(account_id)
         .fetch_all(&self.pool)
         .await
+    }
+
+    pub async fn account_conversations_page(
+        &self,
+        account_id: i64,
+        options: &TimelineOptions,
+    ) -> sqlx::Result<Vec<AccountConversation>> {
+        if options.min_id.is_some() {
+            sqlx::query_as::<_, AccountConversation>(
+                "SELECT account_conversation.id, account_conversation.account_id, \
+                 account_conversation.conversation_id, \
+                 CASE WHEN last_status.id IS NOT NULL AND last_status.deleted_at IS NULL \
+                      THEN account_conversation.last_status_id END AS last_status_id, \
+                 account_conversation.participant_account_ids, \
+                 ARRAY(SELECT status_id FROM unnest(account_conversation.status_ids) \
+                       WITH ORDINALITY ids(status_id, ordinal) \
+                       JOIN statuses status ON status.id = ids.status_id AND status.deleted_at IS NULL \
+                       ORDER BY ids.ordinal) AS status_ids, account_conversation.unread \
+                 FROM account_conversations account_conversation \
+                 LEFT JOIN statuses last_status ON last_status.id = account_conversation.last_status_id \
+                 WHERE account_conversation.account_id = $1 \
+                   AND account_conversation.last_status_id IS NOT NULL \
+                   AND ($2::bigint IS NULL OR account_conversation.last_status_id > $2) \
+                   AND ($3::bigint IS NULL OR account_conversation.last_status_id < $3) \
+                 ORDER BY account_conversation.last_status_id ASC LIMIT $4",
+            )
+            .bind(account_id)
+            .bind(options.min_id)
+            .bind(options.max_id)
+            .bind(options.limit)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query_as::<_, AccountConversation>(
+                "SELECT account_conversation.id, account_conversation.account_id, \
+                 account_conversation.conversation_id, \
+                 CASE WHEN last_status.id IS NOT NULL AND last_status.deleted_at IS NULL \
+                      THEN account_conversation.last_status_id END AS last_status_id, \
+                 account_conversation.participant_account_ids, \
+                 ARRAY(SELECT status_id FROM unnest(account_conversation.status_ids) \
+                       WITH ORDINALITY ids(status_id, ordinal) \
+                       JOIN statuses status ON status.id = ids.status_id AND status.deleted_at IS NULL \
+                       ORDER BY ids.ordinal) AS status_ids, account_conversation.unread \
+                 FROM account_conversations account_conversation \
+                 LEFT JOIN statuses last_status ON last_status.id = account_conversation.last_status_id \
+                 WHERE account_conversation.account_id = $1 \
+                   AND account_conversation.last_status_id IS NOT NULL \
+                   AND ($2::bigint IS NULL OR account_conversation.last_status_id < $2) \
+                   AND ($3::bigint IS NULL OR account_conversation.last_status_id > $3) \
+                 ORDER BY account_conversation.last_status_id DESC LIMIT $4",
+            )
+            .bind(account_id)
+            .bind(options.max_id)
+            .bind(options.since_id)
+            .bind(options.limit)
+            .fetch_all(&self.pool)
+            .await
+        }
     }
 
     pub async fn conversation_mutes(&self, account_id: i64) -> sqlx::Result<Vec<ConversationMute>> {
@@ -2047,6 +2726,51 @@ impl Repository {
         .await
     }
 
+    pub(crate) async fn rest_list_account_ids(
+        &self,
+        list_id: i64,
+        max_id: Option<i64>,
+        since_id: Option<i64>,
+        limit: i64,
+    ) -> sqlx::Result<Vec<i64>> {
+        sqlx::query_scalar(
+            "SELECT account.id \
+             FROM accounts account \
+             JOIN list_accounts list_account ON list_account.account_id = account.id \
+             WHERE list_account.list_id = $1 \
+               AND account.suspended_at IS NULL \
+               AND ($2::bigint IS NULL OR account.id < $2) \
+               AND ($3::bigint IS NULL OR account.id > $3) \
+             ORDER BY CASE WHEN $4 = 0 THEN list_account.id END, \
+                      CASE WHEN $4 <> 0 THEN account.id END DESC \
+             LIMIT NULLIF($4::bigint, 0)",
+        )
+        .bind(list_id)
+        .bind(max_id)
+        .bind(since_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn rest_account_lists(
+        &self,
+        owner_account_id: i64,
+        member_account_id: i64,
+    ) -> sqlx::Result<Vec<List>> {
+        sqlx::query_as::<_, List>(
+            "SELECT list.id, list.account_id, list.title, list.replies_policy, list.exclusive \
+             FROM lists list \
+             JOIN list_accounts list_account ON list_account.list_id = list.id \
+             WHERE list.account_id = $1 AND list_account.account_id = $2 \
+             ORDER BY list.id",
+        )
+        .bind(owner_account_id)
+        .bind(member_account_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     pub async fn custom_filters(&self, account_id: i64) -> sqlx::Result<Vec<CustomFilter>> {
         sqlx::query_as::<_, CustomFilter>(
             "SELECT id, account_id, phrase, context, action, expires_at \
@@ -2086,59 +2810,148 @@ impl Repository {
     }
 
     pub async fn notifications(&self, account_id: i64) -> sqlx::Result<Vec<Notification>> {
-        self.notification_rows(account_id, false, None, false).await
+        self.notification_rows(account_id, &NotificationOptions::default(), false)
+            .await
     }
 
     pub async fn notifications_including_filtered(
         &self,
         account_id: i64,
     ) -> sqlx::Result<Vec<Notification>> {
-        self.notification_rows(account_id, true, None, false).await
+        let options = NotificationOptions {
+            include_filtered: true,
+            ..NotificationOptions::default()
+        };
+        self.notification_rows(account_id, &options, false).await
     }
 
     pub(crate) async fn rest_notifications(
         &self,
         account_id: i64,
-        include_filtered: bool,
-        requested_types: Option<&[String]>,
+        options: &NotificationOptions,
         grouped: bool,
     ) -> sqlx::Result<Vec<Notification>> {
-        self.notification_rows(account_id, include_filtered, requested_types, grouped)
+        self.notification_rows(account_id, options, grouped).await
+    }
+
+    pub(crate) async fn rest_notification(
+        &self,
+        account_id: i64,
+        notification_id: i64,
+    ) -> sqlx::Result<Option<Notification>> {
+        sqlx::query_as::<_, Notification>(
+            "SELECT notification.id, notification.account_id, notification.activity_id, \
+                    notification.activity_type, notification.from_account_id, \
+                    notification.type AS notification_type, notification.group_key, \
+                    notification.filtered, notification.created_at \
+             FROM notifications notification \
+             JOIN accounts sender ON sender.id = notification.from_account_id \
+               AND sender.suspended_at IS NULL \
+             WHERE notification.account_id = $1 AND notification.id = $2",
+        )
+        .bind(account_id)
+        .bind(notification_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn rest_notification_by_group_key(
+        &self,
+        account_id: i64,
+        group_key: &str,
+    ) -> sqlx::Result<Option<Notification>> {
+        let query = if group_key.starts_with("ungrouped-") {
+            let Some(notification_id) = group_key
+                .strip_prefix("ungrouped-")
+                .and_then(|value| value.parse::<i64>().ok())
+            else {
+                return Ok(None);
+            };
+            return self.rest_notification(account_id, notification_id).await;
+        } else {
+            "SELECT notification.id, notification.account_id, notification.activity_id, \
+                    notification.activity_type, notification.from_account_id, \
+                    notification.type AS notification_type, notification.group_key, \
+                    notification.filtered, notification.created_at \
+             FROM notifications notification \
+             JOIN accounts sender ON sender.id = notification.from_account_id \
+               AND sender.suspended_at IS NULL \
+             WHERE notification.account_id = $1 AND notification.group_key = $2 \
+             ORDER BY notification.id DESC LIMIT 1"
+        };
+        sqlx::query_as::<_, Notification>(query)
+            .bind(account_id)
+            .bind(group_key)
+            .fetch_optional(&self.pool)
             .await
     }
 
     async fn notification_rows(
         &self,
         account_id: i64,
-        include_filtered: bool,
-        requested_types: Option<&[String]>,
+        options: &NotificationOptions,
         grouped: bool,
     ) -> sqlx::Result<Vec<Notification>> {
-        sqlx::query_as::<_, Notification>(
-            "WITH ranked AS ( \
+        let grouped_types = grouped_notification_types(&options.grouped_types);
+        let type_filter = match &options.types {
+            Some(types) if types.is_empty() => Some(Vec::new()),
+            Some(types) => notification_type_filter_with_exclusions(types, &options.exclude_types),
+            None => notification_type_filter_with_exclusions(&[], &options.exclude_types),
+        };
+        let order = if options.min_id.is_some() {
+            "ASC"
+        } else {
+            "DESC"
+        };
+        let cursor = if options.min_id.is_some() {
+            "AND id > $9 AND ($8 IS NULL OR id < $8)"
+        } else {
+            "AND ($8 IS NULL OR id < $8) \
+             AND ($10 IS NULL OR id > $10)"
+        };
+        let query = format!(
+            "WITH base AS ( \
                SELECT notification.id, notification.account_id, notification.activity_id, \
                  notification.activity_type, notification.from_account_id, \
                  notification.type AS notification_type, notification.group_key, \
-                 notification.filtered, notification.created_at, \
-                 row_number() OVER (PARTITION BY CASE WHEN $4 \
-                   THEN COALESCE(notification.group_key, 'ungrouped-' || notification.id) \
-                   ELSE notification.id::text END ORDER BY notification.id DESC) AS group_rank \
+                 notification.filtered, notification.created_at \
                FROM notifications notification \
                JOIN accounts sender ON sender.id = notification.from_account_id \
                  AND sender.suspended_at IS NULL \
-               WHERE notification.account_id = $1 AND ($2 OR notification.filtered = false) \
-                 AND (NOT $5 OR notification.type = ANY($3)) \
+               WHERE notification.account_id = $1 \
+                 AND ($2 OR notification.filtered = false) \
+                 AND ($7 IS NULL OR notification.from_account_id = $7) \
+             ), filtered AS ( \
+               SELECT * FROM base \
+               WHERE (NOT $4 OR notification_type = ANY($3)) \
+                 {cursor} \
+             ), ranked AS ( \
+               SELECT id, account_id, activity_id, activity_type, from_account_id, \
+                 notification_type, group_key, filtered, created_at, \
+                 row_number() OVER (PARTITION BY CASE WHEN $5 \
+                   THEN COALESCE(CASE WHEN notification_type = ANY($6) \
+                     THEN CASE WHEN group_key ~ '[^[:space:]]' THEN group_key END END, \
+                     'ungrouped-' || id) \
+                   ELSE id::text END ORDER BY id {order}) AS group_rank \
+               FROM filtered \
              ) SELECT id, account_id, activity_id, activity_type, from_account_id, \
                  notification_type, group_key, filtered, created_at FROM ranked \
-               WHERE group_rank = 1 ORDER BY id DESC LIMIT 40",
-        )
-        .bind(account_id)
-        .bind(include_filtered)
-        .bind(requested_types.unwrap_or_default())
-        .bind(grouped)
-        .bind(requested_types.is_some())
-        .fetch_all(&self.pool)
-        .await
+               WHERE group_rank = 1 ORDER BY id {order} LIMIT $11",
+        );
+        sqlx::query_as::<_, Notification>(&query)
+            .bind(account_id)
+            .bind(options.include_filtered || options.account_id.is_some())
+            .bind(type_filter.as_deref().unwrap_or_default())
+            .bind(type_filter.is_some())
+            .bind(grouped)
+            .bind(grouped_types)
+            .bind(options.account_id)
+            .bind(options.max_id)
+            .bind(options.min_id)
+            .bind(options.since_id)
+            .bind(options.limit)
+            .fetch_all(&self.pool)
+            .await
     }
 
     pub(crate) async fn rest_notification_groups(
@@ -2146,29 +2959,38 @@ impl Repository {
         account_id: i64,
         group_keys: &[String],
         page_min_id: i64,
-        page_max_id: i64,
+        page_max_id: Option<i64>,
+        page_max_exclusive: bool,
     ) -> sqlx::Result<Vec<RestNotificationGroupRow>> {
-        sqlx::query_as::<_, RestNotificationGroupRow>(
+        let upper_bound = match page_max_id {
+            Some(_) if page_max_exclusive => "AND id < $4",
+            Some(_) => "AND id <= $4",
+            None => "",
+        };
+        let query = format!(
             "SELECT key AS group_key, \
                (SELECT id FROM notifications WHERE account_id = $1 AND group_key = key \
-                AND id <= $4 ORDER BY id DESC LIMIT 1) AS most_recent_notification_id, \
+                {upper_bound} ORDER BY id DESC LIMIT 1) AS most_recent_notification_id, \
                ARRAY(SELECT from_account_id FROM notifications \
-                     WHERE account_id = $1 AND group_key = key AND id <= $4 \
+                     WHERE account_id = $1 AND group_key = key {upper_bound} \
                      ORDER BY id DESC LIMIT 8)::bigint[] AS sample_account_ids, \
                (SELECT count(*) FROM notifications WHERE account_id = $1 \
-                AND group_key = key AND id <= $4) AS notifications_count, \
+                AND group_key = key {upper_bound}) AS notifications_count, \
                (SELECT id FROM notifications WHERE account_id = $1 AND group_key = key \
-                AND id >= $3 AND id <= $4 ORDER BY id ASC LIMIT 1) AS page_min_id, \
+                AND id >= $3 ORDER BY id ASC LIMIT 1) AS page_min_id, \
                (SELECT created_at FROM notifications WHERE account_id = $1 AND group_key = key \
-                AND id <= $4 ORDER BY id DESC LIMIT 1) AS latest_page_notification_at \
+                {upper_bound} ORDER BY id DESC LIMIT 1) AS latest_page_notification_at \
              FROM unnest($2::text[]) AS key ORDER BY key",
-        )
-        .bind(account_id)
-        .bind(group_keys)
-        .bind(page_min_id)
-        .bind(page_max_id)
-        .fetch_all(&self.pool)
-        .await
+        );
+        let query = sqlx::query_as::<_, RestNotificationGroupRow>(&query)
+            .bind(account_id)
+            .bind(group_keys)
+            .bind(page_min_id);
+        if let Some(page_max_id) = page_max_id {
+            query.bind(page_max_id).fetch_all(&self.pool).await
+        } else {
+            query.fetch_all(&self.pool).await
+        }
     }
 
     pub(crate) async fn rest_notification_targets(
@@ -2399,6 +3221,23 @@ impl Repository {
         .await
     }
 
+    pub async fn notification_policy_summary(&self, account_id: i64) -> sqlx::Result<(i64, i64)> {
+        sqlx::query_as::<_, (i64, i64)>(
+            "SELECT COUNT(*)::bigint, COALESCE(SUM(pending.notifications_count), 0)::bigint \
+             FROM ( \
+               SELECT request.notifications_count \
+               FROM notification_requests request \
+               JOIN accounts sender ON sender.id = request.from_account_id \
+                 AND sender.suspended_at IS NULL \
+               WHERE request.account_id = $1 \
+               LIMIT 100 \
+             ) pending",
+        )
+        .bind(account_id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
     pub async fn notification_permissions(
         &self,
         account_id: i64,
@@ -2420,7 +3259,7 @@ impl Repository {
             "SELECT request.id, request.account_id, request.from_account_id, \
               CASE WHEN status.id IS NOT NULL AND status.deleted_at IS NULL \
                    THEN request.last_status_id END AS last_status_id, \
-              request.notifications_count, request.created_at FROM notification_requests request \
+               request.notifications_count, request.created_at, request.updated_at FROM notification_requests request \
               JOIN accounts sender ON sender.id = request.from_account_id \
                 AND sender.suspended_at IS NULL \
               LEFT JOIN statuses status ON status.id = request.last_status_id \
@@ -2429,6 +3268,44 @@ impl Repository {
         .bind(account_id)
         .fetch_all(&self.pool)
         .await
+    }
+
+    pub(crate) async fn rest_notification_requests(
+        &self,
+        account_id: i64,
+        max_id: Option<i64>,
+        since_id: Option<i64>,
+        min_id: Option<i64>,
+        limit: i64,
+    ) -> sqlx::Result<Vec<NotificationRequest>> {
+        let mut requests = sqlx::query_as::<_, NotificationRequest>(
+            "SELECT request.id, request.account_id, request.from_account_id, \
+              CASE WHEN status.id IS NOT NULL AND status.deleted_at IS NULL \
+                   THEN request.last_status_id END AS last_status_id, \
+              request.notifications_count, request.created_at, request.updated_at \
+             FROM notification_requests request \
+             JOIN accounts sender ON sender.id = request.from_account_id \
+               AND sender.suspended_at IS NULL \
+             LEFT JOIN statuses status ON status.id = request.last_status_id \
+             WHERE request.account_id = $1 \
+               AND ($2::bigint IS NULL OR request.id < $2) \
+               AND ($3::bigint IS NULL OR request.id > $3) \
+               AND ($4::bigint IS NULL OR request.id > $4) \
+             ORDER BY CASE WHEN $4::bigint IS NULL THEN request.id END DESC, \
+                      CASE WHEN $4::bigint IS NOT NULL THEN request.id END ASC \
+             LIMIT $5",
+        )
+        .bind(account_id)
+        .bind(max_id)
+        .bind(since_id)
+        .bind(min_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        if min_id.is_some() {
+            requests.reverse();
+        }
+        Ok(requests)
     }
 
     pub async fn domain_allows(&self) -> sqlx::Result<Vec<DomainAllow>> {
@@ -2442,6 +3319,73 @@ impl Repository {
             "SELECT id, domain, severity, reject_media, reject_reports, private_comment, public_comment, obfuscate \
              FROM domain_blocks ORDER BY id",
         )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn remote_domain_allowed(
+        &self,
+        domain: &str,
+        limited_federation: bool,
+    ) -> sqlx::Result<bool> {
+        let domain = domain_policy_hostname(domain);
+        if limited_federation {
+            sqlx::query_scalar(
+                "SELECT EXISTS (
+                   SELECT 1 FROM domain_allows
+                   WHERE lower(domain) = lower($1)
+                 )",
+            )
+            .bind(domain)
+            .fetch_one(&self.pool)
+            .await
+        } else {
+            let blocks = self.matching_domain_blocks(&domain).await?;
+            let rules = blocks
+                .iter()
+                .map(DomainBlock::policy_rule)
+                .collect::<Vec<_>>();
+            Ok(!global_domain_policy(&domain, &rules).blocks_federation())
+        }
+    }
+
+    pub(crate) async fn remote_media_allowed(
+        &self,
+        domain: &str,
+        limited_federation: bool,
+    ) -> sqlx::Result<bool> {
+        let domain = domain_policy_hostname(domain);
+        if limited_federation {
+            let allowed = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (
+                   SELECT 1 FROM domain_allows
+                   WHERE lower(domain) = lower($1)
+                 )",
+            )
+            .bind(&domain)
+            .fetch_one(&self.pool)
+            .await?;
+            if !allowed {
+                return Ok(false);
+            }
+        }
+        let blocks = self.matching_domain_blocks(&domain).await?;
+        let rules = blocks
+            .iter()
+            .map(DomainBlock::policy_rule)
+            .collect::<Vec<_>>();
+        Ok(!global_domain_policy(&domain, &rules).rejects_media())
+    }
+
+    async fn matching_domain_blocks(&self, domain: &str) -> sqlx::Result<Vec<DomainBlock>> {
+        sqlx::query_as::<_, DomainBlock>(
+            "SELECT id, domain, severity, reject_media, reject_reports, private_comment,
+                    public_comment, obfuscate
+               FROM domain_blocks
+              WHERE lower(domain) = lower(trim(trailing '.' FROM $1))
+                 OR lower(trim(trailing '.' FROM $1)) LIKE '%.' || lower(domain)",
+        )
+        .bind(domain)
         .fetch_all(&self.pool)
         .await
     }
@@ -2494,6 +3438,57 @@ impl Repository {
              FROM collections WHERE id = ANY($1) ORDER BY id",
         )
         .bind(ids)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn rest_account_collection_ids(
+        &self,
+        account_id: i64,
+        viewer_account_id: Option<i64>,
+        offset: i64,
+        limit: i64,
+    ) -> sqlx::Result<Vec<i64>> {
+        sqlx::query_scalar(
+            "SELECT collection.id \
+             FROM collections collection \
+             WHERE collection.account_id = $1 \
+               AND ($2::bigint = $1 OR collection.discoverable) \
+               AND ($2::bigint IS NULL OR ( \
+                    NOT EXISTS (SELECT 1 FROM blocks block \
+                                WHERE block.account_id = collection.account_id \
+                                  AND block.target_account_id = $2) \
+                    AND NOT EXISTS (SELECT 1 FROM account_domain_blocks domain_block \
+                                    JOIN accounts viewer ON viewer.id = $2 \
+                                    WHERE domain_block.account_id = collection.account_id \
+                                      AND domain_block.domain = viewer.domain))) \
+             ORDER BY collection.created_at DESC, collection.id DESC \
+             OFFSET $3 LIMIT $4",
+        )
+        .bind(account_id)
+        .bind(viewer_account_id)
+        .bind(offset)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn rest_account_in_collection_ids(
+        &self,
+        account_id: i64,
+        offset: i64,
+        limit: i64,
+    ) -> sqlx::Result<Vec<i64>> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT collection.id \
+             FROM collections collection \
+             JOIN collection_items item ON item.collection_id = collection.id \
+             WHERE item.account_id = $1 \
+             ORDER BY collection.id DESC OFFSET $2 LIMIT $3",
+        )
+        .bind(account_id)
+        .bind(offset)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await
     }
@@ -2694,6 +3689,95 @@ impl Repository {
         .await
     }
 
+    pub async fn activitypub_signature_key(
+        &self,
+        key_id: &str,
+        origin: &str,
+    ) -> sqlx::Result<Option<ActivityPubSignatureKey>> {
+        if let Some(key) =
+            sqlx::query_as::<_, (i64, i64, String, String, bool, Option<NaiveDateTime>)>(
+                "SELECT id, account_id, uri, public_key, revoked, expires_at \
+             FROM keypairs WHERE uri = $1",
+            )
+            .bind(key_id)
+            .fetch_optional(&self.pool)
+            .await?
+        {
+            return Ok(Some(ActivityPubSignatureKey {
+                account_id: key.1,
+                key_id: key.2,
+                public_key: key.3,
+                revoked: key.4,
+                expires_at: key.5,
+            }));
+        }
+
+        let origin = origin.trim_end_matches('/');
+        let local_domain = Url::parse(origin)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .unwrap_or_default();
+        let account = if let Some((username, domain)) = parse_acct_key_id(key_id) {
+            sqlx::query_as::<_, SignatureAccountRow>(
+                "SELECT id, username, domain, uri, id_scheme, public_key \
+                 FROM accounts \
+                 WHERE username = $1 \
+                   AND (lower(domain) = lower($2) OR (domain IS NULL AND lower($2) = lower($3))) \
+                 ORDER BY id LIMIT 1",
+            )
+            .bind(username)
+            .bind(domain)
+            .bind(&local_domain)
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, SignatureAccountRow>(
+                "SELECT id, username, domain, uri, id_scheme, public_key \
+                 FROM accounts \
+                 WHERE (domain IS NOT NULL AND uri <> '' AND uri || '#main-key' = $1) \
+                    OR (domain IS NULL AND ( \
+                      $2 || '/users/' || username || '#main-key' = $1 \
+                      OR (id_scheme = 1 AND $2 || '/ap/users/' || id::text || '#main-key' = $1) \
+                      OR (id = -99 AND $2 || '/actor#main-key' = $1))) \
+                 ORDER BY id LIMIT 1",
+            )
+            .bind(key_id)
+            .bind(origin)
+            .fetch_optional(&self.pool)
+            .await?
+        };
+        let Some(account) = account else {
+            return Ok(None);
+        };
+
+        if key_id.starts_with("acct:")
+            && let Some(key) =
+                sqlx::query_as::<_, (i64, String, String, bool, Option<NaiveDateTime>)>(
+                    "SELECT id, uri, public_key, revoked, expires_at \
+                 FROM keypairs WHERE account_id = $1 ORDER BY id LIMIT 1",
+                )
+                .bind(account.id)
+                .fetch_optional(&self.pool)
+                .await?
+        {
+            return Ok(Some(ActivityPubSignatureKey {
+                account_id: account.id,
+                key_id: key_id.to_owned(),
+                public_key: key.2,
+                revoked: key.3,
+                expires_at: key.4,
+            }));
+        }
+
+        Ok(Some(ActivityPubSignatureKey {
+            account_id: account.id,
+            key_id: key_id.to_owned(),
+            public_key: account.public_key,
+            revoked: false,
+            expires_at: None,
+        }))
+    }
+
     pub async fn tombstone(&self, id: i64) -> sqlx::Result<Option<Tombstone>> {
         sqlx::query_as::<_, Tombstone>(
             "SELECT id, account_id, uri, by_moderator, created_at FROM tombstones WHERE id = $1",
@@ -2825,6 +3909,10 @@ struct PaperclipMetadataRow {
     file_name: String,
     content_type: Option<String>,
     variant: Option<String>,
+}
+
+fn domain_policy_hostname(domain: &str) -> String {
+    canonical_remote_host(domain).unwrap_or_else(|_| domain.trim_end_matches('.').to_owned())
 }
 
 fn normalize_hashtag(value: &str) -> String {

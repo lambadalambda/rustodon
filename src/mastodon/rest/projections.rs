@@ -76,6 +76,13 @@ pub(crate) struct RestCredentialRow {
 }
 
 #[derive(Clone, Debug, sqlx::FromRow)]
+pub(crate) struct RestPreferencesRow {
+    pub settings: Option<String>,
+    pub locale: Option<String>,
+    pub locked: bool,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
 pub(crate) struct RestRelationshipRow {
     pub target_account_id: i64,
     pub following: bool,
@@ -208,6 +215,108 @@ impl Default for SavedStatusesOptions {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NotificationOptions {
+    pub max_id: Option<i64>,
+    pub min_id: Option<i64>,
+    pub since_id: Option<i64>,
+    pub limit: i64,
+    pub account_id: Option<i64>,
+    pub types: Option<Vec<String>>,
+    pub exclude_types: Vec<String>,
+    pub grouped_types: Vec<String>,
+    pub include_filtered: bool,
+}
+
+impl Default for NotificationOptions {
+    fn default() -> Self {
+        Self {
+            max_id: None,
+            min_id: None,
+            since_id: None,
+            limit: 40,
+            account_id: None,
+            types: None,
+            exclude_types: Vec::new(),
+            grouped_types: Vec::new(),
+            include_filtered: false,
+        }
+    }
+}
+
+pub const KNOWN_NOTIFICATION_TYPES: [&str; 17] = [
+    "mention",
+    "status",
+    "reblog",
+    "follow",
+    "follow_request",
+    "favourite",
+    "poll",
+    "update",
+    "severed_relationships",
+    "moderation_warning",
+    "annual_report",
+    "admin.sign_up",
+    "admin.report",
+    "quote",
+    "quoted_update",
+    "added_to_collection",
+    "collection_update",
+];
+
+pub const GROUPABLE_NOTIFICATION_TYPES: [&str; 4] =
+    ["favourite", "reblog", "follow", "admin.sign_up"];
+
+#[must_use]
+pub fn notification_type_filter(requested_types: &[String]) -> Option<Vec<String>> {
+    if requested_types.is_empty() {
+        return None;
+    }
+    let known = KNOWN_NOTIFICATION_TYPES
+        .into_iter()
+        .filter(|kind| requested_types.iter().any(|requested| requested == kind))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    (known.len() != KNOWN_NOTIFICATION_TYPES.len()).then_some(known)
+}
+
+#[must_use]
+pub fn notification_type_filter_with_exclusions(
+    requested_types: &[String],
+    excluded_types: &[String],
+) -> Option<Vec<String>> {
+    let excluded = KNOWN_NOTIFICATION_TYPES
+        .into_iter()
+        .filter(|kind| excluded_types.iter().any(|excluded| excluded == kind))
+        .collect::<Vec<_>>();
+    if excluded.is_empty() {
+        return notification_type_filter(requested_types);
+    }
+    let mut allowed = notification_type_filter(requested_types).unwrap_or_else(|| {
+        KNOWN_NOTIFICATION_TYPES
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    });
+    allowed.retain(|kind| !excluded.iter().any(|excluded| excluded == kind));
+    (allowed.len() != KNOWN_NOTIFICATION_TYPES.len()).then_some(allowed)
+}
+
+#[must_use]
+pub fn grouped_notification_types(requested_types: &[String]) -> Vec<String> {
+    if requested_types.is_empty() {
+        return GROUPABLE_NOTIFICATION_TYPES
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+    }
+    GROUPABLE_NOTIFICATION_TYPES
+        .into_iter()
+        .filter(|kind| requested_types.iter().any(|requested| requested == kind))
+        .map(str::to_owned)
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SavedStatusesPage {
     pub statuses: Vec<StatusProjection>,
@@ -215,9 +324,23 @@ pub struct SavedStatusesPage {
     pub last_cursor: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatusQuotesPage {
+    pub statuses: Vec<StatusProjection>,
+    pub first_cursor: Option<i64>,
+    pub last_cursor: Option<i64>,
+    pub records_continue: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, sqlx::FromRow)]
 pub(crate) struct RestSavedStatusRow {
     pub cursor_id: i64,
+    pub status_id: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, sqlx::FromRow)]
+pub(crate) struct RestStatusQuoteRow {
+    pub quote_id: i64,
     pub status_id: i64,
 }
 
@@ -492,6 +615,24 @@ pub struct AccountProjection {
     pub profile_mentions: Vec<AccountProjection>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationProjection {
+    pub id: i64,
+    pub unread: bool,
+    pub participant_accounts: Vec<AccountProjection>,
+    pub last_status: Option<StatusProjection>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NotificationRequestProjection {
+    pub id: i64,
+    pub account: AccountProjection,
+    pub last_status: Option<StatusProjection>,
+    pub notifications_count: i64,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
 impl AccountProjection {
     #[must_use]
     pub fn local(&self) -> bool {
@@ -528,6 +669,17 @@ pub struct CredentialAccountProjection {
     pub attribution_domains: Option<Vec<String>>,
     pub quote_policy: String,
     pub role: CredentialRoleProjection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreferencesProjection {
+    pub posting_default_visibility: String,
+    pub posting_default_sensitive: bool,
+    pub posting_default_language: String,
+    pub posting_default_quote_policy: String,
+    pub reading_default_sensitive_media: String,
+    pub reading_default_sensitive_text: bool,
+    pub reading_autoplay_gifs: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -692,6 +844,32 @@ pub struct ListProjection {
     pub exclusive: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FollowedTagsOptions {
+    pub max_id: Option<i64>,
+    pub min_id: Option<i64>,
+    pub since_id: Option<i64>,
+    pub limit: i64,
+}
+
+impl Default for FollowedTagsOptions {
+    fn default() -> Self {
+        Self {
+            max_id: None,
+            min_id: None,
+            since_id: None,
+            limit: 100,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FollowedTagsPage {
+    pub tags: Vec<TagProjection>,
+    pub first_cursor: Option<i64>,
+    pub last_cursor: Option<i64>,
+}
+
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub(crate) struct RestFeaturedTagRow {
     pub id: i64,
@@ -710,6 +888,15 @@ pub(crate) struct RestTagSuggestionRow {
     pub name: String,
     pub display_name: Option<String>,
     pub following: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, sqlx::FromRow)]
+pub(crate) struct RestFollowedTagRow {
+    pub tag_follow_id: i64,
+    pub id: i64,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub featuring: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -763,8 +950,9 @@ pub struct NotificationGroupProjection {
     pub sample_accounts: Vec<AccountProjection>,
     pub notifications_count: i64,
     pub most_recent_notification_id: i64,
-    pub page_min_id: i64,
-    pub latest_page_notification_at: NaiveDateTime,
+    pub page_min_id: Option<i64>,
+    pub page_max_id: Option<i64>,
+    pub latest_page_notification_at: Option<NaiveDateTime>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -806,7 +994,7 @@ pub struct InstanceRuntimeConfig {
     pub version: String,
     pub source_url: String,
     pub streaming_api: String,
-    pub vapid_public_key: String,
+    pub vapid_public_key: Option<String>,
     pub thumbnail_url: String,
     pub thumbnail_description: String,
     pub thumbnail_blurhash: Option<String>,
@@ -994,6 +1182,38 @@ pub struct StatusProjection {
     pub quote_current_user: String,
 }
 
+impl StatusProjection {
+    pub(crate) fn without_status_relationships(mut self) -> Self {
+        self.clear_status_relationships();
+        self
+    }
+
+    fn clear_status_relationships(&mut self) {
+        if let Some(viewer) = self.viewer.as_mut() {
+            viewer.favourited = false;
+            viewer.reblogged = false;
+            viewer.muted = false;
+            viewer.bookmarked = false;
+            viewer.pinned = viewer.pinned.map(|_| false);
+            viewer.filtered.clear();
+        }
+        if let Some(quote) = self.quote.as_mut()
+            && quote.accepted
+            && quote.target_access == QuoteTargetAccess::Visible
+        {
+            "accepted".clone_into(&mut quote.state);
+        }
+        if let Some(reblog) = self.reblog.as_mut() {
+            reblog.clear_status_relationships();
+        }
+        if let Some(quote) = self.quote.as_mut()
+            && let Some(quoted_status) = quote.quoted_status.as_mut()
+        {
+            quoted_status.clear_status_relationships();
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct StatusEditProjection {
     pub account: AccountProjection,
@@ -1005,4 +1225,65 @@ pub struct StatusEditProjection {
     pub emojis: Vec<CustomEmojiProjection>,
     pub quote: Option<QuoteProjection>,
     pub poll_options: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GROUPABLE_NOTIFICATION_TYPES, KNOWN_NOTIFICATION_TYPES, grouped_notification_types,
+        notification_type_filter, notification_type_filter_with_exclusions,
+    };
+
+    #[test]
+    fn notification_type_filter_matches_mastodons_known_type_intersection() {
+        assert_eq!(notification_type_filter(&[]), None);
+        assert_eq!(
+            notification_type_filter(&["future_event".to_owned()]),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            notification_type_filter(&["mention".to_owned(), "future_event".to_owned()]),
+            Some(vec!["mention".to_owned()])
+        );
+        assert_eq!(
+            notification_type_filter(
+                &KNOWN_NOTIFICATION_TYPES
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn notification_type_exclusions_preserve_legacy_unfiltered_rows() {
+        assert_eq!(
+            notification_type_filter_with_exclusions(&[], &["future_event".to_owned()]),
+            None
+        );
+        let filtered = notification_type_filter_with_exclusions(&[], &["favourite".to_owned()])
+            .expect("known exclusion should create an allow-list");
+        assert_eq!(filtered.len(), KNOWN_NOTIFICATION_TYPES.len() - 1);
+        assert!(!filtered.iter().any(|kind| kind == "favourite"));
+    }
+
+    #[test]
+    fn grouped_notification_types_intersect_only_groupable_types() {
+        assert_eq!(
+            grouped_notification_types(&[]),
+            GROUPABLE_NOTIFICATION_TYPES
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            grouped_notification_types(&[
+                "follow".to_owned(),
+                "mention".to_owned(),
+                "future_event".to_owned(),
+            ]),
+            vec!["follow".to_owned()]
+        );
+    }
 }

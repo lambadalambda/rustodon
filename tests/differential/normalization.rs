@@ -23,6 +23,10 @@ pub(crate) enum NormalizationRule {
         prefix: &'static str,
         reason: &'static str,
     },
+    MediaBlurhash {
+        pointer: &'static str,
+        reason: &'static str,
+    },
 }
 
 pub(crate) const REQUEST_ID_HEADER: NormalizationRule = NormalizationRule::RequestIdHeader {
@@ -35,12 +39,22 @@ pub(crate) const GENERATED_TIMESTAMP: NormalizationRule = NormalizationRule::Rfc
     reason: "the response records the instant at which each implementation generated it",
 };
 
+pub(crate) const MARKER_TIMESTAMP: NormalizationRule = NormalizationRule::Rfc3339Timestamp {
+    pointer: "/home/updated_at",
+    reason: "each implementation timestamps the marker update independently",
+};
+
 pub(crate) const RANDOM_TEST_TOKEN: NormalizationRule =
     NormalizationRule::PrefixedRandomTestToken {
         pointer: "/token",
         prefix: "differential-",
         reason: "the compatibility case deliberately asks each implementation to mint a test token",
     };
+
+pub(crate) const MEDIA_BLURHASH: NormalizationRule = NormalizationRule::MediaBlurhash {
+    pointer: "/blurhash",
+    reason: "libvips and the Rust image processor produce different deterministic blurhash bytes",
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NormalizationError {
@@ -92,6 +106,15 @@ pub(crate) fn normalize_pair(
                     |value| is_prefixed_token(value, prefix),
                 )?;
             }
+            NormalizationRule::MediaBlurhash { pointer, .. } => {
+                normalize_json_values(
+                    mastodon,
+                    rust,
+                    "media-blurhash",
+                    pointer,
+                    is_media_blurhash,
+                )?;
+            }
         }
     }
     Ok(())
@@ -103,6 +126,7 @@ impl NormalizationRule {
             Self::RequestIdHeader { .. } => "request-id-header",
             Self::Rfc3339Timestamp { .. } => "rfc3339-generated-timestamp",
             Self::PrefixedRandomTestToken { .. } => "prefixed-random-test-token",
+            Self::MediaBlurhash { .. } => "media-blurhash",
         }
     }
 
@@ -110,9 +134,42 @@ impl NormalizationRule {
         match self {
             Self::RequestIdHeader { reason, .. }
             | Self::Rfc3339Timestamp { reason, .. }
-            | Self::PrefixedRandomTestToken { reason, .. } => reason,
+            | Self::PrefixedRandomTestToken { reason, .. }
+            | Self::MediaBlurhash { reason, .. } => reason,
         }
     }
+}
+
+fn is_media_blurhash(value: &Value) -> bool {
+    value.as_str().is_some_and(|value| {
+        value.len() == 36
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'#' | b'$'
+                            | b'%'
+                            | b'*'
+                            | b'+'
+                            | b','
+                            | b'-'
+                            | b'.'
+                            | b':'
+                            | b';'
+                            | b'='
+                            | b'?'
+                            | b'@'
+                            | b'['
+                            | b']'
+                            | b'^'
+                            | b'_'
+                            | b'{'
+                            | b'|'
+                            | b'}'
+                            | b'~'
+                    )
+            })
+    })
 }
 
 fn normalize_request_id_header(

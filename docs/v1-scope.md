@@ -232,8 +232,8 @@ Required discovery and representations:
 - NodeInfo discovery and NodeInfo 2.0.
 - Local actor JSON-LD with stable IDs, inbox, outbox, followers/following,
   shared inbox, and legacy RSA public key.
-- Local Note object GET and basic paginated outbox/followers/following
-  `OrderedCollection` responses.
+- Local Note object GET, its `replies`/`likes`/`shares` collections, and basic
+  paginated outbox/followers/following `OrderedCollection` responses.
 
 Required transport and fetching:
 
@@ -560,6 +560,11 @@ or exact Rails error prose unless a real client relies on it.
 - Exotic provider and object-storage test matrices.
 
 ## V1 Acceptance Criteria
+
+The requirement-to-proof traceability table is maintained in the [v1 acceptance
+matrix](v1-acceptance-matrix.md). It is intentionally explicit about local
+automated evidence and acceptance work that still requires a browser, mobile
+client, live peer, or cutover rehearsal.
 
 Rustodon v1 is ready when tested against a one-domain, local-filesystem
 Mastodon 4.6.5 instance with 1-20 local users:

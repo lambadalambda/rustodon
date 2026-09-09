@@ -6,23 +6,32 @@ rust-version = "1.97.1"
 description = "A mostly-in-place Mastodon replacement written in Rust"
 publish = false
 
+[features]
+test-support = []
+
 [dependencies]
 aes-gcm = "0.10.3"
 ammonia = "4.1"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22.1"
+bcrypt = "0.15.1"
+blurhash = { version = "0.2.3", default-features = false }
 chrono = { version = "0.4.41", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive"] }
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+hmac = "0.12.1"
 http = "1.5"
 httpdate = "1.0.3"
 idna = "1.1"
 html-escape = "0.2"
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 ipnetwork = "0.20.0"
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "pool", "smtp-transport", "tokio1-rustls-tls", "rustls-native-certs"] }
 linkify = "0.10"
 pbkdf2 = "0.12.2"
 percent-encoding = "2.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "stream"] }
 rsa = { version = "0.9.10", features = ["pem", "sha2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustix = { version = "1.1", features = ["fs"] }
@@ -33,13 +42,14 @@ sha1 = "0.10.7"
 sha2 = { version = "0.10.9", features = ["oid"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "chrono", "json", "ipnetwork", "derive"] }
 tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower-http = { version = "0.6.11", features = ["fs"] }
 url = "2.5"
 unicode-normalization = "0.1"
 webpki-roots = "0.26.11"
 zeroize = "1.9"
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false }
+tokio-tungstenite = "0.29"
 
 [lints.rust]
 unsafe_code = "forbid"

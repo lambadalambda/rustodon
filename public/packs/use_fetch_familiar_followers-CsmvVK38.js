@@ -1,0 +1,2 @@
+import{o as e}from"./chunk-CMxvf4Kt.js";import{n as t}from"./jsx-runtime-SsSjplwM.js";import{b as n}from"./prop-types-BTvjt2rf.js";import{J as r,V as i}from"./poll-jQ-MWCuw.js";import{vn as a}from"./render-CoSj8P7u.js";import{o,s}from"./typed_functions-CyAHd4bl.js";var c=e(t()),l=({accountId:e})=>{let t=o(),l=s(t=>e?i(t,e):null),{signedIn:u}=r(),d=l===null;return(0,c.useEffect)(()=>{d&&u&&e&&e!==n&&t(a({id:e}))},[t,e,d,u]),{familiarFollowers:d?[]:l,isLoading:d}};export{l as t};
+//# sourceMappingURL=use_fetch_familiar_followers-CsmvVK38.js.map

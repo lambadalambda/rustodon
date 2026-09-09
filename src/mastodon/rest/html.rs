@@ -50,12 +50,12 @@ impl<'a> HtmlFormatter<'a> {
         mentions: &[MentionTarget<'_>],
         quoted_status_url: Option<&str>,
     ) -> RenderedHtml {
-        let inline = self.linkify_local(text, mentions, true);
+        let inline = self.linkify_local(text, mentions, true, false);
         let mut html = simple_format(&inline);
         if let Some(url) = quoted_status_url.filter(|url| !url.is_empty() && !html.contains(url)) {
             html = format!(
                 "<p class=\"quote-inline\">RE: {}</p>{html}",
-                shortened_link(url)
+                shortened_link(url, false)
             );
         }
         RenderedHtml(html)
@@ -63,17 +63,19 @@ impl<'a> HtmlFormatter<'a> {
 
     #[must_use]
     pub fn local_inline(&self, text: &str, mentions: &[MentionTarget<'_>]) -> RenderedHtml {
-        RenderedHtml(self.linkify_local(text, mentions, true))
+        RenderedHtml(self.linkify_local(text, mentions, true, false))
     }
 
     #[must_use]
     pub fn local_profile_text(&self, text: &str, mentions: &[MentionTarget<'_>]) -> RenderedHtml {
-        RenderedHtml(simple_format(&self.linkify_local(text, mentions, false)))
+        RenderedHtml(simple_format(
+            &self.linkify_local(text, mentions, false, false),
+        ))
     }
 
     #[must_use]
     pub fn local_profile_inline(&self, text: &str, mentions: &[MentionTarget<'_>]) -> RenderedHtml {
-        RenderedHtml(self.linkify_local(text, mentions, false))
+        RenderedHtml(self.linkify_local(text, mentions, true, true))
     }
 
     #[must_use]
@@ -125,6 +127,7 @@ impl<'a> HtmlFormatter<'a> {
         text: &str,
         mentions: &[MentionTarget<'_>],
         display_domains: bool,
+        with_rel_me: bool,
     ) -> String {
         let mut finder = LinkFinder::new();
         finder.kinds(&[LinkKind::Url]);
@@ -136,7 +139,7 @@ impl<'a> HtmlFormatter<'a> {
                 mentions,
                 display_domains,
             ));
-            output.push_str(&shortened_link(link.as_str()));
+            output.push_str(&shortened_link(link.as_str(), with_rel_me));
             cursor = link.end();
         }
         output.push_str(&self.linkify_mentions_and_tags(
@@ -184,11 +187,11 @@ impl<'a> HtmlFormatter<'a> {
                 plain_start = end;
                 continue;
             }
-            if character == '#'
+            if matches!(character, '#' | '＃')
                 && let Some(end) = hashtag_end(text, cursor)
             {
                 output.push_str(&escape_html(&text[plain_start..cursor]));
-                let tag = &text[cursor + 1..end];
+                let tag = &text[cursor + character.len_utf8()..end];
                 let path = format!("tags/{tag}");
                 let url = self
                     .origin
@@ -271,19 +274,27 @@ fn hashtag_end(text: &str, start: usize) -> Option<usize> {
         && text[..start]
             .chars()
             .next_back()
-            .is_some_and(|character| character.is_alphanumeric() || character == '_')
+            .is_some_and(|character| !character.is_whitespace())
     {
         return None;
     }
-    let mut end = start + 1;
+    let hash = text[start..].chars().next()?;
+    if !matches!(hash, '#' | '＃') {
+        return None;
+    }
+    let mut end = start + hash.len_utf8();
     while let Some(character) = text[end..].chars().next() {
-        if character.is_alphanumeric() || character == '_' {
+        if character.is_alphanumeric() || matches!(character, '_' | '·' | '・' | '\u{200c}') {
             end += character.len_utf8();
         } else {
             break;
         }
     }
-    (end > start + 1).then_some(end)
+    (end > start + hash.len_utf8()
+        && text[start + hash.len_utf8()..end]
+            .chars()
+            .any(char::is_alphabetic))
+    .then_some(end)
 }
 
 fn simple_format(html: &str) -> String {
@@ -301,7 +312,7 @@ fn simple_format(html: &str) -> String {
         })
 }
 
-fn shortened_link(url: &str) -> String {
+fn shortened_link(url: &str, with_rel_me: bool) -> String {
     let escaped_url = escape_attribute(url);
     let prefix_length = [
         "https://www.",
@@ -326,8 +337,13 @@ fn shortened_link(url: &str) -> String {
     }
     let display = &remainder[..display_end];
     let ellipsis_class = if suffix.is_empty() { "" } else { "ellipsis" };
+    let rel = if with_rel_me {
+        "nofollow noopener me"
+    } else {
+        "nofollow noopener"
+    };
     format!(
-        "<a href=\"{escaped_url}\" target=\"_blank\" rel=\"nofollow noopener\" translate=\"no\"><span class=\"invisible\">{}</span><span class=\"{ellipsis_class}\">{}</span><span class=\"invisible\">{}</span></a>",
+        "<a href=\"{escaped_url}\" target=\"_blank\" rel=\"{rel}\" translate=\"no\"><span class=\"invisible\">{}</span><span class=\"{ellipsis_class}\">{}</span><span class=\"invisible\">{}</span></a>",
         escape_html(prefix),
         escape_html(display),
         escape_html(suffix)

@@ -46,6 +46,7 @@ fn mastodon_compatible_defaults_are_typed() {
         config.domains.canonical_origin.as_str(),
         "https://example.com/"
     );
+    assert!(!config.limited_federation);
 
     assert_eq!(config.database.pool_size, 5);
     assert_eq!(config.database.ssl_mode, PostgresSslMode::Prefer);
@@ -108,6 +109,80 @@ fn mastodon_compatible_defaults_are_typed() {
     assert_eq!(config.worker.shutdown_seconds, 15);
     assert_eq!(config.web.bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
     assert_eq!(config.web.port, 3000);
+}
+
+#[test]
+fn limited_federation_mode_is_explicitly_configurable() {
+    let mut environment = required_environment();
+    environment.insert("LIMITED_FEDERATION_MODE".into(), "true".into());
+    assert!(
+        Config::from_environment(&environment)
+            .unwrap()
+            .limited_federation
+    );
+
+    for value in ["1", "yes", "TRUE"] {
+        let error = error_for("LIMITED_FEDERATION_MODE", value);
+        assert!(error.to_string().contains("LIMITED_FEDERATION_MODE"));
+    }
+
+    let mut environment = required_environment();
+    environment.insert("WHITELIST_MODE".into(), "true".into());
+    assert!(
+        Config::from_environment(&environment)
+            .unwrap()
+            .limited_federation
+    );
+    environment.insert("LIMITED_FEDERATION_MODE".into(), "false".into());
+    assert!(
+        !Config::from_environment(&environment)
+            .unwrap()
+            .limited_federation
+    );
+}
+
+#[test]
+fn optional_writer_database_is_typed_without_changing_the_read_default() {
+    let mut environment = required_environment();
+    environment.insert(
+        "DATABASE_URL".into(),
+        "postgresql://reader:secret@db.example/mastodon".into(),
+    );
+    environment.insert(
+        "WRITE_DATABASE_URL".into(),
+        "postgresql://writer:secret@db.example/mastodon".into(),
+    );
+    environment.insert("DB_POOL".into(), "9".into());
+    let config = Config::from_environment(&environment).unwrap();
+    assert!(matches!(
+        config.database.connection,
+        PostgresConnection::Url {
+            source: PostgresUrlSource::DatabaseUrl,
+            ..
+        }
+    ));
+    assert_eq!(config.database.pool_size, 9);
+    let writer = config.write_database.expect("writer URL should be present");
+    assert_eq!(writer.pool_size, 9);
+    assert_eq!(
+        config.worker.lanes,
+        [
+            Lane::Core,
+            Lane::Ingress,
+            Lane::Maintenance,
+            Lane::Pull,
+            Lane::Push,
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+    );
+    assert!(matches!(
+        writer.connection,
+        PostgresConnection::Url {
+            source: PostgresUrlSource::WriteDatabaseUrl,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -186,6 +261,32 @@ fn worker_settings_are_typed_bounded_and_use_sidekiq_concurrency_as_a_fallback()
             "{name} error did not name its variable"
         );
     }
+}
+
+#[test]
+fn smtp_configuration_adds_mail_to_the_default_worker_lanes() {
+    let mut environment = required_environment();
+    environment.insert(
+        "WRITE_DATABASE_URL".into(),
+        "postgres://writer@db/mastodon".into(),
+    );
+    environment.insert("SMTP_SERVER".into(), "mail.example".into());
+
+    let config = Config::from_environment(&environment).unwrap();
+
+    assert_eq!(
+        config.worker.lanes,
+        [
+            Lane::Core,
+            Lane::Ingress,
+            Lane::Mail,
+            Lane::Maintenance,
+            Lane::Pull,
+            Lane::Push
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+    );
 }
 
 #[test]
@@ -463,6 +564,7 @@ fn smtp_transport_modes_and_contradictions_are_strict() {
         ("SMTP_FROM_ADDRESS", "not-a-mailbox"),
         ("SMTP_DELIVERY_METHOD", "sendmail"),
         ("SMTP_AUTH_METHOD", "oauth"),
+        ("SMTP_AUTH_METHOD", "cram_md5"),
         ("SMTP_ENABLE_STARTTLS", "yes"),
         ("SMTP_TLS", "TRUE"),
         ("SMTP_OPENSSL_VERIFY_MODE", "sometimes"),

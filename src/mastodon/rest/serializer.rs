@@ -11,15 +11,16 @@ use super::{
     CustomEmojiProjection, DecimalId, FeaturedTagProjection, FilterProjection,
     FilterResultProjection, GroupedNotificationsProjection, HtmlFormatter, InstanceProjection,
     ListProjection, MarkerProjection, MediaAttachmentProjection, MentionProjection,
-    NotificationGroupProjection, NotificationProjection, PollProjection, PreviewCardProjection,
-    QuoteProjection, QuoteTargetAccess, QuoteTargetLinkProjection, ReportProjection, RestAccount,
-    RestAccountField, RestAccountRole, RestAccountWarning, RestAnnualReport, RestAppeal,
-    RestApplication, RestCollection, RestCollectionItem, RestCollectionWithAccounts,
-    RestCredentialAccount, RestCredentialSource, RestCustomEmoji, RestFallback,
-    RestFeatureApproval, RestFeaturedTag, RestFilter, RestFilterKeyword, RestFilterResult,
-    RestFilterStatus, RestGroupedNotifications, RestInstanceV1, RestInstanceV2, RestList,
-    RestMarker, RestMediaAttachment, RestMention, RestMutedAccount, RestNotification,
-    RestNotificationGroup, RestPartialAccount, RestPoll, RestPollOption, RestPreviewCard,
+    NotificationGroupProjection, NotificationProjection, NotificationRequestProjection,
+    PollProjection, PreferencesProjection, PreviewCardProjection, QuoteProjection,
+    QuoteTargetAccess, QuoteTargetLinkProjection, ReportProjection, RestAccount, RestAccountField,
+    RestAccountRole, RestAccountWarning, RestAnnualReport, RestAppeal, RestApplication,
+    RestCollection, RestCollectionItem, RestCollectionWithAccounts, RestCredentialAccount,
+    RestCredentialSource, RestCustomEmoji, RestFallback, RestFeatureApproval, RestFeaturedTag,
+    RestFilter, RestFilterKeyword, RestFilterResult, RestFilterStatus, RestGroupedNotifications,
+    RestInstanceV1, RestInstanceV2, RestList, RestMarker, RestMediaAttachment, RestMention,
+    RestMutedAccount, RestNotification, RestNotificationGroup, RestNotificationRequest,
+    RestPartialAccount, RestPoll, RestPollOption, RestPreferences, RestPreviewCard,
     RestPreviewCardAuthor, RestQuote, RestQuoteApproval, RestQuotePayload, RestRelationship,
     RestReport, RestRole, RestRule, RestSeveranceEvent, RestShallowQuote, RestShallowTag,
     RestStatus, RestStatusContext, RestStatusEdit, RestStatusEditPoll, RestStatusEditPollOption,
@@ -30,7 +31,7 @@ use crate::mastodon::AccountIdScheme;
 
 const DEFAULT_AVATAR: &str = "avatars/original/missing.png";
 const DEFAULT_HEADER: &str = "headers/original/missing.png";
-const SUPPORTED_MIME_TYPES: &[&str] = &[
+pub(crate) const SUPPORTED_MIME_TYPES: &[&str] = &[
     "image/jpeg",
     "image/png",
     "image/gif",
@@ -199,6 +200,19 @@ impl<'a> RestSerializer<'a> {
             },
             account,
         })
+    }
+
+    #[must_use]
+    pub fn preferences(&self, preferences: &PreferencesProjection) -> RestPreferences {
+        RestPreferences {
+            posting_default_visibility: preferences.posting_default_visibility.clone(),
+            posting_default_sensitive: preferences.posting_default_sensitive,
+            posting_default_language: preferences.posting_default_language.clone(),
+            posting_default_quote_policy: preferences.posting_default_quote_policy.clone(),
+            reading_default_sensitive_media: preferences.reading_default_sensitive_media.clone(),
+            reading_default_sensitive_text: preferences.reading_default_sensitive_text,
+            reading_autoplay_gifs: preferences.reading_autoplay_gifs,
+        }
     }
 
     #[must_use]
@@ -579,6 +593,24 @@ impl<'a> RestSerializer<'a> {
         }
     }
 
+    pub fn notification_request(
+        &self,
+        request: &NotificationRequestProjection,
+    ) -> Result<RestNotificationRequest, RestError> {
+        Ok(RestNotificationRequest {
+            id: DecimalId::new(request.id),
+            created_at: ApiDateTime::new(request.created_at),
+            updated_at: ApiDateTime::new(request.updated_at),
+            notifications_count: request.notifications_count.to_string(),
+            account: self.account(&request.account)?,
+            last_status: request
+                .last_status
+                .as_ref()
+                .map(|status| self.status(status, StatusShape::Full))
+                .transpose()?,
+        })
+    }
+
     #[must_use]
     pub fn list(&self, list: &ListProjection) -> RestList {
         RestList {
@@ -761,7 +793,7 @@ impl<'a> RestSerializer<'a> {
         })
     }
 
-    fn report(&self, report: &ReportProjection) -> Result<RestReport, RestError> {
+    pub fn report(&self, report: &ReportProjection) -> Result<RestReport, RestError> {
         Ok(RestReport {
             id: DecimalId::new(report.id),
             action_taken: report.action_taken_at.is_some(),
@@ -1012,9 +1044,9 @@ impl<'a> RestSerializer<'a> {
             notifications_count: group.notifications_count,
             notification_type: notification_type.to_owned(),
             most_recent_notification_id: group.most_recent_notification_id,
-            page_min_id: Some(DecimalId::new(group.page_min_id)),
-            page_max_id: Some(DecimalId::new(group.most_recent_notification_id)),
-            latest_page_notification_at: Some(ApiDateTime::new(group.latest_page_notification_at)),
+            page_min_id: group.page_min_id.map(DecimalId::new),
+            page_max_id: group.page_max_id.map(DecimalId::new),
+            latest_page_notification_at: group.latest_page_notification_at.map(ApiDateTime::new),
             fallback: self.notification_fallback(
                 notification,
                 &group.sample_accounts,
@@ -1394,7 +1426,7 @@ impl<'a> RestSerializer<'a> {
                     name: field.name.clone(),
                     value: if account.local() {
                         formatter
-                            .local_inline(&field.value, &profile_mentions)
+                            .local_profile_inline(&field.value, &profile_mentions)
                             .into_string()
                     } else {
                         formatter.remote_fragment(&field.value).into_string()

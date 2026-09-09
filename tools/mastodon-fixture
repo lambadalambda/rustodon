@@ -23,6 +23,8 @@ DATABASE_READER='rustodon_reader'
 DATABASE_READER_PASSWORD='fixture-reader-password-v4-6-5'
 DIFFERENTIAL_READER='rustodon_differential_reader'
 DIFFERENTIAL_READER_PASSWORD='fixture-differential-reader-v4-6-5'
+DIFFERENTIAL_WRITER='rustodon_differential_writer'
+DIFFERENTIAL_WRITER_PASSWORD='fixture-differential-writer-v4-6-5'
 OPERATIONAL_MIGRATOR='rustodon_schema_migrator'
 OPERATIONAL_MIGRATOR_PASSWORD='fixture-schema-migrator-v4-6-5'
 WORKER_RUNTIME='rustodon_worker_runtime'
@@ -91,7 +93,10 @@ cleanup_containers() {
        [ -f "$marker" ] &&
        [ "$(cat "$marker")" = "run=$DIFFERENTIAL_RUN_ID" ]
     then
-      rm -rf "$DIFFERENTIAL_ROOT"
+      rm -rf "$DIFFERENTIAL_ROOT" || true
+      if [ -e "$DIFFERENTIAL_ROOT" ]; then
+        run_podman unshare rm -rf "$DIFFERENTIAL_ROOT" >/dev/null 2>&1 || true
+      fi
     fi
     DIFFERENTIAL_ROOT=''
   fi
@@ -801,7 +806,7 @@ generate_fixture() {
   rm -rf "$stage/media-source"
 
   write_migrations_manifest "$SOURCE_DIR" "$stage/migrations.tsv" "$stage/expected-migrations.txt"
-  run_podman exec "$PG_CONTAINER" psql \
+  run_podman exec -i "$PG_CONTAINER" psql \
     --set ON_ERROR_STOP=1 --tuples-only --no-align \
     --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
     --command 'SELECT version FROM schema_migrations ORDER BY version' \
@@ -978,6 +983,13 @@ REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM $DATABASE_READER;
 EOF
 
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres >/dev/null <<EOF
+CREATE ROLE $DIFFERENTIAL_WRITER LOGIN PASSWORD '$DIFFERENTIAL_WRITER_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+EOF
+  prepare_differential_writer_database "$DATABASE_NAME"
+
   published_endpoint=$(run_podman port "$PG_CONTAINER" 5432/tcp)
   published_port=${published_endpoint##*:}
   case "$published_port" in
@@ -985,9 +997,11 @@ EOF
   esac
   database_url="postgresql://$DATABASE_READER:$DATABASE_READER_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
   owner_url="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
+  writer_url="postgresql://$DIFFERENTIAL_WRITER:$DIFFERENTIAL_WRITER_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
 
   RUSTODON_MASTODON_DATABASE_URL="$database_url" \
   RUSTODON_MASTODON_OWNER_DATABASE_URL="$owner_url" \
+  RUSTODON_MASTODON_WRITER_DATABASE_URL="$writer_url" \
     cargo test --locked --test mastodon_schema -- --ignored --nocapture --test-threads=1
 
   finish_database
@@ -995,6 +1009,7 @@ EOF
 }
 
 operational_schema_test() {
+  export RUSTUP_TOOLCHAIN=1.97.1
   fixture=$FIXTURE_DIR
   verify_static "$fixture"
   verify_images
@@ -1012,13 +1027,20 @@ CREATE ROLE $OPERATIONAL_MIGRATOR LOGIN PASSWORD '$OPERATIONAL_MIGRATOR_PASSWORD
   NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
 CREATE ROLE rustodon_displaced_owner NOLOGIN
   NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+CREATE ROLE $WORKER_RUNTIME LOGIN NOINHERIT PASSWORD '$WORKER_RUNTIME_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+REVOKE ALL ON DATABASE $DATABASE_NAME FROM PUBLIC;
 GRANT CONNECT, CREATE ON DATABASE $DATABASE_NAME TO $OPERATIONAL_MIGRATOR;
+GRANT CONNECT ON DATABASE $DATABASE_NAME TO $WORKER_RUNTIME;
 EOF
   run_podman exec -i "$PG_CONTAINER" psql \
     --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" >/dev/null <<EOF
 GRANT USAGE ON SCHEMA public TO $OPERATIONAL_MIGRATOR;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO $OPERATIONAL_MIGRATOR;
 GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO $OPERATIONAL_MIGRATOR;
+GRANT USAGE ON SCHEMA public TO $WORKER_RUNTIME;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO $WORKER_RUNTIME;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 EOF
 
   before_catalog="$ROOT/target/operational-before-catalog-$$.txt"
@@ -1071,16 +1093,65 @@ EOF
     ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT='22222222222222222222222222222222' \
     ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY='33333333333333333333333333333333' \
     cargo run --locked --quiet -- admin migrate-operational-schema
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" >/dev/null <<EOF
+GRANT USAGE ON SCHEMA public TO $WORKER_RUNTIME;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO $WORKER_RUNTIME;
+GRANT USAGE ON SCHEMA rustodon TO $WORKER_RUNTIME;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
+  rustodon.durable_jobs, rustodon.outbox_events, rustodon.idempotency_keys,
+  rustodon.ordering_markers, rustodon.domain_health, rustodon.heartbeats,
+  rustodon.rate_limit_windows
+  TO $WORKER_RUNTIME;
+GRANT SELECT ON TABLE rustodon.schema_migrations TO $WORKER_RUNTIME;
+GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq
+  TO $WORKER_RUNTIME;
+DROP TABLE rustodon.remote_fetch_leases;
+DELETE FROM rustodon.schema_migrations WHERE version = 3;
+EOF
+  RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
+  RUSTODON_OPERATIONAL_RUNTIME_ROLE="$WORKER_RUNTIME" \
+    cargo test --locked --test operational_schema \
+      operational_schema_upgrade_grants_new_runtime_table_access \
+      -- --ignored --exact --nocapture
   RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
     cargo test --locked --test operational_schema \
       operational_schema_lifecycle_is_isolated_and_idempotent \
+      -- --ignored --exact --nocapture
+  RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
+    cargo test --locked --lib web::tests::shared_rate_limiter_coordinates_independent_pools \
+      -- --ignored --exact --nocapture
+  RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
+    cargo test --locked --lib remote::tests::remote_domain_budget_coordinates_independent_pools_and_reclaims_expired_leases \
       -- --ignored --exact --nocapture
   RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
   RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
     cargo test --locked --test operational_schema \
       operational_schema_rejects_namespace_and_access_drift \
       -- --ignored --exact --nocapture
-
+  RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
+  RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+    cargo test --locked --test operational_schema \
+      operational_write_composition_is_atomic_and_idempotent \
+      -- --ignored --exact --nocapture
+  RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+    cargo test --locked --test operational_schema \
+      stream_events_are_replayable_and_not_dispatchable \
+      -- --ignored --exact --nocapture
+  RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+    cargo test --locked --test operational_schema \
+      stream_cursor_does_not_skip_inflight_commits \
+      -- --ignored --exact --nocapture
+  RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
+  RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+    cargo test --locked --test streaming \
+      websocket_stream_delivers_one_deduplicated_mastodon_envelope \
+      -- --ignored --exact --nocapture
+  RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
+  RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+    cargo test --locked --test streaming \
+      websocket_stream_revocation_is_token_specific \
+      -- --ignored --exact --nocapture
   unsupported_database="rustodon_operational_unsupported_$$"
   run_podman exec -i "$PG_CONTAINER" psql \
     --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres >/dev/null <<EOF
@@ -1145,6 +1216,11 @@ EOF
     --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
     < "$fixture/verify.sql" >/dev/null
   run_rails "$fixture" 'bundle exec rails runner /fixture/verify.rb'
+  RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
+  RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+    cargo test --locked --test streaming \
+      websocket_stream_terminates_when_local_account_is_suspended \
+      -- --ignored --exact --nocapture
   finish_database
   printf 'operational schema integration passed for Mastodon %s\n' "$RELEASE"
 }
@@ -1163,6 +1239,8 @@ worker_test() {
 CREATE ROLE $OPERATIONAL_MIGRATOR LOGIN PASSWORD '$OPERATIONAL_MIGRATOR_PASSWORD'
   NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
 CREATE ROLE $WORKER_RUNTIME LOGIN NOINHERIT PASSWORD '$WORKER_RUNTIME_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE $DIFFERENTIAL_WRITER LOGIN PASSWORD '$DIFFERENTIAL_WRITER_PASSWORD'
   NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 GRANT CONNECT, CREATE ON DATABASE $DATABASE_NAME TO $OPERATIONAL_MIGRATOR;
 REVOKE ALL ON DATABASE $DATABASE_NAME FROM PUBLIC;
@@ -1186,6 +1264,7 @@ EOF
   esac
   migrator_url="postgresql://$OPERATIONAL_MIGRATOR:$OPERATIONAL_MIGRATOR_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
   runtime_url="postgresql://$WORKER_RUNTIME:$WORKER_RUNTIME_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
+  writer_url="postgresql://$DIFFERENTIAL_WRITER:$DIFFERENTIAL_WRITER_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
   worker_log="$ROOT/target/worker-log-$$"
   cargo build --locked --quiet --bin rustodon
   run_worker_cli "$migrator_url" admin migrate-operational-schema
@@ -1194,19 +1273,23 @@ EOF
 GRANT USAGE ON SCHEMA rustodon TO $WORKER_RUNTIME;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   rustodon.durable_jobs, rustodon.outbox_events, rustodon.idempotency_keys,
-  rustodon.ordering_markers, rustodon.domain_health, rustodon.heartbeats
+  rustodon.ordering_markers, rustodon.domain_health, rustodon.heartbeats,
+  rustodon.rate_limit_windows
   TO $WORKER_RUNTIME;
+GRANT SELECT, INSERT, DELETE ON TABLE rustodon.remote_fetch_leases TO $WORKER_RUNTIME;
 GRANT SELECT ON TABLE rustodon.schema_migrations TO $WORKER_RUNTIME;
 GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq
   TO $WORKER_RUNTIME;
 EOF
   run_worker_cli "$migrator_url" admin migrate-operational-schema
+  prepare_differential_writer_database "$DATABASE_NAME"
   RUSTODON_WORKER_DATABASE_URL="$runtime_url" \
   RUSTODON_WORKER_ADMIN_DATABASE_URL="$migrator_url" \
+  RUSTODON_WORKER_WRITE_DATABASE_URL="$writer_url" \
   RUSTODON_WORKER_OWNER_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
-    cargo test --locked --test workers -- --ignored --nocapture --test-threads=1
+    cargo test --locked --features test-support --test workers -- --ignored --nocapture --test-threads=1
 
-  start_worker_cli "$runtime_url" "$worker_log" &
+  start_worker_cli "$runtime_url" "$worker_log" "$writer_url" &
   worker_pid=$!
   ready=false
   for _ in $(seq 1 60); do
@@ -1273,6 +1356,7 @@ EOF
   migrator_url="postgresql://$OPERATIONAL_MIGRATOR:$OPERATIONAL_MIGRATOR_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
   runtime_url="postgresql://$WORKER_RUNTIME:$WORKER_RUNTIME_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
   owner_url="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
+  writer_url="postgresql://$DIFFERENTIAL_WRITER:$DIFFERENTIAL_WRITER_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
   cargo build --locked --quiet --bin rustodon
   run_worker_cli "$migrator_url" admin migrate-operational-schema
   run_podman exec -i "$PG_CONTAINER" psql \
@@ -1280,15 +1364,24 @@ EOF
 GRANT USAGE ON SCHEMA rustodon TO $WORKER_RUNTIME;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   rustodon.durable_jobs, rustodon.outbox_events, rustodon.idempotency_keys,
-  rustodon.ordering_markers, rustodon.domain_health, rustodon.heartbeats
+  rustodon.ordering_markers, rustodon.domain_health, rustodon.heartbeats,
+  rustodon.rate_limit_windows
   TO $WORKER_RUNTIME;
+GRANT SELECT, INSERT, DELETE ON TABLE rustodon.remote_fetch_leases TO $WORKER_RUNTIME;
 GRANT SELECT ON TABLE rustodon.schema_migrations TO $WORKER_RUNTIME;
 GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq
   TO $WORKER_RUNTIME;
 EOF
   run_worker_cli "$migrator_url" admin migrate-operational-schema
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres >/dev/null <<EOF
+CREATE ROLE $DIFFERENTIAL_WRITER LOGIN PASSWORD '$DIFFERENTIAL_WRITER_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+EOF
+  prepare_differential_writer_database "$DATABASE_NAME"
   RUSTODON_STARTUP_DATABASE_URL="$runtime_url" \
   RUSTODON_STARTUP_OWNER_DATABASE_URL="$owner_url" \
+  RUSTODON_STARTUP_WRITE_DATABASE_URL="$writer_url" \
   RUSTODON_STARTUP_MEDIA_ROOT="$FIXTURE_DIR/media" \
     cargo test --locked --test startup -- --ignored --nocapture --test-threads=1
 
@@ -1306,7 +1399,7 @@ run_worker_cli() {
     RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.97.1}" \
     CC='clang' AR="$ROOT/tools/clang-ar" \
     LOCAL_DOMAIN="$LOCAL_DOMAIN" WEB_DOMAIN="$LOCAL_DOMAIN" \
-    DATABASE_URL="$database_url" PAPERCLIP_ROOT_PATH="$FIXTURE_DIR/media" \
+    DATABASE_URL="$database_url" PAPERCLIP_ROOT_PATH="${CUTOVER_MEDIA_ROOT:-$FIXTURE_DIR/media}" \
     SECRET_KEY_BASE='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
     ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY='11111111111111111111111111111111' \
     ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT='22222222222222222222222222222222' \
@@ -1319,6 +1412,11 @@ run_worker_cli() {
 start_worker_cli() {
   database_url=$1
   worker_log=$2
+  writer_url=${3:-}
+  writer_environment=''
+  if [ -n "$writer_url" ]; then
+    writer_environment="WRITE_DATABASE_URL=$writer_url"
+  fi
   exec env -i \
     PATH="$PATH" HOME="${HOME:-/tmp}" \
     CARGO_HOME="${CARGO_HOME:-${HOME:-/tmp}/.cargo}" \
@@ -1326,14 +1424,42 @@ start_worker_cli() {
     RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.97.1}" \
     CC='clang' AR="$ROOT/tools/clang-ar" \
     LOCAL_DOMAIN="$LOCAL_DOMAIN" WEB_DOMAIN="$LOCAL_DOMAIN" \
-    DATABASE_URL="$database_url" PAPERCLIP_ROOT_PATH="$FIXTURE_DIR/media" \
+    DATABASE_URL="$database_url" PAPERCLIP_ROOT_PATH="${CUTOVER_MEDIA_ROOT:-$FIXTURE_DIR/media}" \
     SECRET_KEY_BASE='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
     ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY='11111111111111111111111111111111' \
     ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT='22222222222222222222222222222222' \
     ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY='33333333333333333333333333333333' \
     WORKER_LANES='maintenance' WORKER_CONCURRENCY='2' WORKER_HEARTBEAT_SECONDS='1' \
     WORKER_POLL_MILLISECONDS='25' WORKER_SHUTDOWN_SECONDS='5' \
+    $writer_environment \
     "$ROOT/target/debug/rustodon" worker >"$worker_log" 2>&1
+}
+
+run_web_cli() {
+  database_url=$1
+  writer_url=$2
+  port=$3
+  web_log=$4
+  exec env -i \
+    PATH="$PATH" HOME="${HOME:-/tmp}" \
+    CARGO_HOME="${CARGO_HOME:-${HOME:-/tmp}/.cargo}" \
+    RUSTUP_HOME="${RUSTUP_HOME:-${HOME:-/tmp}/.rustup}" \
+    RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.97.1}" \
+    CC='clang' AR="$ROOT/tools/clang-ar" \
+    LOCAL_DOMAIN="$LOCAL_DOMAIN" WEB_DOMAIN="$LOCAL_DOMAIN" ALTERNATE_DOMAINS='' \
+    LIMITED_FEDERATION_MODE='false' \
+    DATABASE_URL="$database_url" WRITE_DATABASE_URL="$writer_url" \
+    DB_POOL='4' DB_SSLMODE='disable' \
+    PAPERCLIP_ROOT_PATH="${CUTOVER_MEDIA_ROOT:-$FIXTURE_DIR/media}" PAPERCLIP_ROOT_URL='/system' \
+    TRUSTED_PROXY_IP='127.0.0.1/32,::1/128' \
+    SECRET_KEY_BASE='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
+    ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY='11111111111111111111111111111111' \
+    ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT='22222222222222222222222222222222' \
+    ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY='33333333333333333333333333333333' \
+    WORKER_LANES='maintenance' WORKER_CONCURRENCY='2' WORKER_HEARTBEAT_SECONDS='1' \
+    WORKER_POLL_MILLISECONDS='25' WORKER_SHUTDOWN_SECONDS='5' \
+    BIND='127.0.0.1' PORT="$port" \
+    "$ROOT/target/debug/rustodon" web >"$web_log" 2>&1
 }
 
 grant_preflight_reader() {
@@ -1352,6 +1478,7 @@ GRANT USAGE ON SCHEMA public TO $DATABASE_READER;
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM $DATABASE_READER;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO $DATABASE_READER;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM $DATABASE_READER;
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO $DATABASE_READER;
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM $DATABASE_READER;
 EOF
@@ -1459,6 +1586,44 @@ EOF
 
   run_preflight_cli "$DATABASE_NAME"
 
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres >/dev/null <<EOF
+CREATE ROLE $OPERATIONAL_MIGRATOR LOGIN NOINHERIT PASSWORD '$OPERATIONAL_MIGRATOR_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+GRANT CONNECT, CREATE ON DATABASE $DATABASE_NAME TO $OPERATIONAL_MIGRATOR;
+ALTER ROLE $DATABASE_READER NOINHERIT;
+EOF
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" >/dev/null <<EOF
+GRANT USAGE ON SCHEMA public TO $OPERATIONAL_MIGRATOR;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO $OPERATIONAL_MIGRATOR;
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO $OPERATIONAL_MIGRATOR;
+EOF
+  migrator_url="postgresql://$OPERATIONAL_MIGRATOR:$OPERATIONAL_MIGRATOR_PASSWORD@127.0.0.1:$PREFLIGHT_DATABASE_PORT/$DATABASE_NAME"
+  cargo build --locked --quiet --bin rustodon
+  run_worker_cli "$migrator_url" admin migrate-operational-schema
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" >/dev/null <<EOF
+GRANT USAGE ON SCHEMA rustodon TO $DATABASE_READER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
+  rustodon.durable_jobs, rustodon.outbox_events, rustodon.idempotency_keys,
+  rustodon.ordering_markers, rustodon.domain_health, rustodon.heartbeats,
+  rustodon.rate_limit_windows
+  TO $DATABASE_READER;
+GRANT SELECT, INSERT, DELETE ON TABLE rustodon.remote_fetch_leases TO $DATABASE_READER;
+GRANT SELECT ON TABLE rustodon.schema_migrations TO $DATABASE_READER;
+GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq
+  TO $DATABASE_READER;
+EOF
+  run_preflight_cli "$DATABASE_NAME"
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    --command "REVOKE SELECT ON TABLE rustodon.remote_fetch_leases FROM $DATABASE_READER" >/dev/null
+  run_preflight_cli "$DATABASE_NAME" PF_OPERATIONAL_SCHEMA
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    --command "GRANT SELECT ON TABLE rustodon.remote_fetch_leases TO $DATABASE_READER" >/dev/null
+
   run_preflight_clone_case missing_relation PF_DB_RELATION_MISSING \
     'DROP TABLE generated_annual_reports CASCADE'
   run_preflight_clone_case changed_relation PF_DB_RELATION_CHANGED \
@@ -1540,6 +1705,377 @@ EOF
   printf 'configuration preflight integration passed for Mastodon %s\n' "$RELEASE"
 }
 
+dump_cutover_public_state() {
+  prefix=$1
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --tuples-only --no-align \
+    --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$FIXTURE_DIR/catalog-query.sql" > "${prefix}-catalog"
+  run_podman exec --env LC_ALL=C "$PG_CONTAINER" pg_dump \
+    --format=plain --encoding=UTF8 --no-owner --no-privileges --no-comments \
+    --schema=public --schema-only --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    > "${prefix}-schema.raw"
+  run_podman exec --env LC_ALL=C "$PG_CONTAINER" pg_dump \
+    --format=plain --encoding=UTF8 --no-owner --no-privileges --no-comments \
+    --schema=public --data-only --exclude-table-data=public.users \
+    --exclude-table-data=public.oauth_access_tokens \
+    --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    > "${prefix}-data.raw"
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --tuples-only --no-align --field-separator "$(printf '\t')" \
+    --username "$DATABASE_USER" --dbname "$DATABASE_NAME" > "${prefix}-auth" <<'SQL'
+SELECT 'users', u.id::text,
+       (to_jsonb(u) - ARRAY['current_sign_in_at', 'last_sign_in_at', 'updated_at'])::text
+FROM public.users AS u
+UNION ALL
+SELECT 'oauth_access_tokens', t.id::text,
+       (to_jsonb(t) - ARRAY['last_used_at', 'last_used_ip'])::text
+FROM public.oauth_access_tokens AS t
+ORDER BY 1, 2;
+SQL
+  sed -i \
+    -e 's/^\\restrict .*/\\restrict rustodonCutoverTest/' \
+    -e 's/^\\unrestrict .*/\\unrestrict rustodonCutoverTest/' \
+    "${prefix}-schema.raw" "${prefix}-data.raw"
+  mv "${prefix}-schema.raw" "${prefix}-schema"
+  mv "${prefix}-data.raw" "${prefix}-data"
+}
+
+cutover_stop_processes() {
+  if [ -n "${cutover_web_pid:-}" ]; then
+    kill -TERM "$cutover_web_pid" >/dev/null 2>&1 || true
+    wait "$cutover_web_pid" >/dev/null 2>&1 || true
+    cutover_web_pid=''
+  fi
+  if [ -n "${cutover_worker_pid:-}" ]; then
+    kill -TERM "$cutover_worker_pid" >/dev/null 2>&1 || true
+    wait "$cutover_worker_pid" >/dev/null 2>&1 || true
+    cutover_worker_pid=''
+  fi
+}
+
+cutover_abort() {
+  status=$?
+  cutover_stop_processes
+  cleanup_containers
+  if [ "${CUTOVER_KEEP_ARTIFACTS:-false}" = true ]; then
+    printf 'cutover artifacts retained under %s and %s\n' \
+      "${cutover_worker_log:-}" "${cutover_web_log:-}" >&2
+  else
+    rm -rf "${cutover_before_media:-}" "${cutover_after_media:-}" \
+      "${cutover_before_prefix:-}-catalog" "${cutover_before_prefix:-}-schema" \
+      "${cutover_before_prefix:-}-data" "${cutover_before_prefix:-}-auth" \
+      "${cutover_after_prefix:-}-catalog" "${cutover_after_prefix:-}-schema" \
+      "${cutover_after_prefix:-}-data" "${cutover_after_prefix:-}-auth" \
+      "${cutover_media_root:-}" \
+      "${cutover_worker_log:-}" "${cutover_web_log:-}"
+  fi
+  trap - EXIT HUP INT TERM
+  exit "$status"
+}
+
+wait_for_http() {
+  url=$1
+  attempts=0
+  until curl --silent --show-error --fail --max-time 2 "$url" >/dev/null 2>&1
+  do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 120 ]; then
+      die "Rustodon did not become ready at $url"
+    fi
+    sleep 1
+  done
+}
+
+cutover_preflight() {
+  database_url=$1
+  preflight_writer_url=${2:-}
+  writer_environment=''
+  if [ -n "$preflight_writer_url" ]; then
+    writer_environment="WRITE_DATABASE_URL=$preflight_writer_url"
+  fi
+  if ! preflight_output=$(env -i \
+    PATH="$PATH" HOME="${HOME:-/tmp}" \
+    CARGO_HOME="${CARGO_HOME:-${HOME:-/tmp}/.cargo}" \
+    RUSTUP_HOME="${RUSTUP_HOME:-${HOME:-/tmp}/.rustup}" \
+    RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.97.1}" \
+    CC='clang' AR="$ROOT/tools/clang-ar" \
+    LOCAL_DOMAIN="$LOCAL_DOMAIN" WEB_DOMAIN="$LOCAL_DOMAIN" ALTERNATE_DOMAINS='' \
+    LIMITED_FEDERATION_MODE='false' \
+    DATABASE_URL="$database_url" $writer_environment \
+    DB_POOL='4' DB_SSLMODE='disable' \
+    PAPERCLIP_ROOT_PATH="$FIXTURE_DIR/media" PAPERCLIP_ROOT_URL='/system' \
+    TRUSTED_PROXY_IP='127.0.0.1/32,::1/128' \
+    SIDEKIQ_REDIS_HOST='127.0.0.1' SIDEKIQ_REDIS_PORT="$PREFLIGHT_REDIS_PORT" \
+    SIDEKIQ_REDIS_DB='0' \
+    SECRET_KEY_BASE='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
+    ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY='11111111111111111111111111111111' \
+    ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT='22222222222222222222222222222222' \
+    ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY='33333333333333333333333333333333' \
+    S3_ENABLED='false' SWIFT_ENABLED='false' AZURE_ENABLED='false' \
+    LDAP_ENABLED='false' PAM_ENABLED='false' CAS_ENABLED='false' \
+    SAML_ENABLED='false' OIDC_ENABLED='false' OMNIAUTH_ONLY='false' \
+    ONE_CLICK_SSO_LOGIN='false' \
+    cargo run --locked --quiet -- preflight 2>&1); then
+    runtime_diagnostic=$(run_podman exec "$PG_CONTAINER" psql \
+      --set ON_ERROR_STOP=1 --tuples-only --no-align \
+      --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+      --command "SELECT rolname || E'|' || rolinherit || '|' || pg_catalog.has_database_privilege(oid, current_database(), 'CONNECT') || '|' || pg_catalog.has_database_privilege(oid, current_database(), 'TEMP') || '|' || pg_catalog.has_schema_privilege(oid, 'rustodon', 'USAGE') FROM pg_catalog.pg_roles WHERE rolname IN ('$WORKER_RUNTIME', '$DIFFERENTIAL_WRITER') ORDER BY rolname")
+    runtime_acl=$(run_podman exec "$PG_CONTAINER" psql \
+      --set ON_ERROR_STOP=1 --tuples-only --no-align \
+      --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+      --command "SELECT c.relname || '=' || COALESCE(c.relacl::text, '') FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'rustodon' ORDER BY c.relname")
+    runtime_probe=$(run_podman exec --env "PGPASSWORD=$WORKER_RUNTIME_PASSWORD" "$PG_CONTAINER" psql \
+      --set ON_ERROR_STOP=1 --tuples-only --no-align \
+      --username "$WORKER_RUNTIME" --dbname "$DATABASE_NAME" \
+      --command "SELECT current_user || '|' || session_user || '|' || current_setting('transaction_read_only'); SELECT last_value FROM public.accounts_id_seq; SELECT count(*) FROM public.accounts; SELECT count(*) FROM rustodon.schema_migrations" 2>&1 || true)
+    runtime_reads=$(run_podman exec "$PG_CONTAINER" psql \
+      --set ON_ERROR_STOP=1 --tuples-only --no-align \
+      --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+      --command "SELECT table_name FROM unnest(ARRAY['account_aliases','account_conversations','account_deletion_requests','account_domain_blocks','account_migrations','account_notes','account_pins','account_relationship_severance_events','account_stats','account_statuses_cleanup_policies','account_warnings','accounts','accounts_tags','appeals','blocks','bookmarks','canonical_email_blocks','collection_items','collection_reports','collections','conversation_mutes','conversations','custom_emojis','custom_filter_keywords','custom_filter_statuses','custom_filters','domain_allows','domain_blocks','favourites','featured_tags','follow_requests','follows','generated_annual_reports','instances','keypairs','list_accounts','lists','markers','media_attachments','mentions','mutes','notification_permissions','notification_policies','notification_requests','notifications','oauth_access_tokens','oauth_applications','poll_votes','polls','preview_card_providers','preview_cards','preview_cards_statuses','quotes','relays','relationship_severance_events','report_notes','reports','rule_translations','rules','scheduled_statuses','site_uploads','status_edits','status_pins','status_stats','statuses','statuses_tags','tag_follows','tagged_objects','tags','tombstones','user_roles','users','invites','webauthn_credentials','web_push_subscriptions']::text[]) table_name WHERE NOT pg_catalog.has_table_privilege('$WORKER_RUNTIME', format('public.%I', table_name), 'SELECT')")
+    runtime_privilege_diff=$(run_podman exec "$PG_CONTAINER" psql \
+      --set ON_ERROR_STOP=1 --tuples-only --no-align \
+      --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+      --command "WITH actual AS (SELECT c.relname || ':' || acl.privilege_type || ':' || acl.is_grantable::text AS privilege FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) acl WHERE n.nspname = 'rustodon' AND acl.grantee = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = '$WORKER_RUNTIME') UNION ALL SELECT 'schema:' || acl.privilege_type || ':' || acl.is_grantable::text FROM pg_catalog.pg_namespace n CROSS JOIN LATERAL pg_catalog.aclexplode(n.nspacl) acl WHERE n.nspname = 'rustodon' AND acl.grantee = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = '$WORKER_RUNTIME') UNION ALL SELECT 'function:' || p.proname || ':' || acl.privilege_type || ':' || acl.is_grantable::text FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace CROSS JOIN LATERAL pg_catalog.aclexplode(p.proacl) acl WHERE n.nspname = 'rustodon' AND acl.grantee = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = '$WORKER_RUNTIME')), expected AS (SELECT unnest(ARRAY['domain_health:DELETE:false','domain_health:INSERT:false','domain_health:SELECT:false','domain_health:UPDATE:false','durable_jobs:DELETE:false','durable_jobs:INSERT:false','durable_jobs:SELECT:false','durable_jobs:UPDATE:false','durable_jobs_id_seq:USAGE:false','heartbeats:DELETE:false','heartbeats:INSERT:false','heartbeats:SELECT:false','heartbeats:UPDATE:false','idempotency_keys:DELETE:false','idempotency_keys:INSERT:false','idempotency_keys:SELECT:false','idempotency_keys:UPDATE:false','ordering_markers:DELETE:false','ordering_markers:INSERT:false','ordering_markers:SELECT:false','ordering_markers:UPDATE:false','outbox_events:DELETE:false','outbox_events:INSERT:false','outbox_events:SELECT:false','outbox_events:UPDATE:false','outbox_events_id_seq:USAGE:false','rate_limit_windows:DELETE:false','rate_limit_windows:INSERT:false','rate_limit_windows:SELECT:false','rate_limit_windows:UPDATE:false','remote_fetch_leases:DELETE:false','remote_fetch_leases:INSERT:false','remote_fetch_leases:SELECT:false','schema:USAGE:false','schema_migrations:SELECT:false']::text[]) AS privilege) SELECT 'extra:' || privilege FROM actual WHERE NOT EXISTS (SELECT 1 FROM expected WHERE expected.privilege = actual.privilege) UNION ALL SELECT 'missing:' || privilege FROM expected WHERE NOT EXISTS (SELECT 1 FROM actual WHERE actual.privilege = expected.privilege) ORDER BY 1")
+    die "cutover preflight failed: $preflight_output\nruntime roles: $runtime_diagnostic\nruntime ACL: $runtime_acl\nruntime probe: $runtime_probe\nruntime missing reads: $runtime_reads\nruntime privilege diff: $runtime_privilege_diff"
+  fi
+}
+
+cutover_test() {
+  fixture=$FIXTURE_DIR
+  verify_static "$fixture"
+  verify_differential_images
+  start_database publish
+  cutover_worker_pid=''
+  cutover_web_pid=''
+  cutover_worker_log="$ROOT/target/cutover-worker-$$.log"
+  cutover_web_log="$ROOT/target/cutover-web-$$.log"
+  cutover_before_prefix="$ROOT/target/cutover-before-$$"
+  cutover_after_prefix="$ROOT/target/cutover-after-$$"
+  cutover_before_media="$ROOT/target/cutover-before-media-$$"
+  cutover_after_media="$ROOT/target/cutover-after-media-$$"
+  cutover_media_root="$ROOT/target/cutover-media-$$"
+  trap cutover_abort EXIT HUP INT TERM
+
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$fixture/database.sql" >/dev/null
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$fixture/verify.sql" >/dev/null
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres >/dev/null <<EOF
+CREATE ROLE $DATABASE_READER LOGIN PASSWORD '$DATABASE_READER_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+ALTER ROLE $DATABASE_READER SET default_transaction_read_only = on;
+CREATE ROLE $OPERATIONAL_MIGRATOR LOGIN PASSWORD '$OPERATIONAL_MIGRATOR_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+CREATE ROLE $WORKER_RUNTIME LOGIN NOINHERIT PASSWORD '$WORKER_RUNTIME_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE $DIFFERENTIAL_WRITER LOGIN PASSWORD '$DIFFERENTIAL_WRITER_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+GRANT CONNECT, CREATE ON DATABASE $DATABASE_NAME TO $OPERATIONAL_MIGRATOR;
+EOF
+  grant_preflight_reader "$DATABASE_NAME"
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" >/dev/null <<EOF
+REVOKE ALL ON DATABASE $DATABASE_NAME FROM $WORKER_RUNTIME;
+GRANT CONNECT ON DATABASE $DATABASE_NAME TO $WORKER_RUNTIME;
+REVOKE ALL ON SCHEMA public FROM $WORKER_RUNTIME;
+GRANT USAGE ON SCHEMA public TO $WORKER_RUNTIME;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM $WORKER_RUNTIME;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO $WORKER_RUNTIME;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM $WORKER_RUNTIME;
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO $WORKER_RUNTIME;
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM $WORKER_RUNTIME;
+EOF
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" >/dev/null <<EOF
+GRANT USAGE ON SCHEMA public TO $OPERATIONAL_MIGRATOR;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO $OPERATIONAL_MIGRATOR;
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO $OPERATIONAL_MIGRATOR;
+REVOKE ALL ON DATABASE $DATABASE_NAME FROM PUBLIC;
+EOF
+
+  start_differential_redis publish
+  published_database=$(run_podman port "$PG_CONTAINER" 5432/tcp)
+  PREFLIGHT_DATABASE_PORT=${published_database##*:}
+  published_redis=$(run_podman port "$REDIS_CONTAINER" 6379/tcp)
+  PREFLIGHT_REDIS_PORT=${published_redis##*:}
+  case "$PREFLIGHT_DATABASE_PORT:$PREFLIGHT_REDIS_PORT" in
+    *[!0-9:]*|:|*:*:) die 'invalid cutover fixture endpoint' ;;
+  esac
+  reader_url="postgresql://$DATABASE_READER:$DATABASE_READER_PASSWORD@127.0.0.1:$PREFLIGHT_DATABASE_PORT/$DATABASE_NAME"
+  migrator_url="postgresql://$OPERATIONAL_MIGRATOR:$OPERATIONAL_MIGRATOR_PASSWORD@127.0.0.1:$PREFLIGHT_DATABASE_PORT/$DATABASE_NAME"
+  runtime_url="postgresql://$WORKER_RUNTIME:$WORKER_RUNTIME_PASSWORD@127.0.0.1:$PREFLIGHT_DATABASE_PORT/$DATABASE_NAME"
+  writer_url="postgresql://$DIFFERENTIAL_WRITER:$DIFFERENTIAL_WRITER_PASSWORD@127.0.0.1:$PREFLIGHT_DATABASE_PORT/$DATABASE_NAME"
+  cargo build --locked --quiet --bin rustodon
+
+  # The refresh helper is an expected cutover prerequisite, not a Mastodon
+  # schema change performed by Rustodon. Provision it before the baseline so
+  # the final catalog comparison covers the idempotent cutover sequence.
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$ROOT/docs/mastodon-refresh-instances.sql" >/dev/null
+  dump_cutover_public_state "$cutover_before_prefix"
+  cp -a "$fixture/media" "$cutover_before_media"
+  mkdir "$cutover_media_root"
+  cp -a "$fixture/media/." "$cutover_media_root/"
+  chmod -R u+rwX "$cutover_media_root"
+  CUTOVER_MEDIA_ROOT="$cutover_media_root"
+  cutover_preflight "$reader_url"
+  run_worker_cli "$migrator_url" admin migrate-operational-schema
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$ROOT/docs/mastodon-refresh-instances.sql" >/dev/null
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --set writer_role="$DIFFERENTIAL_WRITER" \
+    --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    < "$ROOT/docs/mastodon-writer-grants.sql" >/dev/null
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" >/dev/null <<EOF
+GRANT USAGE ON SCHEMA rustodon TO $WORKER_RUNTIME;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
+  rustodon.durable_jobs, rustodon.outbox_events, rustodon.idempotency_keys,
+  rustodon.ordering_markers, rustodon.domain_health, rustodon.heartbeats,
+  rustodon.rate_limit_windows TO $WORKER_RUNTIME;
+GRANT SELECT, INSERT, DELETE ON TABLE rustodon.remote_fetch_leases TO $WORKER_RUNTIME;
+GRANT SELECT ON TABLE rustodon.schema_migrations TO $WORKER_RUNTIME;
+GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq
+  TO $WORKER_RUNTIME;
+EOF
+  cutover_preflight "$runtime_url" "$writer_url"
+
+  start_worker_cli "$runtime_url" "$cutover_worker_log" "$writer_url" &
+  cutover_worker_pid=$!
+  ready=false
+  for _ in $(seq 1 120); do
+    if run_worker_cli "$runtime_url" admin worker-readiness >/dev/null 2>&1; then
+      ready=true
+      break
+    fi
+    sleep 1
+  done
+  [ "$ready" = true ] || die "cutover worker did not become ready; inspect $cutover_worker_log"
+  cutover_web_port=$((18000 + ($$ % 1000)))
+  run_web_cli "$runtime_url" "$writer_url" "$cutover_web_port" "$cutover_web_log" &
+  cutover_web_pid=$!
+  wait_for_http "http://127.0.0.1:$cutover_web_port/health"
+  wait_for_http "http://127.0.0.1:$cutover_web_port/ready"
+  RUSTODON_SMOKE_DOMAIN="$LOCAL_DOMAIN" \
+    RUSTODON_SMOKE_HOST="$LOCAL_DOMAIN" \
+    RUSTODON_SMOKE_TOKEN='fixture-bearer-token-v4-6-5' \
+    "$ROOT/tools/rustodon-smoke" \
+    "http://127.0.0.1:$cutover_web_port" \
+    116844606259201001 alice \
+    "http://127.0.0.1:$cutover_web_port/system/accounts/avatars/116/844/606/259/201/001/original/0112603425bb49c1.png"
+
+  cutover_media_description='Rustodon cutover rollback attachment'
+  cutover_media_sequence=$(run_podman exec "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --tuples-only --no-align --field-separator '|' \
+    --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    --command 'SELECT last_value, is_called FROM public.media_attachments_id_seq')
+  IFS='|' read -r cutover_media_sequence_value cutover_media_sequence_called <<EOF
+$cutover_media_sequence
+EOF
+  case "$cutover_media_sequence_value" in
+    ''|*[!0-9]*) die "invalid media attachment sequence value: $cutover_media_sequence" ;;
+  esac
+  case "$cutover_media_sequence_called" in
+    t|f) ;;
+    *) die "invalid media attachment sequence state: $cutover_media_sequence" ;;
+  esac
+  curl --silent --show-error --fail --max-time 30 \
+    --header "Host: $LOCAL_DOMAIN" \
+    --header 'Authorization: Bearer fixture-bearer-token-v4-6-5' \
+    --form "file=@$SOURCE_DIR/spec/fixtures/files/attachment.jpg;type=image/jpeg" \
+    --form "description=$cutover_media_description" \
+    "http://127.0.0.1:$cutover_web_port/api/v1/media" >/dev/null
+  cutover_media_id=$(run_podman exec "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --tuples-only --no-align \
+    --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    --command "SELECT id FROM public.media_attachments WHERE account_id = 116844606259201001 AND id > $cutover_media_sequence_value AND description = '$cutover_media_description' ORDER BY id DESC LIMIT 1")
+  case "$cutover_media_id" in
+    ''|*[!0-9]*) die "Rustodon media upload did not create an isolated attachment: $cutover_media_id" ;;
+  esac
+
+  cutover_stop_processes
+  run_podman rm -f --volumes "$REDIS_CONTAINER" >/dev/null 2>&1 || true
+  REDIS_CONTAINER=''
+  start_differential_redis
+  start_differential_web "$DATABASE_NAME" "$cutover_media_root" ro false
+  mastodon_web_endpoint=$(run_podman port "$WEB_CONTAINER" 3000/tcp)
+  mastodon_web_port=${mastodon_web_endpoint##*:}
+  case "$mastodon_web_port" in
+    ''|*[!0-9]*) die "invalid published Mastodon web endpoint: $mastodon_web_endpoint" ;;
+  esac
+  RUSTODON_SMOKE_DOMAIN="$LOCAL_DOMAIN" \
+    RUSTODON_SMOKE_HOST="$LOCAL_DOMAIN" \
+    RUSTODON_SMOKE_CHECK_READY=false \
+    RUSTODON_SMOKE_FORWARD_PROTO=https \
+    RUSTODON_SMOKE_TOKEN='fixture-bearer-token-v4-6-5' \
+    "$ROOT/tools/rustodon-smoke" \
+    "http://127.0.0.1:$mastodon_web_port" \
+    116844606259201001 alice \
+    "http://127.0.0.1:$mastodon_web_port/system/accounts/avatars/116/844/606/259/201/001/original/0112603425bb49c1.png"
+  cutover_media_paths=$(run_podman exec "$WEB_CONTAINER" bundle exec rails runner \
+    "require 'uri'; media = MediaAttachment.find($cutover_media_id); meta = media.file_meta || {}; checks = { account: media.account_id == 116844606259201001, status: media.status_id.nil?, scheduled: media.scheduled_status_id.nil?, description: media.description == '$cutover_media_description', content_type: media.file_content_type == 'image/jpeg', filename: media.file_file_name.to_s.end_with?('.jpg'), original_width: Integer(meta.dig('original', 'width') || 0) == 600, original_height: Integer(meta.dig('original', 'height') || 0) == 400, small_width: Integer(meta.dig('small', 'width') || 0) == 588, small_height: Integer(meta.dig('small', 'height') || 0) == 392 }; abort \"reopened Rails media metadata mismatch: checks=#{checks.inspect} filename=#{media.file_file_name.inspect} meta=#{meta.inspect} original=#{media.file.path(:original)} small=#{media.file.path(:small)}\" unless checks.values.all?; puts [URI.parse(media.file.url(:original)).path, URI.parse(media.file.url(:small)).path].join('|')")
+  IFS='|' read -r cutover_media_original_path cutover_media_small_path <<EOF
+$cutover_media_paths
+EOF
+  case "$cutover_media_original_path:$cutover_media_small_path" in
+    /system/*:/system/*) ;;
+    *) die "reopened Rails media URLs were not Paperclip system paths: $cutover_media_paths" ;;
+  esac
+  curl --silent --show-error --fail --max-time 15 \
+    --header "Host: $LOCAL_DOMAIN" \
+    --header 'Authorization: Bearer fixture-bearer-token-v4-6-5' \
+    "http://127.0.0.1:$mastodon_web_port/api/v1/media/$cutover_media_id" >/dev/null
+  curl --silent --show-error --fail --head --max-time 15 \
+    --header "Host: $LOCAL_DOMAIN" \
+    "http://127.0.0.1:$mastodon_web_port$cutover_media_original_path" >/dev/null
+  curl --silent --show-error --fail --head --max-time 15 \
+    --header "Host: $LOCAL_DOMAIN" \
+    "http://127.0.0.1:$mastodon_web_port$cutover_media_small_path" >/dev/null
+  run_podman rm -f --volumes "$WEB_CONTAINER" >/dev/null 2>&1 || true
+  WEB_CONTAINER=''
+  run_podman exec "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    --command "DELETE FROM public.media_attachments WHERE id = $cutover_media_id AND account_id = 116844606259201001; SELECT setval('public.media_attachments_id_seq', $cutover_media_sequence_value, '$cutover_media_sequence_called'::boolean);" >/dev/null
+  cutover_media_remaining=$(run_podman exec "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --tuples-only --no-align \
+    --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+    --command "SELECT count(*) FROM public.media_attachments WHERE id = $cutover_media_id")
+  [ "$cutover_media_remaining" = '0' ] ||
+    die "cutover media attachment was not removed: $cutover_media_remaining"
+  rm -rf "$cutover_media_root"
+  mkdir "$cutover_media_root"
+  cp -a "$fixture/media/." "$cutover_media_root/"
+  chmod -R u+rwX "$cutover_media_root"
+  run_rails "$fixture" 'bundle exec rails runner /fixture/verify.rb'
+  dump_cutover_public_state "$cutover_after_prefix"
+  cp -a "$cutover_media_root" "$cutover_after_media"
+  cmp -s "${cutover_before_prefix}-catalog" "${cutover_after_prefix}-catalog" ||
+    die 'cutover changed the Mastodon public catalog'
+  cmp -s "${cutover_before_prefix}-schema" "${cutover_after_prefix}-schema" ||
+    die 'cutover changed the Mastodon public schema'
+  cmp -s "${cutover_before_prefix}-data" "${cutover_after_prefix}-data" ||
+    die 'cutover changed Mastodon public data'
+  cmp -s "${cutover_before_prefix}-auth" "${cutover_after_prefix}-auth" ||
+    die 'cutover changed stable Mastodon authentication data'
+  diff -r "$cutover_before_media" "$cutover_after_media" >/dev/null ||
+    die 'cutover changed Mastodon media'
+  finish_database
+  rm -rf "$cutover_before_media" "$cutover_after_media" \
+    "${cutover_before_prefix}-catalog" "${cutover_before_prefix}-schema" \
+    "${cutover_before_prefix}-data" "${cutover_after_prefix}-catalog" \
+    "${cutover_before_prefix}-auth" "${cutover_after_prefix}-schema" \
+    "${cutover_after_prefix}-data" "${cutover_after_prefix}-auth" \
+    "$cutover_worker_log" "$cutover_web_log" "$cutover_media_root"
+  trap - EXIT HUP INT TERM
+  printf 'fixture cutover and rollback rehearsal passed for Mastodon %s\n' "$RELEASE"
+}
+
 validate_differential_case() {
   case_name=$1
   case "$case_name" in
@@ -1548,7 +2084,7 @@ validate_differential_case() {
       ;;
   esac
   case "$case_name" in
-    core_rest_serializers|federation_discovery|instance_v2|local_paperclip_media|oauth_bearer_authentication|rest_protocol_contracts|status_authorization_matrix) ;;
+    account_settings|admin_create_user|authorized_fetch_read_routes_require_signatures|browser_authentication|browser_two_factor_management|core_rest_serializers|federation_discovery|instance_v2|local_paperclip_media|local_paperclip_deleted_media|local_web_client_shell|media_writes|notification_writes|oauth_authorization_code|oauth_bearer_authentication|password_recovery|report_writes|rest_protocol_contracts|status_authorization_matrix|write_transactions) ;;
     *) die "unknown differential case: $case_name" ;;
   esac
 }
@@ -1580,6 +2116,197 @@ REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM $DIFFERENTIAL_READER;
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM $DIFFERENTIAL_READER;
 EOF
+}
+
+prepare_differential_writer_database() {
+  database=$1
+  include_operational=${2:-true}
+
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres >/dev/null <<EOF
+REVOKE ALL ON DATABASE $database FROM $DIFFERENTIAL_WRITER;
+GRANT CONNECT ON DATABASE $database TO $DIFFERENTIAL_WRITER;
+EOF
+
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$database" >/dev/null <<EOF
+CREATE OR REPLACE FUNCTION public.rustodon_refresh_instances()
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS \$\$
+BEGIN
+  REFRESH MATERIALIZED VIEW CONCURRENTLY public.instances;
+END
+\$\$;
+REVOKE ALL ON FUNCTION public.rustodon_refresh_instances() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.timestamp_id(text) FROM PUBLIC;
+REVOKE ALL ON SCHEMA public FROM $DIFFERENTIAL_WRITER;
+GRANT USAGE ON SCHEMA public TO $DIFFERENTIAL_WRITER;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM $DIFFERENTIAL_WRITER;
+GRANT SELECT ON TABLE
+  public.account_aliases, public.account_deletion_requests,
+  public.account_relationship_severance_events, public.account_stats,
+  public.account_migrations, public.account_notes, public.account_pins,
+  public.account_warnings,
+  public.account_conversations,
+  public.account_domain_blocks, public.accounts, public.blocks,
+    public.canonical_email_blocks, public.domain_allows, public.domain_blocks,
+   public.collection_items, public.collection_reports, public.collections, public.conversation_mutes,
+      public.conversations, public.custom_emojis,
+     public.follows, public.follow_requests, public.generated_annual_reports,
+     public.favourites, public.featured_tags, public.invites, public.list_accounts,
+     public.lists, public.mentions, public.mutes, public.notification_permissions,
+     public.notification_policies, public.poll_votes, public.polls, public.quotes,
+     public.report_notes, public.reports, public.scheduled_statuses,
+     public.tag_follows,
+     public.custom_filters,
+      public.media_attachments, public.keypairs, public.rules, public.admin_action_logs,
+      public.status_pins, public.status_stats, public.statuses, public.tombstones,
+      public.user_roles, public.users,
+     public.relays,
+    public.relationship_severance_events, public.severed_relationships,
+    public.webauthn_credentials, public.login_activities, public.session_activations,
+   public.web_push_subscriptions
+   TO $DIFFERENTIAL_WRITER;
+  GRANT UPDATE (username, domain, display_name, note, actor_type, locked, memorial, discoverable,
+    trendable, also_known_as, moved_to_account_id, reviewed_at, requested_review_at,
+    hide_collections, indexable, attribution_domains, fields, avatar_content_type, avatar_description,
+   avatar_file_name, avatar_file_size, avatar_remote_url, avatar_storage_schema_version,
+   avatar_updated_at, header_content_type, header_description, header_file_name,
+   header_file_size, header_remote_url, header_storage_schema_version, header_updated_at,
+     silenced_at, suspended_at, suspension_origin, uri, url, inbox_url, outbox_url,
+     followers_url, following_url, shared_inbox_url,
+     protocol, public_key, last_webfingered_at, updated_at) ON TABLE public.accounts
+    TO $DIFFERENTIAL_WRITER;
+  GRANT UPDATE (last_webfingered_at) ON TABLE public.accounts
+    TO $DIFFERENTIAL_WRITER;
+   GRANT UPDATE (settings, consumed_timestep, otp_backup_codes, otp_required_for_login,
+     otp_secret, current_sign_in_at,
+    last_sign_in_at, sign_in_count, encrypted_password, reset_password_token,
+    reset_password_sent_at, sign_in_token, sign_in_token_sent_at, confirmed_at,
+    confirmation_token, confirmation_sent_at, disabled, updated_at)
+   ON TABLE public.users TO $DIFFERENTIAL_WRITER;
+ GRANT INSERT (username, private_key, public_key, created_at, updated_at)
+   ON TABLE public.accounts TO $DIFFERENTIAL_WRITER;
+  GRANT INSERT (username, domain, actor_type, display_name, note, uri, url,
+    inbox_url, shared_inbox_url, protocol, public_key, last_webfingered_at,
+    created_at, updated_at)
+   ON TABLE public.accounts TO $DIFFERENTIAL_WRITER;
+ GRANT INSERT (account_id, email, encrypted_password, approved, confirmed_at,
+   confirmation_token, confirmation_sent_at, created_at, updated_at)
+   ON TABLE public.users TO $DIFFERENTIAL_WRITER;
+ GRANT SELECT, INSERT, DELETE ON TABLE public.login_activities TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.session_activations TO $DIFFERENTIAL_WRITER;
+ GRANT SELECT, DELETE ON TABLE public.web_push_subscriptions TO $DIFFERENTIAL_WRITER;
+ GRANT DELETE ON TABLE public.webauthn_credentials TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.accounts_tags TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE ON TABLE public.tags TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, DELETE ON TABLE public.statuses_tags TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT ON TABLE public.status_edits TO $DIFFERENTIAL_WRITER;
+ GRANT SELECT, UPDATE, DELETE ON TABLE public.featured_tags TO $DIFFERENTIAL_WRITER;
+ GRANT SELECT, DELETE ON TABLE
+    public.account_aliases, public.account_domain_blocks, public.account_migrations,
+   public.account_notes, public.account_pins, public.collection_items, public.collections,
+   public.custom_filters, public.invites, public.list_accounts, public.lists,
+    public.poll_votes, public.report_notes, public.scheduled_statuses, public.tag_follows,
+    public.custom_emojis
+   TO $DIFFERENTIAL_WRITER;
+  GRANT SELECT, INSERT, DELETE ON TABLE public.mentions TO $DIFFERENTIAL_WRITER;
+  GRANT UPDATE (silent, updated_at) ON TABLE public.mentions TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE ON TABLE public.markers TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.account_conversations TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
+  public.notifications, public.notification_requests TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
+  public.bookmarks, public.favourites, public.status_pins, public.status_stats
+  TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, DELETE ON TABLE public.notification_permissions TO $DIFFERENTIAL_WRITER;
+ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.reports TO $DIFFERENTIAL_WRITER;
+  GRANT SELECT, INSERT ON TABLE public.collection_reports TO $DIFFERENTIAL_WRITER;
+ GRANT SELECT, INSERT ON TABLE public.admin_action_logs TO $DIFFERENTIAL_WRITER;
+ GRANT SELECT, INSERT ON TABLE public.account_warnings TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.account_deletion_requests TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, DELETE ON TABLE public.canonical_email_blocks TO $DIFFERENTIAL_WRITER;
+ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.domain_blocks TO $DIFFERENTIAL_WRITER;
+ GRANT INSERT ON TABLE public.tombstones TO $DIFFERENTIAL_WRITER;
+GRANT DELETE ON TABLE public.accounts TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE ON TABLE
+  public.relationship_severance_events, public.account_relationship_severance_events
+  TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT ON TABLE public.severed_relationships TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.notification_policies TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.statuses TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, UPDATE, DELETE ON TABLE public.polls TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.account_stats TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, DELETE ON TABLE public.generated_annual_reports TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, DELETE ON TABLE public.fasp_follow_recommendations TO $DIFFERENTIAL_WRITER;
+ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.keypairs TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.conversations TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
+  public.follows, public.follow_requests, public.mutes,
+  public.media_attachments, public.conversation_mutes
+  TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.blocks TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, DELETE ON TABLE public.oauth_applications TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.oauth_access_grants TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.oauth_access_tokens TO $DIFFERENTIAL_WRITER;
+ REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM $DIFFERENTIAL_WRITER;
+ GRANT USAGE, SELECT ON SEQUENCE public.markers_id_seq TO $DIFFERENTIAL_WRITER;
+GRANT USAGE, SELECT ON SEQUENCE
+      public.accounts_id_seq, public.account_deletion_requests_id_seq,
+      public.account_stats_id_seq, public.account_warnings_id_seq,
+      public.canonical_email_blocks_id_seq,
+      public.domain_blocks_id_seq, public.relationship_severance_events_id_seq,
+      public.severed_relationships_id_seq, public.account_relationship_severance_events_id_seq,
+      public.keypairs_id_seq,
+    public.users_id_seq
+   TO $DIFFERENTIAL_WRITER;
+GRANT USAGE, SELECT ON SEQUENCE
+   public.notifications_id_seq, public.notification_requests_id_seq,
+   public.notification_permissions_id_seq, public.notification_policies_id_seq
+     TO $DIFFERENTIAL_WRITER;
+GRANT USAGE, SELECT ON SEQUENCE public.reports_id_seq, public.collection_reports_id_seq
+   TO $DIFFERENTIAL_WRITER;
+GRANT USAGE, SELECT ON SEQUENCE public.admin_action_logs_id_seq TO $DIFFERENTIAL_WRITER;
+GRANT USAGE, SELECT ON SEQUENCE
+   public.bookmarks_id_seq, public.favourites_id_seq, public.status_stats_id_seq,
+   public.status_pins_id_seq, public.statuses_id_seq, public.conversations_id_seq,
+   public.account_conversations_id_seq, public.follows_id_seq,
+  public.follow_requests_id_seq, public.blocks_id_seq, public.mutes_id_seq,
+    public.media_attachments_id_seq, public.oauth_applications_id_seq,
+    public.oauth_access_grants_id_seq,
+    public.login_activities_id_seq, public.session_activations_id_seq
+    TO $DIFFERENTIAL_WRITER;
+GRANT USAGE, SELECT ON SEQUENCE public.oauth_access_tokens_id_seq TO $DIFFERENTIAL_WRITER;
+GRANT USAGE, SELECT ON SEQUENCE public.tags_id_seq TO $DIFFERENTIAL_WRITER;
+GRANT USAGE, SELECT ON SEQUENCE public.mentions_id_seq TO $DIFFERENTIAL_WRITER;
+ GRANT USAGE, SELECT ON SEQUENCE public.status_edits_id_seq, public.tombstones_id_seq
+   TO $DIFFERENTIAL_WRITER;
+GRANT EXECUTE ON FUNCTION public.timestamp_id(text) TO $DIFFERENTIAL_WRITER;
+GRANT EXECUTE ON FUNCTION public.rustodon_refresh_instances() TO $DIFFERENTIAL_WRITER;
+EOF
+
+  operational_schema_exists=$(run_podman exec "$PG_CONTAINER" psql \
+    --tuples-only --no-align --username "$DATABASE_USER" --dbname "$database" \
+    --command "SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = 'rustodon'")
+  if [ "$include_operational" = true ] && [ "$operational_schema_exists" = '1' ]; then
+    run_podman exec -i "$PG_CONTAINER" psql \
+      --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$database" >/dev/null <<EOF
+GRANT USAGE ON SCHEMA rustodon TO $DIFFERENTIAL_WRITER;
+GRANT USAGE, SELECT ON SEQUENCE rustodon.outbox_events_id_seq TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, DELETE ON TABLE rustodon.durable_jobs TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
+  rustodon.idempotency_keys, rustodon.outbox_events, rustodon.ordering_markers,
+    rustodon.rate_limit_windows
+  TO $DIFFERENTIAL_WRITER;
+EOF
+    run_podman exec -i "$PG_CONTAINER" psql \
+      --set ON_ERROR_STOP=1 --set writer_role="$DIFFERENTIAL_WRITER" \
+      --username "$DATABASE_USER" --dbname "$database" \
+      < "$ROOT/docs/mastodon-writer-grants.sql" >/dev/null
+  fi
 }
 
 start_differential_redis() {
@@ -1615,6 +2342,8 @@ start_differential_redis() {
 start_differential_web() {
   mastodon_database=$1
   media_root=$2
+  media_mode=${3:-ro}
+  prepare_feeds=${4:-true}
   WEB_CONTAINER="rustodon-differential-v4-6-5-web-$$"
 
   run_podman run -d \
@@ -1624,7 +2353,7 @@ start_differential_web() {
     --label "io.rustodon.fixture.session=$$" \
     --network "$NETWORK" \
     --publish 127.0.0.1::3000 \
-    --volume "$media_root:/opt/mastodon/public/system:ro,Z" \
+    --volume "$media_root:/opt/mastodon/public/system:$media_mode,Z" \
     --env 'RAILS_ENV=production' \
     --env 'NODE_ENV=production' \
     --env 'TZ=Etc/UTC' \
@@ -1651,7 +2380,6 @@ start_differential_web() {
     --env 'FORCE_DEFAULT_LOCALE=true' \
     --env 'SINGLE_USER_MODE=false' \
     --env 'LIMITED_FEDERATION_MODE=false' \
-    --env 'WHITELIST_MODE=false' \
     --env 'DISALLOW_UNAUTHENTICATED_API_ACCESS=false' \
     --env 'AUTHORIZED_FETCH=false' \
     --env 'S3_ENABLED=false' \
@@ -1682,8 +2410,29 @@ start_differential_web() {
     sleep 1
   done
 
-  run_podman exec "$WEB_CONTAINER" bundle exec rails runner \
-    'account = Account.find(116844606259201001); PrecomputeFeedService.new.call(account); account.owned_lists.each { |list| ListAccount.where(list: list, account: account, follow_id: nil).find_each { |member| account.statuses.list_eligible_visibility.find_each { |status| FeedInsertWorker.new.perform(status.id, member.list_id, "list") } } }; tag_ids = TagFollow.where(account_id: account.id).select(:tag_id); Status.public_visibility.without_reblogs.joins(:account, :tags).merge(Account.without_suspended.without_silenced).where(tags: { id: tag_ids }).distinct.find_each { |status| FeedInsertWorker.new.perform(status.id, account.id, "tags") }' >/dev/null
+  if [ "$prepare_feeds" = true ]; then
+    run_podman exec "$WEB_CONTAINER" bundle exec rails runner \
+      'account = Account.find(116844606259201001); PrecomputeFeedService.new.call(account); account.owned_lists.each { |list| ListAccount.where(list: list, account: account, follow_id: nil).find_each { |member| account.statuses.list_eligible_visibility.find_each { |status| FeedInsertWorker.new.perform(status.id, member.list_id, "list") } } }; tag_ids = TagFollow.where(account_id: account.id).select(:tag_id); Status.public_visibility.without_reblogs.joins(:account, :tags).merge(Account.without_suspended.without_silenced).where(tags: { id: tag_ids }).distinct.find_each { |status| FeedInsertWorker.new.perform(status.id, account.id, "tags") }' >/dev/null
+  elif [ "$prepare_feeds" != false ]; then
+    die 'invalid Mastodon differential feed preparation mode'
+  fi
+}
+
+reset_differential_feeds() {
+  mastodon_database=$1
+  media_root=$2
+  media_mode=$3
+
+  if [ -n "$WEB_CONTAINER" ]; then
+    run_podman rm -f --volumes "$WEB_CONTAINER" >/dev/null 2>&1 || true
+    WEB_CONTAINER=''
+  fi
+  if [ -n "$REDIS_CONTAINER" ]; then
+    run_podman rm -f --volumes "$REDIS_CONTAINER" >/dev/null 2>&1 || true
+    REDIS_CONTAINER=''
+  fi
+  start_differential_redis
+  start_differential_web "$mastodon_database" "$media_root" "$media_mode"
 }
 
 verify_podman_resource_absent() {
@@ -1755,6 +2504,10 @@ differential_test() {
   if [ -n "$case_name" ]; then
     validate_differential_case "$case_name"
   fi
+  media_mode=ro
+  if [ -z "$case_name" ] || [ "$case_name" = 'media_writes' ]; then
+    media_mode=rw
+  fi
   verify_static "$FIXTURE_DIR"
   verify_differential_images
   start_database publish differential
@@ -1788,11 +2541,19 @@ EOF
 CREATE ROLE $DIFFERENTIAL_READER LOGIN PASSWORD '$DIFFERENTIAL_READER_PASSWORD'
   NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
 ALTER ROLE $DIFFERENTIAL_READER SET default_transaction_read_only = on;
+CREATE ROLE $DIFFERENTIAL_WRITER LOGIN PASSWORD '$DIFFERENTIAL_WRITER_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
 CREATE DATABASE $mastodon_database WITH TEMPLATE $DATABASE_NAME OWNER $DATABASE_USER;
 CREATE DATABASE $rust_database WITH TEMPLATE $DATABASE_NAME OWNER $DATABASE_USER;
 EOF
   prepare_differential_database "$mastodon_database" mastodon
   prepare_differential_database "$rust_database" rust
+  published_database=$(run_podman port "$PG_CONTAINER" 5432/tcp)
+  database_port=${published_database##*:}
+  cargo build --locked --quiet --bin rustodon
+  rust_owner_url="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$database_port/$rust_database"
+  run_worker_cli "$rust_owner_url" admin migrate-operational-schema
+  prepare_differential_writer_database "$rust_database"
 
   DIFFERENTIAL_ROOT="$ROOT/target/differential-$DIFFERENTIAL_RUN_ID"
   [ ! -e "$DIFFERENTIAL_ROOT" ] || die "differential run root already exists: $DIFFERENTIAL_ROOT"
@@ -1803,11 +2564,14 @@ EOF
   mkdir "$mastodon_media" "$rust_media"
   cp -a "$FIXTURE_DIR/media/." "$mastodon_media/"
   cp -a "$FIXTURE_DIR/media/." "$rust_media/"
+  if [ "$media_mode" = 'rw' ]; then
+    chmod -R a+rwX "$mastodon_media" "$rust_media"
+  fi
   printf 'run=%s\nside=mastodon\n' "$DIFFERENTIAL_RUN_ID" > "$mastodon_media/.rustodon-differential-media-root"
   printf 'run=%s\nside=rust\n' "$DIFFERENTIAL_RUN_ID" > "$rust_media/.rustodon-differential-media-root"
 
   start_differential_redis
-  start_differential_web "$mastodon_database" "$mastodon_media"
+  start_differential_web "$mastodon_database" "$mastodon_media" "$media_mode"
 
   published_database=$(run_podman port "$PG_CONTAINER" 5432/tcp)
   database_port=${published_database##*:}
@@ -1822,18 +2586,53 @@ EOF
 
   mastodon_database_url="postgresql://$DIFFERENTIAL_READER:$DIFFERENTIAL_READER_PASSWORD@127.0.0.1:$database_port/$mastodon_database"
   rust_database_url="postgresql://$DIFFERENTIAL_READER:$DIFFERENTIAL_READER_PASSWORD@127.0.0.1:$database_port/$rust_database"
+  mastodon_owner_database_url="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$database_port/$mastodon_database"
+  rust_write_database_url="postgresql://$DIFFERENTIAL_WRITER:$DIFFERENTIAL_WRITER_PASSWORD@127.0.0.1:$database_port/$rust_database"
   if [ -n "$case_name" ]; then
     RUSTODON_DIFFERENTIAL_RUN_ID="$DIFFERENTIAL_RUN_ID" \
       RUSTODON_DIFFERENTIAL_MASTODON_HTTP_URL="http://127.0.0.1:$web_port" \
-      RUSTODON_DIFFERENTIAL_MASTODON_DATABASE_URL="$mastodon_database_url" \
-      RUSTODON_DIFFERENTIAL_RUST_DATABASE_URL="$rust_database_url" \
-      cargo test --locked --test differential "$case_name" -- --ignored --exact --nocapture
+       RUSTODON_DIFFERENTIAL_MASTODON_DATABASE_URL="$mastodon_database_url" \
+       RUSTODON_DIFFERENTIAL_MASTODON_OWNER_DATABASE_URL="$mastodon_owner_database_url" \
+       RUSTODON_DIFFERENTIAL_RUST_DATABASE_URL="$rust_database_url" \
+       RUSTODON_DIFFERENTIAL_RUST_OWNER_DATABASE_URL="$rust_owner_url" \
+       RUSTODON_DIFFERENTIAL_RUST_WRITE_DATABASE_URL="$rust_write_database_url" \
+      cargo test --locked --test differential "$case_name" -- --ignored --exact --nocapture --test-threads=1
   else
     RUSTODON_DIFFERENTIAL_RUN_ID="$DIFFERENTIAL_RUN_ID" \
       RUSTODON_DIFFERENTIAL_MASTODON_HTTP_URL="http://127.0.0.1:$web_port" \
-      RUSTODON_DIFFERENTIAL_MASTODON_DATABASE_URL="$mastodon_database_url" \
-      RUSTODON_DIFFERENTIAL_RUST_DATABASE_URL="$rust_database_url" \
-      cargo test --locked --test differential -- --ignored --nocapture
+       RUSTODON_DIFFERENTIAL_MASTODON_DATABASE_URL="$mastodon_database_url" \
+       RUSTODON_DIFFERENTIAL_MASTODON_OWNER_DATABASE_URL="$mastodon_owner_database_url" \
+       RUSTODON_DIFFERENTIAL_RUST_DATABASE_URL="$rust_database_url" \
+      RUSTODON_DIFFERENTIAL_RUST_OWNER_DATABASE_URL="$rust_owner_url" \
+      RUSTODON_DIFFERENTIAL_RUST_WRITE_DATABASE_URL="$rust_write_database_url" \
+      cargo test --locked --test differential -- --ignored --nocapture --test-threads=1 \
+        --skip notification_writes --skip status_authorization_matrix
+
+    reset_differential_feeds "$mastodon_database" "$mastodon_media" "$media_mode"
+    published_web=$(run_podman port "$WEB_CONTAINER" 3000/tcp)
+    web_port=${published_web##*:}
+    RUSTODON_DIFFERENTIAL_RUN_ID="$DIFFERENTIAL_RUN_ID" \
+      RUSTODON_DIFFERENTIAL_MASTODON_HTTP_URL="http://127.0.0.1:$web_port" \
+       RUSTODON_DIFFERENTIAL_MASTODON_DATABASE_URL="$mastodon_database_url" \
+       RUSTODON_DIFFERENTIAL_MASTODON_OWNER_DATABASE_URL="$mastodon_owner_database_url" \
+       RUSTODON_DIFFERENTIAL_RUST_DATABASE_URL="$rust_database_url" \
+       RUSTODON_DIFFERENTIAL_RUST_OWNER_DATABASE_URL="$rust_owner_url" \
+       RUSTODON_DIFFERENTIAL_RUST_WRITE_DATABASE_URL="$rust_write_database_url" \
+      cargo test --locked --test differential notification_writes \
+        -- --ignored --exact --nocapture --test-threads=1
+
+    reset_differential_feeds "$mastodon_database" "$mastodon_media" "$media_mode"
+    published_web=$(run_podman port "$WEB_CONTAINER" 3000/tcp)
+    web_port=${published_web##*:}
+    RUSTODON_DIFFERENTIAL_RUN_ID="$DIFFERENTIAL_RUN_ID" \
+      RUSTODON_DIFFERENTIAL_MASTODON_HTTP_URL="http://127.0.0.1:$web_port" \
+       RUSTODON_DIFFERENTIAL_MASTODON_DATABASE_URL="$mastodon_database_url" \
+       RUSTODON_DIFFERENTIAL_MASTODON_OWNER_DATABASE_URL="$mastodon_owner_database_url" \
+       RUSTODON_DIFFERENTIAL_RUST_DATABASE_URL="$rust_database_url" \
+       RUSTODON_DIFFERENTIAL_RUST_OWNER_DATABASE_URL="$rust_owner_url" \
+       RUSTODON_DIFFERENTIAL_RUST_WRITE_DATABASE_URL="$rust_write_database_url" \
+      cargo test --locked --test differential status_authorization_matrix \
+        -- --ignored --exact --nocapture --test-threads=1
   fi
 
   finish_differential
@@ -1869,6 +2668,7 @@ Commands:
   worker-test              Exercise durable jobs and worker process lifecycle
   startup-test             Prove web and worker fail closed before readiness
   preflight-test         Run canonical and rejection preflight cases
+  cutover-test            Rehearse cutover, smoke checks, rollback, and Mastodon reopen
   differential-test [CASE]
                           Run all or one Rails-versus-Rust compatibility case
   repro                   Regenerate and compare every fixture byte
@@ -1924,6 +2724,10 @@ case "$command" in
   preflight-test)
     [ "$#" -eq 0 ] || die 'preflight-test takes no arguments'
     preflight_test
+    ;;
+  cutover-test)
+    [ "$#" -eq 0 ] || die 'cutover-test takes no arguments'
+    cutover_test
     ;;
   differential-test)
     [ "$#" -le 1 ] || die 'differential-test accepts at most one case'

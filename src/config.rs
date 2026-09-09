@@ -43,7 +43,9 @@ const REDIS_SENTINEL_VARIABLES: &[&str] = &[
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub domains: DomainConfig,
+    pub limited_federation: bool,
     pub database: PostgresConfig,
+    pub write_database: Option<PostgresConfig>,
     pub paperclip: PaperclipConfig,
     pub trusted_proxies: Vec<IpNetwork>,
     pub smtp: SmtpConfig,
@@ -65,7 +67,13 @@ impl Config {
         reject_replica_configuration(environment)?;
 
         let domains = parse_domains(environment)?;
+        let limited_federation = match environment.get("LIMITED_FEDERATION_MODE") {
+            Some(_) => parse_optional_bool(environment, "LIMITED_FEDERATION_MODE")?,
+            None => parse_optional_bool(environment, "WHITELIST_MODE")?,
+        }
+        .unwrap_or(false);
         let database = parse_database(environment)?;
+        let write_database = parse_write_database(environment)?;
         let paperclip = parse_paperclip(environment)?;
         let trusted_proxies = parse_trusted_proxies(environment)?;
         let smtp = parse_smtp(environment, &domains)?;
@@ -77,7 +85,9 @@ impl Config {
 
         Ok(Self {
             domains,
+            limited_federation,
             database,
+            write_database,
             paperclip,
             trusted_proxies,
             smtp,
@@ -169,6 +179,7 @@ pub enum PostgresConnection {
 pub enum PostgresUrlSource {
     PrimaryDatabaseUrl,
     DatabaseUrl,
+    WriteDatabaseUrl,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -544,9 +555,61 @@ fn parse_database(environment: &HashMap<String, String>) -> Result<PostgresConfi
     })
 }
 
+fn parse_write_database(
+    environment: &HashMap<String, String>,
+) -> Result<Option<PostgresConfig>, ConfigError> {
+    let Some(url) = environment.get("WRITE_DATABASE_URL") else {
+        return Ok(None);
+    };
+    let pool_variable = if environment.contains_key("DB_POOL") {
+        "DB_POOL"
+    } else if environment.contains_key("MAX_THREADS") {
+        "MAX_THREADS"
+    } else {
+        "DB_POOL"
+    };
+    let pool_size = environment
+        .get("DB_POOL")
+        .or_else(|| environment.get("MAX_THREADS"))
+        .map_or(Ok(5), |value| parse_positive_u32(value, pool_variable))?;
+    let (connection, ssl_mode) = parse_database_url(
+        url,
+        "WRITE_DATABASE_URL",
+        PostgresUrlSource::WriteDatabaseUrl,
+        environment,
+    )?;
+    Ok(Some(PostgresConfig {
+        connection,
+        pool_size,
+        ssl_mode,
+    }))
+}
+
 fn parse_worker(environment: &HashMap<String, String>) -> Result<WorkerConfig, ConfigError> {
     let lanes = environment.get("WORKER_LANES").map_or_else(
-        || Ok([Lane::Maintenance].into_iter().collect()),
+        || {
+            if environment.contains_key("WRITE_DATABASE_URL") {
+                let mut lanes = [
+                    Lane::Ingress,
+                    Lane::Core,
+                    Lane::Pull,
+                    Lane::Maintenance,
+                    Lane::Push,
+                ]
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+                if smtp_is_configured(environment) {
+                    lanes.insert(Lane::Mail);
+                }
+                Ok(lanes)
+            } else {
+                let mut lanes = [Lane::Maintenance].into_iter().collect::<BTreeSet<_>>();
+                if smtp_is_configured(environment) {
+                    lanes.insert(Lane::Mail);
+                }
+                Ok(lanes)
+            }
+        },
         |value| {
             if value.is_empty() {
                 return Err(ConfigError::new(
@@ -614,6 +677,12 @@ fn parse_worker(environment: &HashMap<String, String>) -> Result<WorkerConfig, C
                 parse_bounded_u32(value, "WORKER_SHUTDOWN_SECONDS", 1, 3600)
             })?,
     })
+}
+
+fn smtp_is_configured(environment: &HashMap<String, String>) -> bool {
+    environment
+        .get("SMTP_SERVER")
+        .is_some_and(|value| !value.is_empty())
 }
 
 fn parse_web(environment: &HashMap<String, String>) -> Result<WebConfig, ConfigError> {
@@ -962,10 +1031,13 @@ fn parse_smtp_authentication(
         "none" => Ok(SmtpAuthentication::None),
         "plain" => Ok(SmtpAuthentication::Plain),
         "login" => Ok(SmtpAuthentication::Login),
-        "cram_md5" => Ok(SmtpAuthentication::CramMd5),
+        "cram_md5" => Err(ConfigError::new(
+            &["SMTP_AUTH_METHOD"],
+            "cram_md5 is not supported by the SMTP client",
+        )),
         _ => Err(ConfigError::new(
             &["SMTP_AUTH_METHOD"],
-            "must be none, plain, login, or cram_md5",
+            "must be none, plain, or login",
         )),
     }
 }

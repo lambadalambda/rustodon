@@ -117,12 +117,39 @@ pub struct User {
     pub settings: Option<RawJsonText>,
     pub sign_up_ip: Option<IpNetwork>,
     pub role_id: Option<i64>,
+    pub role_requires_2fa: bool,
     pub approved: bool,
     pub disabled: bool,
     pub confirmed_at: Option<NaiveDateTime>,
     pub locale: Option<String>,
     pub webauthn_id: Option<String>,
     pub has_webauthn_credentials: bool,
+}
+
+#[derive(Clone, PartialEq, sqlx::FromRow)]
+#[allow(clippy::struct_excessive_bools)]
+pub(crate) struct BrowserLoginUser {
+    pub id: i64,
+    pub account_id: i64,
+    pub encrypted_password: SecretText,
+    pub otp_backup_codes: Option<Vec<SecretText>>,
+    pub otp_required_for_login: bool,
+    pub otp_secret: Option<SecretText>,
+    pub consumed_timestep: Option<i32>,
+    pub approved: bool,
+    pub confirmed_at: Option<NaiveDateTime>,
+    pub role_requires_2fa: bool,
+    pub has_webauthn_credentials: bool,
+    pub account_memorial: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, sqlx::FromRow)]
+pub struct BrowserSession {
+    pub user_id: i64,
+    pub account_id: i64,
+    pub access_token: SecretText,
+    pub updated_at: NaiveDateTime,
+    pub functional: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
@@ -564,6 +591,7 @@ pub struct NotificationRequest {
     pub last_status_id: Option<i64>,
     pub notifications_count: i64,
     pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
 }
 
 #[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
@@ -670,6 +698,15 @@ pub struct Keypair {
     pub uri: String,
     pub public_key: String,
     pub private_key: Option<SecretText>,
+    pub revoked: bool,
+    pub expires_at: Option<NaiveDateTime>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActivityPubSignatureKey {
+    pub account_id: i64,
+    pub key_id: String,
+    pub public_key: String,
     pub revoked: bool,
     pub expires_at: Option<NaiveDateTime>,
 }

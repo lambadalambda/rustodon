@@ -21,7 +21,7 @@ const USER_CACHE_CONTROL: HeaderValue = HeaderValue::from_static("private, no-st
 pub struct RequiredScopes(&'static [&'static str]);
 
 impl RequiredScopes {
-    const fn new(scopes: &'static [&'static str]) -> Self {
+    pub(crate) const fn new(scopes: &'static [&'static str]) -> Self {
         Self(scopes)
     }
 
@@ -36,13 +36,28 @@ pub const READ_BLOCKS: RequiredScopes = RequiredScopes::new(&["follow", "read", 
 pub const READ_BOOKMARKS: RequiredScopes = RequiredScopes::new(&["read", "read:bookmarks"]);
 pub const READ_COLLECTIONS: RequiredScopes = RequiredScopes::new(&["read", "read:collections"]);
 pub const READ_FAVOURITES: RequiredScopes = RequiredScopes::new(&["read", "read:favourites"]);
-pub const READ_FOLLOWS: RequiredScopes = RequiredScopes::new(&["read", "read:follows"]);
+pub const READ_FOLLOWS: RequiredScopes = RequiredScopes::new(&["follow", "read", "read:follows"]);
 pub const READ_FILTERS: RequiredScopes = RequiredScopes::new(&["read", "read:filters"]);
 pub const READ_LISTS: RequiredScopes = RequiredScopes::new(&["read", "read:lists"]);
 pub const READ_MUTES: RequiredScopes = RequiredScopes::new(&["follow", "read", "read:mutes"]);
 pub const READ_NOTIFICATIONS: RequiredScopes = RequiredScopes::new(&["read", "read:notifications"]);
 pub const READ_STATUSES: RequiredScopes = RequiredScopes::new(&["read", "read:statuses"]);
+pub const WRITE_NOTIFICATIONS: RequiredScopes =
+    RequiredScopes::new(&["write", "write:notifications"]);
+pub const WRITE_FOLLOWS: RequiredScopes =
+    RequiredScopes::new(&["follow", "write", "write:follows"]);
+pub const WRITE_BLOCKS: RequiredScopes = RequiredScopes::new(&["follow", "write", "write:blocks"]);
+pub const WRITE_MUTES: RequiredScopes = RequiredScopes::new(&["follow", "write", "write:mutes"]);
+pub const WRITE_CONVERSATIONS: RequiredScopes =
+    RequiredScopes::new(&["write", "write:conversations"]);
+pub const WRITE_ACCOUNTS: RequiredScopes = RequiredScopes::new(&["write", "write:accounts"]);
+pub const WRITE_MEDIA: RequiredScopes = RequiredScopes::new(&["write", "write:media"]);
+pub const WRITE_REPORTS: RequiredScopes = RequiredScopes::new(&["write", "write:reports"]);
+pub const WRITE_BOOKMARKS: RequiredScopes = RequiredScopes::new(&["write", "write:bookmarks"]);
+pub const WRITE_FAVOURITES: RequiredScopes = RequiredScopes::new(&["write", "write:favourites"]);
+pub const WRITE_STATUSES: RequiredScopes = RequiredScopes::new(&["write", "write:statuses"]);
 pub const NO_SCOPE: RequiredScopes = RequiredScopes::new(&[]);
+pub const PROFILE: RequiredScopes = RequiredScopes::new(&["profile"]);
 pub const VERIFY_CREDENTIALS: RequiredScopes =
     RequiredScopes::new(&["profile", "read", "read:accounts"]);
 

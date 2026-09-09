@@ -3,7 +3,7 @@ use std::fmt::{self, Write};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection, Postgres, Row, Transaction};
 
-pub const CURRENT_VERSION: i64 = 1;
+pub const CURRENT_VERSION: i64 = 3;
 
 const BOOTSTRAP_SQL: &str = "CREATE SCHEMA rustodon; \
 CREATE TABLE rustodon.schema_migrations ( \
@@ -16,6 +16,8 @@ REVOKE ALL ON SCHEMA rustodon FROM PUBLIC; \
 REVOKE ALL ON TABLE rustodon.schema_migrations FROM PUBLIC";
 
 const MIGRATION_1_SQL: &str = include_str!("../migrations/rustodon/0001_operational.sql");
+const MIGRATION_2_SQL: &str = include_str!("../migrations/rustodon/0002_rate_limit_windows.sql");
+const MIGRATION_3_SQL: &str = include_str!("../migrations/rustodon/0003_remote_fetch_leases.sql");
 const TABLES: &[&str] = &[
     "domain_health",
     "durable_jobs",
@@ -23,6 +25,8 @@ const TABLES: &[&str] = &[
     "idempotency_keys",
     "ordering_markers",
     "outbox_events",
+    "rate_limit_windows",
+    "remote_fetch_leases",
     "schema_migrations",
 ];
 const SEQUENCES: &[&str] = &["durable_jobs_id_seq", "outbox_events_id_seq"];
@@ -43,11 +47,15 @@ const INDEXES: &[&str] = &[
     "outbox_events_logical_key_idx",
     "outbox_events_pending_idx",
     "outbox_events_pkey",
+    "rate_limit_windows_expires_idx",
+    "rate_limit_windows_pkey",
+    "remote_fetch_leases_expires_idx",
+    "remote_fetch_leases_pkey",
     "schema_migrations_pkey",
 ];
 const EXPECTED_CATALOG_SHA256: [u8; 32] = [
-    0xd9, 0x50, 0x11, 0x64, 0x1b, 0xdd, 0xda, 0xd3, 0x8c, 0xb1, 0xdb, 0xcc, 0xa0, 0x14, 0xce, 0xbc,
-    0x0c, 0x93, 0xdb, 0xb0, 0x25, 0xdc, 0x07, 0xb6, 0x66, 0x25, 0xbd, 0x9a, 0xb9, 0xcc, 0xd4, 0xf8,
+    0x7c, 0x12, 0x0a, 0x36, 0x70, 0x94, 0xdf, 0x1c, 0xe4, 0x32, 0xd2, 0xbb, 0xc8, 0x11, 0x11, 0x0c,
+    0x03, 0x29, 0x34, 0xf9, 0x21, 0x9d, 0x22, 0x75, 0x52, 0x6b, 0x75, 0x2f, 0x12, 0x0c, 0x9b, 0x52,
 ];
 const CATALOG_QUERY: &str = r#"
 WITH schema_info AS (
@@ -57,9 +65,12 @@ WITH schema_info AS (
   SELECT r.oid FROM pg_catalog.pg_roles r
    WHERE r.rolname = pg_catalog.current_setting('rustodon.expected_owner')
 ), runtime_role AS (
-  SELECT r.oid FROM pg_catalog.pg_roles r CROSS JOIN expected_owner owner
-   WHERE r.rolname = pg_catalog.current_setting('rustodon.runtime_role', true)
-     AND r.oid <> owner.oid
+   SELECT r.oid FROM pg_catalog.pg_roles r CROSS JOIN expected_owner owner
+    WHERE r.rolname = pg_catalog.current_setting('rustodon.runtime_role', true)
+      AND r.oid <> owner.oid
+), writer_role AS (
+   SELECT r.oid FROM pg_catalog.pg_roles r
+    WHERE r.rolname = pg_catalog.current_setting('rustodon.writer_role', true)
 ), acl_entries AS (
   SELECT 'schema'::text AS kind, s.oid::text AS object_key,
          acl.grantee, acl.grantor, acl.privilege_type, acl.is_grantable
@@ -112,7 +123,8 @@ WITH schema_info AS (
               ELSE 'ROLE:' || pg_catalog.pg_get_userbyid(acl.grantor) END AS grantor,
          acl.privilege_type, acl.is_grantable
     FROM acl_entries acl CROSS JOIN expected_owner role
-   WHERE NOT EXISTS (SELECT 1 FROM runtime_role runtime WHERE runtime.oid = acl.grantee)
+    WHERE NOT EXISTS (SELECT 1 FROM runtime_role runtime WHERE runtime.oid = acl.grantee)
+      AND NOT EXISTS (SELECT 1 FROM writer_role writer WHERE writer.oid = acl.grantee)
 ), acl_sets AS (
   SELECT kind, object_key,
          pg_catalog.jsonb_agg(
@@ -656,10 +668,21 @@ impl Migration {
 }
 
 fn migration(version: i64) -> Option<Migration> {
-    (version == 1).then_some(Migration {
-        version,
-        sql: MIGRATION_1_SQL,
-    })
+    match version {
+        1 => Some(Migration {
+            version,
+            sql: MIGRATION_1_SQL,
+        }),
+        2 => Some(Migration {
+            version,
+            sql: MIGRATION_2_SQL,
+        }),
+        3 => Some(Migration {
+            version,
+            sql: MIGRATION_3_SQL,
+        }),
+        _ => None,
+    }
 }
 
 /// Returns the known migrations not present in an exact applied prefix.
@@ -776,7 +799,13 @@ async fn migrate_transaction(
     bootstrap(transaction).await?;
     validate_ledger(transaction).await?;
     let applied = load_records(transaction).await?;
-    for version in migration_plan(&applied)? {
+    let plan = migration_plan(&applied)?;
+    let runtime_role = if plan.is_empty() {
+        None
+    } else {
+        discover_runtime_role(transaction).await?
+    };
+    for version in plan {
         let migration = migration(version).ok_or(MigrationError::UnknownVersion(version))?;
         sqlx::raw_sql(migration.sql)
             .execute(&mut **transaction)
@@ -789,6 +818,8 @@ async fn migrate_transaction(
         .bind(migration.checksum().as_slice())
         .execute(&mut **transaction)
         .await?;
+        grant_runtime_privileges_for_migration(transaction, version, runtime_role.as_deref())
+            .await?;
     }
     validate_runtime_role(transaction, false).await?;
     validate_catalog(transaction).await?;
@@ -925,7 +956,9 @@ async fn validate_catalog(
         "WITH expected(table_name, column_count) AS (VALUES \
            ('domain_health', 7), ('durable_jobs', 15), ('heartbeats', 6), \
            ('idempotency_keys', 6), ('ordering_markers', 6), \
-           ('outbox_events', 6), ('schema_migrations', 4)) \
+           ('outbox_events', 6), ('rate_limit_windows', 4), \
+           ('remote_fetch_leases', 3), \
+           ('schema_migrations', 4)) \
          SELECT expected.table_name FROM expected \
          LEFT JOIN ( \
            SELECT c.relname::text AS table_name, count(*)::integer AS column_count \
@@ -948,9 +981,25 @@ async fn validate_catalog(
     let entries = catalog_entries(transaction).await?;
     let checksum: [u8; 32] = Sha256::digest(entries.join("\n").as_bytes()).into();
     if checksum != EXPECTED_CATALOG_SHA256 {
+        let runtime_role = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT pg_catalog.current_setting('rustodon.runtime_role', true)",
+        )
+        .fetch_one(&mut **transaction)
+        .await?;
+        let writer_role = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT pg_catalog.current_setting('rustodon.writer_role', true)",
+        )
+        .fetch_one(&mut **transaction)
+        .await?;
+        let expected_owner = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT pg_catalog.current_setting('rustodon.expected_owner', true)",
+        )
+        .fetch_one(&mut **transaction)
+        .await?;
         return Err(MigrationError::SchemaDrift(format!(
-            "catalog fingerprint {} is not recognized",
-            hex(&checksum)
+            "catalog fingerprint {} is not recognized (runtime_role={runtime_role:?}, writer_role={writer_role:?}, expected_owner={expected_owner:?}, entries={})",
+            hex(&checksum),
+            entries.len()
         )));
     }
     Ok(())
@@ -960,6 +1009,44 @@ async fn validate_runtime_role(
     transaction: &mut Transaction<'_, Postgres>,
     required_for_current_user: bool,
 ) -> Result<(), MigrationError> {
+    let Some(runtime_role) = discover_runtime_role(transaction).await? else {
+        if required_for_current_user {
+            return Err(MigrationError::SchemaDrift(
+                "runtime role is missing".to_owned(),
+            ));
+        }
+        sqlx::query("SELECT pg_catalog.set_config('rustodon.runtime_role', '', true)")
+            .execute(&mut **transaction)
+            .await?;
+        return Ok(());
+    };
+    validate_runtime_role_attributes(transaction, &runtime_role).await?;
+    validate_mastodon_read_privileges(transaction, &runtime_role).await?;
+    let privileges = runtime_role_privileges(transaction, &runtime_role).await?;
+    let expected = expected_runtime_role_privileges();
+    if privileges != expected {
+        return Err(MigrationError::SchemaDrift(
+            "runtime role privileges changed".to_owned(),
+        ));
+    }
+    if required_for_current_user
+        && (runtime_role != current_user(transaction).await?
+            || current_user(transaction).await? != session_user(transaction).await?)
+    {
+        return Err(MigrationError::SchemaDrift(
+            "runtime process is not directly connected as the operational role".to_owned(),
+        ));
+    }
+    sqlx::query("SELECT pg_catalog.set_config('rustodon.runtime_role', $1, true)")
+        .bind(runtime_role)
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
+async fn discover_runtime_role(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<Option<String>, MigrationError> {
     let candidates = sqlx::query_scalar::<_, String>(
         "SELECT role.rolname::text FROM pg_catalog.pg_class relation \
          JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace \
@@ -972,43 +1059,53 @@ async fn validate_runtime_role(
     )
     .fetch_all(&mut **transaction)
     .await?;
-    let Some(runtime_role) = candidates.first() else {
-        if required_for_current_user {
-            return Err(MigrationError::SchemaDrift(
-                "runtime role is missing".to_owned(),
-            ));
-        }
-        sqlx::query("SELECT pg_catalog.set_config('rustodon.runtime_role', '', true)")
-            .execute(&mut **transaction)
-            .await?;
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [runtime_role] => Ok(Some(runtime_role.clone())),
+        _ => Err(MigrationError::SchemaDrift(
+            "multiple runtime roles are granted operational access".to_owned(),
+        )),
+    }
+}
+
+async fn grant_runtime_privileges_for_migration(
+    transaction: &mut Transaction<'_, Postgres>,
+    version: i64,
+    runtime_role: Option<&str>,
+) -> Result<(), MigrationError> {
+    let Some(runtime_role) = runtime_role else {
         return Ok(());
     };
-    if candidates.len() != 1 {
-        return Err(MigrationError::SchemaDrift(
-            "multiple runtime roles are granted operational access".to_owned(),
-        ));
-    }
-    validate_runtime_role_attributes(transaction, runtime_role).await?;
-    validate_mastodon_read_privileges(transaction, runtime_role).await?;
-    let privileges = runtime_role_privileges(transaction, runtime_role).await?;
-    let expected = expected_runtime_role_privileges();
-    if privileges != expected {
-        return Err(MigrationError::SchemaDrift(
-            "runtime role privileges changed".to_owned(),
-        ));
-    }
-    if required_for_current_user
-        && (runtime_role != &current_user(transaction).await?
-            || current_user(transaction).await? != session_user(transaction).await?)
-    {
-        return Err(MigrationError::SchemaDrift(
-            "runtime process is not directly connected as the operational role".to_owned(),
-        ));
-    }
-    sqlx::query("SELECT pg_catalog.set_config('rustodon.runtime_role', $1, true)")
+    let grants: &[(&str, &str)] = match version {
+        1 => &[
+            (
+                "SELECT, INSERT, UPDATE, DELETE",
+                "TABLE rustodon.durable_jobs, rustodon.outbox_events, rustodon.idempotency_keys, rustodon.ordering_markers, rustodon.domain_health, rustodon.heartbeats",
+            ),
+            (
+                "USAGE",
+                "SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq",
+            ),
+        ],
+        2 => &[(
+            "SELECT, INSERT, UPDATE, DELETE",
+            "TABLE rustodon.rate_limit_windows",
+        )],
+        3 => &[(
+            "SELECT, INSERT, DELETE",
+            "TABLE rustodon.remote_fetch_leases",
+        )],
+        _ => &[],
+    };
+    let quoted_role = sqlx::query_scalar::<_, String>("SELECT pg_catalog.quote_ident($1)")
         .bind(runtime_role)
-        .execute(&mut **transaction)
+        .fetch_one(&mut **transaction)
         .await?;
+    for (privileges, objects) in grants {
+        sqlx::query(&format!("GRANT {privileges} ON {objects} TO {quoted_role}"))
+            .execute(&mut **transaction)
+            .await?;
+    }
     Ok(())
 }
 
@@ -1197,6 +1294,13 @@ fn expected_runtime_role_privileges() -> Vec<String> {
         "outbox_events:SELECT:false",
         "outbox_events:UPDATE:false",
         "outbox_events_id_seq:USAGE:false",
+        "rate_limit_windows:DELETE:false",
+        "rate_limit_windows:INSERT:false",
+        "rate_limit_windows:SELECT:false",
+        "rate_limit_windows:UPDATE:false",
+        "remote_fetch_leases:DELETE:false",
+        "remote_fetch_leases:INSERT:false",
+        "remote_fetch_leases:SELECT:false",
         "schema:USAGE:false",
         "schema_migrations:SELECT:false",
     ]

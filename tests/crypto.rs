@@ -76,6 +76,21 @@ fn decrypts_checked_mastodon_rails_fixture() {
 }
 
 #[test]
+fn encrypts_a_secret_that_the_rails_decryptor_can_read() {
+    let encrypted = encryption_config()
+        .encrypt_string("fixture TOTP secret")
+        .expect("fixture secret should encrypt");
+    assert_ne!(encrypted, "fixture TOTP secret");
+    assert_eq!(
+        encryption_config()
+            .decrypt_string(&encrypted, 4_096)
+            .expect("Rust-generated envelope should decrypt")
+            .expose_secret(),
+        "fixture TOTP secret"
+    );
+}
+
+#[test]
 fn sha1_is_supported_for_legacy_non_deterministic_ciphertext() {
     let plaintext = encryption_config()
         .decrypt_string(SHA1_ENVELOPE, 4_096)

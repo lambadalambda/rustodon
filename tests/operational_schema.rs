@@ -1,9 +1,19 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
+use chrono::{Duration as ChronoDuration, NaiveDateTime, Utc};
+use http::HeaderMap;
+use http::header::{AUTHORIZATION, HeaderValue};
+use rustodon::jobs::{JobSpec, Lane, Queue, record_stream_event_in};
+use rustodon::mastodon::{
+    BearerAuthenticator, IdempotencyKey, Repository, WRITE_STATUSES, WriteError, WriteOptions,
+    WriteOutcome, WriteRepository,
+};
 use rustodon::operational_schema::{
     CURRENT_VERSION, MigrationError, MigrationRecord, migrate, migration_plan,
 };
-use sqlx::{Connection, PgConnection};
+use sqlx::{Connection, PgConnection, PgPool};
+use tokio::sync::Barrier;
 use tokio::time::{Duration, timeout};
 
 const TABLES: &[&str] = &[
@@ -13,13 +23,15 @@ const TABLES: &[&str] = &[
     "idempotency_keys",
     "ordering_markers",
     "outbox_events",
+    "rate_limit_windows",
+    "remote_fetch_leases",
 ];
 
 #[test]
 fn migration_plan_requires_an_exact_known_prefix() {
-    assert_eq!(migration_plan(&[]).unwrap(), vec![1]);
+    assert_eq!(migration_plan(&[]).unwrap(), vec![1, 2, 3]);
     let current = vec![MigrationRecord::known(1).expect("migration 1 exists")];
-    assert!(migration_plan(&current).unwrap().is_empty());
+    assert_eq!(migration_plan(&current).unwrap(), vec![2, 3]);
 
     let unknown = vec![MigrationRecord {
         version: CURRENT_VERSION + 1,
@@ -27,7 +39,7 @@ fn migration_plan_requires_an_exact_known_prefix() {
     }];
     assert!(matches!(
         migration_plan(&unknown),
-        Err(MigrationError::UnknownVersion(2))
+        Err(MigrationError::UnknownVersion(4))
     ));
 
     let wrong_checksum = vec![MigrationRecord {
@@ -89,22 +101,28 @@ async fn operational_schema_lifecycle_is_isolated_and_idempotent()
     }
     assert_schema(&mut connection).await?;
 
-    sqlx::query("UPDATE rustodon.schema_migrations SET version = $1")
+    sqlx::query("UPDATE rustodon.schema_migrations SET version = $1 WHERE version = $2")
         .bind(CURRENT_VERSION + 1)
+        .bind(CURRENT_VERSION)
         .execute(&mut connection)
         .await?;
     let error = migrate(&mut connection)
         .await
         .expect_err("future schema versions must be rejected");
-    assert!(matches!(error, MigrationError::UnknownVersion(2)));
+    assert!(matches!(
+        error,
+        MigrationError::UnknownVersion(version) if version == CURRENT_VERSION + 1
+    ));
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT version FROM rustodon.schema_migrations")
-            .fetch_one(&mut connection)
-            .await?,
-        2
+        sqlx::query_scalar::<_, i64>(
+            "SELECT version FROM rustodon.schema_migrations ORDER BY version DESC LIMIT 1",
+        )
+        .fetch_one(&mut connection)
+        .await?,
+        CURRENT_VERSION + 1
     );
 
-    sqlx::query("UPDATE rustodon.schema_migrations SET version = 1, checksum = $1")
+    sqlx::query("UPDATE rustodon.schema_migrations SET checksum = $1 WHERE version = 1")
         .bind([0_u8; 32].as_slice())
         .execute(&mut connection)
         .await?;
@@ -114,8 +132,13 @@ async fn operational_schema_lifecycle_is_isolated_and_idempotent()
     ));
 
     let checksum = MigrationRecord::known(1).unwrap().checksum;
-    sqlx::query("UPDATE rustodon.schema_migrations SET checksum = $1")
+    sqlx::query("UPDATE rustodon.schema_migrations SET checksum = $1 WHERE version = 1")
         .bind(checksum.as_slice())
+        .execute(&mut connection)
+        .await?;
+    sqlx::query("UPDATE rustodon.schema_migrations SET version = $1 WHERE version = $2")
+        .bind(CURRENT_VERSION)
+        .bind(CURRENT_VERSION + 1)
         .execute(&mut connection)
         .await?;
     sqlx::query("ALTER TABLE rustodon.heartbeats ADD COLUMN drift text")
@@ -155,6 +178,310 @@ async fn operational_schema_lifecycle_is_isolated_and_idempotent()
         .await?;
     migrate(&mut connection).await?;
     assert_schema(&mut connection).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+async fn operational_schema_upgrade_grants_new_runtime_table_access()
+-> Result<(), Box<dyn std::error::Error>> {
+    let url = std::env::var("RUSTODON_OPERATIONAL_DATABASE_URL")?;
+    let runtime_role = std::env::var("RUSTODON_OPERATIONAL_RUNTIME_ROLE")?;
+    let mut connection = PgConnection::connect(&url).await?;
+
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT to_regclass('rustodon.remote_fetch_leases') IS NOT NULL",
+        )
+        .fetch_one(&mut connection)
+        .await?
+    );
+
+    migrate(&mut connection).await?;
+
+    for privilege in ["SELECT", "INSERT", "DELETE"] {
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT has_table_privilege($1, 'rustodon.remote_fetch_leases', $2)",
+            )
+            .bind(&runtime_role)
+            .bind(privilege)
+            .fetch_one(&mut connection)
+            .await?,
+            "runtime role should have {privilege} on the new lease table",
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+#[allow(clippy::too_many_lines)]
+async fn operational_write_composition_is_atomic_and_idempotent()
+-> Result<(), Box<dyn std::error::Error>> {
+    let read_url = std::env::var("RUSTODON_OPERATIONAL_DATABASE_URL")?;
+    let write_url = std::env::var("RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL")?;
+    let reader = Repository::connect(&read_url).await?;
+    let authenticator = BearerAuthenticator::new(reader);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_static("Bearer fixture-bearer-token-v4-6-5"),
+    );
+    let authenticated = authenticator.authenticate(&headers, WRITE_STATUSES).await?;
+    let writer = WriteRepository::connect(&write_url).await?;
+    let pool = sqlx::PgPool::connect(&write_url).await?;
+    let (last_read_id, lock_version, updated_at): (i64, i32, NaiveDateTime) = sqlx::query_as(
+        "SELECT last_read_id, lock_version, updated_at FROM markers \
+         WHERE user_id = $1 AND timeline = $2",
+    )
+    .bind(101_i64)
+    .bind("home")
+    .fetch_one(&pool)
+    .await?;
+    let idempotency = IdempotencyKey {
+        scope: "operational-write-test",
+        key: "marker-1",
+        fingerprint: [7; 32],
+        expires_at: Utc::now() + ChronoDuration::hours(1),
+    };
+    let job = JobSpec::new(
+        Lane::Maintenance,
+        "operational_write_probe",
+        serde_json::json!({ "timeline": "home" }),
+    )
+    .logical_key("operational-write-probe-1");
+    let options = || WriteOptions {
+        idempotency: Some(idempotency),
+        outbox: Some(&job),
+    };
+
+    let first = writer
+        .update_marker_with_options(
+            &authenticated,
+            "home",
+            last_read_id + 1,
+            Some(lock_version),
+            options(),
+        )
+        .await?;
+    let replay = writer
+        .update_marker_with_options(
+            &authenticated,
+            "home",
+            last_read_id + 2,
+            Some(lock_version),
+            options(),
+        )
+        .await?;
+    let fingerprint_conflict = writer
+        .update_marker_with_options(
+            &authenticated,
+            "home",
+            last_read_id + 3,
+            Some(lock_version + 1),
+            WriteOptions {
+                idempotency: Some(IdempotencyKey {
+                    fingerprint: [8; 32],
+                    ..idempotency
+                }),
+                outbox: None,
+            },
+        )
+        .await;
+    let stored_marker: (i64, i32) = sqlx::query_as(
+        "SELECT last_read_id, lock_version FROM markers WHERE user_id = $1 AND timeline = $2",
+    )
+    .bind(101_i64)
+    .bind("home")
+    .fetch_one(&pool)
+    .await?;
+    let stored_idempotency: (Vec<u8>, serde_json::Value) = sqlx::query_as(
+        "SELECT fingerprint, result FROM rustodon.idempotency_keys \
+         WHERE scope = $1 AND key = $2",
+    )
+    .bind(idempotency.scope)
+    .bind(idempotency.key)
+    .fetch_one(&pool)
+    .await?;
+    let outbox_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM rustodon.outbox_events \
+         WHERE kind = $1 AND logical_key = $2",
+    )
+    .bind("operational_write_probe")
+    .bind("operational-write-probe-1")
+    .fetch_one(&pool)
+    .await?;
+
+    sqlx::query(
+        "UPDATE markers SET last_read_id = $1, lock_version = $2, updated_at = $3 \
+         WHERE user_id = $4 AND timeline = $5",
+    )
+    .bind(last_read_id)
+    .bind(lock_version)
+    .bind(updated_at)
+    .bind(101_i64)
+    .bind("home")
+    .execute(&pool)
+    .await?;
+    sqlx::query("DELETE FROM rustodon.outbox_events WHERE kind = $1 AND logical_key = $2")
+        .bind("operational_write_probe")
+        .bind("operational-write-probe-1")
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM rustodon.idempotency_keys WHERE scope = $1 AND key = $2")
+        .bind(idempotency.scope)
+        .bind(idempotency.key)
+        .execute(&pool)
+        .await?;
+
+    let first = match first {
+        WriteOutcome::Applied(marker) => marker,
+        WriteOutcome::Replayed(_) => panic!("first idempotent write must apply"),
+    };
+    let replay = match replay {
+        WriteOutcome::Replayed(marker) => marker,
+        WriteOutcome::Applied(_) => panic!("duplicate idempotent write must replay"),
+    };
+    assert_eq!(first.last_read_id, last_read_id + 1);
+    assert_eq!(replay.last_read_id, first.last_read_id);
+    assert_eq!(stored_marker, (last_read_id + 1, lock_version + 1));
+    assert_eq!(stored_idempotency.0, vec![7; 32]);
+    assert_eq!(stored_idempotency.1["last_read_id"], last_read_id + 1);
+    assert_eq!(outbox_count, 1);
+    assert!(matches!(fingerprint_conflict, Err(WriteError::Conflict)));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+async fn stream_events_are_replayable_and_not_dispatchable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let url = std::env::var("RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL")?;
+    let pool = sqlx::PgPool::connect(&url).await?;
+    let queue = Queue::new(pool.clone());
+    let logical_key = "stream:test:101:update:42:1";
+    sqlx::query("DELETE FROM rustodon.outbox_events WHERE kind = $1 AND logical_key = $2")
+        .bind(rustodon::streaming::STREAM_EVENT_KIND)
+        .bind(logical_key)
+        .execute(&pool)
+        .await?;
+
+    let cursor = queue.stream_cursor().await?;
+    let mut transaction = pool.begin().await?;
+    let first = record_stream_event_in(&mut transaction, 101, "update", 42, logical_key).await?;
+    let duplicate =
+        record_stream_event_in(&mut transaction, 101, "update", 42, logical_key).await?;
+    transaction.commit().await?;
+
+    assert_eq!(first, duplicate);
+    let first_read = queue.stream_events_after(cursor, 10).await?;
+    let second_read = queue.stream_events_after(cursor, 10).await?;
+    assert_eq!(first_read, second_read);
+    assert_eq!(
+        first_read.iter().filter(|event| event.id == first).count(),
+        1
+    );
+
+    queue.dispatch_outbox(100).await?;
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT dispatched_at IS NOT NULL FROM rustodon.outbox_events WHERE id = $1",
+        )
+        .bind(first)
+        .fetch_one(&pool)
+        .await?
+    );
+
+    sqlx::query("DELETE FROM rustodon.outbox_events WHERE id = $1")
+        .bind(first)
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+async fn stream_cursor_does_not_skip_inflight_commits() -> Result<(), Box<dyn std::error::Error>> {
+    let url = std::env::var("RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL")?;
+    let pool = PgPool::connect(&url).await?;
+    let queue = Queue::new(pool.clone());
+    let first_key = "stream:commit-order:101:update:900000001:1";
+    let second_key = "stream:commit-order:101:update:900000002:1";
+    for key in [first_key, second_key] {
+        sqlx::query("DELETE FROM rustodon.outbox_events WHERE kind = $1 AND logical_key = $2")
+            .bind(rustodon::streaming::STREAM_EVENT_KIND)
+            .bind(key)
+            .execute(&pool)
+            .await?;
+    }
+
+    let cursor = queue.stream_cursor().await?;
+    let mut first_transaction = pool.begin().await?;
+    let first_id = record_stream_event_in(
+        &mut first_transaction,
+        101,
+        "update",
+        900_000_001,
+        first_key,
+    )
+    .await?;
+
+    let reader_barrier = Arc::new(Barrier::new(2));
+    let reader = {
+        let barrier = Arc::clone(&reader_barrier);
+        let queue = queue.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            queue.stream_events_after(cursor, 10).await
+        })
+    };
+    let writer_barrier = Arc::new(Barrier::new(2));
+    let second = {
+        let barrier = Arc::clone(&writer_barrier);
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let mut transaction = pool.begin().await?;
+            barrier.wait().await;
+            let second_id =
+                record_stream_event_in(&mut transaction, 101, "update", 900_000_002, second_key)
+                    .await?;
+            transaction.commit().await?;
+            Ok::<i64, rustodon::jobs::JobError>(second_id)
+        })
+    };
+    reader_barrier.wait().await;
+    writer_barrier.wait().await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !reader.is_finished(),
+        "a stream reader must wait for an in-flight stream transaction"
+    );
+    assert!(
+        !second.is_finished(),
+        "a later stream writer must wait for the earlier transaction to commit"
+    );
+
+    first_transaction.commit().await?;
+    let reader_events = timeout(Duration::from_secs(5), reader).await??;
+    reader_events?;
+    let second_result = timeout(Duration::from_secs(5), second).await??;
+    let second_id = second_result?;
+    let events = queue.stream_events_after(cursor, 10).await?;
+    let event_ids = events
+        .iter()
+        .filter(|event| matches!(event.object_id, 900_000_001 | 900_000_002))
+        .map(|event| event.id)
+        .collect::<Vec<_>>();
+    assert_eq!(event_ids, vec![first_id, second_id]);
+
+    for key in [first_key, second_key] {
+        sqlx::query("DELETE FROM rustodon.outbox_events WHERE kind = $1 AND logical_key = $2")
+            .bind(rustodon::streaming::STREAM_EVENT_KIND)
+            .bind(key)
+            .execute(&pool)
+            .await?;
+    }
     Ok(())
 }
 
@@ -430,9 +757,11 @@ async fn assert_schema(connection: &mut PgConnection) -> Result<(), sqlx::Error>
             .collect::<BTreeSet<_>>()
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT version FROM rustodon.schema_migrations")
-            .fetch_one(&mut *connection)
-            .await?,
+        sqlx::query_scalar::<_, i64>(
+            "SELECT version FROM rustodon.schema_migrations ORDER BY version DESC LIMIT 1",
+        )
+        .fetch_one(&mut *connection)
+        .await?,
         CURRENT_VERSION
     );
     Ok(())

@@ -452,8 +452,9 @@ INSERT INTO oauth_access_tokens (
       '2026-07-01 12:00:00', NULL, '2026-07-01 12:30:00', '192.0.2.10'),
   (416, 101, 301, 'fixture-bearer-read-mutes-v4-6-5', NULL, 'read:mutes', NULL,
       '2026-07-01 12:00:00', NULL, '2026-07-01 12:30:00', '192.0.2.10'),
-  (417, 101, 301, 'fixture-bearer-follow-v4-6-5', NULL, 'follow', NULL,
-      '2026-07-01 12:00:00', NULL, '2026-07-01 12:30:00', '192.0.2.10');
+   (417, 101, 301, 'fixture-bearer-follow-v4-6-5', NULL,
+       'follow write:blocks write:mutes', NULL,
+       '2026-07-01 12:00:00', NULL, '2026-07-01 12:30:00', '192.0.2.10');
 
 INSERT INTO statuses (
   id, account_id, text, spoiler_text, visibility, local, uri, url, language,
@@ -1161,7 +1162,14 @@ INSERT INTO reports (
 ) VALUES (
   8601, 116844606259201001, 116844606259202001, 'Readable fixture report', 1000, ARRAY[116845105643525105]::bigint[],
   false, 'https://fixture-v4-6-5.rustodon.invalid/users/alice/reports/8601',
-  '2026-07-01 17:10:00', '2026-07-01 17:10:00'
+  '2026-07-01 17:10:00', '2026-07-01 17:15:00'
+);
+
+INSERT INTO report_notes (
+  id, account_id, content, created_at, report_id, updated_at
+) VALUES (
+  8602, 116844606259201002, 'Preserved fixture report note',
+  '2026-07-01 17:15:00', 8601, '2026-07-01 17:15:00'
 );
 
 INSERT INTO account_warnings (
@@ -1170,6 +1178,76 @@ INSERT INTO account_warnings (
 ) VALUES (
   8401, 116844606259201002, 116844606259201001, NULL, 0, 'Readable fixture moderation warning',
   ARRAY['116844842188805001'], '2026-07-01 17:20:00', '2026-07-01 17:20:00'
+);
+
+INSERT INTO account_warnings (
+  id, account_id, target_account_id, report_id, action, text, status_ids,
+  created_at, updated_at
+) VALUES (
+  8402, 116844606259201002, 116844606259201001, NULL, 0,
+  'Preserved fixture appeal warning', ARRAY[]::bigint[],
+  '2026-07-01 17:25:00', '2026-07-01 17:25:00'
+);
+
+INSERT INTO account_migrations (
+  id, account_id, acct, followers_count, target_account_id, created_at, updated_at
+) VALUES (
+  8700, 116844606259201001, 'deleted@remote.fixture.invalid', 3,
+  NULL, '2026-07-01 17:35:00', '2026-07-01 17:35:00'
+);
+
+INSERT INTO announcements (
+  id, all_day, created_at, ends_at, notification_sent_at, published,
+  published_at, scheduled_at, starts_at, status_ids, text, updated_at
+) VALUES (
+  8701, false, '2026-07-01 17:36:00', '2026-07-03 00:00:00',
+  '2026-07-01 17:37:00', true, '2026-07-01 17:36:00', NULL,
+  '2026-07-01 17:36:00', ARRAY[116844842188805001]::bigint[],
+  'Preserved fixture announcement', '2026-07-01 17:37:00'
+);
+
+INSERT INTO appeals (
+  id, account_id, account_warning_id, approved_at, approved_by_account_id,
+  created_at, rejected_at, rejected_by_account_id, text, updated_at
+) VALUES (
+  8702, 116844606259201001, 8402, NULL, NULL, '2026-07-01 17:38:00',
+  NULL, NULL, 'Preserved fixture appeal', '2026-07-01 17:38:00'
+);
+
+INSERT INTO backups (
+  id, created_at, dump_content_type, dump_file_name, dump_file_size,
+  dump_updated_at, processed, updated_at, user_id
+) VALUES (
+  8703, '2026-07-01 17:39:00', NULL, NULL, NULL, NULL, false,
+  '2026-07-01 17:39:00', 101
+);
+
+INSERT INTO bulk_imports (
+  id, account_id, created_at, finished_at, imported_items, likely_mismatched,
+  missing_status, original_filename, overwrite, processed_items, state,
+  total_items, type, updated_at
+) VALUES (
+  8704, 116844606259201001, '2026-07-01 17:40:00', '2026-07-01 17:41:00',
+  0, false, false, 'following.csv', false, 1, 3, 1, 0,
+  '2026-07-01 17:41:00'
+);
+
+INSERT INTO bulk_import_rows (id, bulk_import_id, created_at, data, updated_at) VALUES (
+  8705, 8704, '2026-07-01 17:40:30',
+  '{"acct":"missing@remote.fixture.invalid"}'::jsonb,
+  '2026-07-01 17:40:30'
+);
+
+INSERT INTO web_push_subscriptions (
+  id, access_token_id, created_at, data, endpoint, key_auth, key_p256dh,
+  standard, updated_at, user_id
+) VALUES (
+  8706, 401, '2026-07-01 17:42:00',
+  '{"policy":"all","alerts":{"mention":true}}'::json,
+  'https://fcm.googleapis.com/fcm/send/fixture-alice',
+  'eH_C8rq2raXqlcBVDa1gLg==',
+  'BEm_a0bdPDhf0SOsrnB2-ategf1hHoCnpXgQsFj5JCkcoMrMt2WHoPfEYOYPzOIs9mZE8ZUaD7VA5vouy0kEkr8=',
+  true, '2026-07-01 17:42:00', 101
 );
 
 INSERT INTO generated_annual_reports (

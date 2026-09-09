@@ -248,6 +248,51 @@ pub(crate) enum StatusAccessDenied {
     UnsupportedVisibility,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StatusActionAccess {
+    Allowed,
+    DeniedViewerBlocksAuthor,
+    DeniedPrivateStatus,
+    DeniedMentionOnlyStatus,
+    DeniedUnsupportedVisibility,
+}
+
+impl StatusActionAccess {
+    #[must_use]
+    pub(crate) const fn is_allowed(self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+}
+
+#[must_use]
+pub(crate) const fn status_favourite_access(viewer_blocks_author: bool) -> StatusActionAccess {
+    if viewer_blocks_author {
+        StatusActionAccess::DeniedViewerBlocksAuthor
+    } else {
+        StatusActionAccess::Allowed
+    }
+}
+
+#[must_use]
+pub(crate) const fn status_reblog_access(
+    visibility: StatusVisibility,
+    viewer_is_author: bool,
+    viewer_blocks_author: bool,
+) -> StatusActionAccess {
+    if viewer_blocks_author {
+        return StatusActionAccess::DeniedViewerBlocksAuthor;
+    }
+    match visibility {
+        StatusVisibility::Public | StatusVisibility::Unlisted => StatusActionAccess::Allowed,
+        StatusVisibility::Private if viewer_is_author => StatusActionAccess::Allowed,
+        StatusVisibility::Private => StatusActionAccess::DeniedPrivateStatus,
+        StatusVisibility::Direct | StatusVisibility::Limited => {
+            StatusActionAccess::DeniedMentionOnlyStatus
+        }
+        StatusVisibility::Unknown(_) => StatusActionAccess::DeniedUnsupportedVisibility,
+    }
+}
+
 #[must_use]
 pub(crate) const fn status_access(facts: StatusAccessFacts) -> StatusAccess {
     match facts.availability {
@@ -445,6 +490,47 @@ mod tests {
         assert_eq!(
             status_access(facts),
             StatusAccess::Denied(StatusAccessDenied::StatusDeleted)
+        );
+    }
+
+    #[test]
+    fn favourite_action_denies_a_blocked_author_without_changing_status_reads() {
+        assert_eq!(status_favourite_access(false), StatusActionAccess::Allowed);
+        assert_eq!(
+            status_favourite_access(true),
+            StatusActionAccess::DeniedViewerBlocksAuthor
+        );
+        let mut facts = public_facts();
+        facts.viewer = ViewerFacts::Authenticated(AuthenticatedViewerFacts {
+            is_author: false,
+            follows_author: false,
+            is_mentioned: false,
+            author_restriction: AuthorRestriction::None,
+        });
+        assert_eq!(status_access(facts), StatusAccess::Allowed);
+    }
+
+    #[test]
+    fn reblog_action_rejects_blocked_and_explicit_audiences() {
+        assert_eq!(
+            status_reblog_access(StatusVisibility::Public, false, false),
+            StatusActionAccess::Allowed
+        );
+        assert_eq!(
+            status_reblog_access(StatusVisibility::Private, true, false),
+            StatusActionAccess::Allowed
+        );
+        assert_eq!(
+            status_reblog_access(StatusVisibility::Private, false, false),
+            StatusActionAccess::DeniedPrivateStatus
+        );
+        assert_eq!(
+            status_reblog_access(StatusVisibility::Limited, true, false),
+            StatusActionAccess::DeniedMentionOnlyStatus
+        );
+        assert_eq!(
+            status_reblog_access(StatusVisibility::Public, true, true),
+            StatusActionAccess::DeniedViewerBlocksAuthor
         );
     }
 

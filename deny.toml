@@ -12,7 +12,7 @@ ignore = [
 [licenses]
 version = 2
 confidence-threshold = 0.93
-allow = ["Apache-2.0", "CDLA-Permissive-2.0", "ISC", "MIT", "Unicode-3.0"]
+allow = ["0BSD", "Apache-2.0", "CDLA-Permissive-2.0", "ISC", "MIT", "Unicode-3.0"]
 exceptions = [
   # Ammonia's standards-compliant CSS parsing stack is MPL-2.0.
   { name = "cssparser", version = "=0.37.0", allow = ["MPL-2.0"] },
@@ -35,16 +35,23 @@ highlight = "all"
 allow = []
 deny = []
 skip = [
-  # SQLx's Redox support and whoami currently select different major releases.
-  { name = "redox_syscall", version = "=0.5.18" },
+   # Lettre's email encoding stack currently uses a parallel major release.
+   { name = "base64", version = "=0.23.1" },
+   # SQLx's Redox support and whoami currently select different major releases.
+   { name = "redox_syscall", version = "=0.5.18" },
   # SQLx derives use syn 2 while the pinned CLI/Serde stack has moved to syn 3.
   { name = "syn", version = "=2.0.119" },
-  # SQLx's etcetera still supports the older Windows API crate line.
-  { name = "windows-sys", version = "=0.48.0" },
+   # SQLx's etcetera still supports the older Windows API crate line.
+   { name = "windows-sys", version = "=0.48.0" },
+   # Lettre's Rustls stack currently uses a parallel major release.
+   { name = "webpki-roots", version = "=1.0.9" },
 ]
 skip-tree = [
   # Ring's Windows support remains on the 0.52 platform crate family.
   { name = "windows-sys", version = "=0.52.0" },
+  # Axum's WebSocket transport currently requires tokio-tungstenite 0.29,
+  # whose rand 0.9 tree is parallel to the crypto and SQLx rand 0.8 tree.
+  { name = "rand", version = "=0.9.5" },
 ]
 
 [sources]

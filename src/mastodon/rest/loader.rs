@@ -6,42 +6,26 @@ use serde_json::Value;
 use super::{
     AccountFieldProjection, AccountProjection, AccountRelationshipProjection,
     AccountRoleProjection, AccountWarningProjection, AppealProjection, CollectionItemProjection,
-    CollectionProjection, CredentialAccountProjection, CredentialRoleProjection,
-    CustomEmojiProjection, FilterKeywordProjection, FilterProjection, FilterResultProjection,
-    FilterStatusProjection, GroupedNotificationsProjection, HtmlFormatter, InstanceProjection,
-    InstanceRuntimeConfig, MarkerProjection, MediaAttachmentProjection, MentionProjection,
-    NotificationGroupProjection, NotificationProjection, PollOptionProjection, PollProjection,
-    PreviewCardProjection, QuoteProjection, QuoteTargetAccess, ReportProjection, RestAccountRow,
-    RestStatusRow, RuleProjection, SeveranceEventProjection, StatusApplicationProjection,
-    StatusEditProjection, StatusProjection, StatusViewerProjection, TagHistoryProjection,
-    TagProjection,
+    CollectionProjection, ConversationProjection, CredentialAccountProjection,
+    CredentialRoleProjection, CustomEmojiProjection, FilterKeywordProjection, FilterProjection,
+    FilterResultProjection, FilterStatusProjection, FollowedTagsPage,
+    GroupedNotificationsProjection, HtmlFormatter, InstanceProjection, InstanceRuntimeConfig,
+    MarkerProjection, MediaAttachmentProjection, MentionProjection, NotificationGroupProjection,
+    NotificationOptions, NotificationProjection, NotificationRequestProjection,
+    PollOptionProjection, PollProjection, PreviewCardProjection, QuoteProjection,
+    QuoteTargetAccess, ReportProjection, RestAccountRow, RestStatusRow, RuleProjection,
+    SeveranceEventProjection, StatusApplicationProjection, StatusEditProjection, StatusProjection,
+    StatusQuotesPage, StatusViewerProjection, TagHistoryProjection, TagProjection,
+    grouped_notification_types,
 };
 use crate::mastodon::StatusVisibility;
 use crate::mastodon::policy::{
     AuthenticatedViewerFacts, AuthorRestriction, StatusAccessFacts, StatusAvailability,
     ViewerFacts, status_access,
 };
-use crate::mastodon::{Notification, NotificationType, PermissionBits, Repository, UserPermission};
-
-const KNOWN_NOTIFICATION_TYPES: [&str; 17] = [
-    "mention",
-    "status",
-    "reblog",
-    "follow",
-    "follow_request",
-    "favourite",
-    "poll",
-    "update",
-    "severed_relationships",
-    "moderation_warning",
-    "annual_report",
-    "admin.sign_up",
-    "admin.report",
-    "quote",
-    "quoted_update",
-    "added_to_collection",
-    "collection_update",
-];
+use crate::mastodon::{
+    AccountConversation, Notification, NotificationType, PermissionBits, Repository, UserPermission,
+};
 
 #[derive(Clone)]
 pub struct RestProjectionLoader {
@@ -118,6 +102,80 @@ impl RestProjectionLoader {
         Ok(accounts)
     }
 
+    /// Loads the authenticated account's visibility-correct conversations.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when conversation, account, or status loading fails.
+    pub async fn conversations(
+        &self,
+        account_id: i64,
+        options: &super::TimelineOptions,
+    ) -> sqlx::Result<Vec<ConversationProjection>> {
+        let rows = self
+            .repository
+            .account_conversations_page(account_id, options)
+            .await?;
+        let mut projections = Vec::with_capacity(rows.len());
+        for row in rows {
+            projections.push(self.conversation_projection(row).await?);
+        }
+        Ok(projections)
+    }
+
+    /// Loads one account-owned conversation with its participant and status graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when conversation, account, or status loading fails.
+    pub async fn conversation(
+        &self,
+        account_id: i64,
+        conversation_id: i64,
+    ) -> sqlx::Result<Option<ConversationProjection>> {
+        let row = self
+            .repository
+            .account_conversations(account_id)
+            .await?
+            .into_iter()
+            .find(|conversation| conversation.id == conversation_id);
+        match row {
+            Some(row) => Ok(Some(self.conversation_projection(row).await?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn conversation_projection(
+        &self,
+        conversation: AccountConversation,
+    ) -> sqlx::Result<ConversationProjection> {
+        let participant_account_ids = if conversation.participant_account_ids.is_empty() {
+            vec![conversation.account_id]
+        } else {
+            conversation.participant_account_ids.clone()
+        };
+        let accounts = self
+            .accounts(&participant_account_ids)
+            .await?
+            .into_iter()
+            .map(|account| (account.id, account))
+            .collect::<BTreeMap<_, _>>();
+        let last_status = match conversation.last_status_id {
+            Some(id) => self.authorized_status(id).await?,
+            None => None,
+        };
+        let participant_accounts = participant_account_ids
+            .into_iter()
+            .filter_map(|id| accounts.get(&id).cloned())
+            .collect();
+        Ok(ConversationProjection {
+            id: conversation.id,
+            unread: conversation.unread,
+            participant_accounts,
+            last_status,
+        })
+    }
+
     async fn accounts_without_profile_mentions(
         &self,
         ids: &[i64],
@@ -172,6 +230,39 @@ impl RestProjectionLoader {
     /// Returns a database error when the read-only account query fails.
     pub async fn account(&self, id: i64) -> sqlx::Result<Option<AccountProjection>> {
         Ok(self.accounts(&[id]).await?.into_iter().next())
+    }
+
+    /// Loads one report with the target account required by the REST serializer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when the report, collection, or account projection queries fail.
+    pub async fn report(&self, id: i64) -> sqlx::Result<Option<ReportProjection>> {
+        let Some(report) = self.repository.report(id).await? else {
+            return Ok(None);
+        };
+        let Some(target_account) = self.account(report.target_account_id).await? else {
+            return Ok(None);
+        };
+        let collection_ids = self
+            .repository
+            .rest_report_collections(&[id])
+            .await?
+            .into_iter()
+            .map(|(_, collection_id)| collection_id)
+            .collect();
+        Ok(Some(ReportProjection {
+            id: report.id,
+            action_taken_at: report.action_taken_at,
+            category: report.category.0,
+            comment: report.comment,
+            forwarded: report.forwarded,
+            created_at: report.created_at,
+            status_ids: report.status_ids,
+            rule_ids: report.rule_ids,
+            collection_ids,
+            target_account,
+        }))
     }
 
     /// Loads the credential representation for one local account.
@@ -255,6 +346,60 @@ impl RestProjectionLoader {
                 highlighted: row.role_highlighted,
                 collection_limit: row.collection_limit,
             },
+        }))
+    }
+
+    /// Loads the authenticated user's REST preference values without credential fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when the exact user/account settings row cannot be loaded.
+    pub async fn preferences(
+        &self,
+        user_id: i64,
+        account_id: i64,
+    ) -> sqlx::Result<Option<super::PreferencesProjection>> {
+        let Some(row) = self
+            .repository
+            .rest_preferences_row(user_id, account_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let settings = row
+            .settings
+            .as_deref()
+            .and_then(|settings| serde_json::from_str::<Value>(settings).ok())
+            .unwrap_or_else(|| Value::Object(serde_json::Map::default()));
+        let setting_string = |key: &str| settings.get(key).and_then(Value::as_str);
+        Ok(Some(super::PreferencesProjection {
+            posting_default_visibility: setting_string("default_privacy").map_or_else(
+                || if row.locked { "private" } else { "public" }.to_owned(),
+                str::to_owned,
+            ),
+            posting_default_sensitive: settings
+                .get("default_sensitive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            posting_default_language: setting_string("default_language")
+                .filter(|language| !language.is_empty())
+                .or(row.locale.as_deref().filter(|locale| !locale.is_empty()))
+                .unwrap_or("en")
+                .to_owned(),
+            posting_default_quote_policy: setting_string("default_quote_policy")
+                .unwrap_or("public")
+                .to_owned(),
+            reading_default_sensitive_media: setting_string("web.display_media")
+                .unwrap_or("default")
+                .to_owned(),
+            reading_default_sensitive_text: settings
+                .get("web.expand_content_warnings")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            reading_autoplay_gifs: settings
+                .get("web.auto_play")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         }))
     }
 
@@ -825,6 +970,19 @@ impl RestProjectionLoader {
         Ok(self.authorized_statuses(&[id]).await?.into_iter().next())
     }
 
+    /// Loads one status without applying presentation policy after a write has
+    /// already authorized ownership of the response-producing action.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when the projection queries fail.
+    pub async fn status_without_authorization(
+        &self,
+        id: i64,
+    ) -> sqlx::Result<Option<StatusProjection>> {
+        Ok(self.preauthorized_statuses(&[id]).await?.into_iter().next())
+    }
+
     /// Loads the authorized edit history, or the current status snapshot when it has no edits.
     ///
     /// # Errors
@@ -886,20 +1044,22 @@ impl RestProjectionLoader {
         let mut history = Vec::with_capacity(edits.len());
         for edit in edits {
             let media_attachments = match edit.ordered_media_attachment_ids.as_deref() {
-                Some(ids) => self
-                    .repository
-                    .rest_media_attachments_by_ids(id, ids)
-                    .await?
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, media)| {
-                        let description = edit
-                            .media_descriptions
-                            .as_ref()
-                            .and_then(|descriptions| descriptions.get(index).cloned().flatten());
-                        media_projection(&media, description)
-                    })
-                    .collect(),
+                Some(ids) => {
+                    let ids = ids.iter().take(4).copied().collect::<Vec<_>>();
+                    self.repository
+                        .rest_media_attachments_by_ids(id, &ids)
+                        .await?
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, media)| {
+                            let description =
+                                edit.media_descriptions.as_ref().and_then(|descriptions| {
+                                    descriptions.get(index).cloned().flatten()
+                                });
+                            media_projection(&media, description)
+                        })
+                        .collect()
+                }
                 None => Vec::new(),
             };
             history.push(StatusEditProjection {
@@ -918,6 +1078,44 @@ impl RestProjectionLoader {
             });
         }
         Ok(Some(history))
+    }
+
+    /// Loads accepted quotes of one visibility-authorized status.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when status authorization, quote selection, or
+    /// status projection loading fails.
+    pub async fn status_quotes(
+        &self,
+        id: i64,
+        options: &super::FollowCollectionOptions,
+    ) -> sqlx::Result<Option<StatusQuotesPage>> {
+        if self.authorized_status(id).await?.is_none() {
+            return Ok(None);
+        }
+        let rows = self
+            .repository
+            .rest_status_quote_rows(id, self.viewer_account_id, options)
+            .await?;
+        let status_ids = rows.iter().map(|row| row.status_id).collect::<Vec<_>>();
+        let visible_status_ids = self
+            .repository
+            .rest_status_quote_visible_ids(&status_ids, self.viewer_account_id)
+            .await?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut statuses = self.authorized_statuses(&status_ids).await?;
+        statuses.retain(|status| visible_status_ids.contains(&status.id));
+        let first_cursor = rows.first().map(|row| row.quote_id);
+        let last_cursor = rows.last().map(|row| row.quote_id);
+        Ok(Some(StatusQuotesPage {
+            statuses,
+            first_cursor,
+            last_cursor,
+            records_continue: options.limit > 0
+                && rows.len() == usize::try_from(options.limit).unwrap_or_default(),
+        }))
     }
 
     /// Loads one account's visibility-correct status page.
@@ -1102,6 +1300,28 @@ impl RestProjectionLoader {
         let rows = self
             .repository
             .rest_follow_collection_rows(account_id, self.viewer_account_id, kind, options)
+            .await?;
+        let ids = rows.iter().map(|row| row.account_id).collect::<Vec<_>>();
+        Ok(super::FollowCollectionPage {
+            accounts: self.accounts(&ids).await?,
+            first_cursor: rows.first().map(|row| row.follow_id),
+            last_cursor: rows.last().map(|row| row.follow_id),
+        })
+    }
+
+    /// Loads pending follow requests for one authenticated account.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when follow-request selection or account loading fails.
+    pub async fn follow_requests(
+        &self,
+        account_id: i64,
+        options: &super::FollowCollectionOptions,
+    ) -> sqlx::Result<super::FollowCollectionPage> {
+        let rows = self
+            .repository
+            .rest_follow_request_rows(account_id, options)
             .await?;
         let ids = rows.iter().map(|row| row.account_id).collect::<Vec<_>>();
         Ok(super::FollowCollectionPage {
@@ -1480,6 +1700,78 @@ impl RestProjectionLoader {
             .collect())
     }
 
+    /// Loads notification requests and their account/status serializer graphs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when any request, account, or status projection
+    /// query fails.
+    pub async fn notification_requests(
+        &self,
+        account_id: i64,
+        max_id: Option<i64>,
+        since_id: Option<i64>,
+        min_id: Option<i64>,
+        limit: i64,
+    ) -> sqlx::Result<Vec<NotificationRequestProjection>> {
+        let requests = self
+            .repository
+            .rest_notification_requests(account_id, max_id, since_id, min_id, limit)
+            .await?;
+        let account_ids = requests
+            .iter()
+            .map(|request| request.from_account_id)
+            .collect::<Vec<_>>();
+        let accounts = self
+            .accounts(&account_ids)
+            .await?
+            .into_iter()
+            .map(|account| (account.id, account))
+            .collect::<BTreeMap<_, _>>();
+        let status_ids = requests
+            .iter()
+            .filter_map(|request| request.last_status_id)
+            .collect::<Vec<_>>();
+        let statuses = self
+            .authorized_statuses(&status_ids)
+            .await?
+            .into_iter()
+            .map(|status| (status.id, status))
+            .collect::<BTreeMap<_, _>>();
+        Ok(requests
+            .into_iter()
+            .filter_map(|request| {
+                Some(NotificationRequestProjection {
+                    id: request.id,
+                    account: accounts.get(&request.from_account_id)?.clone(),
+                    last_status: request
+                        .last_status_id
+                        .and_then(|id| statuses.get(&id).cloned()),
+                    notifications_count: request.notifications_count,
+                    created_at: request.created_at,
+                    updated_at: request.updated_at,
+                })
+            })
+            .collect())
+    }
+
+    /// Loads one account-owned notification request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when the request projection query fails.
+    pub async fn notification_request(
+        &self,
+        account_id: i64,
+        request_id: i64,
+    ) -> sqlx::Result<Option<NotificationRequestProjection>> {
+        Ok(self
+            .notification_requests(account_id, None, None, None, i64::MAX)
+            .await?
+            .into_iter()
+            .find(|request| request.id == request_id))
+    }
+
     /// Loads featured tags owned by one authenticated account.
     ///
     /// # Errors
@@ -1532,6 +1824,40 @@ impl RestProjectionLoader {
                 featuring: Some(false),
             })
             .collect())
+    }
+
+    /// Loads tags followed by one authenticated account with cursor metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when the read-only tag-follow query fails.
+    pub async fn followed_tags(
+        &self,
+        account_id: i64,
+        options: &super::FollowedTagsOptions,
+    ) -> sqlx::Result<FollowedTagsPage> {
+        let rows = self
+            .repository
+            .rest_followed_tags(account_id, options)
+            .await?;
+        let first_cursor = rows.first().map(|row| row.tag_follow_id);
+        let last_cursor = rows.last().map(|row| row.tag_follow_id);
+        let tags = rows
+            .into_iter()
+            .map(|tag| TagProjection {
+                id: tag.id,
+                name: tag.name,
+                display_name: tag.display_name,
+                history: recent_tag_history(),
+                following: Some(true),
+                featuring: Some(tag.featuring),
+            })
+            .collect();
+        Ok(FollowedTagsPage {
+            tags,
+            first_cursor,
+            last_cursor,
+        })
     }
 
     /// Loads the locally listed custom emojis for the public picker endpoint.
@@ -1660,13 +1986,11 @@ impl RestProjectionLoader {
     pub async fn notifications(
         &self,
         account_id: i64,
-        requested_types: &[String],
-        include_filtered: bool,
+        options: &NotificationOptions,
     ) -> sqlx::Result<Vec<NotificationProjection>> {
-        let type_filter = notification_type_filter(requested_types);
         let notifications = self
             .repository
-            .rest_notifications(account_id, include_filtered, type_filter.as_deref(), false)
+            .rest_notifications(account_id, options, false)
             .await?;
         self.notification_projections(notifications).await
     }
@@ -1888,6 +2212,30 @@ impl RestProjectionLoader {
             .collect())
     }
 
+    /// Loads one notification owned by the authenticated account.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when notification or dependent projections fail.
+    pub async fn notification(
+        &self,
+        account_id: i64,
+        notification_id: i64,
+    ) -> sqlx::Result<Option<NotificationProjection>> {
+        let Some(notification) = self
+            .repository
+            .rest_notification(account_id, notification_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .notification_projections(vec![notification])
+            .await?
+            .into_iter()
+            .next())
+    }
+
     /// Loads the default v2 grouped-notification envelope.
     ///
     /// # Errors
@@ -1896,13 +2244,11 @@ impl RestProjectionLoader {
     pub async fn grouped_notifications(
         &self,
         account_id: i64,
-        requested_types: &[String],
-        include_filtered: bool,
+        options: &NotificationOptions,
     ) -> sqlx::Result<GroupedNotificationsProjection> {
-        let type_filter = notification_type_filter(requested_types);
         let rows = self
             .repository
-            .rest_notifications(account_id, include_filtered, type_filter.as_deref(), true)
+            .rest_notifications(account_id, options, true)
             .await?;
         let notifications = self.notification_projections(rows).await?;
         let Some(page_max_id) = notifications.first().map(|notification| notification.id) else {
@@ -1912,28 +2258,55 @@ impl RestProjectionLoader {
                 groups: Vec::new(),
             });
         };
-        let page_min_id = if notifications.len() < 40 {
-            0
+        let page_limit = usize::try_from(options.limit).unwrap_or(usize::MAX);
+        let incomplete_page = notifications.len() < page_limit;
+        let page_min_id = if options.min_id.is_some() {
+            notifications
+                .last()
+                .map_or(0, |notification| notification.id)
+        } else if incomplete_page {
+            options
+                .since_id
+                .map_or(0, |since_id| since_id.saturating_add(1))
         } else {
             notifications
                 .last()
                 .map_or(page_max_id, |notification| notification.id)
         };
+        let page_max_id = if options.min_id.is_some() && incomplete_page {
+            options.max_id
+        } else {
+            Some(page_max_id)
+        };
+        let page_max_exclusive =
+            options.min_id.is_some() && incomplete_page && page_max_id.is_some();
+        let grouped_types = grouped_notification_types(&options.grouped_types);
         let group_keys = notifications
             .iter()
             .filter(|notification| {
-                matches!(
-                    notification.notification_type.raw(),
-                    "favourite" | "reblog" | "follow" | "admin.sign_up"
-                )
+                grouped_types
+                    .iter()
+                    .any(|kind| kind == notification.notification_type.raw())
             })
-            .filter_map(|notification| notification.group_key.clone())
+            .filter_map(|notification| {
+                notification
+                    .group_key
+                    .as_deref()
+                    .filter(|key| !key.trim().is_empty())
+                    .map(str::to_owned)
+            })
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
         let group_data = self
             .repository
-            .rest_notification_groups(account_id, &group_keys, page_min_id, page_max_id)
+            .rest_notification_groups(
+                account_id,
+                &group_keys,
+                page_min_id,
+                page_max_id,
+                page_max_exclusive,
+            )
             .await?
             .into_iter()
             .map(|group| (group.group_key.clone(), group))
@@ -1953,13 +2326,17 @@ impl RestProjectionLoader {
         let groups = notifications
             .into_iter()
             .map(|notification| {
-                let grouped = matches!(
-                    notification.notification_type.raw(),
-                    "favourite" | "reblog" | "follow" | "admin.sign_up"
-                )
-                .then(|| notification.group_key.as_ref())
-                .flatten()
-                .and_then(|key| group_data.get(key));
+                let grouped = grouped_types
+                    .iter()
+                    .any(|kind| kind == notification.notification_type.raw())
+                    .then_some(
+                        notification
+                            .group_key
+                            .as_deref()
+                            .filter(|key| !key.trim().is_empty()),
+                    )
+                    .flatten()
+                    .and_then(|key| group_data.get(key));
                 if let Some(group) = grouped {
                     NotificationGroupProjection {
                         group_key: group.group_key.clone(),
@@ -1970,8 +2347,9 @@ impl RestProjectionLoader {
                             .collect(),
                         notifications_count: group.notifications_count,
                         most_recent_notification_id: group.most_recent_notification_id,
-                        page_min_id: group.page_min_id,
-                        latest_page_notification_at: group.latest_page_notification_at,
+                        page_min_id: Some(group.page_min_id),
+                        page_max_id: Some(group.most_recent_notification_id),
+                        latest_page_notification_at: Some(group.latest_page_notification_at),
                         notification,
                     }
                 } else {
@@ -1980,8 +2358,9 @@ impl RestProjectionLoader {
                         sample_accounts: vec![notification.account.clone()],
                         notifications_count: 1,
                         most_recent_notification_id: notification.id,
-                        page_min_id: notification.id,
-                        latest_page_notification_at: notification.created_at,
+                        page_min_id: Some(notification.id),
+                        page_max_id: Some(notification.id),
+                        latest_page_notification_at: Some(notification.created_at),
                         notification,
                     }
                 }
@@ -2006,6 +2385,89 @@ impl RestProjectionLoader {
             statuses,
             groups,
         })
+    }
+
+    /// Loads one v2 notification group without pagination metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when notification or dependent projections fail.
+    pub async fn grouped_notification(
+        &self,
+        account_id: i64,
+        group_key: &str,
+    ) -> sqlx::Result<Option<GroupedNotificationsProjection>> {
+        let Some(notification) = self
+            .repository
+            .rest_notification_by_group_key(account_id, group_key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(notification) = self
+            .notification_projections(vec![notification])
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let groupable = grouped_notification_types(&[]);
+        let group_data = (groupable
+            .iter()
+            .any(|kind| kind == notification.notification_type.raw())
+            && notification
+                .group_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty()))
+        .then(|| notification.group_key.clone())
+        .flatten()
+        .map(|key| async move {
+            self.repository
+                .rest_notification_groups(
+                    account_id,
+                    std::slice::from_ref(&key),
+                    0,
+                    Some(i64::MAX),
+                    false,
+                )
+                .await
+        });
+        let group_data = match group_data {
+            Some(query) => query.await?.into_iter().next(),
+            None => None,
+        };
+        let (group_key, sample_accounts, notifications_count, most_recent_notification_id) =
+            match group_data {
+                Some(group) => (
+                    group.group_key,
+                    self.accounts(&group.sample_account_ids).await?,
+                    group.notifications_count,
+                    group.most_recent_notification_id,
+                ),
+                None => (
+                    format!("ungrouped-{}", notification.id),
+                    vec![notification.account.clone()],
+                    1,
+                    notification.id,
+                ),
+            };
+        let accounts = sample_accounts.clone();
+        let statuses = notification.status.clone().into_iter().collect();
+        Ok(Some(GroupedNotificationsProjection {
+            accounts,
+            statuses,
+            groups: vec![NotificationGroupProjection {
+                notification,
+                group_key,
+                sample_accounts,
+                notifications_count,
+                most_recent_notification_id,
+                page_min_id: None,
+                page_max_id: None,
+                latest_page_notification_at: None,
+            }],
+        }))
     }
 
     async fn hydrate_account_emojis(
@@ -2121,22 +2583,6 @@ fn effective_notification_type(
             _ => return None,
         })
     })
-}
-
-fn notification_type_filter(requested_types: &[String]) -> Option<Vec<String>> {
-    if requested_types.is_empty() {
-        return None;
-    }
-    let requested = requested_types
-        .iter()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    let known = KNOWN_NOTIFICATION_TYPES
-        .into_iter()
-        .filter(|kind| requested.contains(kind))
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    (known.len() != KNOWN_NOTIFICATION_TYPES.len()).then_some(known)
 }
 
 fn account_profile_handles(account: &AccountProjection, local_domain: &str) -> Vec<String> {
@@ -2430,7 +2876,7 @@ struct StatusBuildContext<'a> {
     viewer_account_id: Option<i64>,
 }
 
-fn media_projection(
+pub(crate) fn media_projection(
     media: &crate::mastodon::MediaAttachment,
     description: Option<String>,
 ) -> MediaAttachmentProjection {
@@ -2909,10 +3355,7 @@ fn policy_allows(bitmap: i32, viewer_follows: bool, follows_viewer: bool) -> boo
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        KNOWN_NOTIFICATION_TYPES, QuoteViewerRestriction, notification_type_filter,
-        quote_filter_state_from,
-    };
+    use super::{QuoteViewerRestriction, quote_filter_state_from};
 
     #[test]
     fn quote_filter_never_bypasses_failed_status_authorization() {
@@ -2927,28 +3370,6 @@ mod tests {
         assert_eq!(
             quote_filter_state_from(true, true, QuoteViewerRestriction::DomainBlock),
             "accepted"
-        );
-    }
-
-    #[test]
-    fn notification_type_filter_matches_mastodons_known_type_intersection() {
-        assert_eq!(notification_type_filter(&[]), None);
-        assert_eq!(
-            notification_type_filter(&["future_event".to_owned()]),
-            Some(Vec::new())
-        );
-        assert_eq!(
-            notification_type_filter(&["mention".to_owned(), "future_event".to_owned()]),
-            Some(vec!["mention".to_owned()])
-        );
-        assert_eq!(
-            notification_type_filter(
-                &KNOWN_NOTIFICATION_TYPES
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            ),
-            None
         );
     }
 }

@@ -1,65 +1,965 @@
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
-use std::time::SystemTime;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::path::{Component, Path as FsPath, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration as StdDuration, SystemTime};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{ConnectInfo, Extension, Path, Query, RawQuery, Request, State};
+use axum::extract::{
+    ConnectInfo, Extension, Path, Query, RawQuery, Request, State,
+    ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
+};
 use axum::http::header::{
-    ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE, ACCESS_CONTROL_REQUEST_HEADERS,
-    ACCESS_CONTROL_REQUEST_METHOD, AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE,
-    CONTENT_TYPE, HOST, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION, ORIGIN, RANGE,
-    VARY,
+    ACCEPT, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
+    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE,
+    ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD, AUTHORIZATION, CACHE_CONTROL,
+    CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, COOKIE, HOST, IF_MODIFIED_SINCE, IF_NONE_MATCH,
+    LAST_MODIFIED, LOCATION, ORIGIN, PRAGMA, RANGE, SEC_WEBSOCKET_PROTOCOL, SET_COOKIE, USER_AGENT,
+    VARY, WWW_AUTHENTICATE,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, Uri};
 use axum::middleware::{self, Next};
-use axum::routing::{any, get};
-use chrono::Utc;
+use axum::routing::{any, delete, get, patch, post};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use chrono::{Duration as ChronoDuration, NaiveDateTime, SecondsFormat, Utc};
 use futures_util::TryStreamExt;
 use ipnetwork::IpNetwork;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use sha2::{Digest, Sha256};
+use sqlx::PgPool;
+use tower_http::services::{ServeDir, ServeFile};
 use url::Url;
 
+use crate::jobs::{ACTIVITYPUB_INBOX_JOB_KIND, JobError, JobSpec, Lane, Queue};
+use crate::mail::MailConfig;
 use crate::mastodon::rest::{
-    AccountListKind, AccountListOptions, AccountSearchError, AccountStatusesOptions,
-    FollowCollectionKind, FollowCollectionOptions, InstanceRuntimeConfig, RestProjectionLoader,
-    RestSerializer, SavedStatusKind, SavedStatusesOptions, StatusShape, TagTimelineOptions,
-    TimelineOptions,
+    AccountListKind, AccountListOptions, AccountSearchError, AccountStatusesOptions, ApiDateTime,
+    ConversationProjection, DecimalId, FollowCollectionKind, FollowCollectionOptions,
+    FollowedTagsOptions, InstanceProjection, InstanceRuntimeConfig, ListProjection,
+    NotificationOptions, PreferencesProjection, RestAccount, RestConversation, RestError,
+    RestMarker, RestPreferences, RestProjectionLoader, RestRole, RestSerializer,
+    SUPPORTED_MIME_TYPES, SavedStatusKind, SavedStatusesOptions, StatusShape, TagTimelineOptions,
+    TimelineOptions, media_projection, notification_type_filter_with_exclusions,
 };
 use crate::mastodon::{
-    Account, BearerAuthenticator, NO_SCOPE, OAuthAuthenticationError, OAuthError,
-    OAuthResourceOwner, READ_ACCOUNTS, READ_BLOCKS, READ_BOOKMARKS, READ_COLLECTIONS,
-    READ_FAVOURITES, READ_FILTERS, READ_FOLLOWS, READ_LISTS, READ_MUTES, READ_STATUSES, Repository,
-    RequiredScopes, VERIFY_CREDENTIALS,
+    Account, AccountFieldUpdate, AccountMediaUpdate, AccountProfileUpdate, AccountProfileValue,
+    AccountSourceUpdate, AuthenticatedBearer, BearerAuthenticator, BearerToken,
+    BrowserAuthenticationError, BrowserSession, HttpSignatureError, HttpSignatureKey,
+    HttpSignatureRequest, HttpSignatureSigner, IdempotencyKey, MediaAttachment,
+    MediaAttachmentCreate, MediaAttachmentUpdate, MediaFocus, NO_SCOPE, NotificationPolicy,
+    NotificationPolicyUpdate, OAUTH_CONFIGURED_SCOPES, OAuthAuthenticationError,
+    OAuthAuthorizationCodeError, OAuthAuthorizationGrantError, OAuthClientCredentialsError,
+    OAuthError, OAuthResourceOwner, OAuthScopes, OAuthTokenRevocationError, PROFILE, READ_ACCOUNTS,
+    READ_BLOCKS, READ_BOOKMARKS, READ_COLLECTIONS, READ_FAVOURITES, READ_FILTERS, READ_FOLLOWS,
+    READ_LISTS, READ_MUTES, READ_NOTIFICATIONS, READ_STATUSES, REPORT_RATE_LIMIT, Repository,
+    RequiredScopes, StatusMediaAttributeUpdate, StatusUpdate, TwoFactorVerification, User,
+    VERIFY_CREDENTIALS, WRITE_ACCOUNTS, WRITE_BLOCKS, WRITE_BOOKMARKS, WRITE_CONVERSATIONS,
+    WRITE_FAVOURITES, WRITE_FOLLOWS, WRITE_MEDIA, WRITE_MUTES, WRITE_NOTIFICATIONS, WRITE_REPORTS,
+    WRITE_STATUSES, WriteError, WriteRepository,
     activitypub::{self, ACTIVITY_JSON, JRD_JSON},
+    random_auth_token, random_totp_secret, signature_key_id, verify_http_signature,
+    verify_password, verify_two_factor,
 };
-use crate::paperclip::{PaperclipRoot, parse_paperclip_path};
+use crate::paperclip::{
+    PaperclipAttachment, PaperclipMetadata, PaperclipRoot, PreparedAccountMedia,
+    PreparedMediaAttachment, parse_paperclip_path, prepare_account_media, prepare_media_attachment,
+    write_prepared_media,
+};
+use crate::remote::{
+    RemoteAccountResolver, RemoteFetchError, canonical_remote_domain,
+    canonical_remote_domain_from_url, valid_remote_username,
+};
+use crate::remote::{RemoteFetchLimits, RemoteFetcher};
+use crate::streaming::{
+    ClientCommand, STATUS_UPDATE_NOTIFICATION_EVENT, STREAM_EVENT_BATCH_SIZE, SYSTEM_KILL_EVENT,
+    StreamEvent, StreamName, TOKEN_KILL_EVENT, event_message,
+};
+use tokio::time::{Instant, MissedTickBehavior, interval};
 
 const CORS_METHODS: &str = "POST, PUT, DELETE, GET, PATCH, OPTIONS";
 const CORS_MAX_AGE: &str = "7200";
 const CORS_EXPOSE_HEADERS: &str = "Link, Mastodon-Async-Refresh, X-RateLimit-Reset, X-RateLimit-Limit, X-RateLimit-Remaining, X-Request-Id";
 const PUBLIC_CACHE: &str = "max-age=300, public, stale-while-revalidate=30, stale-if-error=86400";
+const ACTIVITYPUB_STATUS_PUBLIC_VARY: &str =
+    "Accept, Accept-Language, Cookie, Authorization, Signature";
+const ACTIVITYPUB_STATUS_AUTHORIZED_VARY: &str =
+    "Accept, Accept-Language, Cookie, Signature, Authorization";
+const ACTIVITYPUB_STATUS_PUBLIC_CACHE: &str = "max-age=180, public";
+const ACTIVITYPUB_STATUS_PENDING_QUOTE_CACHE: &str = "max-age=5, public";
+const ACTIVITYPUB_STATUS_PRIVATE_ACTIVITY_CACHE: &str = "max-age=180, private";
 const ANONYMOUS_CACHE: &str = "max-age=15, public, stale-while-revalidate=30, stale-if-error=86400";
 const PRIVATE_CACHE: &str = "private, no-store";
 const PAPERCLIP_CACHE: &str = "public, max-age=2419200, immutable";
+const PAPERCLIP_STATUS_VARY: &str = "Authorization, Cookie, Signature";
 const PAPERCLIP_CSP: &str = "default-src 'none'; form-action 'none'";
+const HTML_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:";
+const MEDIA_PROXY_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MULTIPART_BOUNDARY: &str = "AaB03x";
 const FRAMEWORK_ERROR_HEADER: &str = "x-rustodon-framework-error";
 const RACK_BYTES_LIMIT: usize = 4 * 1024 * 1024;
 const RACK_PARAMETER_LIMIT: usize = 4096;
 const RACK_DEPTH_LIMIT: usize = 32;
+const PUBLIC_REQUEST_BODY_LIMIT_BYTES: usize = RACK_BYTES_LIMIT;
 pub const REST_BODY_LIMIT_BYTES: usize = 99 * 1024 * 1024;
+const ACCOUNT_PROFILE_BODY_LIMIT_BYTES: usize = 12 * 1024 * 1024;
+pub const ACTIVITYPUB_INBOX_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+const REQUEST_BODY_READ_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+const ACTIVITYPUB_INBOX_RATE_LIMIT: usize = 300;
+const ACTIVITYPUB_INBOX_RATE_LIMIT_PERIOD: StdDuration = StdDuration::from_mins(5);
+const MEDIA_UPLOAD_RATE_LIMIT: usize = 30;
+const MEDIA_UPLOAD_RATE_LIMIT_PERIOD: StdDuration = StdDuration::from_mins(30);
+const REPORT_RATE_LIMIT_PERIOD: StdDuration = StdDuration::from_hours(24);
+const SIGNATURE_FETCH_COOL_OFF: StdDuration = StdDuration::from_mins(5);
+const MAX_SIGNATURE_FETCH_CIRCUITS: usize = 65_536;
+const FRONTEND_ANDROID_ICON_SIZES: &[u16] = &[36, 48, 72, 96, 144, 192, 256, 384, 512];
+const FRONTEND_CACHE: &str = "public, max-age=31536000, immutable";
+
+#[derive(Clone, Copy)]
+enum ActivityPubStatusDocument {
+    Note { pending_quote: bool },
+    Activity,
+}
+const FRONTEND_CSRF_MAX_AGE: i64 = 30 * 24 * 60 * 60;
+const FRONTEND_THEME_SELECTION: &str = r"(function (element) {
+  const {colorScheme, contrast} = element.dataset;
+  const colorSchemeMediaWatcher = window.matchMedia('(prefers-color-scheme: dark)');
+  const contrastMediaWatcher = window.matchMedia('(prefers-contrast: more)');
+  const updateColorScheme = () => {
+    const useDarkMode = colorScheme === 'auto' ? colorSchemeMediaWatcher.matches : colorScheme === 'dark';
+    element.dataset.colorScheme = useDarkMode ? 'dark' : 'light';
+  };
+  const updateContrast = () => {
+    const useHighContrast = contrast === 'high' || contrastMediaWatcher.matches;
+    element.dataset.contrast = useHighContrast ? 'high' : 'default';
+  };
+  colorSchemeMediaWatcher.addEventListener('change', updateColorScheme);
+  contrastMediaWatcher.addEventListener('change', updateContrast);
+  updateColorScheme();
+  updateContrast();
+})(document.documentElement);";
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct FrontendAsset {
+    file: String,
+    #[serde(default)]
+    css: Vec<String>,
+    #[serde(default)]
+    imports: Vec<String>,
+    #[serde(default)]
+    integrity: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct FrontendAssets {
+    root: PathBuf,
+    manifest: BTreeMap<String, FrontendAsset>,
+    asset_manifest: BTreeMap<String, FrontendAsset>,
+}
+
+struct FrontendAuthenticatedState {
+    account: RestAccount,
+    access_token: String,
+    account_id: i64,
+    preferences: RestPreferences,
+    role: RestRole,
+}
+
+impl FrontendAssets {
+    fn load(root: PathBuf) -> io::Result<Self> {
+        let manifest = load_frontend_manifest(&root.join("packs/.vite/manifest.json"))?;
+        let asset_manifest =
+            load_frontend_manifest(&root.join("packs/.vite/manifest-assets.json"))?;
+        if manifest
+            .values()
+            .chain(asset_manifest.values())
+            .any(|asset| {
+                safe_frontend_path(&asset.file).is_none()
+                    || asset
+                        .css
+                        .iter()
+                        .any(|path| safe_frontend_path(path).is_none())
+                    || asset
+                        .imports
+                        .iter()
+                        .any(|path| safe_frontend_path(path).is_none())
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frontend manifest contains an unsafe asset path",
+            ));
+        }
+        Ok(Self {
+            root,
+            manifest,
+            asset_manifest,
+        })
+    }
+
+    fn entry(&self, source: &str) -> Option<&FrontendAsset> {
+        self.manifest.get(source)
+    }
+
+    fn asset(&self, source: &str) -> Option<&FrontendAsset> {
+        self.asset_manifest.get(source)
+    }
+
+    fn file_url(file: &str) -> Option<String> {
+        Some(format!("/packs/{}", safe_frontend_path(file)?))
+    }
+
+    fn entry_url(&self, source: &str) -> Option<String> {
+        self.entry(source)
+            .and_then(|asset| Self::file_url(&asset.file))
+    }
+
+    fn asset_url(&self, source: &str) -> Option<String> {
+        self.asset(source)
+            .and_then(|asset| Self::file_url(&asset.file))
+    }
+
+    fn path(&self, relative: &str) -> Option<PathBuf> {
+        Some(self.root.join(safe_frontend_path(relative)?))
+    }
+}
+
+fn load_frontend_manifest(path: &FsPath) -> io::Result<BTreeMap<String, FrontendAsset>> {
+    let body = std::fs::read(path)?;
+    serde_json::from_slice(&body).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frontend manifest {} is invalid: {error}", path.display()),
+        )
+    })
+}
+
+fn safe_frontend_path(path: &str) -> Option<&str> {
+    if path.is_empty() || path.starts_with('/') || path.contains('\\') {
+        return None;
+    }
+    if FsPath::new(path).components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        )
+    }) {
+        return None;
+    }
+    Some(path)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestMetadata {
     pub client_ip: IpAddr,
     pub scheme: Option<String>,
     pub host: Option<String>,
+}
+
+const MAX_RATE_LIMIT_WINDOWS: usize = 65_536;
+
+#[derive(Clone, Copy, Debug)]
+struct RateLimitExceeded {
+    limit: usize,
+    period: StdDuration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RateLimitStatus {
+    limit: usize,
+    remaining: usize,
+    period: StdDuration,
+}
+
+struct RateLimitWindow {
+    bucket: u64,
+    attempts: usize,
+    expires_at: u64,
+}
+
+#[derive(Default)]
+struct AttemptLimiterState {
+    windows: HashMap<String, RateLimitWindow>,
+    expirations: BinaryHeap<Reverse<(u64, String, u64)>>,
+}
+
+#[derive(Clone, Default)]
+struct AttemptLimiter {
+    state: Arc<Mutex<AttemptLimiterState>>,
+}
+
+impl AttemptLimiter {
+    fn try_allow<I>(&self, keys: I) -> Result<(), RateLimitExceeded>
+    where
+        I: IntoIterator<Item = (String, usize, StdDuration)>,
+    {
+        self.try_allow_at(keys, unix_timestamp_seconds())
+    }
+
+    #[cfg(test)]
+    fn allow_at<I>(&self, keys: I, now: u64) -> bool
+    where
+        I: IntoIterator<Item = (String, usize, StdDuration)>,
+    {
+        self.try_allow_at(keys, now).is_ok()
+    }
+
+    fn try_allow_at<I>(&self, keys: I, now: u64) -> Result<(), RateLimitExceeded>
+    where
+        I: IntoIterator<Item = (String, usize, StdDuration)>,
+    {
+        let keys = keys.into_iter().collect::<Vec<_>>();
+        if keys.is_empty()
+            || keys
+                .iter()
+                .any(|(_, limit, period)| *limit == 0 || period.as_secs() == 0)
+        {
+            return Err(RateLimitExceeded {
+                limit: 0,
+                period: StdDuration::from_secs(1),
+            });
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return Err(RateLimitExceeded {
+                limit: keys[0].1,
+                period: keys[0].2,
+            });
+        };
+        state.purge_expired(now);
+        for (key, _, period) in &keys {
+            let bucket = rate_limit_bucket(now, *period);
+            if state
+                .windows
+                .get(key)
+                .is_some_and(|window| window.bucket != bucket)
+            {
+                state.windows.remove(key);
+            }
+        }
+        let new_keys = keys
+            .iter()
+            .filter(|(key, _, _)| !state.windows.contains_key(key))
+            .count();
+        if state.windows.len().saturating_add(new_keys) > MAX_RATE_LIMIT_WINDOWS {
+            return Err(RateLimitExceeded {
+                limit: keys[0].1,
+                period: keys[0].2,
+            });
+        }
+        if let Some((_, limit, period)) = keys.iter().find(|(key, limit, _)| {
+            state
+                .windows
+                .get(key)
+                .is_some_and(|window| window.attempts >= *limit)
+        }) {
+            return Err(RateLimitExceeded {
+                limit: *limit,
+                period: *period,
+            });
+        }
+        for (key, _, period) in keys {
+            let bucket = rate_limit_bucket(now, period);
+            let expires_at = bucket.saturating_add(1).saturating_mul(period.as_secs());
+            if let Some(window) = state.windows.get_mut(&key) {
+                window.attempts += 1;
+            } else {
+                state.windows.insert(
+                    key.clone(),
+                    RateLimitWindow {
+                        bucket,
+                        attempts: 1,
+                        expires_at,
+                    },
+                );
+                state.expirations.push(Reverse((expires_at, key, bucket)));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl AttemptLimiterState {
+    fn purge_expired(&mut self, now: u64) {
+        while let Some(Reverse((expires_at, key, bucket))) = self.expirations.peek().cloned() {
+            if expires_at > now {
+                break;
+            }
+            self.expirations.pop();
+            if self
+                .windows
+                .get(&key)
+                .is_some_and(|window| window.bucket == bucket && window.expires_at <= now)
+            {
+                self.windows.remove(&key);
+            }
+        }
+    }
+}
+
+fn unix_timestamp_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn rate_limit_bucket(now: u64, period: StdDuration) -> u64 {
+    now / period.as_secs()
+}
+
+#[derive(Clone)]
+struct SharedRateLimiter {
+    pool: PgPool,
+}
+
+struct SharedRateLimitKey {
+    window_key: String,
+    limit: usize,
+    period: StdDuration,
+    bucket: i64,
+    expires_at: i64,
+}
+
+impl SharedRateLimiter {
+    const fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn try_allow<I>(&self, keys: I) -> Result<(), RateLimitExceeded>
+    where
+        I: IntoIterator<Item = (String, usize, StdDuration)>,
+    {
+        let keys = keys.into_iter().collect::<Vec<_>>();
+        let Some((_, limit, period)) = keys.first() else {
+            return Err(RateLimitExceeded {
+                limit: 0,
+                period: StdDuration::from_secs(1),
+            });
+        };
+        let fallback = RateLimitExceeded {
+            limit: *limit,
+            period: *period,
+        };
+        if keys
+            .iter()
+            .any(|(_, limit, period)| *limit == 0 || period.as_secs() == 0)
+        {
+            return Err(fallback);
+        }
+        let now = unix_timestamp_seconds();
+        let mut shared_keys = Vec::with_capacity(keys.len());
+        for (window_key, limit, period) in keys {
+            let Ok(period_seconds) = i64::try_from(period.as_secs()) else {
+                return Err(fallback);
+            };
+            let Ok(bucket) = i64::try_from(now / period.as_secs()) else {
+                return Err(fallback);
+            };
+            let Some(expires_at) = bucket
+                .checked_add(1)
+                .and_then(|bucket| bucket.checked_mul(period_seconds))
+            else {
+                return Err(fallback);
+            };
+            if i32::try_from(limit).is_err() {
+                return Err(fallback);
+            }
+            shared_keys.push(SharedRateLimitKey {
+                window_key,
+                limit,
+                period,
+                bucket,
+                expires_at,
+            });
+        }
+
+        let mut lock_keys = shared_keys
+            .iter()
+            .map(|key| key.window_key.as_str())
+            .collect::<Vec<_>>();
+        lock_keys.sort_unstable();
+        let Ok(mut transaction) = self.pool.begin().await else {
+            return Err(fallback);
+        };
+        for window_key in lock_keys {
+            if sqlx::query(
+                "SELECT pg_catalog.pg_advisory_xact_lock(\
+                   pg_catalog.hashtext('rustodon:rate_limit:' || $1))",
+            )
+            .bind(window_key)
+            .execute(&mut *transaction)
+            .await
+            .is_err()
+            {
+                return Err(fallback);
+            }
+        }
+        for key in &shared_keys {
+            if sqlx::query(
+                "DELETE FROM rustodon.rate_limit_windows \
+                 WHERE window_key = $1 AND expires_at <= clock_timestamp()",
+            )
+            .bind(&key.window_key)
+            .execute(&mut *transaction)
+            .await
+            .is_err()
+            {
+                return Err(fallback);
+            }
+        }
+        for key in &shared_keys {
+            let attempts = match sqlx::query_scalar::<_, i32>(
+                "SELECT attempts FROM rustodon.rate_limit_windows \
+                 WHERE window_key = $1 AND bucket = $2",
+            )
+            .bind(&key.window_key)
+            .bind(key.bucket)
+            .fetch_optional(&mut *transaction)
+            .await
+            {
+                Ok(attempts) => attempts.unwrap_or_default(),
+                Err(_) => return Err(fallback),
+            };
+            if usize::try_from(attempts).unwrap_or(usize::MAX) >= key.limit {
+                return Err(RateLimitExceeded {
+                    limit: key.limit,
+                    period: key.period,
+                });
+            }
+        }
+        for key in &shared_keys {
+            if sqlx::query(
+                "INSERT INTO rustodon.rate_limit_windows \
+                   (window_key, bucket, attempts, expires_at) \
+                 VALUES ($1, $2, 1, to_timestamp($3::double precision)) \
+                 ON CONFLICT (window_key, bucket) DO UPDATE \
+                 SET attempts = rustodon.rate_limit_windows.attempts + 1",
+            )
+            .bind(&key.window_key)
+            .bind(key.bucket)
+            .bind(key.expires_at)
+            .execute(&mut *transaction)
+            .await
+            .is_err()
+            {
+                return Err(fallback);
+            }
+        }
+        if transaction.commit().await.is_err() {
+            return Err(fallback);
+        }
+        Ok(())
+    }
+
+    async fn circuit_open(&self, window_key: &str) -> Result<bool, sqlx::Error> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock(\
+               pg_catalog.hashtext('rustodon:rate_limit:' || $1))",
+        )
+        .bind(window_key)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "DELETE FROM rustodon.rate_limit_windows \
+             WHERE window_key = $1 AND bucket = 0 AND expires_at <= clock_timestamp()",
+        )
+        .bind(window_key)
+        .execute(&mut *transaction)
+        .await?;
+        let open = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(\
+               SELECT 1 FROM rustodon.rate_limit_windows \
+               WHERE window_key = $1 AND bucket = 0 AND expires_at > clock_timestamp())",
+        )
+        .bind(window_key)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(open)
+    }
+
+    async fn record_circuit_failure(
+        &self,
+        window_key: &str,
+        cool_off: StdDuration,
+    ) -> Result<(), sqlx::Error> {
+        let cool_off_seconds = i64::try_from(cool_off.as_secs())
+            .map_err(|_| sqlx::Error::Protocol("signature circuit period is too large".into()))?;
+        if cool_off_seconds <= 0 {
+            return Err(sqlx::Error::Protocol(
+                "signature circuit period must be positive".into(),
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock(\
+               pg_catalog.hashtext('rustodon:rate_limit:' || $1))",
+        )
+        .bind(window_key)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "DELETE FROM rustodon.rate_limit_windows \
+             WHERE window_key = $1 AND bucket = 0 AND expires_at <= clock_timestamp()",
+        )
+        .bind(window_key)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO rustodon.rate_limit_windows \
+               (window_key, bucket, attempts, expires_at) \
+             VALUES ($1, 0, 1, clock_timestamp() + ($2::double precision * INTERVAL '1 second')) \
+             ON CONFLICT (window_key, bucket) DO NOTHING",
+        )
+        .bind(window_key)
+        .bind(cool_off_seconds)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await
+    }
+}
+
+async fn try_rate_limit<I>(
+    local: &AttemptLimiter,
+    shared: Option<&SharedRateLimiter>,
+    keys: I,
+) -> Result<(), RateLimitExceeded>
+where
+    I: IntoIterator<Item = (String, usize, StdDuration)>,
+{
+    let keys = keys.into_iter().collect::<Vec<_>>();
+    match shared {
+        Some(shared) => shared.try_allow(keys).await,
+        None => local.try_allow(keys),
+    }
+}
+
+#[derive(Clone, Default)]
+struct PasswordResetLimiter {
+    limiter: AttemptLimiter,
+}
+
+impl PasswordResetLimiter {
+    fn keys(client_ip: IpAddr, email: &str) -> [(String, usize, StdDuration); 2] {
+        let normalized_email = email.trim().to_ascii_lowercase();
+        let email_digest = format!("{:x}", Sha256::digest(normalized_email.as_bytes()));
+        [
+            (
+                format!("password_reset:ip:{}", attempt_ip_bucket(client_ip)),
+                25,
+                StdDuration::from_mins(5),
+            ),
+            (
+                format!("password_reset:email:{email_digest}"),
+                5,
+                StdDuration::from_mins(30),
+            ),
+        ]
+    }
+
+    #[cfg(test)]
+    fn check(&self, client_ip: IpAddr, email: &str) -> Result<(), RateLimitExceeded> {
+        self.limiter.try_allow(Self::keys(client_ip, email))
+    }
+
+    async fn check_shared(
+        &self,
+        shared: Option<&SharedRateLimiter>,
+        client_ip: IpAddr,
+        email: &str,
+    ) -> Result<(), RateLimitExceeded> {
+        try_rate_limit(&self.limiter, shared, Self::keys(client_ip, email)).await
+    }
+}
+
+#[derive(Clone, Default)]
+struct BrowserLoginLimiter {
+    limiter: AttemptLimiter,
+}
+
+impl BrowserLoginLimiter {
+    fn keys(client_ip: IpAddr, email: &str) -> [(String, usize, StdDuration); 2] {
+        let normalized_email = email.trim().to_ascii_lowercase();
+        let email_digest = format!("{:x}", Sha256::digest(normalized_email.as_bytes()));
+        [
+            (
+                format!("browser_login:ip:{}", attempt_ip_bucket(client_ip)),
+                25,
+                StdDuration::from_mins(5),
+            ),
+            (
+                format!("browser_login:email:{email_digest}"),
+                25,
+                StdDuration::from_hours(1),
+            ),
+        ]
+    }
+
+    #[cfg(test)]
+    fn check(&self, client_ip: IpAddr, email: &str) -> Result<(), RateLimitExceeded> {
+        self.limiter.try_allow(Self::keys(client_ip, email))
+    }
+
+    async fn check_shared(
+        &self,
+        shared: Option<&SharedRateLimiter>,
+        client_ip: IpAddr,
+        email: &str,
+    ) -> Result<(), RateLimitExceeded> {
+        try_rate_limit(&self.limiter, shared, Self::keys(client_ip, email)).await
+    }
+}
+
+#[derive(Clone, Default)]
+struct OAuthApplicationLimiter {
+    limiter: AttemptLimiter,
+}
+
+impl OAuthApplicationLimiter {
+    fn keys(client_ip: IpAddr) -> [(String, usize, StdDuration); 1] {
+        [(
+            format!("oauth_application:ip:{}", attempt_ip_bucket(client_ip)),
+            5,
+            StdDuration::from_mins(10),
+        )]
+    }
+
+    #[cfg(test)]
+    fn check(&self, client_ip: IpAddr) -> Result<(), RateLimitExceeded> {
+        self.limiter.try_allow(Self::keys(client_ip))
+    }
+
+    async fn check_shared(
+        &self,
+        shared: Option<&SharedRateLimiter>,
+        client_ip: IpAddr,
+    ) -> Result<(), RateLimitExceeded> {
+        try_rate_limit(&self.limiter, shared, Self::keys(client_ip)).await
+    }
+}
+
+#[derive(Clone, Default)]
+struct MediaProxyLimiter {
+    limiter: AttemptLimiter,
+}
+
+impl MediaProxyLimiter {
+    fn keys(client_ip: IpAddr) -> [(String, usize, StdDuration); 1] {
+        [(
+            format!("media_proxy:ip:{}", attempt_ip_bucket(client_ip)),
+            30,
+            StdDuration::from_mins(10),
+        )]
+    }
+
+    #[cfg(test)]
+    fn check(&self, client_ip: IpAddr) -> Result<(), RateLimitExceeded> {
+        self.limiter.try_allow(Self::keys(client_ip))
+    }
+
+    async fn check_shared(
+        &self,
+        shared: Option<&SharedRateLimiter>,
+        client_ip: IpAddr,
+    ) -> Result<(), RateLimitExceeded> {
+        try_rate_limit(&self.limiter, shared, Self::keys(client_ip)).await
+    }
+}
+
+#[derive(Clone, Default)]
+struct MediaUploadLimiter {
+    limiter: AttemptLimiter,
+}
+
+impl MediaUploadLimiter {
+    fn keys(user_id: i64) -> [(String, usize, StdDuration); 1] {
+        [(
+            format!("media_upload:user:{user_id}"),
+            MEDIA_UPLOAD_RATE_LIMIT,
+            MEDIA_UPLOAD_RATE_LIMIT_PERIOD,
+        )]
+    }
+
+    #[cfg(test)]
+    fn check(&self, user_id: i64) -> Result<(), RateLimitExceeded> {
+        self.limiter.try_allow(Self::keys(user_id))
+    }
+
+    async fn check_shared(
+        &self,
+        shared: Option<&SharedRateLimiter>,
+        user_id: i64,
+    ) -> Result<(), RateLimitExceeded> {
+        try_rate_limit(&self.limiter, shared, Self::keys(user_id)).await
+    }
+}
+
+#[derive(Clone, Default)]
+struct ActivityPubInboxLimiter {
+    limiter: AttemptLimiter,
+}
+
+impl ActivityPubInboxLimiter {
+    fn keys(client_ip: IpAddr) -> [(String, usize, StdDuration); 1] {
+        [(
+            format!("activitypub_inbox:ip:{}", attempt_ip_bucket(client_ip)),
+            ACTIVITYPUB_INBOX_RATE_LIMIT,
+            ACTIVITYPUB_INBOX_RATE_LIMIT_PERIOD,
+        )]
+    }
+
+    #[cfg(test)]
+    fn check(&self, client_ip: IpAddr) -> Result<(), RateLimitExceeded> {
+        self.limiter.try_allow(Self::keys(client_ip))
+    }
+
+    async fn check_shared(
+        &self,
+        shared: Option<&SharedRateLimiter>,
+        client_ip: IpAddr,
+    ) -> Result<(), RateLimitExceeded> {
+        try_rate_limit(&self.limiter, shared, Self::keys(client_ip)).await
+    }
+}
+
+#[derive(Clone, Default)]
+struct RemoteAccountResolutionLimiter {
+    limiter: AttemptLimiter,
+}
+
+impl RemoteAccountResolutionLimiter {
+    fn keys(client_ip: IpAddr, username: &str, domain: &str) -> [(String, usize, StdDuration); 2] {
+        let handle = format!("{}@{}", username.trim(), domain.trim()).to_ascii_lowercase();
+        let handle_digest = format!("{:x}", Sha256::digest(handle.as_bytes()));
+        [
+            (
+                format!(
+                    "remote_account_resolution:ip:{}",
+                    attempt_ip_bucket(client_ip)
+                ),
+                10,
+                StdDuration::from_mins(1),
+            ),
+            (
+                format!("remote_account_resolution:handle:{handle_digest}"),
+                1,
+                StdDuration::from_mins(5),
+            ),
+        ]
+    }
+
+    #[cfg(test)]
+    fn check(
+        &self,
+        client_ip: IpAddr,
+        username: &str,
+        domain: &str,
+    ) -> Result<(), RateLimitExceeded> {
+        self.limiter
+            .try_allow(Self::keys(client_ip, username, domain))
+    }
+
+    async fn check_shared(
+        &self,
+        shared: Option<&SharedRateLimiter>,
+        client_ip: IpAddr,
+        username: &str,
+        domain: &str,
+    ) -> Result<(), RateLimitExceeded> {
+        try_rate_limit(
+            &self.limiter,
+            shared,
+            Self::keys(client_ip, username, domain),
+        )
+        .await
+    }
+}
+
+#[derive(Clone, Default)]
+struct SignatureFetchCircuit {
+    state: Arc<Mutex<SignatureFetchCircuitState>>,
+}
+
+#[derive(Default)]
+struct SignatureFetchCircuitState {
+    failures: HashMap<IpAddr, u64>,
+    expirations: BinaryHeap<Reverse<(u64, IpAddr)>>,
+}
+
+impl SignatureFetchCircuit {
+    fn allow(&self, client_ip: IpAddr) -> bool {
+        self.allow_at(client_ip, unix_timestamp_seconds())
+    }
+
+    fn allow_at(&self, client_ip: IpAddr, now: u64) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        state.purge_expired(now);
+        !state.failures.contains_key(&client_ip)
+            && state.failures.len() < MAX_SIGNATURE_FETCH_CIRCUITS
+    }
+
+    fn record_failure(&self, client_ip: IpAddr) {
+        self.record_failure_at(client_ip, unix_timestamp_seconds());
+    }
+
+    fn record_failure_at(&self, client_ip: IpAddr, now: u64) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.purge_expired(now);
+        if state.failures.len() >= MAX_SIGNATURE_FETCH_CIRCUITS
+            || state.failures.contains_key(&client_ip)
+        {
+            return;
+        }
+        let expires_at = now.saturating_add(SIGNATURE_FETCH_COOL_OFF.as_secs());
+        state.failures.insert(client_ip, expires_at);
+        state.expirations.push(Reverse((expires_at, client_ip)));
+    }
+}
+
+impl SignatureFetchCircuitState {
+    fn purge_expired(&mut self, now: u64) {
+        while let Some(Reverse((expires_at, client_ip))) = self.expirations.peek().copied() {
+            if expires_at > now {
+                break;
+            }
+            self.expirations.pop();
+            if self
+                .failures
+                .get(&client_ip)
+                .is_some_and(|expiration| *expiration == expires_at)
+            {
+                self.failures.remove(&client_ip);
+            }
+        }
+    }
+}
+
+fn attempt_ip_bucket(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => {
+            let network = u128::from(ip) & (!0_u128 << 64);
+            format!("{}/64", Ipv6Addr::from(network))
+        }
+    }
+}
+
+fn signature_fetch_circuit_key(client_ip: IpAddr) -> String {
+    format!(
+        "signature_fetch_circuit:ip:{}",
+        attempt_ip_bucket(client_ip)
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -158,6 +1058,10 @@ pub enum ApiRouteSupport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApiMethod {
     Get,
+    Post,
+    Delete,
+    Patch,
+    Put,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,6 +1101,58 @@ macro_rules! route {
         ApiRouteContract {
             path: $path,
             method: ApiMethod::Get,
+            support: ApiRouteSupport::$support,
+            authentication: $authentication,
+            pagination: PaginationContract::$pagination,
+            cache: ApiCachePolicy::$cache,
+        }
+    };
+}
+
+macro_rules! post_route {
+    ($path:literal, $support:ident, $authentication:expr, $pagination:ident, $cache:ident) => {
+        ApiRouteContract {
+            path: $path,
+            method: ApiMethod::Post,
+            support: ApiRouteSupport::$support,
+            authentication: $authentication,
+            pagination: PaginationContract::$pagination,
+            cache: ApiCachePolicy::$cache,
+        }
+    };
+}
+
+macro_rules! delete_route {
+    ($path:literal, $support:ident, $authentication:expr, $pagination:ident, $cache:ident) => {
+        ApiRouteContract {
+            path: $path,
+            method: ApiMethod::Delete,
+            support: ApiRouteSupport::$support,
+            authentication: $authentication,
+            pagination: PaginationContract::$pagination,
+            cache: ApiCachePolicy::$cache,
+        }
+    };
+}
+
+macro_rules! patch_route {
+    ($path:literal, $support:ident, $authentication:expr, $pagination:ident, $cache:ident) => {
+        ApiRouteContract {
+            path: $path,
+            method: ApiMethod::Patch,
+            support: ApiRouteSupport::$support,
+            authentication: $authentication,
+            pagination: PaginationContract::$pagination,
+            cache: ApiCachePolicy::$cache,
+        }
+    };
+}
+
+macro_rules! put_route {
+    ($path:literal, $support:ident, $authentication:expr, $pagination:ident, $cache:ident) => {
+        ApiRouteContract {
+            path: $path,
+            method: ApiMethod::Put,
             support: ApiRouteSupport::$support,
             authentication: $authentication,
             pagination: PaginationContract::$pagination,
@@ -255,10 +1211,262 @@ pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
         None,
         Private
     ),
+    post_route!(
+        "/api/v1/apps",
+        Implemented,
+        ApiAuthentication::Public,
+        None,
+        Private
+    ),
+    route!(
+        "/api/v1/apps/verify_credentials",
+        Implemented,
+        ApiAuthentication::Required(NO_SCOPE.as_slice()),
+        None,
+        Private
+    ),
     route!(
         "/api/v1/markers",
         Implemented,
         ApiAuthentication::Required(READ_STATUSES.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/markers",
+        Implemented,
+        ApiAuthentication::Required(WRITE_STATUSES.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/statuses",
+        Implemented,
+        ApiAuthentication::Required(WRITE_STATUSES.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/reports",
+        Implemented,
+        ApiAuthentication::Required(WRITE_REPORTS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/media",
+        Implemented,
+        ApiAuthentication::Required(WRITE_MEDIA.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v1/media/{id}",
+        Implemented,
+        ApiAuthentication::Required(WRITE_MEDIA.as_slice()),
+        None,
+        Private
+    ),
+    patch_route!(
+        "/api/v1/media/{id}",
+        Implemented,
+        ApiAuthentication::Required(WRITE_MEDIA.as_slice()),
+        None,
+        Private
+    ),
+    put_route!(
+        "/api/v1/media/{id}",
+        Implemented,
+        ApiAuthentication::Required(WRITE_MEDIA.as_slice()),
+        None,
+        Private
+    ),
+    delete_route!(
+        "/api/v1/media/{id}",
+        Implemented,
+        ApiAuthentication::Required(WRITE_MEDIA.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v2/media",
+        Implemented,
+        ApiAuthentication::Required(WRITE_MEDIA.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v1/conversations",
+        Implemented,
+        ApiAuthentication::Required(READ_STATUSES.as_slice()),
+        StatusId,
+        Private
+    ),
+    post_route!(
+        "/api/v1/conversations/{id}/read",
+        Implemented,
+        ApiAuthentication::Required(WRITE_CONVERSATIONS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/conversations/{id}/unread",
+        Implemented,
+        ApiAuthentication::Required(WRITE_CONVERSATIONS.as_slice()),
+        None,
+        Private
+    ),
+    delete_route!(
+        "/api/v1/conversations/{id}",
+        Implemented,
+        ApiAuthentication::Required(WRITE_CONVERSATIONS.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v1/notifications",
+        Implemented,
+        ApiAuthentication::Required(READ_NOTIFICATIONS.as_slice()),
+        AssociationId,
+        Private
+    ),
+    route!(
+        "/api/v2/notifications",
+        Implemented,
+        ApiAuthentication::Required(READ_NOTIFICATIONS.as_slice()),
+        AssociationId,
+        Private
+    ),
+    post_route!(
+        "/api/v1/notifications/clear",
+        Implemented,
+        ApiAuthentication::Required(WRITE_NOTIFICATIONS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/notifications/{id}/dismiss",
+        Implemented,
+        ApiAuthentication::Required(WRITE_NOTIFICATIONS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v2/notifications/clear",
+        Implemented,
+        ApiAuthentication::Required(WRITE_NOTIFICATIONS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v2/notifications/{id}/dismiss",
+        Implemented,
+        ApiAuthentication::Required(WRITE_NOTIFICATIONS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/notifications/requests/{id}/accept",
+        Implemented,
+        ApiAuthentication::Required(WRITE_NOTIFICATIONS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/notifications/requests/{id}/dismiss",
+        Implemented,
+        ApiAuthentication::Required(WRITE_NOTIFICATIONS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/notifications/requests/accept",
+        Implemented,
+        ApiAuthentication::Required(WRITE_NOTIFICATIONS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/notifications/requests/dismiss",
+        Implemented,
+        ApiAuthentication::Required(WRITE_NOTIFICATIONS.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v1/notifications/unread_count",
+        Implemented,
+        ApiAuthentication::Required(READ_NOTIFICATIONS.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v1/notifications/{id}",
+        Implemented,
+        ApiAuthentication::Required(READ_NOTIFICATIONS.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v1/notifications/requests",
+        Implemented,
+        ApiAuthentication::Required(READ_NOTIFICATIONS.as_slice()),
+        AssociationId,
+        Private
+    ),
+    route!(
+        "/api/v1/notifications/requests/merged",
+        Implemented,
+        ApiAuthentication::Required(READ_NOTIFICATIONS.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v1/notifications/requests/{id}",
+        Implemented,
+        ApiAuthentication::Required(READ_NOTIFICATIONS.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v1/notifications/policy",
+        Implemented,
+        ApiAuthentication::Required(READ_NOTIFICATIONS.as_slice()),
+        None,
+        Private
+    ),
+    put_route!(
+        "/api/v1/notifications/policy",
+        Implemented,
+        ApiAuthentication::Required(WRITE_NOTIFICATIONS.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v2/notifications/unread_count",
+        Implemented,
+        ApiAuthentication::Required(READ_NOTIFICATIONS.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v2/notifications/{id}",
+        Implemented,
+        ApiAuthentication::Required(READ_NOTIFICATIONS.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v2/notifications/policy",
+        Implemented,
+        ApiAuthentication::Required(READ_NOTIFICATIONS.as_slice()),
+        None,
+        Private
+    ),
+    put_route!(
+        "/api/v2/notifications/policy",
+        Implemented,
+        ApiAuthentication::Required(WRITE_NOTIFICATIONS.as_slice()),
         None,
         Private
     ),
@@ -277,7 +1485,77 @@ pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
         Private
     ),
     route!(
+        "/api/v1/lists/{id}",
+        Implemented,
+        ApiAuthentication::Required(READ_LISTS.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v1/lists/{id}/accounts",
+        Implemented,
+        ApiAuthentication::Required(READ_LISTS.as_slice()),
+        AssociationId,
+        Private
+    ),
+    route!(
+        "/api/v1/accounts/{id}/lists",
+        Implemented,
+        ApiAuthentication::Required(READ_LISTS.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v1/accounts/{id}/collections",
+        Implemented,
+        ApiAuthentication::Optional(READ_COLLECTIONS.as_slice()),
+        AssociationId,
+        Anonymous
+    ),
+    route!(
+        "/api/v1/accounts/{id}/in_collections",
+        Implemented,
+        ApiAuthentication::Optional(READ_COLLECTIONS.as_slice()),
+        AssociationId,
+        Anonymous
+    ),
+    route!(
         "/api/v1/featured_tags",
+        Implemented,
+        ApiAuthentication::Required(READ_ACCOUNTS.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v1/followed_tags",
+        Implemented,
+        ApiAuthentication::Required(READ_FOLLOWS.as_slice()),
+        AssociationId,
+        Private
+    ),
+    route!(
+        "/api/v1/follow_requests",
+        Implemented,
+        ApiAuthentication::Required(READ_FOLLOWS.as_slice()),
+        RelationshipId,
+        Private
+    ),
+    post_route!(
+        "/api/v1/follow_requests/{id}/authorize",
+        Implemented,
+        ApiAuthentication::Required(WRITE_FOLLOWS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/follow_requests/{id}/reject",
+        Implemented,
+        ApiAuthentication::Required(WRITE_FOLLOWS.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v1/preferences",
         Implemented,
         ApiAuthentication::Required(READ_ACCOUNTS.as_slice()),
         None,
@@ -308,6 +1586,27 @@ pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
         "/api/v1/accounts/verify_credentials",
         Implemented,
         ApiAuthentication::Required(VERIFY_CREDENTIALS.as_slice()),
+        None,
+        Private
+    ),
+    patch_route!(
+        "/api/v1/accounts/update_credentials",
+        Implemented,
+        ApiAuthentication::Required(WRITE_ACCOUNTS.as_slice()),
+        None,
+        Private
+    ),
+    delete_route!(
+        "/api/v1/profile/avatar",
+        Implemented,
+        ApiAuthentication::Required(WRITE_ACCOUNTS.as_slice()),
+        None,
+        Private
+    ),
+    delete_route!(
+        "/api/v1/profile/header",
+        Implemented,
+        ApiAuthentication::Required(WRITE_ACCOUNTS.as_slice()),
         None,
         Private
     ),
@@ -353,6 +1652,146 @@ pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
         None,
         Anonymous
     ),
+    patch_route!(
+        "/api/v1/statuses/{id}",
+        Implemented,
+        ApiAuthentication::Required(WRITE_STATUSES.as_slice()),
+        None,
+        Private
+    ),
+    put_route!(
+        "/api/v1/statuses/{id}",
+        Implemented,
+        ApiAuthentication::Required(WRITE_STATUSES.as_slice()),
+        None,
+        Private
+    ),
+    delete_route!(
+        "/api/v1/statuses/{id}",
+        Implemented,
+        ApiAuthentication::Required(WRITE_STATUSES.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/statuses/{id}/bookmark",
+        Implemented,
+        ApiAuthentication::Required(WRITE_BOOKMARKS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/statuses/{id}/unbookmark",
+        Implemented,
+        ApiAuthentication::Required(WRITE_BOOKMARKS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/statuses/{id}/favourite",
+        Implemented,
+        ApiAuthentication::Required(WRITE_FAVOURITES.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/statuses/{id}/unfavourite",
+        Implemented,
+        ApiAuthentication::Required(WRITE_FAVOURITES.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/statuses/{id}/reblog",
+        Implemented,
+        ApiAuthentication::Required(WRITE_STATUSES.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/statuses/{id}/unreblog",
+        Implemented,
+        ApiAuthentication::Required(WRITE_STATUSES.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/statuses/{id}/mute",
+        Implemented,
+        ApiAuthentication::Required(WRITE_MUTES.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/statuses/{id}/unmute",
+        Implemented,
+        ApiAuthentication::Required(WRITE_MUTES.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/statuses/{id}/pin",
+        Implemented,
+        ApiAuthentication::Required(WRITE_ACCOUNTS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/statuses/{id}/unpin",
+        Implemented,
+        ApiAuthentication::Required(WRITE_ACCOUNTS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/accounts/{id}/follow",
+        Implemented,
+        ApiAuthentication::Required(WRITE_FOLLOWS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/accounts/{id}/unfollow",
+        Implemented,
+        ApiAuthentication::Required(WRITE_FOLLOWS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/accounts/{id}/remove_from_followers",
+        Implemented,
+        ApiAuthentication::Required(WRITE_FOLLOWS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/accounts/{id}/block",
+        Implemented,
+        ApiAuthentication::Required(WRITE_BLOCKS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/accounts/{id}/unblock",
+        Implemented,
+        ApiAuthentication::Required(WRITE_BLOCKS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/accounts/{id}/mute",
+        Implemented,
+        ApiAuthentication::Required(WRITE_MUTES.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/accounts/{id}/unmute",
+        Implemented,
+        ApiAuthentication::Required(WRITE_MUTES.as_slice()),
+        None,
+        Private
+    ),
     route!(
         "/api/v1/statuses/{id}/source",
         Implemented,
@@ -366,6 +1805,13 @@ pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
         ApiAuthentication::Optional(READ_STATUSES.as_slice()),
         None,
         Anonymous
+    ),
+    route!(
+        "/api/v1/statuses/{id}/quotes",
+        Implemented,
+        ApiAuthentication::Required(READ_STATUSES.as_slice()),
+        AssociationId,
+        Private
     ),
     route!(
         "/api/v1/statuses/{id}/favourited_by",
@@ -446,9 +1892,400 @@ pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
     ),
 ];
 
+/// The REST routes required by `docs/v1-scope.md` for ordinary v1 clients.
+///
+/// This is deliberately separate from `API_ROUTE_INVENTORY`: the inventory also
+/// contains harmless read-only compatibility routes used by the web client.
+pub const V1_REQUIRED_API_ROUTES: &[(&str, ApiMethod, ApiRouteSupport)] = &[
+    (
+        "/api/v1/instance",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v2/instance",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/instance/rules",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/instance/translation_languages",
+        ApiMethod::Get,
+        ApiRouteSupport::DisabledResponse,
+    ),
+    (
+        "/api/v1/accounts/{id}",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/accounts/verify_credentials",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/accounts/update_credentials",
+        ApiMethod::Patch,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/accounts/lookup",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/accounts/search",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/accounts/relationships",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/accounts/{id}/statuses",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/accounts/{id}/followers",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/accounts/{id}/following",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/reports",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{id}",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{id}",
+        ApiMethod::Patch,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{id}",
+        ApiMethod::Put,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{id}",
+        ApiMethod::Delete,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{id}/source",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{id}/history",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{id}/context",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{id}/bookmark",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{id}/unbookmark",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{id}/favourite",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{id}/unfavourite",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{id}/reblog",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{id}/unreblog",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{id}/favourited_by",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{id}/reblogged_by",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/timelines/home",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/timelines/public",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/timelines/tag/{hashtag}",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/timelines/list/{id}",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/favourites",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/bookmarks",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/blocks",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/mutes",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/follow_requests",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/follow_requests/{id}/authorize",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/follow_requests/{id}/reject",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/accounts/{id}/follow",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/accounts/{id}/unfollow",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/accounts/{id}/remove_from_followers",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/accounts/{id}/block",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/accounts/{id}/unblock",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/accounts/{id}/mute",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/accounts/{id}/unmute",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/conversations",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/conversations/{id}/read",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/conversations/{id}/unread",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/conversations/{id}",
+        ApiMethod::Delete,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/notifications",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v2/notifications",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/notifications/unread_count",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v2/notifications/unread_count",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/notifications/{id}",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v2/notifications/{id}",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/notifications/clear",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v2/notifications/clear",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/notifications/{id}/dismiss",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v2/notifications/{id}/dismiss",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v2/filters",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/preferences",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/apps",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/apps/verify_credentials",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/markers",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/markers",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/media",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/media/{id}",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/media/{id}",
+        ApiMethod::Patch,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/media/{id}",
+        ApiMethod::Put,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/media/{id}",
+        ApiMethod::Delete,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v2/media",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+];
+
 #[derive(Clone)]
 pub struct WebState {
     repository: Repository,
+    queue: Option<Queue>,
+    write_repository: Option<WriteRepository>,
+    remote_fetcher: RemoteFetcher,
+    remote_account_resolver: RemoteAccountResolver,
+    signature_fetch_circuit: SignatureFetchCircuit,
+    shared_rate_limiter: Option<SharedRateLimiter>,
+    mail_config: Option<MailConfig>,
+    password_reset_limiter: PasswordResetLimiter,
+    browser_login_limiter: BrowserLoginLimiter,
+    oauth_application_limiter: OAuthApplicationLimiter,
+    media_proxy_limiter: MediaProxyLimiter,
+    media_upload_limiter: MediaUploadLimiter,
+    activitypub_inbox_limiter: ActivityPubInboxLimiter,
+    remote_account_resolution_limiter: RemoteAccountResolutionLimiter,
     authenticator: BearerAuthenticator,
     origin: Url,
     local_domain: String,
@@ -457,6 +2294,7 @@ pub struct WebState {
     media_route_path: String,
     media_route_authority: Option<String>,
     instance_runtime: InstanceRuntimeConfig,
+    frontend: FrontendAssets,
     trusted_proxies: Vec<IpNetwork>,
     allowed_hosts: Vec<String>,
 }
@@ -480,9 +2318,45 @@ impl WebState {
     ) -> std::io::Result<Self> {
         let media_root_url = media_root_url.into();
         let (media_route_path, media_route_authority) = media_route(&media_root_url);
+        let frontend =
+            FrontendAssets::load(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("public"))?;
+        let mut instance_runtime = instance_runtime;
+        if instance_runtime
+            .thumbnail_url
+            .ends_with("/packs/assets/preview.png")
+            && let Some(path) = frontend.asset_url("images/preview.png")
+        {
+            instance_runtime.thumbnail_url = origin.join(&path).map_or(path, |url| url.to_string());
+        }
+        if instance_runtime.icons.is_empty() {
+            instance_runtime.icons = FRONTEND_ANDROID_ICON_SIZES
+                .iter()
+                .filter_map(|size| {
+                    let source = format!("icons/android-chrome-{size}x{size}.png");
+                    let path = frontend.asset_url(&source)?;
+                    let url = origin.join(&path).map_or(path, |url| url.to_string());
+                    Some((url, format!("{size}x{size}")))
+                })
+                .collect();
+        }
+        let remote_fetcher = RemoteFetcher::default();
         Ok(Self {
             authenticator: BearerAuthenticator::new(repository.clone()),
             repository,
+            queue: None,
+            write_repository: None,
+            remote_fetcher: remote_fetcher.clone(),
+            remote_account_resolver: RemoteAccountResolver::new(remote_fetcher),
+            signature_fetch_circuit: SignatureFetchCircuit::default(),
+            shared_rate_limiter: None,
+            mail_config: None,
+            password_reset_limiter: PasswordResetLimiter::default(),
+            browser_login_limiter: BrowserLoginLimiter::default(),
+            oauth_application_limiter: OAuthApplicationLimiter::default(),
+            media_proxy_limiter: MediaProxyLimiter::default(),
+            media_upload_limiter: MediaUploadLimiter::default(),
+            activitypub_inbox_limiter: ActivityPubInboxLimiter::default(),
+            remote_account_resolution_limiter: RemoteAccountResolutionLimiter::default(),
             origin,
             local_domain: local_domain.into(),
             media_root_url,
@@ -490,9 +2364,37 @@ impl WebState {
             media_route_path,
             media_route_authority,
             instance_runtime,
+            frontend,
             trusted_proxies,
             allowed_hosts,
         })
+    }
+
+    #[must_use]
+    pub fn with_write_repository(mut self, repository: WriteRepository) -> Self {
+        if self.shared_rate_limiter.is_none() {
+            self.shared_rate_limiter = Some(SharedRateLimiter::new(repository.pool().clone()));
+        }
+        self.write_repository = Some(repository);
+        self
+    }
+
+    #[must_use]
+    pub fn with_queue(mut self, queue: Queue) -> Self {
+        self.shared_rate_limiter = Some(SharedRateLimiter::new(queue.pool().clone()));
+        let remote_fetcher = self
+            .remote_fetcher
+            .with_operational_pool(queue.pool().clone());
+        self.remote_fetcher = remote_fetcher.clone();
+        self.remote_account_resolver = RemoteAccountResolver::new(remote_fetcher);
+        self.queue = Some(queue);
+        self
+    }
+
+    #[must_use]
+    pub fn with_mail_config(mut self, config: MailConfig) -> Self {
+        self.mail_config = Some(config);
+        self
     }
 
     fn loader(&self, viewer_account_id: Option<i64>) -> RestProjectionLoader {
@@ -526,6 +2428,678 @@ fn media_route(media_root_url: &str) -> (String, Option<String>) {
     )
 }
 
+fn media_proxy_path(path: &str) -> Option<(i64, bool)> {
+    let (id, suffix) = path.split_once('/').map_or((path, ""), |value| value);
+    Some((
+        path_id(id)?,
+        suffix == "small" || suffix.ends_with("/small"),
+    ))
+}
+
+fn cached_remote_media_response(
+    state: &WebState,
+    media: &MediaAttachment,
+    small: bool,
+) -> Option<Response<Body>> {
+    let file_name = media.file_file_name.as_deref()?;
+    let content_type = media.file_content_type.as_deref()?;
+    let metadata = PaperclipMetadata {
+        attachment: PaperclipAttachment::MediaFile,
+        id: media.id,
+        remote: true,
+        storage_schema_version: media.file_storage_schema_version,
+        file_name: file_name.to_owned(),
+        content_type: Some(content_type.to_owned()),
+        variant: None,
+    };
+    let style = if small { "small" } else { "original" };
+    let relative_path = metadata.relative_path(style)?;
+    let file = state
+        .media_root
+        .open_file(FsPath::new(&relative_path))
+        .ok()?;
+    let mut body = Vec::new();
+    let read_limit = u64::try_from(MEDIA_PROXY_MAX_RESPONSE_BYTES)
+        .ok()?
+        .saturating_add(1);
+    file.take(read_limit).read_to_end(&mut body).ok()?;
+    if body.len() > MEDIA_PROXY_MAX_RESPONSE_BYTES {
+        return None;
+    }
+    let content_type = if small && content_type == "image/gif" {
+        "image/png"
+    } else {
+        content_type
+    };
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(PRIVATE_CACHE));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    Some(response)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn media_proxy(
+    State(state): State<WebState>,
+    Path(path): Path<String>,
+    Extension(metadata): Extension<RequestMetadata>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if let Err(limited) = state
+        .media_proxy_limiter
+        .check_shared(state.shared_rate_limiter.as_ref(), metadata.client_ip)
+        .await
+    {
+        return rate_limited_response(limited);
+    }
+    let viewer_account_id = if state.instance_runtime.limited_federation {
+        match required_viewer(&state, &headers, READ_STATUSES).await {
+            Ok(account_id) => Some(account_id),
+            Err(response) => return response,
+        }
+    } else {
+        match optional_viewer(&state, &headers, READ_STATUSES).await {
+            Ok(account_id) => account_id,
+            Err(response) => return response,
+        }
+    };
+    let Some((id, small)) = media_proxy_path(&path) else {
+        return not_found();
+    };
+    let media = match state.repository.remote_media_attachment(id).await {
+        Ok(Some(media)) => media,
+        Ok(None) => return not_found(),
+        Err(_) => return internal_error(),
+    };
+    let Some(status_id) = media.status_id else {
+        return not_found();
+    };
+    match state
+        .repository
+        .rest_authorized_status_ids(&[status_id], viewer_account_id)
+        .await
+    {
+        Ok(ids) if ids == [status_id] => {}
+        Ok(_) => return not_found(),
+        Err(_) => return internal_error(),
+    }
+    let Some(account_id) = media.account_id else {
+        return not_found();
+    };
+    let account = match state.repository.account(account_id).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return not_found(),
+        Err(_) => return internal_error(),
+    };
+    let Some(account_domain) = account.domain else {
+        return not_found();
+    };
+    let Ok(account_domain) = canonical_remote_domain(&account_domain) else {
+        return not_found();
+    };
+    if !state
+        .repository
+        .remote_media_allowed(&account_domain, state.instance_runtime.limited_federation)
+        .await
+        .unwrap_or(false)
+    {
+        return not_found();
+    }
+    if let Some(response) = cached_remote_media_response(&state, &media, small) {
+        return response;
+    }
+    let remote_url = if small {
+        media
+            .thumbnail_remote_url
+            .as_deref()
+            .filter(|url| !crate::paperclip::rails_blank(url))
+            .unwrap_or(&media.remote_url)
+    } else {
+        &media.remote_url
+    };
+    let Ok(remote_url) = Url::parse(remote_url) else {
+        return not_found();
+    };
+    let response = match state
+        .remote_fetcher
+        .with_limits(RemoteFetchLimits {
+            max_response_bytes: MEDIA_PROXY_MAX_RESPONSE_BYTES,
+            ..RemoteFetchLimits::default()
+        })
+        .get(remote_url, SUPPORTED_MIME_TYPES)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return match error {
+                crate::remote::RemoteFetchError::InvalidUrl
+                | crate::remote::RemoteFetchError::BlockedAddress(_)
+                | crate::remote::RemoteFetchError::MissingContentType
+                | crate::remote::RemoteFetchError::UnsupportedContentType
+                | crate::remote::RemoteFetchError::UnsupportedEncoding
+                | crate::remote::RemoteFetchError::BodyTooLarge => not_found(),
+                crate::remote::RemoteFetchError::UnexpectedStatus(status)
+                    if status.is_client_error() =>
+                {
+                    not_found()
+                }
+                crate::remote::RemoteFetchError::DomainBudgetExceeded => error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Remote media is temporarily unavailable",
+                ),
+                _ => internal_error(),
+            };
+        }
+    };
+    let content_type = response
+        .content_type
+        .as_deref()
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(media.file_content_type.as_deref())
+        .unwrap_or("application/octet-stream");
+    let mut output = Response::new(Body::from(response.body));
+    *output.status_mut() = StatusCode::OK;
+    output.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=60"),
+    );
+    output.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    output.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    output
+}
+
+async fn frontend_app(State(state): State<WebState>, request: Request) -> Response<Body> {
+    if request.method() != Method::GET && request.method() != Method::HEAD {
+        return not_found();
+    }
+    let path = request.uri().path();
+    if !is_frontend_path(path) {
+        return not_found();
+    }
+    frontend_html_response(&state, path, request.headers()).await
+}
+
+async fn web_fallback(State(state): State<WebState>, request: Request) -> Response<Body> {
+    if is_frontend_path(request.uri().path()) {
+        frontend_app(State(state), request).await
+    } else {
+        api_not_found()
+    }
+}
+
+async fn frontend_html_response(
+    state: &WebState,
+    path: &str,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    let session = match request_cookie(headers, BROWSER_SESSION_COOKIE) {
+        Some(session_id) => match state.repository.browser_session(session_id).await {
+            Ok(session) => session,
+            Err(_) => return internal_error(),
+        },
+        None => None,
+    };
+    let authenticated = if let Some(session) = session.as_ref() {
+        let loader = state.loader(Some(session.account_id));
+        let Ok(Some(credential)) = loader
+            .credential_account(session.user_id, session.account_id)
+            .await
+        else {
+            return internal_error();
+        };
+        let Ok(Some(preferences)) = loader
+            .preferences(session.user_id, session.account_id)
+            .await
+        else {
+            return internal_error();
+        };
+        let Ok(serialized) = state.serializer().credential_account(&credential) else {
+            return internal_error();
+        };
+        Some(FrontendAuthenticatedState {
+            account: serialized.account,
+            access_token: session.access_token.as_str().to_owned(),
+            account_id: session.account_id,
+            preferences: state.serializer().preferences(&preferences),
+            role: serialized.role,
+        })
+    } else {
+        None
+    };
+    let instance = state
+        .loader(None)
+        .instance(state.instance_runtime.clone())
+        .await
+        .ok();
+    let csrf_token = request_cookie(headers, BROWSER_CSRF_COOKIE)
+        .map_or_else(|| random_auth_token(32), ToOwned::to_owned);
+    let csp_nonce = random_auth_token(32);
+    let Some(document) = frontend_document(
+        &state.frontend,
+        &state.instance_runtime,
+        path,
+        instance.as_ref(),
+        authenticated.as_ref(),
+        &csrf_token,
+        &csp_nonce,
+    ) else {
+        return internal_error();
+    };
+    let mut response = html_response(StatusCode::OK, document);
+    response.headers_mut().insert(
+        "content-security-policy",
+        HeaderValue::from_str(&frontend_content_security_policy(&csp_nonce))
+            .expect("frontend CSP nonce is a valid header value"),
+    );
+    if request_cookie(headers, BROWSER_CSRF_COOKIE).is_none() {
+        append_cookie(
+            &mut response,
+            &browser_cookie(
+                BROWSER_CSRF_COOKIE,
+                &csrf_token,
+                FRONTEND_CSRF_MAX_AGE,
+                false,
+                state.origin.scheme() == "https",
+            ),
+        );
+    }
+    response
+}
+
+async fn frontend_manifest(State(state): State<WebState>) -> Response<Body> {
+    let Ok(instance) = state
+        .loader(None)
+        .instance(state.instance_runtime.clone())
+        .await
+    else {
+        return internal_error();
+    };
+    let Some(value) = frontend_manifest_value(&state.frontend, &instance.title) else {
+        return internal_error();
+    };
+    let mut response = json_response(
+        StatusCode::OK,
+        serde_json::to_vec(&value).expect("frontend manifest is serializable"),
+    );
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=180"),
+    );
+    response
+}
+
+async fn frontend_service_worker(State(state): State<WebState>) -> Response<Body> {
+    let mut response = frontend_file_response(
+        &state.frontend,
+        "packs/sw.js",
+        "text/javascript; charset=utf-8",
+        "no-cache",
+    );
+    if response.status().is_success() {
+        response
+            .headers_mut()
+            .insert("service-worker-allowed", HeaderValue::from_static("/"));
+    }
+    response
+}
+
+async fn frontend_favicon(State(state): State<WebState>) -> Response<Body> {
+    let Some(path) = state.frontend.asset("icons/favicon-32x32.png") else {
+        return not_found();
+    };
+    frontend_file_response(
+        &state.frontend,
+        &format!("packs/{}", path.file),
+        "image/png",
+        FRONTEND_CACHE,
+    )
+}
+
+async fn frontend_android_icon(State(state): State<WebState>) -> Response<Body> {
+    let Some(path) = state.frontend.asset("icons/android-chrome-192x192.png") else {
+        return not_found();
+    };
+    frontend_file_response(
+        &state.frontend,
+        &format!("packs/{}", path.file),
+        "image/png",
+        FRONTEND_CACHE,
+    )
+}
+
+fn frontend_file_response(
+    frontend: &FrontendAssets,
+    relative: &str,
+    content_type: &str,
+    cache_control: &str,
+) -> Response<Body> {
+    let Some(path) = frontend.path(relative) else {
+        return not_found();
+    };
+    let Ok(body) = std::fs::read(path) else {
+        return not_found();
+    };
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_str(cache_control)
+            .unwrap_or_else(|_| HeaderValue::from_static("no-cache")),
+    );
+    response
+}
+
+async fn frontend_asset_headers(request: Request, next: Next) -> Response<Body> {
+    let mut response = next.run(request).await;
+    if response.status().is_success() {
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static(FRONTEND_CACHE));
+    }
+    response
+}
+
+fn frontend_manifest_value(frontend: &FrontendAssets, title: &str) -> Option<serde_json::Value> {
+    let icons = FRONTEND_ANDROID_ICON_SIZES
+        .iter()
+        .map(|size| {
+            let source = format!("icons/android-chrome-{size}x{size}.png");
+            let src = frontend.asset_url(&source)?;
+            Some(serde_json::json!({
+                "src": src,
+                "sizes": format!("{size}x{size}"),
+                "type": "image/png",
+                "purpose": "any maskable",
+            }))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(serde_json::json!({
+        "instance": {
+            "id": "/home",
+            "name": title,
+            "short_name": title,
+            "icons": icons,
+            "theme_color": "#191b22",
+            "background_color": "#191b22",
+            "display": "standalone",
+            "start_url": "/",
+            "scope": "/",
+            "share_target": {
+                "url_template": "share?title={title}&text={text}&url={url}",
+                "action": "share",
+                "method": "GET",
+                "enctype": "application/x-www-form-urlencoded",
+                "params": {"title": "title", "text": "text", "url": "url"},
+            },
+            "shortcuts": [
+                {"name": "Compose new post", "url": "/publish"},
+                {"name": "Notifications", "url": "/notifications"},
+                {"name": "Explore", "url": "/explore"},
+            ],
+            "prefer_related_applications": true,
+            "related_applications": [
+                {
+                    "platform": "play",
+                    "url": "https://play.google.com/store/apps/details?id=org.joinmastodon.android",
+                    "id": "org.joinmastodon.android",
+                },
+                {
+                    "platform": "itunes",
+                    "url": "https://apps.apple.com/us/app/mastodon-for-iphone/id1571998974",
+                    "id": "id1571998974",
+                },
+                {
+                    "platform": "f-droid",
+                    "url": "https://f-droid.org/en/packages/org.joinmastodon.android/",
+                    "id": "org.joinmastodon.android",
+                },
+            ],
+        },
+    }))
+}
+
+fn frontend_document(
+    frontend: &FrontendAssets,
+    runtime: &InstanceRuntimeConfig,
+    path: &str,
+    instance: Option<&InstanceProjection>,
+    authenticated: Option<&FrontendAuthenticatedState>,
+    csrf_token: &str,
+    csp_nonce: &str,
+) -> Option<String> {
+    let theme = frontend.entry("styles/application.scss")?;
+    let inert = frontend.entry("styles/entrypoints/inert.scss")?;
+    let common = frontend.entry("entrypoints/common.ts")?;
+    let application = frontend.entry("entrypoints/application.ts")?;
+    let logo = frontend.asset_url("images/logo.svg")?;
+    let logo_symbol = frontend.asset_url("images/logo-symbol-icon.svg")?;
+    let initial_state = frontend_initial_state(runtime, instance, authenticated)?;
+    let initial_state = json_script(&initial_state)?;
+    let props = json_script(&serde_json::json!({"locale": "en"}))?;
+    let title = instance.map_or("Mastodon", |value| value.title.as_str());
+    let vapid_public_key = runtime.vapid_public_key.as_deref().unwrap_or_default();
+
+    let mut favicon_tags = String::new();
+    for size in [16_u16, 32, 48] {
+        let source = format!("icons/favicon-{size}x{size}.png");
+        let url = frontend.asset_url(&source)?;
+        let _ = write!(
+            favicon_tags,
+            "<link rel=\"icon\" sizes=\"{size}x{size}\" href=\"{}\" type=\"image/png\">",
+            html_escape::encode_quoted_attribute(&url),
+        );
+    }
+    let theme_url = frontend.entry_url("styles/application.scss")?;
+    let inert_url = frontend.entry_url("styles/entrypoints/inert.scss")?;
+    let common_url = frontend.entry_url("entrypoints/common.ts")?;
+    let application_url = frontend.entry_url("entrypoints/application.ts")?;
+    let theme_integrity = integrity_attribute(theme.integrity.as_deref());
+    let inert_integrity = integrity_attribute(inert.integrity.as_deref());
+    let common_integrity = integrity_attribute(common.integrity.as_deref());
+    let application_integrity = integrity_attribute(application.integrity.as_deref());
+    let escaped_title = html_escape::encode_text(title);
+    let escaped_path = html_escape::encode_quoted_attribute(path);
+    let escaped_csrf = html_escape::encode_quoted_attribute(csrf_token);
+    let escaped_csp_nonce = html_escape::encode_quoted_attribute(csp_nonce);
+    let escaped_vapid = html_escape::encode_quoted_attribute(vapid_public_key);
+    let escaped_props = html_escape::encode_quoted_attribute(&props);
+
+    Some(format!(
+        "<!doctype html><html lang=\"en\" data-contrast=\"auto\" data-color-scheme=\"auto\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">{favicon_tags}<link rel=\"mask-icon\" href=\"{}\" color=\"#6364FF\"><link rel=\"manifest\" href=\"/manifest\"><script nonce=\"{escaped_csp_nonce}\">{FRONTEND_THEME_SELECTION}</script><meta name=\"theme-color\" content=\"#191b22\"><meta name=\"mobile-web-app-capable\" content=\"yes\"><title>{escaped_title}</title><link rel=\"stylesheet\" href=\"{}\" media=\"all\" crossorigin=\"anonymous\"{theme_integrity}><link rel=\"stylesheet\" id=\"inert-style\" href=\"{}\" media=\"all\" crossorigin=\"anonymous\"{inert_integrity}><meta name=\"csrf-token\" content=\"{escaped_csrf}\"><meta name=\"applicationServerKey\" content=\"{escaped_vapid}\"><meta name=\"initialPath\" content=\"{escaped_path}\"><script id=\"initial-state\" type=\"application/json\" nonce=\"{escaped_csp_nonce}\">{initial_state}</script><script type=\"module\" crossorigin=\"anonymous\" src=\"{}\"{common_integrity}></script><script type=\"module\" crossorigin=\"anonymous\" src=\"{}\"{application_integrity}></script></head><body class=\"app-body\"><div class=\"notranslate app-holder\" id=\"mastodon\" data-props=\"{escaped_props}\"><noscript><img src=\"{}\" alt=\"Mastodon\"><div>JavaScript is required to use Mastodon. See <a href=\"https://joinmastodon.org/apps\">the Mastodon apps</a>.</div></noscript></div></body></html>",
+        html_escape::encode_quoted_attribute(&logo_symbol),
+        html_escape::encode_quoted_attribute(&theme_url),
+        html_escape::encode_quoted_attribute(&inert_url),
+        html_escape::encode_quoted_attribute(&common_url),
+        html_escape::encode_quoted_attribute(&application_url),
+        html_escape::encode_quoted_attribute(&logo),
+    ))
+}
+
+fn frontend_content_security_policy(nonce: &str) -> String {
+    format!(
+        "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; font-src 'self' data: https:; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; manifest-src 'self'; connect-src 'self' https: wss:; script-src 'self' 'nonce-{nonce}' 'wasm-unsafe-eval'; style-src 'self'; worker-src 'self' blob:; frame-src 'self' https:"
+    )
+}
+
+fn frontend_initial_state(
+    runtime: &InstanceRuntimeConfig,
+    instance: Option<&InstanceProjection>,
+    authenticated: Option<&FrontendAuthenticatedState>,
+) -> Option<serde_json::Value> {
+    let title = instance.map_or("Mastodon", |value| value.title.as_str());
+    let languages = runtime
+        .languages
+        .iter()
+        .map(|language| {
+            let name = if language == "en" {
+                "English"
+            } else {
+                language.as_str()
+            };
+            serde_json::json!([language, name, name])
+        })
+        .collect::<Vec<_>>();
+    let mut initial_state = serde_json::json!({
+        "accounts": {},
+        "compose": {"text": ""},
+        "features": [],
+        "languages": languages,
+        "media_attachments": {"accept_content_types": []},
+        "meta": {
+            "access_token": "",
+            "activity_api_enabled": false,
+            "admin": "",
+            "auto_play_gif": true,
+            "display_media": "default",
+            "domain": runtime.domain,
+            "landing_page": "about",
+            "limited_federation_mode": runtime.limited_federation,
+            "locale": "en",
+            "mascot": null,
+            "profile_directory": false,
+            "registrations_open": instance.is_some_and(|value| value.registrations_mode != "none"),
+            "reduce_motion": false,
+            "repository": runtime.source_url,
+            "search_enabled": false,
+            "single_user_mode": runtime.single_user_mode,
+            "source_url": runtime.source_url,
+            "status_page_url": instance.and_then(|value| value.status_page_url.clone()),
+            "streaming_api_base_url": runtime.streaming_api,
+            "title": title,
+            "trends_enabled": false,
+            "show_trends": false,
+            "use_blurhash": true,
+            "version": runtime.version,
+            "terms_of_service_enabled": runtime.terms_of_service_url.is_some(),
+            "local_live_feed_access": instance.map_or("public", |value| value.local_live_feed_access.as_str()),
+            "remote_live_feed_access": instance.map_or("public", |value| value.remote_live_feed_access.as_str()),
+            "local_topic_feed_access": instance.map_or("public", |value| value.local_topic_feed_access.as_str()),
+            "remote_topic_feed_access": instance.map_or("public", |value| value.remote_topic_feed_access.as_str()),
+        },
+        "settings": {},
+    });
+    if let Some(authenticated) = authenticated {
+        let account = serde_json::to_value(&authenticated.account).ok()?;
+        let role = serde_json::to_value(&authenticated.role).ok()?;
+        let account_id = authenticated.account_id.to_string();
+        initial_state["accounts"][&account_id] = account;
+        initial_state["compose"]["default_language"] =
+            serde_json::json!(authenticated.preferences.posting_default_language);
+        initial_state["compose"]["default_privacy"] =
+            serde_json::json!(authenticated.preferences.posting_default_visibility);
+        initial_state["compose"]["default_quote_policy"] =
+            serde_json::json!(authenticated.preferences.posting_default_quote_policy);
+        initial_state["compose"]["default_sensitive"] =
+            serde_json::json!(authenticated.preferences.posting_default_sensitive);
+        initial_state["compose"]["me"] = serde_json::json!(account_id);
+        initial_state["meta"]["access_token"] = serde_json::json!(&authenticated.access_token);
+        initial_state["meta"]["me"] = serde_json::json!(account_id);
+        initial_state["role"] = role;
+    }
+    Some(initial_state)
+}
+
+fn json_script(value: &serde_json::Value) -> Option<String> {
+    Some(
+        serde_json::to_string(value)
+            .ok()?
+            .replace('<', "\\u003c")
+            .replace('>', "\\u003e")
+            .replace('&', "\\u0026"),
+    )
+}
+
+fn integrity_attribute(integrity: Option<&str>) -> String {
+    integrity.map_or_else(String::new, |value| {
+        format!(
+            " integrity=\"{}\"",
+            html_escape::encode_quoted_attribute(value)
+        )
+    })
+}
+
+fn is_frontend_path(path: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "/",
+        "/about",
+        "/blocks",
+        "/bookmarks",
+        "/collections",
+        "/conversations",
+        "/deck",
+        "/directory",
+        "/domain_blocks",
+        "/explore",
+        "/favourites",
+        "/follow_requests",
+        "/followed_tags",
+        "/getting-started",
+        "/home",
+        "/keyboard-shortcuts",
+        "/links",
+        "/lists",
+        "/mutes",
+        "/notifications",
+        "/notifications_v2",
+        "/overview",
+        "/overview/about",
+        "/pinned",
+        "/privacy-policy",
+        "/profile",
+        "/public",
+        "/public/local",
+        "/public/remote",
+        "/publish",
+        "/search",
+        "/start",
+        "/statuses",
+        "/terms-of-service",
+    ];
+    if EXACT.contains(&path) || path.starts_with("/@") {
+        return true;
+    }
+    [
+        "/collections/",
+        "/deck/",
+        "/explore/",
+        "/links/",
+        "/lists/",
+        "/notifications/",
+        "/notifications_v2/",
+        "/profile/",
+        "/start/",
+        "/statuses/",
+        "/tags/",
+        "/terms-of-service/",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn router(state: WebState) -> Router {
     let media_route = format!("{}/{{*path}}", state.media_route_path.trim_end_matches('/'));
@@ -534,18 +3108,50 @@ pub fn router(state: WebState) -> Router {
         .route("/.well-known/host-meta", get(federation_host_meta))
         .route("/.well-known/host-meta.json", get(federation_host_meta))
         .route("/.well-known/nodeinfo", get(federation_nodeinfo_discovery))
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth_metadata),
+        )
         .route("/nodeinfo/2.0", get(federation_nodeinfo))
         .route("/actor", get(federation_actor_instance))
+        .route("/actor/inbox", post(federation_inbox_instance))
+        .route("/inbox", post(federation_inbox_shared))
         .route("/users/{username}", get(federation_actor_username))
+        .route("/users/{username}/inbox", post(federation_inbox_username))
         .route("/@{username}", get(federation_actor_username))
         .route("/ap/users/{id}", get(federation_actor_id))
+        .route("/ap/users/{account_id}/inbox", post(federation_inbox_id))
+        .route(
+            "/users/{username}/quote_authorizations/{id}",
+            get(federation_quote_authorization_username),
+        )
+        .route(
+            "/ap/users/{account_id}/quote_authorizations/{id}",
+            get(federation_quote_authorization_id),
+        )
         .route(
             "/users/{username}/statuses/{id}",
             get(federation_note_username),
         )
         .route(
+            "/users/{username}/statuses/{id}/activity",
+            get(federation_status_activity_username),
+        )
+        .route(
             "/ap/users/{account_id}/statuses/{id}",
             get(federation_note_id),
+        )
+        .route(
+            "/ap/users/{account_id}/statuses/{id}/activity",
+            get(federation_status_activity_id),
+        )
+        .route(
+            "/users/{username}/statuses/{status_id}/{collection}",
+            get(federation_status_collection_username),
+        )
+        .route(
+            "/ap/users/{account_id}/statuses/{status_id}/{collection}",
+            get(federation_status_collection_id),
         )
         .route("/users/{username}/outbox", get(federation_outbox_username))
         .route("/ap/users/{account_id}/outbox", get(federation_outbox_id))
@@ -567,8 +3173,112 @@ pub fn router(state: WebState) -> Router {
             get(federation_following_id),
         );
     let api = Router::new()
+        .route(
+            "/auth/sign_in",
+            get(browser_sign_in_page).post(browser_sign_in),
+        )
+        .route("/auth/password/new", get(browser_password_reset_page))
+        .route("/auth/password/edit", get(browser_password_reset_edit))
+        .route("/auth/confirmation", get(browser_confirmation))
+        .route(
+            "/auth/password",
+            post(browser_password_reset_request)
+                .patch(browser_password_reset_update)
+                .put(browser_password_reset_update),
+        )
+        .route(
+            "/auth/sign_out",
+            post(browser_sign_out).delete(browser_sign_out),
+        )
+        .route("/auth/session", get(browser_session))
+        .route("/settings", get(browser_settings_index))
+        .route("/settings/", get(browser_settings_index))
+        .route(
+            "/settings/profile",
+            get(browser_profile_page).post(browser_profile_update),
+        )
+        .route(
+            "/settings/profile/",
+            get(browser_profile_page).post(browser_profile_update),
+        )
+        .route(
+            "/settings/preferences",
+            get(browser_posting_defaults_redirect),
+        )
+        .route(
+            "/settings/preferences/",
+            get(browser_posting_defaults_redirect),
+        )
+        .route(
+            "/settings/preferences/appearance",
+            get(browser_settings_appearance),
+        )
+        .route(
+            "/settings/preferences/appearance/",
+            get(browser_settings_appearance),
+        )
+        .route(
+            "/settings/preferences/posting_defaults",
+            get(browser_posting_defaults_page).post(browser_posting_defaults_update),
+        )
+        .route(
+            "/settings/preferences/posting_defaults/",
+            get(browser_posting_defaults_page).post(browser_posting_defaults_update),
+        )
+        .route(
+            "/settings/security",
+            get(browser_security_page).post(browser_security_update),
+        )
+        .route(
+            "/settings/security/",
+            get(browser_security_page).post(browser_security_update),
+        )
+        .route(
+            "/settings/two_factor_authentication_methods",
+            get(browser_two_factor_methods_page),
+        )
+        .route(
+            "/settings/two_factor_authentication_methods/disable",
+            post(browser_two_factor_disable),
+        )
+        .route(
+            "/settings/otp_authentication",
+            get(browser_otp_authentication_page).post(browser_otp_authentication_start),
+        )
+        .route(
+            "/settings/two_factor_authentication/confirmation",
+            get(browser_otp_confirmation_redirect).post(browser_otp_confirmation),
+        )
+        .route(
+            "/settings/two_factor_authentication/recovery_codes",
+            post(browser_two_factor_recovery_codes),
+        )
+        .route(
+            "/settings/delete",
+            get(browser_delete_page)
+                .post(browser_delete)
+                .delete(browser_delete),
+        )
+        .route(
+            "/settings/delete/",
+            get(browser_delete_page)
+                .post(browser_delete)
+                .delete(browser_delete),
+        )
+        .route(
+            "/oauth/authorize",
+            get(oauth_authorize).post(oauth_authorize),
+        )
+        .route("/oauth/userinfo", get(oauth_userinfo).post(oauth_userinfo))
+        .route("/oauth/token", post(oauth_token))
+        .route("/oauth/revoke", post(oauth_revoke))
         .route("/health", get(health))
         .route("/ready", get(readiness))
+        .route("/api/v1/streaming", get(streaming))
+        .route("/api/v1/streaming/", get(streaming))
+        .route("/api/v1/streaming/user", get(streaming))
+        .route("/api/v1/streaming/user/notification", get(streaming))
+        .route("/api/v1/streaming/direct", get(streaming))
         .route("/api/v1/instance", get(instance_v1))
         .route("/api/v2/instance", get(instance_v2))
         .route("/api/v1/instance/rules", get(instance_rules))
@@ -579,10 +3289,113 @@ pub fn router(state: WebState) -> Router {
         .route("/api/v1/custom_emojis", get(custom_emojis))
         .route("/api/v1/accounts/lookup", get(account_lookup))
         .route("/api/v1/accounts/search", get(account_search))
-        .route("/api/v1/markers", get(markers))
+        .route("/api/v1/apps", post(app_create))
+        .route(
+            "/api/v1/apps/verify_credentials",
+            get(app_verify_credentials),
+        )
+        .route("/api/v1/markers", get(markers).post(marker_update))
+        .route("/api/v1/statuses", post(status_create))
+        .route("/api/v1/reports", post(report_create))
+        .route("/api/v1/media", post(media_create_v1))
+        .route(
+            "/api/v1/media/{id}",
+            get(media_show)
+                .patch(media_update)
+                .put(media_update)
+                .delete(media_delete),
+        )
+        .route("/api/v2/media", post(media_create_v2))
+        .route("/api/v1/conversations", get(conversations))
+        .route("/api/v1/conversations/{id}/read", post(conversation_read))
+        .route(
+            "/api/v1/conversations/{id}/unread",
+            post(conversation_unread),
+        )
+        .route("/api/v1/conversations/{id}", delete(conversation_delete))
+        .route("/api/v1/notifications", get(notifications))
+        .route("/api/v2/notifications", get(grouped_notifications))
+        .route("/api/v1/notifications/clear", post(notification_clear))
+        .route(
+            "/api/v1/notifications/{id}/dismiss",
+            post(notification_dismiss),
+        )
+        .route(
+            "/api/v2/notifications/clear",
+            post(grouped_notification_clear),
+        )
+        .route(
+            "/api/v2/notifications/{id}/dismiss",
+            post(grouped_notification_dismiss),
+        )
+        .route(
+            "/api/v1/notifications/requests/{id}/accept",
+            post(notification_request_accept),
+        )
+        .route(
+            "/api/v1/notifications/requests/{id}/dismiss",
+            post(notification_request_dismiss),
+        )
+        .route(
+            "/api/v1/notifications/requests/accept",
+            post(notification_requests_accept),
+        )
+        .route(
+            "/api/v1/notifications/requests/dismiss",
+            post(notification_requests_dismiss),
+        )
+        .route(
+            "/api/v1/notifications/requests/merged",
+            get(notification_requests_merged),
+        )
+        .route(
+            "/api/v1/notifications/policy",
+            get(notification_policy_v1).put(notification_policy_v1_update),
+        )
+        .route(
+            "/api/v1/notifications/unread_count",
+            get(notification_unread_count),
+        )
+        .route("/api/v1/notifications/{id}", get(notification_show))
+        .route("/api/v1/notifications/requests", get(notification_requests))
+        .route(
+            "/api/v1/notifications/requests/{id}",
+            get(notification_request_show),
+        )
+        .route(
+            "/api/v2/notifications/unread_count",
+            get(grouped_notification_unread_count),
+        )
+        .route("/api/v2/notifications/{id}", get(grouped_notification_show))
+        .route(
+            "/api/v2/notifications/policy",
+            get(notification_policy_v2).put(notification_policy_v2_update),
+        )
         .route("/api/v2/filters", get(filters))
         .route("/api/v1/lists", get(lists))
+        .route("/api/v1/lists/{id}", get(list_show))
+        .route("/api/v1/lists/{id}/accounts", get(list_accounts))
+        .route("/api/v1/accounts/{id}/lists", get(account_lists))
+        .route(
+            "/api/v1/accounts/{id}/collections",
+            get(account_collections),
+        )
+        .route(
+            "/api/v1/accounts/{id}/in_collections",
+            get(account_in_collections),
+        )
         .route("/api/v1/featured_tags", get(featured_tags))
+        .route("/api/v1/followed_tags", get(followed_tags))
+        .route("/api/v1/follow_requests", get(follow_requests))
+        .route(
+            "/api/v1/follow_requests/{id}/authorize",
+            post(authorize_follow_request),
+        )
+        .route(
+            "/api/v1/follow_requests/{id}/reject",
+            post(reject_follow_request),
+        )
+        .route("/api/v1/preferences", get(preferences))
         .route(
             "/api/v1/featured_tags/suggestions",
             get(featured_tag_suggestions),
@@ -596,14 +3409,50 @@ pub fn router(state: WebState) -> Router {
             "/api/v1/accounts/verify_credentials",
             get(verify_credentials),
         )
+        .route(
+            "/api/v1/accounts/update_credentials",
+            patch(update_credentials),
+        )
+        .route("/api/v1/profile/avatar", delete(delete_profile_avatar))
+        .route("/api/v1/profile/header", delete(delete_profile_header))
         .route("/api/v1/accounts/{id}", get(account_show))
         .route("/api/v1/collections/{id}", get(collection_show))
         .route("/api/v1/accounts/{id}/statuses", get(account_statuses))
         .route("/api/v1/accounts/{id}/followers", get(account_followers))
         .route("/api/v1/accounts/{id}/following", get(account_following))
-        .route("/api/v1/statuses/{id}", get(status_show))
+        .route("/api/v1/accounts/{id}/follow", post(follow_account))
+        .route("/api/v1/accounts/{id}/unfollow", post(unfollow_account))
+        .route(
+            "/api/v1/accounts/{id}/remove_from_followers",
+            post(remove_from_followers),
+        )
+        .route("/api/v1/accounts/{id}/block", post(block_account))
+        .route("/api/v1/accounts/{id}/unblock", post(unblock_account))
+        .route("/api/v1/accounts/{id}/mute", post(mute_account))
+        .route("/api/v1/accounts/{id}/unmute", post(unmute_account))
+        .route(
+            "/api/v1/statuses/{id}",
+            get(status_show)
+                .patch(status_update)
+                .put(status_update)
+                .delete(status_delete),
+        )
+        .route("/api/v1/statuses/{id}/bookmark", post(bookmark_status))
+        .route("/api/v1/statuses/{id}/unbookmark", post(unbookmark_status))
+        .route("/api/v1/statuses/{id}/favourite", post(favourite_status))
+        .route(
+            "/api/v1/statuses/{id}/unfavourite",
+            post(unfavourite_status),
+        )
+        .route("/api/v1/statuses/{id}/reblog", post(reblog_status))
+        .route("/api/v1/statuses/{id}/unreblog", post(unreblog_status))
+        .route("/api/v1/statuses/{id}/mute", post(mute_status))
+        .route("/api/v1/statuses/{id}/unmute", post(unmute_status))
+        .route("/api/v1/statuses/{id}/pin", post(pin_status))
+        .route("/api/v1/statuses/{id}/unpin", post(unpin_status))
         .route("/api/v1/statuses/{id}/source", get(status_source))
         .route("/api/v1/statuses/{id}/history", get(status_history))
+        .route("/api/v1/statuses/{id}/quotes", get(status_quotes))
         .route("/api/v1/statuses/{id}/favourited_by", get(favourited_by))
         .route("/api/v1/statuses/{id}/reblogged_by", get(reblogged_by))
         .route("/api/v1/statuses/{id}/context", get(status_context))
@@ -625,10 +3474,119 @@ pub fn router(state: WebState) -> Router {
         .route("/api/v1/custom_emojis/", get(custom_emojis))
         .route("/api/v1/accounts/lookup/", get(account_lookup))
         .route("/api/v1/accounts/search/", get(account_search))
-        .route("/api/v1/markers/", get(markers))
+        .route("/api/v1/apps/", post(app_create))
+        .route(
+            "/api/v1/apps/verify_credentials/",
+            get(app_verify_credentials),
+        )
+        .route("/api/v1/markers/", get(markers).post(marker_update))
+        .route("/api/v1/statuses/", post(status_create))
+        .route("/api/v1/reports/", post(report_create))
+        .route("/api/v1/media/", post(media_create_v1))
+        .route(
+            "/api/v1/media/{id}/",
+            get(media_show)
+                .patch(media_update)
+                .put(media_update)
+                .delete(media_delete),
+        )
+        .route("/api/v2/media/", post(media_create_v2))
+        .route("/api/v1/conversations/", get(conversations))
+        .route("/api/v1/conversations/{id}/read/", post(conversation_read))
+        .route(
+            "/api/v1/conversations/{id}/unread/",
+            post(conversation_unread),
+        )
+        .route("/api/v1/conversations/{id}/", delete(conversation_delete))
+        .route("/api/v1/notifications/", get(notifications))
+        .route("/api/v2/notifications/", get(grouped_notifications))
+        .route("/api/v1/notifications/clear/", post(notification_clear))
+        .route(
+            "/api/v1/notifications/{id}/dismiss/",
+            post(notification_dismiss),
+        )
+        .route(
+            "/api/v2/notifications/clear/",
+            post(grouped_notification_clear),
+        )
+        .route(
+            "/api/v2/notifications/{id}/dismiss/",
+            post(grouped_notification_dismiss),
+        )
+        .route(
+            "/api/v1/notifications/requests/{id}/accept/",
+            post(notification_request_accept),
+        )
+        .route(
+            "/api/v1/notifications/requests/{id}/dismiss/",
+            post(notification_request_dismiss),
+        )
+        .route(
+            "/api/v1/notifications/requests/accept/",
+            post(notification_requests_accept),
+        )
+        .route(
+            "/api/v1/notifications/requests/dismiss/",
+            post(notification_requests_dismiss),
+        )
+        .route(
+            "/api/v1/notifications/requests/merged/",
+            get(notification_requests_merged),
+        )
+        .route(
+            "/api/v1/notifications/policy/",
+            get(notification_policy_v1).put(notification_policy_v1_update),
+        )
+        .route(
+            "/api/v1/notifications/unread_count/",
+            get(notification_unread_count),
+        )
+        .route("/api/v1/notifications/{id}/", get(notification_show))
+        .route(
+            "/api/v1/notifications/requests/",
+            get(notification_requests),
+        )
+        .route(
+            "/api/v1/notifications/requests/{id}/",
+            get(notification_request_show),
+        )
+        .route(
+            "/api/v2/notifications/unread_count/",
+            get(grouped_notification_unread_count),
+        )
+        .route(
+            "/api/v2/notifications/{id}/",
+            get(grouped_notification_show),
+        )
+        .route(
+            "/api/v2/notifications/policy/",
+            get(notification_policy_v2).put(notification_policy_v2_update),
+        )
         .route("/api/v2/filters/", get(filters))
         .route("/api/v1/lists/", get(lists))
+        .route("/api/v1/lists/{id}/", get(list_show))
+        .route("/api/v1/lists/{id}/accounts/", get(list_accounts))
+        .route("/api/v1/accounts/{id}/lists/", get(account_lists))
+        .route(
+            "/api/v1/accounts/{id}/collections/",
+            get(account_collections),
+        )
+        .route(
+            "/api/v1/accounts/{id}/in_collections/",
+            get(account_in_collections),
+        )
         .route("/api/v1/featured_tags/", get(featured_tags))
+        .route("/api/v1/followed_tags/", get(followed_tags))
+        .route("/api/v1/follow_requests/", get(follow_requests))
+        .route(
+            "/api/v1/follow_requests/{id}/authorize/",
+            post(authorize_follow_request),
+        )
+        .route(
+            "/api/v1/follow_requests/{id}/reject/",
+            post(reject_follow_request),
+        )
+        .route("/api/v1/preferences/", get(preferences))
         .route(
             "/api/v1/featured_tags/suggestions/",
             get(featured_tag_suggestions),
@@ -642,14 +3600,50 @@ pub fn router(state: WebState) -> Router {
             "/api/v1/accounts/verify_credentials/",
             get(verify_credentials),
         )
+        .route(
+            "/api/v1/accounts/update_credentials/",
+            patch(update_credentials),
+        )
+        .route("/api/v1/profile/avatar/", delete(delete_profile_avatar))
+        .route("/api/v1/profile/header/", delete(delete_profile_header))
         .route("/api/v1/accounts/{id}/", get(account_show))
         .route("/api/v1/collections/{id}/", get(collection_show))
         .route("/api/v1/accounts/{id}/statuses/", get(account_statuses))
         .route("/api/v1/accounts/{id}/followers/", get(account_followers))
         .route("/api/v1/accounts/{id}/following/", get(account_following))
-        .route("/api/v1/statuses/{id}/", get(status_show))
+        .route("/api/v1/accounts/{id}/follow/", post(follow_account))
+        .route("/api/v1/accounts/{id}/unfollow/", post(unfollow_account))
+        .route(
+            "/api/v1/accounts/{id}/remove_from_followers/",
+            post(remove_from_followers),
+        )
+        .route("/api/v1/accounts/{id}/block/", post(block_account))
+        .route("/api/v1/accounts/{id}/unblock/", post(unblock_account))
+        .route("/api/v1/accounts/{id}/mute/", post(mute_account))
+        .route("/api/v1/accounts/{id}/unmute/", post(unmute_account))
+        .route(
+            "/api/v1/statuses/{id}/",
+            get(status_show)
+                .patch(status_update)
+                .put(status_update)
+                .delete(status_delete),
+        )
+        .route("/api/v1/statuses/{id}/bookmark/", post(bookmark_status))
+        .route("/api/v1/statuses/{id}/unbookmark/", post(unbookmark_status))
+        .route("/api/v1/statuses/{id}/favourite/", post(favourite_status))
+        .route(
+            "/api/v1/statuses/{id}/unfavourite/",
+            post(unfavourite_status),
+        )
+        .route("/api/v1/statuses/{id}/reblog/", post(reblog_status))
+        .route("/api/v1/statuses/{id}/unreblog/", post(unreblog_status))
+        .route("/api/v1/statuses/{id}/mute/", post(mute_status))
+        .route("/api/v1/statuses/{id}/unmute/", post(unmute_status))
+        .route("/api/v1/statuses/{id}/pin/", post(pin_status))
+        .route("/api/v1/statuses/{id}/unpin/", post(unpin_status))
         .route("/api/v1/statuses/{id}/source/", get(status_source))
         .route("/api/v1/statuses/{id}/history/", get(status_history))
+        .route("/api/v1/statuses/{id}/quotes/", get(status_quotes))
         .route("/api/v1/statuses/{id}/favourited_by/", get(favourited_by))
         .route("/api/v1/statuses/{id}/reblogged_by/", get(reblogged_by))
         .route("/api/v1/statuses/{id}/context/", get(status_context))
@@ -661,17 +3655,75 @@ pub fn router(state: WebState) -> Router {
         .route("/api/v1/bookmarks/", get(bookmarks))
         .route("/api/v1/blocks/", get(blocks))
         .route("/api/v1/mutes/", get(mutes))
-        .fallback(|| async { api_not_found() })
         .method_not_allowed_fallback(|| async { api_not_found() })
-        .layer(middleware::from_fn(api_protocol));
+        .reset_fallback()
+        .layer(middleware::from_fn_with_state(state.clone(), api_protocol));
+    let media_proxy = Router::new().route("/media_proxy/{*path}", get(media_proxy));
+    let frontend_assets = Router::new()
+        .nest_service("/packs", ServeDir::new(state.frontend.root.join("packs")))
+        .layer(middleware::from_fn(frontend_asset_headers));
+    let frontend_public_assets = Router::new()
+        .route_service(
+            "/badge.png",
+            ServeFile::new(state.frontend.root.join("badge.png")),
+        )
+        .route_service(
+            "/loading.gif",
+            ServeFile::new(state.frontend.root.join("loading.gif")),
+        )
+        .route_service(
+            "/loading.png",
+            ServeFile::new(state.frontend.root.join("loading.png")),
+        )
+        .route_service(
+            "/oops.gif",
+            ServeFile::new(state.frontend.root.join("oops.gif")),
+        )
+        .route_service(
+            "/oops.png",
+            ServeFile::new(state.frontend.root.join("oops.png")),
+        )
+        .route_service(
+            "/web-push-icon_expand.png",
+            ServeFile::new(state.frontend.root.join("web-push-icon_expand.png")),
+        )
+        .route_service(
+            "/web-push-icon_favourite.png",
+            ServeFile::new(state.frontend.root.join("web-push-icon_favourite.png")),
+        )
+        .route_service(
+            "/web-push-icon_reblog.png",
+            ServeFile::new(state.frontend.root.join("web-push-icon_reblog.png")),
+        )
+        .route("/android-chrome-192x192.png", get(frontend_android_icon))
+        .nest_service(
+            "/avatars",
+            ServeDir::new(state.frontend.root.join("avatars")),
+        )
+        .nest_service("/emoji", ServeDir::new(state.frontend.root.join("emoji")))
+        .nest_service(
+            "/headers",
+            ServeDir::new(state.frontend.root.join("headers")),
+        )
+        .nest_service("/ocr", ServeDir::new(state.frontend.root.join("ocr")))
+        .nest_service("/sounds", ServeDir::new(state.frontend.root.join("sounds")))
+        .layer(middleware::from_fn(frontend_asset_headers));
     Router::new()
+        .route("/manifest", get(frontend_manifest))
+        .route("/manifest.json", get(frontend_manifest))
+        .route("/sw.js", get(frontend_service_worker))
+        .route("/favicon.ico", get(frontend_favicon))
         .route(&media_route, any(paperclip_media))
+        .merge(media_proxy)
+        .merge(frontend_assets)
+        .merge(frontend_public_assets)
         .merge(federation)
         .merge(api)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             request_context,
         ))
+        .fallback(web_fallback)
         .with_state(state)
 }
 
@@ -720,6 +3772,643 @@ async fn federation_account(
     Ok(account)
 }
 
+async fn verify_optional_federation_signature(
+    state: &WebState,
+    client_ip: IpAddr,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Result<(), Response<Body>> {
+    verify_federation_request(
+        state,
+        client_ip,
+        &Method::GET,
+        uri,
+        headers,
+        &[],
+        false,
+        true,
+    )
+    .await
+    .map(|_| ())
+}
+
+#[derive(Clone, Debug)]
+struct VerifiedFederationRequest {
+    key_id: String,
+    actor_uri: Option<String>,
+}
+
+async fn verify_required_federation_signature(
+    state: &WebState,
+    client_ip: IpAddr,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<VerifiedFederationRequest, Response<Body>> {
+    verify_federation_request(state, client_ip, method, uri, headers, body, true, false)
+        .await?
+        .filter(|request| request.actor_uri.is_some())
+        .ok_or_else(signature_verification_failure)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn verify_federation_request(
+    state: &WebState,
+    client_ip: IpAddr,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+    required: bool,
+    persist_refreshed_key: bool,
+) -> Result<Option<VerifiedFederationRequest>, Response<Body>> {
+    let Some(key_id) = signature_key_id(headers).map_err(|_| {
+        error_response(
+            StatusCode::UNAUTHORIZED,
+            "Request signature verification failed",
+        )
+    })?
+    else {
+        if required || state.instance_runtime.limited_federation {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Request signature verification failed",
+            ));
+        }
+        return Ok(None);
+    };
+    let remote_domain = remote_signature_domain(&key_id, &state.local_domain, &state.origin)
+        .map_err(|()| {
+            error_response(
+                StatusCode::UNAUTHORIZED,
+                "Request signature verification failed",
+            )
+        })?;
+    if let Some(domain) = &remote_domain {
+        let allowed = state
+            .repository
+            .remote_domain_allowed(domain, state.instance_runtime.limited_federation)
+            .await
+            .map_err(|_| internal_error())?;
+        if !allowed {
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                "Request signature verification failed",
+            ));
+        }
+    }
+    let key = state
+        .repository
+        .activitypub_signature_key(&key_id, state.origin.as_str())
+        .await
+        .map_err(|_| internal_error())?;
+    if let Some(key) = key {
+        match verify_federation_signature(
+            method,
+            uri,
+            headers,
+            &key.key_id,
+            &key.public_key,
+            key.revoked,
+            key.expires_at,
+            body,
+        ) {
+            Ok(()) => {
+                let actor_uri = state
+                    .repository
+                    .account(key.account_id)
+                    .await
+                    .map_err(|_| internal_error())?
+                    .map(|account| activitypub::actor_url(&state.origin, &account));
+                return Ok(Some(VerifiedFederationRequest { key_id, actor_uri }));
+            }
+            Err(
+                FederationSignatureError::Inactive
+                | FederationSignatureError::Verification(
+                    HttpSignatureError::OutsideTimeWindow
+                    | HttpSignatureError::MissingDate
+                    | HttpSignatureError::InvalidDate,
+                ),
+            ) => {
+                return Err(signature_verification_failure());
+            }
+            Err(FederationSignatureError::Verification(error))
+                if should_refresh_federation_key(error) && remote_domain.is_some() =>
+            {
+                return Ok(Some(
+                    refresh_remote_federation_signature(
+                        state,
+                        client_ip,
+                        method,
+                        uri,
+                        headers,
+                        body,
+                        &key_id,
+                        persist_refreshed_key,
+                    )
+                    .await?,
+                ));
+            }
+            Err(_) => return Err(signature_verification_failure()),
+        }
+    }
+    if remote_domain.is_none() {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "Request signature verification failed",
+        ));
+    }
+    let verified = refresh_remote_federation_signature(
+        state,
+        client_ip,
+        method,
+        uri,
+        headers,
+        body,
+        &key_id,
+        persist_refreshed_key,
+    )
+    .await?;
+    Ok(Some(verified))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FederationSignatureError {
+    Inactive,
+    Verification(HttpSignatureError),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_federation_signature(
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    key_id: &str,
+    public_key: &str,
+    revoked: bool,
+    expires_at: Option<NaiveDateTime>,
+    body: &[u8],
+) -> Result<(), FederationSignatureError> {
+    if revoked || expires_at.is_some_and(|expires_at| expires_at <= Utc::now().naive_utc()) {
+        return Err(FederationSignatureError::Inactive);
+    }
+    let path_and_query = uri
+        .path_and_query()
+        .map_or_else(|| uri.path().to_owned(), |value| value.as_str().to_owned());
+    let request = HttpSignatureRequest::new(method, &path_and_query, headers, body);
+    let resolved_key = HttpSignatureKey {
+        key_id,
+        public_key_pem: public_key,
+    };
+    verify_http_signature(&request, &resolved_key, SystemTime::now())
+        .map_err(FederationSignatureError::Verification)?;
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+fn verify_federation_signature_request(
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    key_id: &str,
+    public_key: &str,
+    revoked: bool,
+    expires_at: Option<NaiveDateTime>,
+    body: &[u8],
+) -> Result<(), Response<Body>> {
+    verify_federation_signature(
+        method, uri, headers, key_id, public_key, revoked, expires_at, body,
+    )
+    .map_err(|_| signature_verification_failure())
+}
+
+fn should_refresh_federation_key(error: HttpSignatureError) -> bool {
+    matches!(
+        error,
+        HttpSignatureError::InvalidPublicKey | HttpSignatureError::SignatureMismatch
+    )
+}
+
+fn signature_verification_failure() -> Response<Body> {
+    error_response(
+        StatusCode::UNAUTHORIZED,
+        "Request signature verification failed",
+    )
+}
+
+fn signature_fetch_circuit_open() -> Response<Body> {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Request signature verification failed",
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn refresh_remote_federation_signature(
+    state: &WebState,
+    client_ip: IpAddr,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+    key_id: &str,
+    persist_refreshed_key: bool,
+) -> Result<VerifiedFederationRequest, Response<Body>> {
+    let Some(instance) = state
+        .repository
+        .account(-99)
+        .await
+        .map_err(|_| internal_error())?
+    else {
+        return Err(signature_verification_failure());
+    };
+    let Some(private_key) = instance.private_key.as_ref().filter(|key| key.is_present()) else {
+        return Err(signature_verification_failure());
+    };
+    let signer_key_id = format!(
+        "{}#main-key",
+        activitypub::actor_url(&state.origin, &instance)
+    );
+    let signer = HttpSignatureSigner {
+        key_id: &signer_key_id,
+        private_key_pem: private_key.as_str(),
+    };
+    let circuit_key = signature_fetch_circuit_key(client_ip);
+    let circuit_open = match state.shared_rate_limiter.as_ref() {
+        Some(shared) => shared.circuit_open(&circuit_key).await.unwrap_or(true),
+        None => !state.signature_fetch_circuit.allow(client_ip),
+    };
+    if circuit_open {
+        return Err(signature_fetch_circuit_open());
+    }
+    let resolution = match state
+        .remote_account_resolver
+        .resolve_key(key_id, Some(&signer))
+        .await
+    {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            if remote_signature_fetch_should_trip(&error) {
+                match state.shared_rate_limiter.as_ref() {
+                    Some(shared) => {
+                        if shared
+                            .record_circuit_failure(&circuit_key, SIGNATURE_FETCH_COOL_OFF)
+                            .await
+                            .is_err()
+                        {
+                            return Err(signature_fetch_circuit_open());
+                        }
+                    }
+                    None => state.signature_fetch_circuit.record_failure(client_ip),
+                }
+            }
+            return Err(remote_signature_fetch_failure(&error));
+        }
+    };
+    let allowed = state
+        .repository
+        .remote_domain_allowed(
+            &resolution.domain,
+            state.instance_runtime.limited_federation,
+        )
+        .await
+        .map_err(|_| internal_error())?;
+    if !allowed {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Request signature verification failed",
+        ));
+    }
+    verify_federation_signature(
+        method,
+        uri,
+        headers,
+        key_id,
+        &resolution.key.pem,
+        false,
+        None,
+        body,
+    )
+    .map_err(|_| signature_verification_failure())?;
+    let actor_uri = resolution.actor.id.to_string();
+    if !persist_refreshed_key {
+        return Ok(VerifiedFederationRequest {
+            key_id: key_id.to_owned(),
+            actor_uri: Some(actor_uri),
+        });
+    }
+    let Some(writer) = state.write_repository.as_ref() else {
+        return Ok(VerifiedFederationRequest {
+            key_id: key_id.to_owned(),
+            actor_uri: Some(actor_uri),
+        });
+    };
+    let mut actor = resolution.actor.clone();
+    if !actor
+        .public_keys
+        .iter()
+        .any(|key| key.id == resolution.key.id)
+    {
+        actor.public_keys.push(resolution.key.clone());
+    }
+    writer
+        .upsert_remote_actor(
+            &actor.username,
+            &resolution.domain,
+            state.instance_runtime.limited_federation,
+            &actor,
+        )
+        .await
+        .map_err(|_| internal_error())?;
+    let key = state
+        .repository
+        .activitypub_signature_key(key_id, state.origin.as_str())
+        .await
+        .map_err(|_| internal_error())?
+        .ok_or_else(signature_verification_failure)?;
+    verify_federation_signature_request(
+        method,
+        uri,
+        headers,
+        &key.key_id,
+        &key.public_key,
+        key.revoked,
+        key.expires_at,
+        body,
+    )?;
+    Ok(VerifiedFederationRequest {
+        key_id: key_id.to_owned(),
+        actor_uri: Some(actor_uri),
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InboxDeliveryTarget {
+    Shared,
+    Instance,
+    Account(i64),
+}
+
+impl InboxDeliveryTarget {
+    const fn account_id(self) -> Option<i64> {
+        match self {
+            Self::Shared => None,
+            Self::Instance => Some(-99),
+            Self::Account(account_id) => Some(account_id),
+        }
+    }
+}
+
+async fn federation_inbox_shared(
+    State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
+    request: Request,
+) -> Response<Body> {
+    federation_inbox_request(
+        state,
+        request,
+        InboxDeliveryTarget::Shared,
+        metadata.client_ip,
+    )
+    .await
+}
+
+async fn federation_inbox_instance(
+    State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
+    request: Request,
+) -> Response<Body> {
+    federation_inbox_request(
+        state,
+        request,
+        InboxDeliveryTarget::Instance,
+        metadata.client_ip,
+    )
+    .await
+}
+
+async fn federation_inbox_username(
+    State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(username): Path<String>,
+    request: Request,
+) -> Response<Body> {
+    let account_id = match federation_local_account_id(&state, &username).await {
+        Ok(account_id) => account_id,
+        Err(response) => return response,
+    };
+    federation_inbox_request(
+        state,
+        request,
+        InboxDeliveryTarget::Account(account_id),
+        metadata.client_ip,
+    )
+    .await
+}
+
+async fn federation_inbox_id(
+    State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Response<Body> {
+    let Some(account_id) = activitypub_path_id(&id) else {
+        return not_found();
+    };
+    if let Err(response) = federation_account(&state, account_id, false).await {
+        return response;
+    }
+    federation_inbox_request(
+        state,
+        request,
+        InboxDeliveryTarget::Account(account_id),
+        metadata.client_ip,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn federation_inbox_request(
+    state: WebState,
+    request: Request,
+    target: InboxDeliveryTarget,
+    client_ip: IpAddr,
+) -> Response<Body> {
+    let Some(queue) = state.queue.as_ref() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "Inbox unavailable");
+    };
+    if let Err(limited) = state
+        .activitypub_inbox_limiter
+        .check_shared(state.shared_rate_limiter.as_ref(), client_ip)
+        .await
+    {
+        return rate_limited_response(limited);
+    }
+    if request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > ACTIVITYPUB_INBOX_BODY_LIMIT_BYTES as u64)
+    {
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large");
+    }
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let headers = request.headers().clone();
+    let request = match bounded_request(request, ACTIVITYPUB_INBOX_BODY_LIMIT_BYTES).await {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let Some(body) = request
+        .extensions()
+        .get::<BufferedRequestBody>()
+        .map(|body| body.0.to_vec())
+    else {
+        return internal_error();
+    };
+    let verified = match verify_required_federation_signature(
+        &state, client_ip, &method, &uri, &headers, &body,
+    )
+    .await
+    {
+        Ok(verified) => verified,
+        Err(response) => return response,
+    };
+    let Some(actor_uri) = verified.actor_uri.as_deref() else {
+        return signature_verification_failure();
+    };
+    let key_id = verified.key_id;
+    let Ok(Some(remote_domain)) =
+        remote_signature_domain(&key_id, &state.local_domain, &state.origin)
+    else {
+        return signature_verification_failure();
+    };
+    let activity = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(serde_json::Value::Object(activity)) => serde_json::Value::Object(activity),
+        Ok(_) | Err(_) => {
+            return error_response(StatusCode::BAD_REQUEST, "Invalid ActivityPub JSON");
+        }
+    };
+    let Ok(body) = String::from_utf8(body) else {
+        return error_response(StatusCode::BAD_REQUEST, "Invalid ActivityPub JSON");
+    };
+    let logical_key = activitypub_inbox_logical_key(&activity, body.as_bytes(), actor_uri);
+    let logical_key = if activity
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| matches!(kind, "Create" | "Update" | "Delete"))
+        && activity
+            .get("object")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|object| object.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| matches!(kind, "Note" | "Tombstone"))
+        && let Some(target_account_id) = target.account_id()
+    {
+        format!("{logical_key}:delivery:{target_account_id}")
+    } else {
+        logical_key
+    };
+    let ordering_key = activitypub_inbox_ordering_key(actor_uri);
+    let fingerprint: [u8; 32] = Sha256::digest(body.as_bytes()).into();
+    let arguments = serde_json::json!({
+        "body": body,
+        "delivery_target_account_id": target.account_id(),
+        "signature_key_id": key_id,
+        "remote_domain": remote_domain,
+    });
+    let spec =
+        JobSpec::new(Lane::Ingress, ACTIVITYPUB_INBOX_JOB_KIND, arguments).logical_key(logical_key);
+    match queue
+        .enqueue_ordered_once(&spec, &ordering_key, &fingerprint)
+        .await
+    {
+        Ok(_) => {}
+        Err(JobError::Conflict(message)) => {
+            return error_response(StatusCode::CONFLICT, message);
+        }
+        Err(_) => return internal_error(),
+    }
+    Response::builder()
+        .status(StatusCode::ACCEPTED)
+        .body(Body::empty())
+        .expect("static accepted response is valid")
+}
+
+fn activitypub_inbox_logical_key(
+    activity: &serde_json::Value,
+    body: &[u8],
+    verified_actor_uri: &str,
+) -> String {
+    let activity_id = activity
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let source = activity_id.map_or_else(
+        || format!("{}\n{verified_actor_uri}", String::from_utf8_lossy(body)),
+        |activity_id| format!("{activity_id}\n{verified_actor_uri}"),
+    );
+    format!("activitypub:{:x}", Sha256::digest(source.as_bytes()))
+}
+
+fn activitypub_inbox_ordering_key(actor_uri: &str) -> [u8; 32] {
+    Sha256::digest(actor_uri.as_bytes()).into()
+}
+
+fn remote_signature_domain(
+    key_id: &str,
+    local_domain: &str,
+    local_origin: &Url,
+) -> Result<Option<String>, ()> {
+    if let Some(account) = key_id.strip_prefix("acct:") {
+        let (_, domain) = account.rsplit_once('@').ok_or(())?;
+        let domain = canonical_remote_domain(domain).map_err(|_| ())?;
+        return Ok((!domain.eq_ignore_ascii_case(local_domain)).then_some(domain));
+    }
+    let url = Url::parse(key_id).map_err(|_| ())?;
+    let authority = federation_url_authority(&url).ok_or(())?;
+    let local_authority = federation_url_authority(local_origin).ok_or(())?;
+    if authority.eq_ignore_ascii_case(&local_authority)
+        || url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case(local_domain))
+    {
+        return Ok(None);
+    }
+    // Key IDs commonly use fragments; only their validated origin is relevant here.
+    let mut origin = url;
+    origin.set_fragment(None);
+    canonical_remote_domain_from_url(&origin)
+        .map(Some)
+        .map_err(|_| ())
+}
+
+fn remote_signature_fetch_failure(error: &RemoteFetchError) -> Response<Body> {
+    let status = if remote_signature_fetch_should_trip(error)
+        || matches!(error, RemoteFetchError::DomainBudgetExceeded)
+    {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::UNAUTHORIZED
+    };
+    error_response(status, "Request signature verification failed")
+}
+
+fn remote_signature_fetch_should_trip(error: &RemoteFetchError) -> bool {
+    matches!(
+        error,
+        RemoteFetchError::Client
+            | RemoteFetchError::Dns
+            | RemoteFetchError::NoAddresses
+            | RemoteFetchError::Request
+            | RemoteFetchError::BodyRead
+    )
+}
+
 fn federation_domain_matches(state: &WebState, domain: &str) -> bool {
     let origin_authority = federation_url_authority(&state.origin);
     state
@@ -734,8 +4423,14 @@ fn federation_domain_matches(state: &WebState, domain: &str) -> bool {
 
 fn federation_url_authority(url: &Url) -> Option<String> {
     let host = url.host_str()?;
+    let default_port = match url.scheme() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    };
     Some(
         url.port()
+            .filter(|port| Some(*port) != default_port)
             .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}")),
     )
 }
@@ -763,7 +4458,13 @@ async fn federation_webfinger(
     let Some(resource) = parameters.get("resource") else {
         return error_response(StatusCode::BAD_REQUEST, "Missing resource");
     };
-    let account_id = if resource.starts_with("http://") || resource.starts_with("https://") {
+    let is_http_resource = resource
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || resource
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"));
+    let account_id = if is_http_resource {
         let Ok(url) = Url::parse(resource) else {
             return not_found();
         };
@@ -921,19 +4622,21 @@ async fn federation_nodeinfo(State(state): State<WebState>) -> Response<Body> {
 async fn federation_actor_instance(
     State(state): State<WebState>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Response<Body> {
-    federation_actor_response(&state, -99, &headers).await
+    federation_actor_response(&state, -99, None, &headers, &uri).await
 }
 
 async fn federation_actor_username(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(username): Path<String>,
     headers: HeaderMap,
     uri: Uri,
 ) -> Response<Body> {
     if !accepts_activitypub(&headers) {
         if uri.path().starts_with("/@") {
-            return not_found();
+            return frontend_html_response(&state, uri.path(), &headers).await;
         }
         return html_redirect(&state.origin, &format!("/@{username}"));
     }
@@ -941,30 +4644,40 @@ async fn federation_actor_username(
         Ok(account_id) => account_id,
         Err(response) => return response,
     };
-    federation_actor_response(&state, account_id, &headers).await
+    federation_actor_response(&state, account_id, Some(metadata.client_ip), &headers, &uri).await
 }
 
 async fn federation_actor_id(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Response<Body> {
     let Some(id) = activitypub_path_id(&id) else {
         return not_found();
     };
-    federation_actor_response(&state, id, &headers).await
+    federation_actor_response(&state, id, Some(metadata.client_ip), &headers, &uri).await
 }
 
 async fn federation_actor_response(
     state: &WebState,
     account_id: i64,
+    client_ip: Option<IpAddr>,
     headers: &HeaderMap,
+    uri: &Uri,
 ) -> Response<Body> {
     if !accepts_activitypub(headers) {
         return error_response(
             StatusCode::NOT_ACCEPTABLE,
             "ActivityPub representation required",
         );
+    }
+    if let Some(client_ip) = client_ip
+        && let Err(response) =
+            verify_optional_federation_signature(state, client_ip, uri, headers).await
+    {
+        return response;
     }
     let account = match federation_account(state, account_id, false).await {
         Ok(account) => account,
@@ -989,38 +4702,478 @@ async fn federation_actor_response(
     )
 }
 
+async fn federation_quote_authorization_username(
+    State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((username, quote_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response<Body> {
+    let account_id = match federation_local_account_id(&state, &username).await {
+        Ok(account_id) => account_id,
+        Err(response) => return response,
+    };
+    federation_quote_authorization_response(
+        &state,
+        account_id,
+        metadata.client_ip,
+        &quote_id,
+        &headers,
+        &uri,
+    )
+    .await
+}
+
+async fn federation_quote_authorization_id(
+    State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((account_id, quote_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response<Body> {
+    let Some(account_id) = activitypub_path_id(&account_id) else {
+        return not_found();
+    };
+    federation_quote_authorization_response(
+        &state,
+        account_id,
+        metadata.client_ip,
+        &quote_id,
+        &headers,
+        &uri,
+    )
+    .await
+}
+
+async fn federation_quote_authorization_response(
+    state: &WebState,
+    quoted_account_id: i64,
+    client_ip: IpAddr,
+    quote_id: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Response<Body> {
+    if !accepts_activitypub(headers) {
+        return error_response(
+            StatusCode::NOT_ACCEPTABLE,
+            "ActivityPub representation required",
+        );
+    }
+    let Some(quote_id) = route_path_id(quote_id) else {
+        return not_found();
+    };
+    let quoted_account = match federation_account(state, quoted_account_id, true).await {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
+    let viewer_account_id = match federation_status_viewer(state, client_ip, uri, headers).await {
+        Ok(viewer_account_id) => viewer_account_id,
+        Err(response) => return response,
+    };
+    let Some(quote) = (match state
+        .repository
+        .activitypub_quote_authorization(quoted_account.id, quote_id)
+        .await
+    {
+        Ok(quote) => quote,
+        Err(_) => return internal_error(),
+    }) else {
+        return not_found();
+    };
+    let Some(quoted_status_id) = quote.quoted_status_id else {
+        return not_found();
+    };
+    let Some(quoted_status) = (match state.repository.status(quoted_status_id).await {
+        Ok(status) => status,
+        Err(_) => return internal_error(),
+    }) else {
+        return not_found();
+    };
+    let authorized = match state
+        .repository
+        .rest_authorized_status_ids(&[quoted_status.id], viewer_account_id)
+        .await
+    {
+        Ok(ids) => ids == [quoted_status.id],
+        Err(_) => return internal_error(),
+    };
+    if !authorized {
+        return not_found();
+    }
+    let Some(quoting_status) = (match state.repository.status(quote.status_id).await {
+        Ok(status) => status,
+        Err(_) => return internal_error(),
+    }) else {
+        return not_found();
+    };
+    let Some(quoting_account) = (match state.repository.account(quote.account_id).await {
+        Ok(account) => account,
+        Err(_) => return internal_error(),
+    }) else {
+        return not_found();
+    };
+    signature_sensitive_activity_response(
+        headers,
+        activitypub::quote_authorization(
+            &state.origin,
+            &quoted_account,
+            &quoted_status,
+            &quoting_account,
+            &quoting_status,
+            quote.id,
+        ),
+    )
+}
+
 async fn federation_note_username(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path((username, id)): Path<(String, String)>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Response<Body> {
     if !accepts_activitypub(&headers) {
         return html_redirect(&state.origin, &format!("/@{username}/{id}"));
+    }
+    let response = match federation_local_account_id(&state, &username).await {
+        Ok(account_id) => {
+            federation_note_response(&state, account_id, metadata.client_ip, &id, &headers, &uri)
+                .await
+        }
+        Err(response) => response,
+    };
+    finalize_activitypub_status_response(state.instance_runtime.limited_federation, response)
+}
+
+async fn federation_note_id(
+    State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((account_id, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response<Body> {
+    let response = match activitypub_path_id(&account_id) {
+        Some(account_id) => {
+            federation_note_response(&state, account_id, metadata.client_ip, &id, &headers, &uri)
+                .await
+        }
+        None => not_found(),
+    };
+    finalize_activitypub_status_response(state.instance_runtime.limited_federation, response)
+}
+
+async fn federation_status_collection_username(
+    State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((username, status_id, collection)): Path<(String, String, String)>,
+    Query(parameters): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response<Body> {
+    if !matches!(collection.as_str(), "replies" | "likes" | "shares") {
+        return not_found();
+    }
+    if !accepts_activitypub(&headers) {
+        return html_redirect(
+            &state.origin,
+            &format!("/@{username}/{status_id}/{collection}"),
+        );
     }
     let account_id = match federation_local_account_id(&state, &username).await {
         Ok(account_id) => account_id,
         Err(response) => return response,
     };
-    federation_note_response(&state, account_id, &id, &headers).await
+    federation_status_collection_response(
+        &state,
+        account_id,
+        &status_id,
+        &collection,
+        metadata.client_ip,
+        parameters,
+        &headers,
+        &uri,
+    )
+    .await
 }
 
-async fn federation_note_id(
+async fn federation_status_collection_id(
     State(state): State<WebState>,
-    Path((account_id, id)): Path<(String, String)>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((account_id, status_id, collection)): Path<(String, String, String)>,
+    Query(parameters): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Response<Body> {
+    if !matches!(collection.as_str(), "replies" | "likes" | "shares") {
+        return not_found();
+    }
     let Some(account_id) = activitypub_path_id(&account_id) else {
         return not_found();
     };
-    federation_note_response(&state, account_id, &id, &headers).await
+    federation_status_collection_response(
+        &state,
+        account_id,
+        &status_id,
+        &collection,
+        metadata.client_ip,
+        parameters,
+        &headers,
+        &uri,
+    )
+    .await
+}
+
+#[allow(
+    clippy::manual_let_else,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+async fn federation_status_collection_response(
+    state: &WebState,
+    account_id: i64,
+    status_id: &str,
+    collection: &str,
+    client_ip: IpAddr,
+    parameters: HashMap<String, String>,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Response<Body> {
+    if !accepts_activitypub(headers) {
+        return error_response(
+            StatusCode::NOT_ACCEPTABLE,
+            "ActivityPub representation required",
+        );
+    }
+    let Some(status_id) = route_path_id(status_id) else {
+        return not_found();
+    };
+    let account = match federation_account(state, account_id, true).await {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
+    let viewer_account_id = match federation_signed_viewer(state, client_ip, uri, headers).await {
+        Ok(viewer_account_id) => viewer_account_id,
+        Err(response) => return response,
+    };
+    let authorized = match state
+        .repository
+        .rest_authorized_status_ids(&[status_id], viewer_account_id)
+        .await
+    {
+        Ok(ids) => ids == [status_id],
+        Err(_) => return internal_error(),
+    };
+    if !authorized {
+        return not_found();
+    }
+    let status = match state.repository.status(status_id).await {
+        Ok(Some(status)) if status.account_id == account.id => status,
+        Ok(_) => return not_found(),
+        Err(_) => return internal_error(),
+    };
+    match collection {
+        "replies" => {
+            let only_other_accounts = parameters
+                .get("only_other_accounts")
+                .is_some_and(|value| activitypub_truthy(value));
+            let min_id = parameters
+                .get("min_id")
+                .and_then(|value| route_path_id(value));
+            let Ok(replies) = state
+                .repository
+                .activitypub_reply_statuses(account.id, status.id, only_other_accounts, min_id, 60)
+                .await
+            else {
+                return internal_error();
+            };
+            let Ok(items) = activitypub_reply_items(state, &replies).await else {
+                return internal_error();
+            };
+            let page_requested = parameters
+                .get("page")
+                .is_some_and(|value| activitypub_truthy(value));
+            let base = activitypub::replies_url(&state.origin, &account, &status);
+            let next = if only_other_accounts {
+                (replies.len() == 60).then(|| {
+                    activitypub_replies_next_url(&base, replies.last().map(|reply| reply.id), true)
+                })
+            } else {
+                let next_only_other_accounts = replies
+                    .last()
+                    .is_none_or(|reply| reply.account_id != account.id)
+                    || replies.len() < 60;
+                Some(activitypub_replies_next_url(
+                    &base,
+                    (!next_only_other_accounts)
+                        .then(|| replies.last().map(|reply| reply.id))
+                        .flatten(),
+                    next_only_other_accounts,
+                ))
+            };
+            let page_id = activitypub_replies_page_id(&base, &parameters);
+            let mut page = serde_json::json!({
+                "@context": activitypub::ACTIVITY_STREAMS_CONTEXT,
+                "id": page_id,
+                "type": "CollectionPage",
+                "partOf": base.clone(),
+                "items": items
+            });
+            if let Some(next) = next {
+                page["next"] = serde_json::Value::String(next);
+            }
+            let value = if page_requested {
+                page
+            } else {
+                serde_json::json!({
+                    "@context": activitypub::ACTIVITY_STREAMS_CONTEXT,
+                    "id": base,
+                    "type": "Collection",
+                    "first": page
+                })
+            };
+            signature_sensitive_activity_response(headers, value)
+        }
+        "likes" | "shares" => {
+            let (base, count) = match activitypub_status_counts(state, status.id).await {
+                Ok((favourites_count, _reblogs_count)) if collection == "likes" => (
+                    activitypub::likes_url(&state.origin, &account, &status),
+                    favourites_count,
+                ),
+                Ok((_favourites_count, reblogs_count)) => (
+                    activitypub::shares_url(&state.origin, &account, &status),
+                    reblogs_count,
+                ),
+                Err(()) => return internal_error(),
+            };
+            signature_sensitive_activity_response(
+                headers,
+                serde_json::json!({
+                    "@context": activitypub::ACTIVITY_STREAMS_CONTEXT,
+                    "id": base,
+                    "type": "Collection",
+                    "totalItems": count
+                }),
+            )
+        }
+        _ => not_found(),
+    }
+}
+
+async fn activitypub_reply_items(
+    state: &WebState,
+    replies: &[crate::mastodon::Status],
+) -> Result<Vec<serde_json::Value>, ()> {
+    let mut items = Vec::with_capacity(replies.len());
+    for reply in replies {
+        if reply.local == Some(true) || reply.uri.is_none() {
+            let Some(reply_account) = state
+                .repository
+                .account(reply.account_id)
+                .await
+                .map_err(|_| ())?
+            else {
+                return Err(());
+            };
+            items.push(federation_note_value(state, reply, &reply_account).await?);
+        } else {
+            items.push(
+                reply
+                    .uri
+                    .clone()
+                    .map_or(serde_json::Value::Null, serde_json::Value::String),
+            );
+        }
+    }
+    Ok(items)
+}
+
+fn activitypub_replies_page_id(base: &str, parameters: &HashMap<String, String>) -> String {
+    let mut query = Vec::new();
+    if let Some(value) = parameters.get("only_other_accounts") {
+        query.push(format!("only_other_accounts={value}"));
+    }
+    if let Some(value) = parameters.get("min_id") {
+        query.push(format!("min_id={value}"));
+    }
+    query.push("page=true".to_owned());
+    format!("{base}?{}", query.join("&"))
+}
+
+fn activitypub_replies_next_url(
+    base: &str,
+    min_id: Option<i64>,
+    only_other_accounts: bool,
+) -> String {
+    let mut query = Vec::new();
+    if only_other_accounts {
+        query.push("only_other_accounts=true".to_owned());
+    }
+    if let Some(min_id) = min_id {
+        query.push(format!("min_id={min_id}"));
+    }
+    query.push("page=true".to_owned());
+    format!("{base}?{}", query.join("&"))
+}
+
+async fn federation_status_activity_username(
+    State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((username, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response<Body> {
+    if !accepts_activitypub(&headers) {
+        return html_redirect(&state.origin, &format!("/@{username}/{id}"));
+    }
+    let response = match federation_local_account_id(&state, &username).await {
+        Ok(account_id) => {
+            federation_status_activity_response(
+                &state,
+                account_id,
+                metadata.client_ip,
+                &id,
+                &headers,
+                &uri,
+            )
+            .await
+        }
+        Err(response) => response,
+    };
+    finalize_activitypub_status_response(state.instance_runtime.limited_federation, response)
+}
+
+async fn federation_status_activity_id(
+    State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((account_id, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response<Body> {
+    let response = match activitypub_path_id(&account_id) {
+        Some(account_id) => {
+            federation_status_activity_response(
+                &state,
+                account_id,
+                metadata.client_ip,
+                &id,
+                &headers,
+                &uri,
+            )
+            .await
+        }
+        None => not_found(),
+    };
+    finalize_activitypub_status_response(state.instance_runtime.limited_federation, response)
 }
 
 #[allow(clippy::manual_let_else)]
 async fn federation_note_response(
     state: &WebState,
     account_id: i64,
+    client_ip: IpAddr,
     id: &str,
     headers: &HeaderMap,
+    uri: &Uri,
 ) -> Response<Body> {
     if !accepts_activitypub(headers) {
         return error_response(
@@ -1035,27 +5188,383 @@ async fn federation_note_response(
         Ok(account) => account,
         Err(response) => return response,
     };
+    let viewer_account_id = match federation_status_viewer(state, client_ip, uri, headers).await {
+        Ok(viewer_account_id) => viewer_account_id,
+        Err(response) => return response,
+    };
+    let authorized = match state
+        .repository
+        .rest_authorized_status_ids(&[status_id], viewer_account_id)
+        .await
+    {
+        Ok(ids) => ids == [status_id],
+        Err(_) => return internal_error(),
+    };
+    if !authorized {
+        return not_found();
+    }
     let Some(status) = (match state.repository.status(status_id).await {
         Ok(status) => status,
         Err(_) => return internal_error(),
     }) else {
         return not_found();
     };
-    if status.account_id != account_id
-        || !matches!(
-            status.visibility,
-            crate::mastodon::StatusVisibility::Public | crate::mastodon::StatusVisibility::Unlisted
-        )
-    {
+    if status.account_id != account_id {
         return not_found();
     }
-    let media = match state.repository.media_attachments(status_id).await {
-        Ok(media) => media,
+    if let Some(source_id) = status.reblog_of_id {
+        let Some(source) = (match state.repository.status(source_id).await {
+            Ok(source) => source,
+            Err(_) => return internal_error(),
+        }) else {
+            return not_found();
+        };
+        let Some(source_account) = (match state.repository.account(source.account_id).await {
+            Ok(source_account) => source_account,
+            Err(_) => return internal_error(),
+        }) else {
+            return internal_error();
+        };
+        return activitypub_status_redirect(&activitypub::status_url(
+            &state.origin,
+            &source_account,
+            &source,
+        ));
+    }
+    let pending_quote = match state
+        .repository
+        .activitypub_status_has_pending_quote(status.id)
+        .await
+    {
+        Ok(pending_quote) => pending_quote,
         Err(_) => return internal_error(),
     };
-    let mention_rows = match state.repository.mentions(status_id).await {
-        Ok(rows) => rows,
+    let Ok(note) = federation_note_value(state, &status, &account).await else {
+        return internal_error();
+    };
+    let Some(note_id) = note["id"].as_str().map(str::to_owned) else {
+        return internal_error();
+    };
+    signature_sensitive_status_response(
+        headers,
+        note,
+        &note_id,
+        !state.instance_runtime.limited_federation,
+        matches!(
+            status.visibility,
+            crate::mastodon::StatusVisibility::Public | crate::mastodon::StatusVisibility::Unlisted
+        ),
+        ActivityPubStatusDocument::Note { pending_quote },
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+async fn federation_status_activity_response(
+    state: &WebState,
+    account_id: i64,
+    client_ip: IpAddr,
+    id: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Response<Body> {
+    if !accepts_activitypub(headers) {
+        return error_response(
+            StatusCode::NOT_ACCEPTABLE,
+            "ActivityPub representation required",
+        );
+    }
+    let account = match federation_account(state, account_id, true).await {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
+    let Some(status_id) = route_path_id(id) else {
+        return not_found();
+    };
+    let viewer_account_id = match federation_status_viewer(state, client_ip, uri, headers).await {
+        Ok(viewer_account_id) => viewer_account_id,
+        Err(response) => return response,
+    };
+    let authorized = match state
+        .repository
+        .rest_authorized_status_ids(&[status_id], viewer_account_id)
+        .await
+    {
+        Ok(ids) => ids == [status_id],
         Err(_) => return internal_error(),
+    };
+    if !authorized {
+        return not_found();
+    }
+    let Some(status) = (match state.repository.status(status_id).await {
+        Ok(status) => status,
+        Err(_) => return internal_error(),
+    }) else {
+        return not_found();
+    };
+    if status.account_id != account.id {
+        return not_found();
+    }
+    let Ok(note) = federation_note_value(state, &status, &account).await else {
+        return internal_error();
+    };
+    let activity = if let Some(source_id) = status.reblog_of_id {
+        let Some(source) = (match state.repository.status(source_id).await {
+            Ok(source) => source,
+            Err(_) => return internal_error(),
+        }) else {
+            return not_found();
+        };
+        let Some(source_account) = (match state.repository.account(source.account_id).await {
+            Ok(source_account) => source_account,
+            Err(_) => return internal_error(),
+        }) else {
+            return internal_error();
+        };
+        let object = if status.visibility == crate::mastodon::StatusVisibility::Private
+            && source.local == Some(true)
+            && source_account.id == account.id
+        {
+            match federation_note_value(state, &source, &source_account).await {
+                Ok(note) => note,
+                Err(()) => return internal_error(),
+            }
+        } else {
+            serde_json::Value::String(activitypub::status_uri(
+                &state.origin,
+                &source_account,
+                &source,
+            ))
+        };
+        let mut cc = note["cc"].clone();
+        if let serde_json::Value::Array(values) = &mut cc {
+            values.push(serde_json::Value::String(activitypub::actor_url(
+                &state.origin,
+                &source_account,
+            )));
+        }
+        activitypub::status_activity(
+            &state.origin,
+            &account,
+            &status,
+            object,
+            note["to"].clone(),
+            cc,
+        )
+    } else {
+        activitypub::status_activity(
+            &state.origin,
+            &account,
+            &status,
+            note,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        )
+    };
+    let activity_uri = activitypub::status_uri(&state.origin, &account, &status);
+    signature_sensitive_status_response(
+        headers,
+        activity,
+        &activity_uri,
+        !state.instance_runtime.limited_federation,
+        matches!(
+            status.visibility,
+            crate::mastodon::StatusVisibility::Public | crate::mastodon::StatusVisibility::Unlisted
+        ),
+        ActivityPubStatusDocument::Activity,
+    )
+}
+
+fn signature_sensitive_activity_response(
+    headers: &HeaderMap,
+    value: serde_json::Value,
+) -> Response<Body> {
+    let mut response = activity_response(StatusCode::OK, ACTIVITY_JSON, value);
+    response
+        .headers_mut()
+        .insert(VARY, HeaderValue::from_static("Accept, Signature"));
+    if headers.contains_key("signature") {
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static(PRIVATE_CACHE));
+    }
+    response
+}
+
+fn signature_sensitive_status_response(
+    headers: &HeaderMap,
+    value: serde_json::Value,
+    activity_uri: &str,
+    public_fetch_mode: bool,
+    distributable: bool,
+    document: ActivityPubStatusDocument,
+) -> Response<Body> {
+    let mut response = activity_response(StatusCode::OK, ACTIVITY_JSON, value);
+    let vary = if public_fetch_mode {
+        ACTIVITYPUB_STATUS_PUBLIC_VARY
+    } else {
+        ACTIVITYPUB_STATUS_AUTHORIZED_VARY
+    };
+    response
+        .headers_mut()
+        .insert(VARY, HeaderValue::from_static(vary));
+    let has_viewer_credentials = [COOKIE.as_str(), AUTHORIZATION.as_str(), "signature"]
+        .into_iter()
+        .any(|name| request_header_is_nonempty(headers, name));
+    let cache_control = if public_fetch_mode && distributable && !has_viewer_credentials {
+        match document {
+            ActivityPubStatusDocument::Note {
+                pending_quote: true,
+            } => ACTIVITYPUB_STATUS_PENDING_QUOTE_CACHE,
+            ActivityPubStatusDocument::Note {
+                pending_quote: false,
+            }
+            | ActivityPubStatusDocument::Activity => ACTIVITYPUB_STATUS_PUBLIC_CACHE,
+        }
+    } else if public_fetch_mode
+        && !distributable
+        && matches!(document, ActivityPubStatusDocument::Activity)
+    {
+        ACTIVITYPUB_STATUS_PRIVATE_ACTIVITY_CACHE
+    } else {
+        PRIVATE_CACHE
+    };
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(cache_control));
+    response.headers_mut().insert(
+        "link",
+        HeaderValue::from_str(&format!(
+            "<{activity_uri}>; rel=\"alternate\"; type=\"application/activity+json\""
+        ))
+        .expect("ActivityPub status link header is valid"),
+    );
+    response
+}
+
+fn activitypub_status_redirect(location: &str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(LOCATION, location)
+        .body(Body::empty())
+        .expect("ActivityPub status redirect headers are valid")
+}
+
+fn finalize_activitypub_status_response(
+    limited_federation: bool,
+    mut response: Response<Body>,
+) -> Response<Body> {
+    if response.status().is_success() {
+        return response;
+    }
+    let vary = if limited_federation {
+        ACTIVITYPUB_STATUS_AUTHORIZED_VARY
+    } else {
+        ACTIVITYPUB_STATUS_PUBLIC_VARY
+    };
+    response
+        .headers_mut()
+        .insert(VARY, HeaderValue::from_static(vary));
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(PRIVATE_CACHE));
+    response
+}
+
+async fn federation_status_viewer(
+    state: &WebState,
+    client_ip: IpAddr,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Result<Option<i64>, Response<Body>> {
+    let browser_viewer = optional_browser_session_viewer(state, headers).await?;
+    let signature_key_id = match verify_federation_request(
+        state,
+        client_ip,
+        &Method::GET,
+        uri,
+        headers,
+        &[],
+        false,
+        true,
+    )
+    .await
+    {
+        Ok(signature_key_id) => signature_key_id,
+        Err(response)
+            if !state.instance_runtime.limited_federation
+                && (response.status().is_client_error()
+                    || response.status() == StatusCode::SERVICE_UNAVAILABLE) =>
+        {
+            return Ok(browser_viewer.or(optional_viewer(state, headers, READ_STATUSES).await?));
+        }
+        Err(response) => return Err(response),
+    };
+    if browser_viewer.is_some() {
+        return Ok(browser_viewer);
+    }
+    if let Some(signature) = signature_key_id {
+        return state
+            .repository
+            .activitypub_signature_key(&signature.key_id, state.origin.as_str())
+            .await
+            .map(|key| key.map(|key| key.account_id))
+            .map_err(|_| internal_error());
+    }
+    optional_viewer(state, headers, READ_STATUSES).await
+}
+
+async fn federation_signed_viewer(
+    state: &WebState,
+    client_ip: IpAddr,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Result<Option<i64>, Response<Body>> {
+    let Some(signature) = verify_federation_request(
+        state,
+        client_ip,
+        &Method::GET,
+        uri,
+        headers,
+        &[],
+        false,
+        true,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    state
+        .repository
+        .activitypub_signature_key(&signature.key_id, state.origin.as_str())
+        .await
+        .map(|key| key.map(|key| key.account_id))
+        .map_err(|_| internal_error())
+}
+
+async fn optional_browser_session_viewer(
+    state: &WebState,
+    headers: &HeaderMap,
+) -> Result<Option<i64>, Response<Body>> {
+    let Some(session_id) = request_cookie(headers, BROWSER_SESSION_COOKIE) else {
+        return Ok(None);
+    };
+    match state.repository.browser_session(session_id).await {
+        Ok(Some(session)) => Ok(Some(session.account_id)),
+        Ok(None) => Ok(None),
+        Err(_) => Err(internal_error()),
+    }
+}
+
+async fn federation_note_value(
+    state: &WebState,
+    status: &crate::mastodon::Status,
+    account: &Account,
+) -> Result<serde_json::Value, ()> {
+    let Ok(media) = state.repository.media_attachments(status.id).await else {
+        return Err(());
+    };
+    let Ok(mention_rows) = state.repository.mentions(status.id).await else {
+        return Err(());
     };
     let mut mentions = Vec::new();
     for mention in mention_rows {
@@ -1065,47 +5574,64 @@ async fn federation_note_response(
             mentions.push((mention, target));
         }
     }
-    let hashtags = match state.repository.rest_status_tag_rows(&[status_id]).await {
+    let hashtags = match state.repository.rest_status_tag_rows(&[status.id]).await {
         Ok(rows) => rows
             .into_iter()
             .map(|row| (row.name.clone(), row.display_name.unwrap_or(row.name)))
             .collect::<Vec<_>>(),
-        Err(_) => return internal_error(),
+        Err(_) => return Err(()),
     };
-    let quoted_link = match activitypub_quote_url(state, status_id).await {
-        Ok(quoted_link) => quoted_link,
-        Err(()) => return internal_error(),
+    let (favourites_count, reblogs_count) = activitypub_status_counts(state, status.id).await?;
+    let Ok(quoted_link) = activitypub_quote_url(state, status.id).await else {
+        return Err(());
     };
-    let quoted_identifier = match activitypub_quote_uri(state, status_id).await {
-        Ok(quoted_identifier) => quoted_identifier,
-        Err(()) => return internal_error(),
+    let Ok(quoted_identifier) = activitypub_quote_uri(state, status.id).await else {
+        return Err(());
     };
-    let replies = match activitypub_replies(state, &account, &status).await {
-        Ok(replies) => replies,
-        Err(()) => return internal_error(),
+    let Ok(quote_authorization) = activitypub_quote_authorization(state, status.id).await else {
+        return Err(());
     };
-    let in_reply_to_url = match activitypub_reply_url(state, &status).await {
-        Ok(in_reply_to_url) => in_reply_to_url,
-        Err(()) => return internal_error(),
+    let Ok(replies) = activitypub_replies(state, account, status).await else {
+        return Err(());
     };
-    activity_response(
-        StatusCode::OK,
-        ACTIVITY_JSON,
-        activitypub::note(
-            &state.origin,
-            &state.local_domain,
-            &status,
-            &account,
-            &state.media_root_url,
-            &media,
-            &mentions,
-            &hashtags,
-            quoted_link.as_deref(),
-            in_reply_to_url.as_deref(),
-            quoted_identifier.as_deref(),
-            replies,
-        ),
-    )
+    let Ok((in_reply_to_url, in_reply_to_atom_uri, conversation)) =
+        activitypub_note_metadata(state, status).await
+    else {
+        return Err(());
+    };
+    Ok(activitypub::note(
+        &state.origin,
+        &state.local_domain,
+        status,
+        account,
+        &state.media_root_url,
+        &media,
+        &mentions,
+        &hashtags,
+        quoted_link.as_deref(),
+        in_reply_to_url.as_deref(),
+        in_reply_to_atom_uri.as_deref(),
+        conversation.as_deref(),
+        quoted_identifier.as_deref(),
+        quote_authorization.as_deref(),
+        replies,
+        favourites_count,
+        reblogs_count,
+    ))
+}
+
+async fn activitypub_status_counts(state: &WebState, status_id: i64) -> Result<(i64, i64), ()> {
+    let status_stats = state
+        .repository
+        .status_stat(status_id)
+        .await
+        .map_err(|_| ())?;
+    Ok(status_stats.map_or((0, 0), |status_stats| {
+        (
+            status_stats.favourites_count.max(0),
+            status_stats.reblogs_count.max(0),
+        )
+    }))
 }
 
 async fn activitypub_quote_url(state: &WebState, status_id: i64) -> Result<Option<String>, ()> {
@@ -1150,24 +5676,82 @@ async fn activitypub_quote_uri(state: &WebState, status_id: i64) -> Result<Optio
     }))
 }
 
-async fn activitypub_reply_url(
+async fn activitypub_quote_authorization(
     state: &WebState,
-    status: &crate::mastodon::Status,
+    status_id: i64,
 ) -> Result<Option<String>, ()> {
-    let (Some(parent_id), Some(parent_account_id)) =
-        (status.in_reply_to_id, status.in_reply_to_account_id)
-    else {
-        return Ok(None);
-    };
-    let parent = state.repository.status(parent_id).await.map_err(|_| ())?;
-    let account = state
+    let target = state
         .repository
-        .account(parent_account_id)
+        .activitypub_quote_target(status_id)
         .await
         .map_err(|_| ())?;
-    Ok(parent
-        .zip(account)
-        .map(|(parent, account)| activitypub::status_uri(&state.origin, &account, &parent)))
+    Ok(target
+        .map(|target| {
+            if target.quoted_account_local {
+                activitypub::local_quote_authorization_url(
+                    &state.origin,
+                    target.account_id,
+                    &target.username,
+                    target.id_scheme,
+                    target.quote_id,
+                )
+            } else {
+                target
+                    .approval_uri
+                    .filter(|uri| !crate::paperclip::rails_blank(uri))
+                    .unwrap_or_default()
+            }
+        })
+        .filter(|uri| !uri.is_empty()))
+}
+
+async fn activitypub_note_metadata(
+    state: &WebState,
+    status: &crate::mastodon::Status,
+) -> Result<(Option<String>, Option<String>, Option<String>), ()> {
+    let (in_reply_to_url, in_reply_to_atom_uri) =
+        match (status.in_reply_to_id, status.in_reply_to_account_id) {
+            (Some(parent_id), Some(parent_account_id)) => {
+                let parent = state.repository.status(parent_id).await.map_err(|_| ())?;
+                let account = state
+                    .repository
+                    .account(parent_account_id)
+                    .await
+                    .map_err(|_| ())?;
+                match parent.zip(account) {
+                    Some((parent, account)) => {
+                        let atom_uri = if account.domain.is_none() {
+                            Some(parent.uri.clone().unwrap_or_else(|| {
+                                format!(
+                                    "tag:{},{}:objectId={}:objectType=Status",
+                                    state.local_domain,
+                                    parent.created_at.date(),
+                                    parent.id
+                                )
+                            }))
+                        } else {
+                            parent.uri.clone()
+                        };
+                        (
+                            Some(activitypub::status_uri(&state.origin, &account, &parent)),
+                            atom_uri,
+                        )
+                    }
+                    None => (None, None),
+                }
+            }
+            _ => (None, None),
+        };
+    let conversation = match status.conversation_id {
+        Some(conversation_id) => state
+            .repository
+            .conversation(conversation_id)
+            .await
+            .map_err(|_| ())?
+            .and_then(|conversation| conversation.uri),
+        None => None,
+    };
+    Ok((in_reply_to_url, in_reply_to_atom_uri, conversation))
 }
 
 async fn activitypub_replies(
@@ -1181,34 +5765,17 @@ async fn activitypub_replies(
     let base = activitypub::replies_url(&state.origin, account, status);
     let replies = state
         .repository
-        .activitypub_reply_statuses(account.id, status.id, 5)
+        .activitypub_reply_statuses(account.id, status.id, false, None, 5)
         .await
         .map_err(|_| ())?;
     let mut items = Vec::new();
     for reply in &replies {
-        if reply.local == Some(true) {
-            let Some(reply_account) = state
-                .repository
-                .account(reply.account_id)
-                .await
-                .map_err(|_| ())?
-            else {
-                items.push(serde_json::Value::Null);
-                continue;
-            };
-            items.push(serde_json::Value::String(activitypub::status_uri(
-                &state.origin,
-                &reply_account,
-                reply,
-            )));
-        } else {
-            items.push(
-                reply
-                    .uri
-                    .clone()
-                    .map_or(serde_json::Value::Null, serde_json::Value::String),
-            );
-        }
+        items.push(
+            reply
+                .uri
+                .clone()
+                .map_or(serde_json::Value::Null, serde_json::Value::String),
+        );
     }
     let next = replies.last().map_or_else(
         || format!("{base}?page=true&only_other_accounts=true"),
@@ -1228,9 +5795,11 @@ async fn activitypub_replies(
 
 async fn federation_outbox_username(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(username): Path<String>,
     Query(parameters): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Response<Body> {
     if !accepts_activitypub(&headers) {
         return html_redirect(&state.origin, &format!("/@{username}"));
@@ -1239,27 +5808,47 @@ async fn federation_outbox_username(
         Ok(account_id) => account_id,
         Err(response) => return response,
     };
-    federation_outbox_response(&state, account_id, parameters, &headers).await
+    federation_outbox_response(
+        &state,
+        account_id,
+        metadata.client_ip,
+        parameters,
+        &headers,
+        &uri,
+    )
+    .await
 }
 
 async fn federation_outbox_id(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(account_id): Path<String>,
     Query(parameters): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Response<Body> {
     let Some(account_id) = activitypub_path_id(&account_id) else {
         return not_found();
     };
-    federation_outbox_response(&state, account_id, parameters, &headers).await
+    federation_outbox_response(
+        &state,
+        account_id,
+        metadata.client_ip,
+        parameters,
+        &headers,
+        &uri,
+    )
+    .await
 }
 
 async fn federation_outbox_instance(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Query(parameters): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Response<Body> {
-    federation_outbox_response(&state, -99, parameters, &headers).await
+    federation_outbox_response(&state, -99, metadata.client_ip, parameters, &headers, &uri).await
 }
 
 #[allow(
@@ -1270,8 +5859,10 @@ async fn federation_outbox_instance(
 async fn federation_outbox_response(
     state: &WebState,
     account_id: i64,
+    client_ip: IpAddr,
     parameters: HashMap<String, String>,
     headers: &HeaderMap,
+    uri: &Uri,
 ) -> Response<Body> {
     if !accepts_activitypub(headers) {
         return error_response(
@@ -1279,6 +5870,10 @@ async fn federation_outbox_response(
             "ActivityPub representation required",
         );
     }
+    let viewer_account_id = match federation_signed_viewer(state, client_ip, uri, headers).await {
+        Ok(viewer_account_id) => viewer_account_id,
+        Err(response) => return response,
+    };
     let account = match federation_account(state, account_id, true).await {
         Ok(account) => account,
         Err(response) => return response,
@@ -1297,9 +5892,8 @@ async fn federation_outbox_response(
             Ok(total) => total,
             Err(_) => return internal_error(),
         };
-        return activity_response(
-            StatusCode::OK,
-            ACTIVITY_JSON,
+        return signature_sensitive_activity_response(
+            headers,
             activitypub::ordered_collection(
                 base.to_string(),
                 total,
@@ -1319,7 +5913,7 @@ async fn federation_outbox_response(
         .and_then(|value| route_path_id(value));
     let statuses = match state
         .repository
-        .activitypub_outbox_statuses(account_id, 20, max_id, min_id, since_id)
+        .activitypub_outbox_statuses(account_id, viewer_account_id, 20, max_id, min_id, since_id)
         .await
     {
         Ok(statuses) => statuses,
@@ -1364,14 +5958,25 @@ async fn federation_outbox_response(
                     Ok(quoted_identifier) => quoted_identifier,
                     Err(()) => return internal_error(),
                 };
+                let quote_authorization =
+                    match activitypub_quote_authorization(state, status.id).await {
+                        Ok(quote_authorization) => quote_authorization,
+                        Err(()) => return internal_error(),
+                    };
+                let (favourites_count, reblogs_count) =
+                    match activitypub_status_counts(state, status.id).await {
+                        Ok(counts) => counts,
+                        Err(()) => return internal_error(),
+                    };
                 let replies = match activitypub_replies(state, &status_account, &status).await {
                     Ok(replies) => replies,
                     Err(()) => return internal_error(),
                 };
-                let in_reply_to_url = match activitypub_reply_url(state, &status).await {
-                    Ok(in_reply_to_url) => in_reply_to_url,
-                    Err(()) => return internal_error(),
-                };
+                let (in_reply_to_url, in_reply_to_atom_uri, conversation) =
+                    match activitypub_note_metadata(state, &status).await {
+                        Ok(metadata) => metadata,
+                        Err(()) => return internal_error(),
+                    };
                 activitypub::note(
                     &state.origin,
                     &state.local_domain,
@@ -1383,8 +5988,13 @@ async fn federation_outbox_response(
                     &hashtags,
                     quoted_link.as_deref(),
                     in_reply_to_url.as_deref(),
+                    in_reply_to_atom_uri.as_deref(),
+                    conversation.as_deref(),
                     quoted_identifier.as_deref(),
+                    quote_authorization.as_deref(),
                     replies,
+                    favourites_count,
+                    reblogs_count,
                 )
             }
             Ok(None) | Err(_) => return internal_error(),
@@ -1444,9 +6054,8 @@ async fn federation_outbox_response(
         .flatten()
         .map(|id| outbox_page_url(&base, Some(id), None, None));
     let prev = first_status_id.map(|id| outbox_page_url(&base, None, Some(id), None));
-    activity_response(
-        StatusCode::OK,
-        ACTIVITY_JSON,
+    signature_sensitive_activity_response(
+        headers,
         activitypub::ordered_page(id, base.to_string(), None, items, next, prev),
     )
 }
@@ -1473,28 +6082,52 @@ fn outbox_page_url(
 
 async fn federation_followers_username(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(username): Path<String>,
     Query(parameters): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Response<Body> {
-    federation_collection_username(&state, username, true, parameters, &headers).await
+    federation_collection_username(
+        &state,
+        username,
+        true,
+        metadata.client_ip,
+        parameters,
+        &headers,
+        &uri,
+    )
+    .await
 }
 
 async fn federation_following_username(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(username): Path<String>,
     Query(parameters): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Response<Body> {
-    federation_collection_username(&state, username, false, parameters, &headers).await
+    federation_collection_username(
+        &state,
+        username,
+        false,
+        metadata.client_ip,
+        parameters,
+        &headers,
+        &uri,
+    )
+    .await
 }
 
 async fn federation_collection_username(
     state: &WebState,
     username: String,
     followers: bool,
+    client_ip: IpAddr,
     parameters: HashMap<String, String>,
     headers: &HeaderMap,
+    uri: &Uri,
 ) -> Response<Body> {
     if !accepts_activitypub(headers) {
         let collection = if followers { "followers" } else { "following" };
@@ -1504,31 +6137,56 @@ async fn federation_collection_username(
         Ok(account_id) => account_id,
         Err(response) => return response,
     };
-    federation_collection_response(state, account_id, followers, parameters, headers).await
+    federation_collection_response(
+        state, account_id, followers, client_ip, parameters, headers, uri,
+    )
+    .await
 }
 
 async fn federation_followers_id(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(account_id): Path<String>,
     Query(parameters): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Response<Body> {
     let Some(account_id) = activitypub_path_id(&account_id) else {
         return not_found();
     };
-    federation_collection_response(&state, account_id, true, parameters, &headers).await
+    federation_collection_response(
+        &state,
+        account_id,
+        true,
+        metadata.client_ip,
+        parameters,
+        &headers,
+        &uri,
+    )
+    .await
 }
 
 async fn federation_following_id(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(account_id): Path<String>,
     Query(parameters): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Response<Body> {
     let Some(account_id) = activitypub_path_id(&account_id) else {
         return not_found();
     };
-    federation_collection_response(&state, account_id, false, parameters, &headers).await
+    federation_collection_response(
+        &state,
+        account_id,
+        false,
+        metadata.client_ip,
+        parameters,
+        &headers,
+        &uri,
+    )
+    .await
 }
 
 #[allow(clippy::manual_let_else, clippy::uninlined_format_args)]
@@ -1536,14 +6194,21 @@ async fn federation_collection_response(
     state: &WebState,
     account_id: i64,
     followers: bool,
+    client_ip: IpAddr,
     parameters: HashMap<String, String>,
     headers: &HeaderMap,
+    uri: &Uri,
 ) -> Response<Body> {
     if !accepts_activitypub(headers) {
         return error_response(
             StatusCode::NOT_ACCEPTABLE,
             "ActivityPub representation required",
         );
+    }
+    if let Err(response) =
+        verify_optional_federation_signature(state, client_ip, uri, headers).await
+    {
+        return response;
     }
     let account = match federation_account(state, account_id, true).await {
         Ok(account) => account,
@@ -1681,6 +6346,35 @@ fn accepts_activitypub(headers: &HeaderMap) -> bool {
     })
 }
 
+fn accepts_html(headers: &HeaderMap) -> bool {
+    let Some(value) = headers.get(ACCEPT).and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    value.split(',').any(|entry| {
+        let mut parameters = entry.split(';');
+        let media_type = parameters.next().unwrap_or_default().trim();
+        if !media_type.eq_ignore_ascii_case("text/html") && !media_type.eq_ignore_ascii_case("*/*")
+        {
+            return false;
+        }
+        let quality = parameters
+            .find_map(|parameter| {
+                let (name, value) = parameter.trim().split_once('=')?;
+                name.trim()
+                    .eq_ignore_ascii_case("q")
+                    .then_some(value.trim())
+            })
+            .map_or(1.0, |quality| {
+                quality
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|quality| quality.is_finite())
+                    .unwrap_or(0.0)
+            });
+        quality > 0.0
+    })
+}
+
 fn activitypub_truthy(value: &str) -> bool {
     !value.is_empty() && !matches!(value, "0" | "f" | "F" | "false" | "FALSE" | "off" | "OFF")
 }
@@ -1717,7 +6411,7 @@ fn raw_response(status: StatusCode, content_type: &str, body: Vec<u8>) -> Respon
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, content_type)
-        .header(VARY, "Accept")
+        .header(VARY, "Accept, Signature")
         .body(Body::from(body))
         .expect("federation response headers are valid")
 }
@@ -1727,6 +6421,8 @@ async fn request_context(
     mut request: Request,
     next: Next,
 ) -> Response<Body> {
+    let path = request.uri().path().to_owned();
+    let method = request.method().clone();
     let has_peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -1742,6 +6438,7 @@ async fn request_context(
     for name in FORWARDED_HEADERS {
         request.headers_mut().remove(*name);
     }
+    let request_headers = request.headers().clone();
     let Ok(metadata) = metadata else {
         return json_response(
             StatusCode::BAD_REQUEST,
@@ -1766,8 +6463,14 @@ async fn request_context(
             );
         }
     }
+    if method == Method::OPTIONS
+        && let Some(response) = cors_preflight_response(&path, &request_headers)
+    {
+        return response;
+    }
     request.extensions_mut().insert(metadata);
-    next.run(request).await
+    let response = next.run(request).await;
+    finalize_external_cors_response(&path, &method, &request_headers, response)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1787,6 +6490,87 @@ enum RangeSelection {
     Full,
     Ranges(Vec<ByteRange>),
     Unsatisfiable,
+}
+
+#[must_use]
+fn paperclip_media_access_allowed(
+    status_allowed: bool,
+    discarded: bool,
+    can_manage_reports: bool,
+) -> bool {
+    status_allowed || (discarded && can_manage_reports)
+}
+
+fn request_header_is_nonempty(headers: &HeaderMap, name: &str) -> bool {
+    headers
+        .get(name)
+        .is_some_and(|value| !value.as_bytes().iter().all(u8::is_ascii_whitespace))
+}
+
+fn paperclip_response_policy(
+    attachment: PaperclipAttachment,
+    headers: &HeaderMap,
+) -> (&'static str, Option<&'static str>) {
+    if !matches!(
+        attachment,
+        PaperclipAttachment::MediaFile | PaperclipAttachment::MediaThumbnail
+    ) {
+        return (PAPERCLIP_CACHE, None);
+    }
+    let has_viewer_credentials = [COOKIE.as_str(), AUTHORIZATION.as_str(), "signature"]
+        .into_iter()
+        .any(|name| request_header_is_nonempty(headers, name));
+    (
+        if has_viewer_credentials {
+            PRIVATE_CACHE
+        } else {
+            PAPERCLIP_CACHE
+        },
+        Some(PAPERCLIP_STATUS_VARY),
+    )
+}
+
+async fn paperclip_status_media_access(
+    state: &WebState,
+    headers: &HeaderMap,
+    media_id: i64,
+) -> Result<bool, Response<Body>> {
+    let viewer_account_id = if state.instance_runtime.limited_federation {
+        Some(required_viewer(state, headers, READ_STATUSES).await?)
+    } else {
+        optional_viewer(state, headers, READ_STATUSES).await?
+    };
+    let Some((status_id, discarded)) = state
+        .repository
+        .media_attachment_status(media_id)
+        .await
+        .map_err(|_| internal_error())?
+    else {
+        return Ok(false);
+    };
+    let status_allowed = state
+        .repository
+        .rest_authorized_status_ids(&[status_id], viewer_account_id)
+        .await
+        .map_err(|_| internal_error())?
+        == [status_id];
+    let report_manager = if !status_allowed && discarded {
+        match viewer_account_id {
+            Some(account_id) => state
+                .repository
+                .user_can_manage_reports(account_id)
+                .await
+                .map_err(|_| internal_error())?,
+            None => false,
+        }
+    } else {
+        false
+    };
+    Ok(paperclip_media_access_allowed(
+        status_allowed,
+        discarded,
+        report_manager,
+    ))
 }
 
 async fn paperclip_media(
@@ -1820,6 +6604,17 @@ async fn paperclip_media(
     else {
         return not_found();
     };
+    let (cache_control, vary) = paperclip_response_policy(path.attachment(), &headers);
+    if matches!(
+        path.attachment(),
+        PaperclipAttachment::MediaFile | PaperclipAttachment::MediaThumbnail
+    ) {
+        match paperclip_status_media_access(&state, &headers, path.id()).await {
+            Ok(true) => {}
+            Ok(false) => return not_found(),
+            Err(response) => return response,
+        }
+    }
     match state
         .repository
         .paperclip_metadata(path.attachment(), path.id())
@@ -1848,6 +6643,8 @@ async fn paperclip_media(
         path.relative_path(),
         file,
         &file_metadata,
+        cache_control,
+        vary,
     )
 }
 
@@ -1857,6 +6654,8 @@ fn paperclip_file_response(
     path: &std::path::Path,
     file: File,
     file_metadata: &std::fs::Metadata,
+    cache_control: &'static str,
+    vary: Option<&'static str>,
 ) -> Response<Body> {
     let size = file_metadata.len();
     let modified = file_metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -1871,6 +6670,8 @@ fn paperclip_file_response(
             None,
             None,
             Body::empty(),
+            cache_control,
+            vary,
         );
         return response;
     }
@@ -1886,6 +6687,8 @@ fn paperclip_file_response(
                     None,
                     None,
                     Body::empty(),
+                    cache_control,
+                    vary,
                 );
                 response.headers_mut().insert(
                     LAST_MODIFIED,
@@ -1905,6 +6708,8 @@ fn paperclip_file_response(
                 Some(size),
                 None,
                 body,
+                cache_control,
+                vary,
             )
         }
         RangeSelection::Ranges(ranges) if ranges.len() == 1 => {
@@ -1921,6 +6726,8 @@ fn paperclip_file_response(
                 Some(range.len()),
                 Some(format!("bytes {}-{}/{}", range.start, range.end, size)),
                 body,
+                cache_control,
+                vary,
             )
         }
         RangeSelection::Ranges(ranges) => {
@@ -1937,6 +6744,8 @@ fn paperclip_file_response(
                 Some(content_length),
                 None,
                 body,
+                cache_control,
+                vary,
             )
         }
         // Rack marks its 416 as `X-Cascade: pass`, so Rails replaces it with this 404.
@@ -1944,6 +6753,7 @@ fn paperclip_file_response(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paperclip_response(
     status: StatusCode,
     content_type: &'static str,
@@ -1951,14 +6761,21 @@ fn paperclip_response(
     content_length: Option<u64>,
     content_range: Option<String>,
     body: Body,
+    cache_control: &'static str,
+    vary: Option<&'static str>,
 ) -> Response<Body> {
     let mut response = Response::builder()
         .status(status)
-        .header(CACHE_CONTROL, PAPERCLIP_CACHE)
+        .header(CACHE_CONTROL, cache_control)
         .header("content-security-policy", PAPERCLIP_CSP)
         .header("x-content-type-options", "nosniff")
         .body(body)
         .expect("static Paperclip headers are valid");
+    if let Some(vary) = vary {
+        response
+            .headers_mut()
+            .insert(VARY, HeaderValue::from_static(vary));
+    }
     if status != StatusCode::NOT_MODIFIED {
         response
             .headers_mut()
@@ -2299,6 +7116,26 @@ fn api_route(path: &str) -> Option<&'static ApiRouteContract> {
         .find(|route| route_path_matches(route.path, path))
 }
 
+fn api_route_for_method(method: &Method, path: &str) -> Option<&'static ApiRouteContract> {
+    let method = match method.as_str() {
+        "GET" => ApiMethod::Get,
+        "POST" => ApiMethod::Post,
+        "DELETE" => ApiMethod::Delete,
+        "PATCH" => ApiMethod::Patch,
+        "PUT" => ApiMethod::Put,
+        _ => return None,
+    };
+    let path = path.strip_suffix('/').unwrap_or(path);
+    if reserved_static_route(path) {
+        return API_ROUTE_INVENTORY
+            .iter()
+            .find(|route| route.method == method && route.path == path);
+    }
+    API_ROUTE_INVENTORY
+        .iter()
+        .find(|route| route.method == method && route_path_matches(route.path, path))
+}
+
 fn preflight_api_route(path: &str) -> Option<&'static ApiRouteContract> {
     let path = path.strip_suffix('/').unwrap_or(path);
     if reserved_static_route(path) {
@@ -2353,15 +7190,48 @@ fn preflight_route_path_matches(pattern: &str, path: &str) -> bool {
     }
 }
 
-async fn api_protocol(request: Request, next: Next) -> Response<Body> {
+async fn api_protocol(
+    State(state): State<WebState>,
+    request: Request,
+    next: Next,
+) -> Response<Body> {
     let path = request.uri().path().to_owned();
-    let headers = request.headers().clone();
+    let mut headers = request.headers().clone();
     if request.method() == Method::OPTIONS
         && let Some(response) = cors_preflight_response(&path, &headers)
     {
         return response;
     }
-    let mut request = match bounded_request(request, REST_BODY_LIMIT_BYTES).await {
+    inject_query_parameter_bearer(&mut headers, request.uri().query());
+    let route = api_route_for_method(request.method(), &path);
+    if api_request_requires_preauthentication(route, &headers, &request) {
+        let Some(scopes) = required_api_scopes(route) else {
+            unreachable!("pre-authentication requires a required API route");
+        };
+        if let Err(response) = authenticate_required_api_route(&state, &headers, scopes).await {
+            return finalize_api_response(&path, &headers, response);
+        }
+    }
+    let body_limit = api_request_body_limit(&path, route, &headers, &request);
+    let body_limit = if path.trim_end_matches('/') == "/settings/profile"
+        && request_body_may_exceed_public_limit(&request)
+    {
+        match browser_session_allows_large_body(&state, &headers).await {
+            Ok(true) => ACCOUNT_PROFILE_BODY_LIMIT_BYTES,
+            Ok(false) => return browser_redirect_response("/auth/sign_in"),
+            Err(response) => return response,
+        }
+    } else {
+        body_limit
+    };
+    if content_length_exceeds_limit(&headers, body_limit) {
+        return finalize_api_response(
+            &path,
+            &headers,
+            error_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large"),
+        );
+    }
+    let mut request = match bounded_request(request, body_limit).await {
         Ok(request) => request,
         Err(response) => return finalize_api_response(&path, &headers, response),
     };
@@ -2381,15 +7251,194 @@ async fn api_protocol(request: Request, next: Next) -> Response<Body> {
             RequestParameterError::InternalServer => framework_internal_error(),
         };
     }
+    inject_parameter_bearer(&mut request);
+    headers = request.headers().clone();
     let response = next.run(request).await;
     finalize_api_response(&path, &headers, response)
 }
 
+fn required_api_scopes(route: Option<&ApiRouteContract>) -> Option<&'static [&'static str]> {
+    match route.map(|route| route.authentication) {
+        Some(ApiAuthentication::Required(scopes)) => Some(scopes),
+        _ => None,
+    }
+}
+
+fn api_request_requires_preauthentication(
+    route: Option<&ApiRouteContract>,
+    headers: &HeaderMap,
+    request: &Request,
+) -> bool {
+    required_api_scopes(route).is_some()
+        && has_valid_bearer_authorization(headers)
+        && request_body_may_exceed_public_limit(request)
+}
+
+fn request_body_may_exceed_public_limit(request: &Request) -> bool {
+    if !request_body_can_be_large(request) {
+        return false;
+    }
+    request
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_none_or(|length| length > PUBLIC_REQUEST_BODY_LIMIT_BYTES as u64)
+}
+
+fn request_body_can_be_large(request: &Request) -> bool {
+    request.method() == Method::POST
+        || request.method() == Method::PUT
+        || request.method() == Method::PATCH
+}
+
+fn content_length_exceeds_limit(headers: &HeaderMap, limit: usize) -> bool {
+    headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > limit as u64)
+}
+
+fn api_request_body_limit(
+    path: &str,
+    route: Option<&ApiRouteContract>,
+    headers: &HeaderMap,
+    request: &Request,
+) -> usize {
+    if required_api_scopes(route).is_some()
+        && has_valid_bearer_authorization(headers)
+        && request_body_can_be_large(request)
+    {
+        match path.trim_end_matches('/') {
+            "/api/v1/accounts/update_credentials"
+            | "/api/v1/profile/avatar"
+            | "/api/v1/profile/header" => ACCOUNT_PROFILE_BODY_LIMIT_BYTES,
+            _ => REST_BODY_LIMIT_BYTES,
+        }
+    } else {
+        PUBLIC_REQUEST_BODY_LIMIT_BYTES
+    }
+}
+
+async fn browser_session_allows_large_body(
+    state: &WebState,
+    headers: &HeaderMap,
+) -> Result<bool, Response<Body>> {
+    let Some(session_id) = request_cookie(headers, BROWSER_SESSION_COOKIE) else {
+        return Ok(false);
+    };
+    state
+        .repository
+        .browser_session(session_id)
+        .await
+        .map(|session| session.is_some())
+        .map_err(|_| internal_error())
+}
+
+async fn authenticate_required_api_route(
+    state: &WebState,
+    headers: &HeaderMap,
+    scopes: &'static [&'static str],
+) -> Result<(), Response<Body>> {
+    match state
+        .authenticator
+        .authenticate(headers, RequiredScopes::new(scopes))
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(OAuthAuthenticationError::OAuth(error)) => {
+            Err(error.into_http_response().map(Body::from))
+        }
+        Err(OAuthAuthenticationError::Repository(_)) => Err(internal_error()),
+    }
+}
+
+fn inject_query_parameter_bearer(headers: &mut HeaderMap, query: Option<&str>) {
+    if !parameter_bearer_fallback_allowed(headers) {
+        return;
+    }
+    let Some(query) = query.filter(|query| valid_query(query)) else {
+        return;
+    };
+    let Ok(parameters) = RackParameters::parse(query) else {
+        return;
+    };
+    let Some(token) = parameter_bearer(&parameters) else {
+        return;
+    };
+    let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}")) else {
+        return;
+    };
+    headers.insert(AUTHORIZATION, value);
+}
+
+fn inject_parameter_bearer(request: &mut Request) {
+    if !parameter_bearer_fallback_allowed(request.headers()) {
+        return;
+    }
+    let Some(parameters) = request.extensions().get::<RackParameters>() else {
+        return;
+    };
+    let Some(token) = parameter_bearer(parameters) else {
+        return;
+    };
+    let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}")) else {
+        return;
+    };
+    request.headers_mut().insert(AUTHORIZATION, value);
+}
+
+fn parameter_bearer(parameters: &RackParameters) -> Option<&str> {
+    ["access_token", "bearer_token"]
+        .into_iter()
+        .find_map(|name| match parameters.get(name) {
+            Some(RackValue::Scalar(value)) if !value.trim().is_empty() => Some(value.as_str()),
+            _ => None,
+        })
+}
+
+fn has_valid_bearer_authorization(headers: &HeaderMap) -> bool {
+    BearerToken::from_headers(headers).is_ok()
+}
+
+fn parameter_bearer_fallback_allowed(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(AUTHORIZATION).iter();
+    let Some(_) = values.next() else {
+        return true;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    !has_valid_bearer_authorization(headers)
+}
+
+fn cors_external_resource(path: &str, method: &Method) -> bool {
+    let is_get = method.as_str().eq_ignore_ascii_case("GET");
+    let is_post = method.as_str().eq_ignore_ascii_case("POST");
+    match path {
+        "/oauth/token" | "/oauth/revoke" => is_post,
+        "/oauth/userinfo" => is_get || is_post,
+        _ => {
+            is_get
+                && (path.starts_with("/.well-known/")
+                    || path.starts_with("/nodeinfo/")
+                    || path
+                        .strip_prefix("/@")
+                        .is_some_and(|username| !username.is_empty() && !username.contains('/'))
+                    || path
+                        .strip_prefix("/users/")
+                        .is_some_and(|username| !username.is_empty() && !username.contains('/')))
+        }
+    }
+}
+
 fn cors_preflight_response(path: &str, headers: &HeaderMap) -> Option<Response<Body>> {
     let requested_method = headers.get(ACCESS_CONTROL_REQUEST_METHOD)?;
+    let requested_method = Method::from_bytes(requested_method.as_bytes()).ok()?;
     if headers.get(ORIGIN).is_none()
-        || preflight_api_route(path).is_none()
-        || !cors_method(requested_method.as_bytes())
+        || (preflight_api_route(path).is_none() && !cors_external_resource(path, &requested_method))
+        || !cors_method(requested_method.as_str().as_bytes())
     {
         return None;
     }
@@ -2409,30 +7458,66 @@ fn cors_preflight_response(path: &str, headers: &HeaderMap) -> Option<Response<B
     Some(response)
 }
 
+fn finalize_external_cors_response(
+    path: &str,
+    method: &Method,
+    request_headers: &HeaderMap,
+    mut response: Response<Body>,
+) -> Response<Body> {
+    if request_headers.get(ORIGIN).is_some() && cors_external_resource(path, method) {
+        response
+            .headers_mut()
+            .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+        response.headers_mut().insert(
+            ACCESS_CONTROL_EXPOSE_HEADERS,
+            HeaderValue::from_static(CORS_EXPOSE_HEADERS),
+        );
+    }
+    response
+}
+
 async fn bounded_request(request: Request, limit: usize) -> Result<Request, Response<Body>> {
+    bounded_request_with_timeout(request, limit, REQUEST_BODY_READ_TIMEOUT).await
+}
+
+async fn bounded_request_with_timeout(
+    request: Request,
+    limit: usize,
+    timeout: StdDuration,
+) -> Result<Request, Response<Body>> {
     let (mut parts, body) = request.into_parts();
     let mut stream = body.into_data_stream();
-    let mut size = 0_usize;
-    let mut buffer = Vec::new();
-    while let Some(chunk) = stream.try_next().await.map_err(|_| internal_error())? {
-        size = size.saturating_add(chunk.len());
-        if size > limit {
-            return Err(error_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "Payload Too Large",
-            ));
+    let result = tokio::time::timeout(timeout, async move {
+        let mut size = 0_usize;
+        let mut buffer = Vec::new();
+        while let Some(chunk) = stream.try_next().await.map_err(|_| internal_error())? {
+            size = size.saturating_add(chunk.len());
+            if size > limit {
+                return Err(error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Payload Too Large",
+                ));
+            }
+            buffer.extend_from_slice(&chunk);
         }
-        buffer.extend_from_slice(&chunk);
+        let body = Bytes::from(buffer);
+        parts.extensions.insert(BufferedRequestBody(body.clone()));
+        Ok(Request::from_parts(parts, Body::from(body)))
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(error_response(
+            StatusCode::REQUEST_TIMEOUT,
+            "Request Timeout",
+        )),
     }
-    let body = Bytes::from(buffer);
-    parts.extensions.insert(BufferedRequestBody(body.clone()));
-    Ok(Request::from_parts(parts, Body::from(body)))
 }
 
 #[derive(Clone)]
 struct BufferedRequestBody(Bytes);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum RequestParameterError {
     BadRequest,
     InternalServer,
@@ -2446,7 +7531,6 @@ fn merge_request_parameters(request: &mut Request) -> Result<(), RequestParamete
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
         .map(str::trim);
     let body_parameters = if body.is_none_or(|body| body.0.is_empty()) {
         RackParameters::default()
@@ -2455,7 +7539,7 @@ fn merge_request_parameters(request: &mut Request) -> Result<(), RequestParamete
             unreachable!("nonempty request body is present")
         };
         match content_type {
-            Some(value) if value.eq_ignore_ascii_case("application/x-www-form-urlencoded") => {
+            Some(value) if content_type_is(value, "application/x-www-form-urlencoded") => {
                 let body =
                     std::str::from_utf8(&body.0).map_err(|_| RequestParameterError::BadRequest)?;
                 if !valid_query(body) {
@@ -2463,7 +7547,12 @@ fn merge_request_parameters(request: &mut Request) -> Result<(), RequestParamete
                 }
                 RackParameters::parse(body).map_err(RequestParameterError::from)?
             }
-            Some(value) if json_content_type(value) => {
+            Some(value) if content_type_is(value, "multipart/form-data") => {
+                parse_multipart_parameters(&body.0, value)?
+            }
+            Some(value)
+                if json_content_type(value.split(';').next().unwrap_or_default().trim()) =>
+            {
                 let value = serde_json::from_slice(&body.0)
                     .map_err(|_| RequestParameterError::BadRequest)?;
                 let root = RackValue::from_json(&value);
@@ -2503,6 +7592,201 @@ fn json_content_type(value: &str) -> bool {
     .any(|mime| value.eq_ignore_ascii_case(mime))
 }
 
+fn content_type_is(value: &str, expected: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
+}
+
+fn parse_multipart_parameters(
+    body: &[u8],
+    content_type: &str,
+) -> Result<RackParameters, RequestParameterError> {
+    let boundary = multipart_boundary(content_type).ok_or(RequestParameterError::BadRequest)?;
+    let marker = format!("--{boundary}");
+    let marker = marker.as_bytes();
+    if !body.starts_with(marker) {
+        return Err(RequestParameterError::BadRequest);
+    }
+    let separator = format!("\r\n--{boundary}");
+    let mut offset = marker.len();
+    let mut parameters = RackParameters::default();
+    let mut count = 0_usize;
+    loop {
+        if body.get(offset..offset + 2) == Some(b"--") {
+            break;
+        }
+        if body.get(offset..offset + 2) != Some(b"\r\n") {
+            return Err(RequestParameterError::BadRequest);
+        }
+        offset += 2;
+        let Some(header_end) = find_bytes(&body[offset..], b"\r\n\r\n") else {
+            return Err(RequestParameterError::BadRequest);
+        };
+        let headers = parse_multipart_headers(&body[offset..offset + header_end])?;
+        offset += header_end + 4;
+        let relative = find_bytes(&body[offset..], separator.as_bytes())
+            .ok_or(RequestParameterError::BadRequest)?;
+        let next_marker = offset + relative;
+        let value = &body[offset..next_marker];
+        let name = headers
+            .content_disposition
+            .name
+            .as_deref()
+            .ok_or(RequestParameterError::BadRequest)?;
+        let Some((root, segments)) = rack_key(name).map_err(RequestParameterError::from)? else {
+            return Err(RequestParameterError::BadRequest);
+        };
+        let value = if let Some(file_name) = headers.content_disposition.file_name {
+            if file_name.is_empty() {
+                RackValue::Null
+            } else {
+                if file_name.contains(['\0', '\r', '\n']) {
+                    return Err(RequestParameterError::BadRequest);
+                }
+                if matches!(name, "avatar" | "header") && value.len() >= 8 * 1024 * 1024 {
+                    return Err(RequestParameterError::BadRequest);
+                }
+                RackValue::Upload(UploadedFile {
+                    file_name,
+                    content_type: headers
+                        .content_type
+                        .unwrap_or_else(|| "application/octet-stream".to_owned()),
+                    bytes: value.to_vec(),
+                })
+            }
+        } else {
+            RackValue::Scalar(
+                String::from_utf8(value.to_vec()).map_err(|_| RequestParameterError::BadRequest)?,
+            )
+        };
+        count += 1;
+        if count > RACK_PARAMETER_LIMIT {
+            return Err(RequestParameterError::InternalServer);
+        }
+        parameters
+            .insert(root, &segments, value)
+            .map_err(RequestParameterError::from)?;
+        offset = next_marker + 2 + marker.len();
+    }
+    if body.get(offset + 2..) != Some(b"\r\n") {
+        return Err(RequestParameterError::BadRequest);
+    }
+    Ok(parameters)
+}
+
+#[derive(Clone, Debug)]
+struct UploadedFile {
+    file_name: String,
+    content_type: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct MultipartHeaders {
+    content_disposition: MultipartContentDisposition,
+    content_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MultipartContentDisposition {
+    name: Option<String>,
+    file_name: Option<String>,
+}
+
+fn multipart_boundary(content_type: &str) -> Option<String> {
+    if !content_type_is(content_type, "multipart/form-data") {
+        return None;
+    }
+    content_type
+        .split(';')
+        .skip(1)
+        .filter_map(|parameter| parameter.trim().split_once('='))
+        .find_map(|(key, value)| {
+            if !key.trim().eq_ignore_ascii_case("boundary") {
+                return None;
+            }
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or(value);
+            (!value.is_empty()
+                && value.len() <= 70
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() && byte != b'"'))
+            .then(|| value.to_owned())
+        })
+}
+
+fn parse_multipart_headers(value: &[u8]) -> Result<MultipartHeaders, RequestParameterError> {
+    let mut content_disposition = None;
+    let mut content_type = None;
+    for line in value.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            return Err(RequestParameterError::BadRequest);
+        }
+        let Some(separator) = line.iter().position(|byte| *byte == b':') else {
+            return Err(RequestParameterError::BadRequest);
+        };
+        let (name, value) = line.split_at(separator);
+        let value = &value[1..];
+        let name = std::str::from_utf8(name)
+            .map_err(|_| RequestParameterError::BadRequest)?
+            .trim();
+        let value = std::str::from_utf8(value)
+            .map_err(|_| RequestParameterError::BadRequest)?
+            .trim();
+        if name.eq_ignore_ascii_case("content-disposition") {
+            content_disposition = Some(parse_content_disposition(value)?);
+        } else if name.eq_ignore_ascii_case("content-type") {
+            content_type = Some(value.to_owned());
+        }
+    }
+    Ok(MultipartHeaders {
+        content_disposition: content_disposition.ok_or(RequestParameterError::BadRequest)?,
+        content_type,
+    })
+}
+
+fn parse_content_disposition(
+    value: &str,
+) -> Result<MultipartContentDisposition, RequestParameterError> {
+    let mut disposition = value.split(';');
+    if !disposition
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("form-data"))
+    {
+        return Err(RequestParameterError::BadRequest);
+    }
+    let mut result = MultipartContentDisposition::default();
+    for parameter in disposition {
+        let Some((key, value)) = parameter.trim().split_once('=') else {
+            return Err(RequestParameterError::BadRequest);
+        };
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .ok_or(RequestParameterError::BadRequest)?;
+        match key.trim().to_ascii_lowercase().as_str() {
+            "name" => result.name = Some(value.to_owned()),
+            "filename" => result.file_name = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+    Ok(result)
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 #[derive(Clone, Debug)]
 enum RackValue {
     Null,
@@ -2511,6 +7795,7 @@ enum RackValue {
     Boolean(bool),
     Array(Vec<RackValue>),
     Object(BTreeMap<String, RackValue>),
+    Upload(UploadedFile),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2608,7 +7893,7 @@ impl RackParameters {
     fn to_query(&self) -> String {
         fn append(pairs: &mut Vec<(String, String)>, name: String, value: &RackValue) {
             match value {
-                RackValue::Null => {}
+                RackValue::Null | RackValue::Upload(_) => {}
                 RackValue::Scalar(value) => pairs.push((name, value.clone())),
                 RackValue::Number(value) => pairs.push((name, ruby_json_number(value))),
                 RackValue::Boolean(value) => pairs.push((name, value.to_string())),
@@ -2658,7 +7943,9 @@ impl RackValue {
         match self {
             Self::Array(values) => 1 + values.iter().map(Self::json_depth).max().unwrap_or(0),
             Self::Object(values) => 1 + values.values().map(Self::json_depth).max().unwrap_or(0),
-            Self::Null | Self::Scalar(_) | Self::Number(_) | Self::Boolean(_) => 0,
+            Self::Null | Self::Scalar(_) | Self::Number(_) | Self::Boolean(_) | Self::Upload(_) => {
+                0
+            }
         }
     }
 }
@@ -3128,18 +8415,60 @@ async fn account_lookup(
             RackValue::Number(_)
             | RackValue::Boolean(_)
             | RackValue::Array(_)
-            | RackValue::Object(_),
+            | RackValue::Object(_)
+            | RackValue::Upload(_),
         ) => return framework_internal_error(),
     };
     let account = match handle {
-        Some(handle) => state.loader(viewer).lookup_account(&handle).await,
+        Some(handle) => {
+            if let Some((_, domain)) =
+                remote_account_search_handle(Some(&handle), &state.local_domain, 0)
+            {
+                let Ok(domain_allowed) = state
+                    .repository
+                    .remote_domain_allowed(&domain, state.instance_runtime.limited_federation)
+                    .await
+                else {
+                    return internal_error();
+                };
+                if !domain_allowed {
+                    return record_not_found();
+                }
+            }
+            state.loader(viewer).lookup_account(&handle).await
+        }
         None => Ok(None),
     };
     account_response(&state, account)
 }
 
+fn remote_account_search_handle(
+    query: Option<&str>,
+    local_domain: &str,
+    offset: i64,
+) -> Option<(String, String)> {
+    if offset != 0 {
+        return None;
+    }
+    let query = query?.trim();
+    let query = query.strip_prefix('@').unwrap_or(query);
+    let mut parts = query.split('@');
+    let username = parts.next()?.trim();
+    let domain = parts.next()?.trim();
+    if parts.next().is_some() || !valid_remote_username(username) || domain.is_empty() {
+        return None;
+    }
+    let domain = canonical_remote_domain(domain).ok()?;
+    if domain.eq_ignore_ascii_case(local_domain) {
+        return None;
+    }
+    Some((username.to_owned(), domain))
+}
+
+#[allow(clippy::too_many_lines)]
 async fn account_search(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Extension(rack): Extension<RackParameters>,
     headers: HeaderMap,
 ) -> Response<Body> {
@@ -3154,14 +8483,20 @@ async fn account_search(
             RackValue::Number(_)
             | RackValue::Boolean(_)
             | RackValue::Array(_)
-            | RackValue::Object(_),
+            | RackValue::Object(_)
+            | RackValue::Upload(_),
         ) => return framework_internal_error(),
     };
     let offset = match rack.get("offset") {
         None | Some(RackValue::Null) => 0,
         Some(RackValue::Scalar(value)) => ruby_integer(value),
         Some(RackValue::Number(value)) => json_number_integer(value).unwrap_or(0),
-        Some(RackValue::Boolean(_) | RackValue::Array(_) | RackValue::Object(_)) => {
+        Some(
+            RackValue::Boolean(_)
+            | RackValue::Array(_)
+            | RackValue::Object(_)
+            | RackValue::Upload(_),
+        ) => {
             return framework_internal_error();
         }
     };
@@ -3171,18 +8506,121 @@ async fn account_search(
     let Ok(limit) = limit_parameter(&rack, 40, 80) else {
         return framework_internal_error();
     };
+    if limit < 1 {
+        return json_response(StatusCode::OK, b"[]".to_vec());
+    }
     let resolve = boolean_parameter(&rack, "resolve");
-    let accounts = match state
-        .loader(Some(owner))
-        .account_search(
-            query,
-            resolve,
-            boolean_parameter(&rack, "following"),
-            limit,
-            offset,
-        )
-        .await
+    let following = boolean_parameter(&rack, "following");
+    let remote_handle = resolve
+        .then(|| remote_account_search_handle(query, &state.local_domain, offset))
+        .flatten();
+    let accounts = match if let Some((username, domain)) = remote_handle.as_ref()
+        && let Some(writer) = state.write_repository.as_ref()
     {
+        let Ok(domain_allowed) = state
+            .repository
+            .remote_domain_allowed(domain, state.instance_runtime.limited_federation)
+            .await
+        else {
+            return internal_error();
+        };
+        if !domain_allowed {
+            return json_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                br#"{"error":"Remote account resolution is unavailable"}"#.to_vec(),
+            );
+        }
+        let Ok(last_webfingered_at) = state
+            .repository
+            .rest_account_last_webfingered_at(username, domain)
+            .await
+        else {
+            return internal_error();
+        };
+        let fresh_after = Utc::now().naive_utc() - ChronoDuration::days(1);
+        if last_webfingered_at.is_some_and(|value| value >= fresh_after) {
+            state
+                .loader(Some(owner))
+                .account_search(query, false, following, limit, offset)
+                .await
+        } else {
+            if let Err(limited) = state
+                .remote_account_resolution_limiter
+                .check_shared(
+                    state.shared_rate_limiter.as_ref(),
+                    metadata.client_ip,
+                    username,
+                    domain,
+                )
+                .await
+            {
+                return rate_limited_response(limited);
+            }
+            let Ok(instance) = state.repository.account(-99).await else {
+                return internal_error();
+            };
+            let Some(instance) = instance else {
+                return internal_error();
+            };
+            let Some(private_key) = instance.private_key.as_ref().filter(|key| key.is_present())
+            else {
+                return json_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    br#"{"error":"Remote account resolution is unavailable"}"#.to_vec(),
+                );
+            };
+            let key_id = format!(
+                "{}#main-key",
+                activitypub::actor_url(&state.origin, &instance)
+            );
+            let signer = HttpSignatureSigner {
+                key_id: &key_id,
+                private_key_pem: private_key.as_str(),
+            };
+            let actor = match state
+                .remote_account_resolver
+                .resolve_with_signer(username, domain, Some(&signer))
+                .await
+            {
+                Ok(actor) => actor,
+                Err(RemoteFetchError::DomainBudgetExceeded) => {
+                    return json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        br#"{"error":"Remote account resolution is temporarily unavailable"}"#
+                            .to_vec(),
+                    );
+                }
+                Err(_) => {
+                    return json_response(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        br#"{"error":"Remote account resolution is unavailable"}"#.to_vec(),
+                    );
+                }
+            };
+            let actor_username = actor.username.clone();
+            if writer
+                .upsert_remote_actor(
+                    &actor_username,
+                    domain,
+                    state.instance_runtime.limited_federation,
+                    &actor,
+                )
+                .await
+                .is_err()
+            {
+                return internal_error();
+            }
+            state
+                .loader(Some(owner))
+                .account_search(query, false, following, limit, offset)
+                .await
+        }
+    } else {
+        state
+            .loader(Some(owner))
+            .account_search(query, resolve, following, limit, offset)
+            .await
+    } {
         Ok(accounts) => accounts,
         Err(AccountSearchError::RemoteResolutionUnsupported) => {
             return json_response(
@@ -3203,6 +8641,2593 @@ async fn account_search(
     {
         Some(body) => json_response(StatusCode::OK, body),
         None => internal_error(),
+    }
+}
+
+async fn oauth_token(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let grant_type = match oauth_scalar(&rack, "grant_type") {
+        Ok(Some(value)) if !value.is_empty() => value,
+        _ => {
+            return oauth_token_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Missing required parameter: grant_type.",
+            );
+        }
+    };
+    if grant_type == "authorization_code" {
+        return oauth_authorization_code_token(state, &rack, &headers).await;
+    }
+    if grant_type != "client_credentials" {
+        return oauth_token_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_grant_type",
+            "The authorization grant type is not supported by the authorization server.",
+        );
+    }
+    let Ok((client_id, client_secret)) = oauth_client_credentials(&rack, &headers) else {
+        return oauth_token_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "Client authentication failed due to unknown client, no client authentication included, or unsupported authentication method.",
+        );
+    };
+    let Ok(requested_scope) = oauth_scalar(&rack, "scope") else {
+        return oauth_token_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_scope",
+            "The requested scope is invalid, unknown, or malformed.",
+        );
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let token = match writer
+        .issue_oauth_client_credentials_token(&client_id, &client_secret, requested_scope)
+        .await
+    {
+        Ok(token) => token,
+        Err(OAuthClientCredentialsError::InvalidClient) => {
+            return oauth_token_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
+                "Client authentication failed due to unknown client, no client authentication included, or unsupported authentication method.",
+            );
+        }
+        Err(OAuthClientCredentialsError::InvalidScope) => {
+            return oauth_token_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_scope",
+                "The requested scope is invalid, unknown, or malformed.",
+            );
+        }
+        Err(OAuthClientCredentialsError::Database(_)) => return internal_error(),
+    };
+    let body = serde_json::json!({
+        "access_token": token.access_token,
+        "token_type": "Bearer",
+        "scope": token.scopes,
+        "created_at": token.created_at.and_utc().timestamp(),
+    });
+    let Ok(body) = serde_json::to_vec(&body) else {
+        return internal_error();
+    };
+    let mut response = json_response(StatusCode::OK, body);
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    response
+}
+
+async fn oauth_authorization_code_token(
+    state: WebState,
+    parameters: &RackParameters,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    let (client_id, client_secret) = if headers.contains_key(AUTHORIZATION) {
+        match oauth_basic_client_credentials(headers) {
+            Ok((client_id, client_secret)) => (client_id, Some(client_secret)),
+            Err(()) => {
+                return oauth_token_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_client",
+                    "Client authentication failed due to unknown client, no client authentication included, or unsupported authentication method.",
+                );
+            }
+        }
+    } else {
+        let Ok(Some(client_id)) = oauth_scalar(parameters, "client_id") else {
+            return oauth_token_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
+                "Client authentication failed due to unknown client, no client authentication included, or unsupported authentication method.",
+            );
+        };
+        let Ok(client_secret) = oauth_scalar(parameters, "client_secret") else {
+            return oauth_token_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "The request is missing a required parameter.",
+            );
+        };
+        (client_id.to_owned(), client_secret.map(str::to_owned))
+    };
+    let Ok(Some(code)) = oauth_scalar(parameters, "code") else {
+        return oauth_token_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The request is missing a required parameter: code.",
+        );
+    };
+    let Ok(Some(redirect_uri)) = oauth_scalar(parameters, "redirect_uri") else {
+        return oauth_token_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The request is missing a required parameter: redirect_uri.",
+        );
+    };
+    let Ok(code_verifier) = oauth_scalar(parameters, "code_verifier") else {
+        return oauth_token_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The request contains an invalid code_verifier.",
+        );
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let token = match writer
+        .issue_oauth_authorization_code_token(
+            &client_id,
+            client_secret.as_deref(),
+            code,
+            redirect_uri,
+            code_verifier,
+        )
+        .await
+    {
+        Ok(token) => token,
+        Err(OAuthAuthorizationCodeError::InvalidClient) => {
+            return oauth_token_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
+                "Client authentication failed due to unknown client, no client authentication included, or unsupported authentication method.",
+            );
+        }
+        Err(OAuthAuthorizationCodeError::InvalidGrant) => {
+            return oauth_token_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "The provided authorization grant is invalid, expired, revoked, does not match the redirection URI used in the authorization request, or was issued to another client.",
+            );
+        }
+        Err(OAuthAuthorizationCodeError::Database(_)) => return internal_error(),
+    };
+    let body = serde_json::json!({
+        "access_token": token.access_token,
+        "token_type": "Bearer",
+        "scope": token.scopes,
+        "created_at": token.created_at.and_utc().timestamp(),
+    });
+    let Ok(body) = serde_json::to_vec(&body) else {
+        return internal_error();
+    };
+    let mut response = json_response(StatusCode::OK, body);
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    response
+}
+
+async fn oauth_userinfo(State(state): State<WebState>, headers: HeaderMap) -> Response<Body> {
+    let owner = match required_viewer_owner(&state, &headers, PROFILE).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let Some(account) = (match state.loader(None).account(owner.account_id()).await {
+        Ok(account) => account,
+        Err(_) => return internal_error(),
+    }) else {
+        return record_not_found();
+    };
+    let Ok(account) = state.serializer().account(&account) else {
+        return internal_error();
+    };
+    let body = serde_json::json!({
+        "iss": state.origin.as_str(),
+        "sub": account.uri,
+        "name": account.display_name,
+        "preferred_username": account.username,
+        "profile": account.url,
+        "picture": account.avatar,
+    });
+    let Ok(body) = serde_json::to_vec(&body) else {
+        return internal_error();
+    };
+    let mut response = json_response(StatusCode::OK, body);
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(PRIVATE_CACHE));
+    response
+        .headers_mut()
+        .insert(VARY, HeaderValue::from_static("Authorization, Origin"));
+    response
+}
+
+async fn oauth_metadata(State(state): State<WebState>) -> Response<Body> {
+    let endpoint = |path: &str| state.origin.join(path).ok().map(|url| url.to_string());
+    let Some((
+        authorization_endpoint,
+        token_endpoint,
+        userinfo_endpoint,
+        revocation_endpoint,
+        app_registration_endpoint,
+    )) = [
+        endpoint("oauth/authorize"),
+        endpoint("oauth/token"),
+        endpoint("oauth/userinfo"),
+        endpoint("oauth/revoke"),
+        endpoint("api/v1/apps"),
+    ]
+    .into_iter()
+    .collect::<Option<Vec<_>>>()
+    .and_then(|endpoints| {
+        let mut endpoints = endpoints.into_iter();
+        Some((
+            endpoints.next()?,
+            endpoints.next()?,
+            endpoints.next()?,
+            endpoints.next()?,
+            endpoints.next()?,
+        ))
+    })
+    else {
+        return internal_error();
+    };
+    let body = serde_json::json!({
+        "issuer": state.origin.as_str(),
+        "authorization_endpoint": authorization_endpoint,
+        "token_endpoint": token_endpoint,
+        "userinfo_endpoint": userinfo_endpoint,
+        "revocation_endpoint": revocation_endpoint,
+        "scopes_supported": OAUTH_CONFIGURED_SCOPES,
+        "response_types_supported": ["code"],
+        "response_modes_supported": ["query", "fragment", "form_post"],
+        "grant_types_supported": ["authorization_code", "client_credentials"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+        "code_challenge_methods_supported": ["S256"],
+        "service_documentation": "https://docs.joinmastodon.org/",
+        "app_registration_endpoint": app_registration_endpoint,
+    });
+    let Ok(body) = serde_json::to_vec(&body) else {
+        return internal_error();
+    };
+    let mut response = json_response(StatusCode::OK, body);
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("max-age=0, private, must-revalidate"),
+    );
+    response
+        .headers_mut()
+        .insert(VARY, HeaderValue::from_static("Origin"));
+    response
+}
+
+async fn oauth_revoke(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let Ok((client_id, client_secret)) = oauth_client_credentials(&rack, &headers) else {
+        return oauth_revoke_error();
+    };
+    let token = oauth_scalar(&rack, "token").ok().flatten();
+    let token_type_hint = oauth_scalar(&rack, "token_type_hint").ok().flatten();
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    match writer
+        .revoke_oauth_token(&client_id, &client_secret, token, token_type_hint)
+        .await
+    {
+        Ok(()) => empty_json_response(),
+        Err(
+            OAuthTokenRevocationError::InvalidClient
+            | OAuthTokenRevocationError::UnauthorizedClient,
+        ) => oauth_revoke_error(),
+        Err(OAuthTokenRevocationError::Database(_)) => internal_error(),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn oauth_authorize(
+    State(state): State<WebState>,
+    method: Method,
+    Extension(parameters): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let Some(session_id) = request_cookie(&headers, BROWSER_SESSION_COOKIE) else {
+        return oauth_authorize_sign_in_redirect(&parameters);
+    };
+    let session = match state.repository.browser_session(session_id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return oauth_authorize_sign_in_redirect(&parameters),
+        Err(_) => return internal_error(),
+    };
+    if !session.functional {
+        return browser_redirect_response("/settings/profile");
+    }
+    let Ok(Some(client_id)) = oauth_scalar(&parameters, "client_id") else {
+        return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    let Ok(Some(redirect_uri)) = oauth_scalar(&parameters, "redirect_uri") else {
+        return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    let Ok(Some(response_type)) = oauth_scalar(&parameters, "response_type") else {
+        return oauth_authorize_error(StatusCode::BAD_REQUEST, "unsupported_response_type");
+    };
+    let state_value = oauth_scalar(&parameters, "state").ok().flatten();
+    let application = match state.repository.oauth_application_by_uid(client_id).await {
+        Ok(Some(application)) => application,
+        Ok(None) => return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_client"),
+        Err(_) => return internal_error(),
+    };
+    if response_type != "code"
+        || !application
+            .redirect_uri
+            .split_whitespace()
+            .any(|registered| registered == redirect_uri)
+    {
+        return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    if method == Method::GET {
+        return oauth_consent_response(
+            &application.name,
+            client_id,
+            redirect_uri,
+            oauth_scalar(&parameters, "scope")
+                .ok()
+                .flatten()
+                .unwrap_or("read"),
+            state_value,
+            oauth_scalar(&parameters, "code_challenge").ok().flatten(),
+            oauth_scalar(&parameters, "code_challenge_method")
+                .ok()
+                .flatten(),
+            request_cookie(&headers, BROWSER_CSRF_COOKIE),
+        );
+    }
+    let Some(csrf_cookie) = request_cookie(&headers, BROWSER_CSRF_COOKIE) else {
+        return browser_auth_error_response(StatusCode::FORBIDDEN, "invalid_csrf_token");
+    };
+    let csrf_attempt = oauth_scalar(&parameters, "csrf_token").ok().flatten();
+    if csrf_attempt
+        .is_none_or(|attempt| !constant_time_equal(csrf_cookie.as_bytes(), attempt.as_bytes()))
+    {
+        return browser_auth_error_response(StatusCode::FORBIDDEN, "invalid_csrf_token");
+    }
+    let approved = oauth_scalar(&parameters, "approve")
+        .ok()
+        .flatten()
+        .or_else(|| oauth_scalar(&parameters, "commit").ok().flatten())
+        .is_some_and(|value| matches!(value, "1" | "true" | "Authorize" | "authorize"));
+    if !approved {
+        return oauth_authorize_redirect(
+            redirect_uri,
+            state_value,
+            Some("access_denied"),
+            Some("The resource owner or authorization server denied the request."),
+            None,
+        );
+    }
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let grant = match writer
+        .create_oauth_authorization_grant(
+            client_id,
+            session.user_id,
+            redirect_uri,
+            oauth_scalar(&parameters, "scope").ok().flatten(),
+            oauth_scalar(&parameters, "code_challenge").ok().flatten(),
+            oauth_scalar(&parameters, "code_challenge_method")
+                .ok()
+                .flatten(),
+        )
+        .await
+    {
+        Ok(grant) => grant,
+        Err(OAuthAuthorizationGrantError::InvalidClient) => {
+            return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_client");
+        }
+        Err(
+            OAuthAuthorizationGrantError::InvalidRedirectUri
+            | OAuthAuthorizationGrantError::InvalidCodeChallenge,
+        ) => return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_request"),
+        Err(OAuthAuthorizationGrantError::InvalidScope) => {
+            return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_scope");
+        }
+        Err(OAuthAuthorizationGrantError::Database(_)) => return internal_error(),
+    };
+    if redirect_uri == "urn:ietf:wg:oauth:2.0:oob" {
+        let html = format!(
+            "<!doctype html><title>Authorization code</title><p>{}</p>",
+            html_escape::encode_text(&grant.code)
+        );
+        return html_response(StatusCode::OK, html);
+    }
+    oauth_authorize_redirect(redirect_uri, state_value, None, None, Some(&grant.code))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn oauth_consent_response(
+    application_name: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    scope: &str,
+    state: Option<&str>,
+    code_challenge: Option<&str>,
+    code_challenge_method: Option<&str>,
+    csrf_token: Option<&str>,
+) -> Response<Body> {
+    let hidden = |name: &str, value: &str| {
+        format!(
+            "<input type=\"hidden\" name=\"{}\" value=\"{}\">",
+            html_escape::encode_quoted_attribute(name),
+            html_escape::encode_quoted_attribute(value)
+        )
+    };
+    let mut fields = String::new();
+    for (name, value) in [("client_id", client_id), ("redirect_uri", redirect_uri)] {
+        fields.push_str(&hidden(name, value));
+    }
+    fields.push_str(&hidden("response_type", "code"));
+    fields.push_str(&hidden("scope", scope));
+    if let Some(state) = state {
+        fields.push_str(&hidden("state", state));
+    }
+    if let Some(challenge) = code_challenge {
+        fields.push_str(&hidden("code_challenge", challenge));
+    }
+    if let Some(method) = code_challenge_method {
+        fields.push_str(&hidden("code_challenge_method", method));
+    }
+    if let Some(csrf_token) = csrf_token {
+        fields.push_str(&hidden("csrf_token", csrf_token));
+    }
+    html_response(
+        StatusCode::OK,
+        format!(
+            "<!doctype html><title>Authorize application</title><main><h1>Authorize {}</h1><p>Requested scopes: {}</p><form method=\"post\" action=\"/oauth/authorize\">{}<button name=\"approve\" value=\"true\" type=\"submit\">Authorize</button><button name=\"approve\" value=\"false\" type=\"submit\">Deny</button></form></main>",
+            html_escape::encode_text(application_name),
+            html_escape::encode_text(scope),
+            fields
+        ),
+    )
+}
+
+fn oauth_authorize_error(status: StatusCode, error: &str) -> Response<Body> {
+    browser_json_response(status, &serde_json::json!({ "error": error }))
+}
+
+fn oauth_authorize_redirect(
+    redirect_uri: &str,
+    state: Option<&str>,
+    error: Option<&str>,
+    error_description: Option<&str>,
+    code: Option<&str>,
+) -> Response<Body> {
+    let Ok(mut redirect) = Url::parse(redirect_uri) else {
+        return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    {
+        let mut query = redirect.query_pairs_mut();
+        if let Some(code) = code {
+            query.append_pair("code", code);
+        }
+        if let Some(error) = error {
+            query.append_pair("error", error);
+        }
+        if let Some(error_description) = error_description {
+            query.append_pair("error_description", error_description);
+        }
+        if let Some(state) = state {
+            query.append_pair("state", state);
+        }
+    }
+    browser_redirect_response(redirect.as_str())
+}
+
+fn html_response(status: StatusCode, body: String) -> Response<Body> {
+    let mut response = Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(body))
+        .expect("HTML response headers are valid");
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response
+        .headers_mut()
+        .insert("x-frame-options", HeaderValue::from_static("DENY"));
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+        .headers_mut()
+        .insert("x-xss-protection", HeaderValue::from_static("0"));
+    response
+        .headers_mut()
+        .insert("referrer-policy", HeaderValue::from_static("same-origin"));
+    response.headers_mut().insert(
+        "content-security-policy",
+        HeaderValue::from_static(HTML_CONTENT_SECURITY_POLICY),
+    );
+    response
+}
+
+const BROWSER_SESSION_COOKIE: &str = "_mastodon_session";
+const BROWSER_CSRF_COOKIE: &str = "csrf_token";
+const BROWSER_SESSION_MAX_AGE: i64 = 30 * 24 * 60 * 60;
+
+async fn browser_sign_in_page(
+    State(state): State<WebState>,
+    Extension(parameters): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let secure = state.origin.scheme() == "https";
+    let (csrf_token, set_cookie) = browser_page_csrf(&headers, secure);
+    let mut response = html_response(
+        StatusCode::OK,
+        browser_sign_in_document(
+            &csrf_token,
+            None,
+            None,
+            browser_scalar(&parameters, "return_to"),
+        ),
+    );
+    if let Some(cookie) = set_cookie {
+        append_cookie(&mut response, &cookie);
+    }
+    response
+}
+
+fn browser_page_csrf(headers: &HeaderMap, secure: bool) -> (String, Option<String>) {
+    request_cookie(headers, BROWSER_CSRF_COOKIE).map_or_else(
+        || {
+            let token = random_auth_token(32);
+            (
+                token.clone(),
+                Some(browser_cookie(
+                    BROWSER_CSRF_COOKIE,
+                    &token,
+                    BROWSER_SESSION_MAX_AGE,
+                    false,
+                    secure,
+                )),
+            )
+        },
+        |token| (token.to_owned(), None),
+    )
+}
+
+fn browser_sign_in_document(
+    csrf_token: &str,
+    email: Option<&str>,
+    error: Option<&str>,
+    return_to: Option<&str>,
+) -> String {
+    let email = email.map_or_else(String::new, |email| {
+        html_escape::encode_quoted_attribute(email).into_owned()
+    });
+    let error = error.map_or_else(String::new, |message| {
+        format!(
+            "<p role=\"alert\">{}</p>",
+            html_escape::encode_text(message)
+        )
+    });
+    let return_to = valid_browser_return_to(return_to).map_or_else(String::new, |return_to| {
+        format!(
+            "<input type=\"hidden\" name=\"return_to\" value=\"{}\">",
+            html_escape::encode_quoted_attribute(return_to)
+        )
+    });
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Log in</title></head><body><main><h1>Log in</h1>{error}<form method=\"post\" action=\"/auth/sign_in\"><input type=\"hidden\" name=\"csrf_token\" value=\"{}\">{return_to}<label for=\"email\">Email</label><input id=\"email\" type=\"email\" name=\"user[email]\" value=\"{email}\" autocomplete=\"username\" required><label for=\"password\">Password</label><input id=\"password\" type=\"password\" name=\"user[password]\" autocomplete=\"current-password\" required><label for=\"otp_attempt\">Two-factor or recovery code</label><input id=\"otp_attempt\" type=\"text\" name=\"user[otp_attempt]\" autocomplete=\"one-time-code\"><button type=\"submit\">Log in</button></form><p><a href=\"/auth/password/new\">Forgot your password?</a></p></main></body></html>",
+        html_escape::encode_quoted_attribute(csrf_token),
+    )
+}
+
+fn hidden_csrf(csrf_token: &str) -> String {
+    format!(
+        "<input type=\"hidden\" name=\"csrf_token\" value=\"{}\">",
+        html_escape::encode_quoted_attribute(csrf_token)
+    )
+}
+
+async fn required_browser_session(
+    state: &WebState,
+    headers: &HeaderMap,
+) -> Result<BrowserSession, Response<Body>> {
+    let Some(session_id) = request_cookie(headers, BROWSER_SESSION_COOKIE) else {
+        return Err(browser_redirect_response("/auth/sign_in"));
+    };
+    let session = match state.repository.browser_session(session_id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return Err(browser_redirect_response("/auth/sign_in")),
+        Err(_) => return Err(internal_error()),
+    };
+    if let Some(writer) = state.write_repository.as_ref()
+        && !writer
+            .touch_browser_session(session_id)
+            .await
+            .is_ok_and(|touched| touched)
+    {
+        return Err(browser_redirect_response("/auth/sign_in"));
+    }
+    Ok(session)
+}
+
+fn browser_settings_page(
+    title: &str,
+    content: &str,
+    csrf_token: &str,
+    csrf_cookie: Option<String>,
+) -> Response<Body> {
+    let title = html_escape::encode_text(title);
+    let navigation = browser_settings_navigation(csrf_token);
+    let body = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{title}</title></head><body><header>{navigation}</header><main><h1>{title}</h1>{content}</main></body></html>"
+    );
+    let mut response = html_response(StatusCode::OK, body);
+    if let Some(cookie) = csrf_cookie {
+        append_cookie(&mut response, &cookie);
+    }
+    response
+}
+
+fn browser_settings_navigation(csrf_token: &str) -> String {
+    format!(
+        "<nav aria-label=\"Account settings\"><a href=\"/settings/profile\">Profile</a> <a href=\"/settings/preferences/posting_defaults\">Posting defaults</a> <a href=\"/settings/security\">Security</a> <a href=\"/settings/delete\">Delete account</a> <a href=\"/\">Back to Mastodon</a> <form method=\"post\" action=\"/auth/sign_out\">{}<button type=\"submit\">Log out</button></form></nav>",
+        hidden_csrf(csrf_token),
+    )
+}
+
+fn browser_settings_error_response(
+    state: &WebState,
+    headers: &HeaderMap,
+    status: StatusCode,
+    message: &str,
+) -> Response<Body> {
+    let (csrf_token, csrf_cookie) = browser_page_csrf(headers, state.origin.scheme() == "https");
+    let content = format!(
+        "<p role=\"alert\">{}</p><p><a href=\"/settings/profile\">Return to settings</a></p>",
+        html_escape::encode_text(message)
+    );
+    let mut response = browser_settings_page("Settings error", &content, &csrf_token, csrf_cookie);
+    *response.status_mut() = status;
+    response
+}
+
+async fn browser_settings_index(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if let Err(response) = required_browser_session(&state, &headers).await {
+        return response;
+    }
+    browser_redirect_response("/settings/profile")
+}
+
+async fn browser_profile_page(State(state): State<WebState>, headers: HeaderMap) -> Response<Body> {
+    let session = match required_browser_session(&state, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let account = match state.repository.account(session.account_id).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    let (csrf_token, csrf_cookie) = browser_page_csrf(&headers, state.origin.scheme() == "https");
+    browser_settings_page(
+        "Profile",
+        &browser_profile_form(&account, &csrf_token),
+        &csrf_token,
+        csrf_cookie,
+    )
+}
+
+fn browser_profile_form(account: &Account, csrf_token: &str) -> String {
+    let display_name = html_escape::encode_quoted_attribute(&account.display_name);
+    let note = html_escape::encode_text(&account.note);
+    let avatar_description = html_escape::encode_quoted_attribute(&account.avatar_description);
+    let header_description = html_escape::encode_quoted_attribute(&account.header_description);
+    let bot = account
+        .actor_type
+        .as_ref()
+        .is_some_and(|value| value.0 == "Service");
+    let discoverable = account.discoverable.unwrap_or(false);
+    let fields = account
+        .fields
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| {
+                    let object = value.as_object()?;
+                    Some((
+                        object.get("name")?.as_str()?.to_owned(),
+                        object.get("value")?.as_str()?.to_owned(),
+                    ))
+                })
+                .take(4)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut field_inputs = String::new();
+    for index in 0..4 {
+        let (name, value) = fields
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| (String::new(), String::new()));
+        let name = html_escape::encode_quoted_attribute(&name);
+        let value = html_escape::encode_quoted_attribute(&value);
+        let _ = write!(
+            field_inputs,
+            "<div><label for=\"field-{index}-name\">Field {number} name</label><input id=\"field-{index}-name\" name=\"fields_attributes[{index}][name]\" value=\"{name}\" maxlength=\"255\"><label for=\"field-{index}-value\">Field {number} value</label><input id=\"field-{index}-value\" name=\"fields_attributes[{index}][value]\" value=\"{value}\" maxlength=\"255\"></div>",
+            number = index + 1,
+        );
+    }
+    format!(
+        "<p>Update the profile information shown to other accounts.</p><form method=\"post\" action=\"/settings/profile\" enctype=\"multipart/form-data\">{}<fieldset><legend>Profile details</legend><label for=\"display_name\">Display name</label><input id=\"display_name\" name=\"display_name\" value=\"{display_name}\" maxlength=\"40\"><label for=\"note\">Bio</label><textarea id=\"note\" name=\"note\" maxlength=\"500\">{note}</textarea>{field_inputs}</fieldset><fieldset><legend>Account options</legend><label for=\"bot\">Account type</label><select id=\"bot\" name=\"bot\"><option value=\"0\"{}>Personal</option><option value=\"1\"{}>Bot</option></select><input type=\"hidden\" name=\"locked\" value=\"0\"><label><input type=\"checkbox\" name=\"locked\" value=\"1\"{}> Require follow requests</label><input type=\"hidden\" name=\"discoverable\" value=\"0\"><label><input type=\"checkbox\" name=\"discoverable\" value=\"1\"{}> Show account in directory</label></fieldset><fieldset><legend>Profile images</legend><label for=\"avatar\">Avatar</label><input id=\"avatar\" type=\"file\" name=\"avatar\" accept=\"image/jpeg,image/png,image/gif,image/webp\"><label for=\"avatar_description\">Avatar description</label><input id=\"avatar_description\" name=\"avatar_description\" value=\"{avatar_description}\" maxlength=\"150\"><label for=\"header\">Header</label><input id=\"header\" type=\"file\" name=\"header\" accept=\"image/jpeg,image/png,image/gif,image/webp\"><label for=\"header_description\">Header description</label><input id=\"header_description\" name=\"header_description\" value=\"{header_description}\" maxlength=\"150\"></fieldset><button type=\"submit\">Save changes</button></form>",
+        hidden_csrf(csrf_token),
+        if bot { "" } else { " selected" },
+        if bot { " selected" } else { "" },
+        if account.locked { " checked" } else { "" },
+        if discoverable { " checked" } else { "" },
+    )
+}
+
+async fn browser_profile_update(
+    State(state): State<WebState>,
+    Extension(parameters): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    browser_settings_account_update(state, parameters, headers, "/settings/profile").await
+}
+
+async fn browser_posting_defaults_redirect(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if let Err(response) = required_browser_session(&state, &headers).await {
+        return response;
+    }
+    browser_redirect_response("/settings/preferences/appearance")
+}
+
+async fn browser_settings_appearance(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if let Err(response) = required_browser_session(&state, &headers).await {
+        return response;
+    }
+    let (csrf_token, csrf_cookie) = browser_page_csrf(&headers, state.origin.scheme() == "https");
+    let content = format!(
+        "<p>The pinned Mastodon web client controls appearance settings locally. Rustodon v1 keeps the server-side appearance surface English-only.</p><p>Posting defaults are persisted server-side on the <a href=\"/settings/preferences/posting_defaults\">posting defaults page</a>.</p>{}",
+        hidden_csrf(&csrf_token),
+    );
+    browser_settings_page("Appearance", &content, &csrf_token, csrf_cookie)
+}
+
+async fn browser_posting_defaults_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let session = match required_browser_session(&state, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let Ok(Some(preferences)) = state
+        .loader(Some(session.account_id))
+        .preferences(session.user_id, session.account_id)
+        .await
+    else {
+        return internal_error();
+    };
+    let (csrf_token, csrf_cookie) = browser_page_csrf(&headers, state.origin.scheme() == "https");
+    browser_settings_page(
+        "Posting defaults",
+        &browser_posting_defaults_form(&state, &preferences, &csrf_token),
+        &csrf_token,
+        csrf_cookie,
+    )
+}
+
+fn browser_posting_defaults_form(
+    state: &WebState,
+    preferences: &PreferencesProjection,
+    csrf_token: &str,
+) -> String {
+    let visibility = settings_options(
+        &[
+            ("public", "Public"),
+            ("unlisted", "Unlisted"),
+            ("private", "Followers only"),
+        ],
+        &preferences.posting_default_visibility,
+    );
+    let quote_policy = settings_options(
+        &[
+            ("public", "Public"),
+            ("followers", "Followers"),
+            ("nobody", "Nobody"),
+        ],
+        &preferences.posting_default_quote_policy,
+    );
+    let mut language_options = String::new();
+    let languages = if state.instance_runtime.languages.is_empty() {
+        vec!["en".to_owned()]
+    } else {
+        state.instance_runtime.languages.clone()
+    };
+    for language in languages {
+        let label = if language == "en" {
+            "English"
+        } else {
+            language.as_str()
+        };
+        let _ = write!(
+            language_options,
+            "<option value=\"{}\"{}>{}</option>",
+            html_escape::encode_quoted_attribute(&language),
+            if language == preferences.posting_default_language {
+                " selected"
+            } else {
+                ""
+            },
+            html_escape::encode_text(label),
+        );
+    }
+    format!(
+        "<p>These values are used when creating new posts.</p><form method=\"post\" action=\"/settings/preferences/posting_defaults\">{}<fieldset><legend>Posting defaults</legend><label for=\"default_privacy\">Default visibility</label><select id=\"default_privacy\" name=\"source[privacy]\">{visibility}</select><label for=\"default_quote_policy\">Default quote policy</label><select id=\"default_quote_policy\" name=\"source[quote_policy]\">{quote_policy}</select><label for=\"default_language\">Default language</label><select id=\"default_language\" name=\"source[language]\">{language_options}</select><input type=\"hidden\" name=\"source[sensitive]\" value=\"0\"><label><input type=\"checkbox\" name=\"source[sensitive]\" value=\"1\"{}> Mark new posts as sensitive</label></fieldset><button type=\"submit\">Save changes</button></form>",
+        hidden_csrf(csrf_token),
+        if preferences.posting_default_sensitive {
+            " checked"
+        } else {
+            ""
+        },
+    )
+}
+
+fn settings_options(options: &[(&str, &str)], selected: &str) -> String {
+    options
+        .iter()
+        .fold(String::new(), |mut html, (value, label)| {
+            let _ = write!(
+                html,
+                "<option value=\"{}\"{}>{}</option>",
+                html_escape::encode_quoted_attribute(value),
+                if *value == selected { " selected" } else { "" },
+                html_escape::encode_text(label),
+            );
+            html
+        })
+}
+
+async fn browser_posting_defaults_update(
+    State(state): State<WebState>,
+    Extension(parameters): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    browser_settings_account_update(
+        state,
+        parameters,
+        headers,
+        "/settings/preferences/posting_defaults",
+    )
+    .await
+}
+
+async fn browser_two_factor_methods_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let session = match required_browser_session(&state, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let user = match state.repository.user(session.user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    if !user.otp_required_for_login {
+        return browser_redirect_response("/settings/otp_authentication");
+    }
+    let (csrf_token, csrf_cookie) = browser_page_csrf(&headers, state.origin.scheme() == "https");
+    browser_settings_page(
+        "Two-factor authentication",
+        &browser_two_factor_methods_form(&user, &csrf_token),
+        &csrf_token,
+        csrf_cookie,
+    )
+}
+
+fn browser_two_factor_methods_form(user: &User, csrf_token: &str) -> String {
+    let backup_code_count = user.otp_backup_codes.as_ref().map_or(0, Vec::len);
+    let disable = if user.role_requires_2fa {
+        "<p>Your assigned role requires two-factor authentication, so it cannot be disabled here.</p>"
+            .to_owned()
+    } else {
+        format!(
+            "<section aria-labelledby=\"disable-two-factor\"><h2 id=\"disable-two-factor\">Disable two-factor authentication</h2><form method=\"post\" action=\"/settings/two_factor_authentication_methods/disable\">{}<label for=\"disable_current_password\">Current password</label><input id=\"disable_current_password\" type=\"password\" name=\"current_password\" autocomplete=\"current-password\" required><button type=\"submit\">Disable two-factor authentication</button></form></section>",
+            hidden_csrf(csrf_token),
+        )
+    };
+    format!(
+        "<p>One-time password authentication is enabled. The login form accepts a six-digit TOTP code or a recovery code.</p><p>{backup_code_count} recovery codes remain.</p><section aria-labelledby=\"recovery-codes\"><h2 id=\"recovery-codes\">Recovery codes</h2><p>Generating new recovery codes invalidates the existing set.</p><form method=\"post\" action=\"/settings/two_factor_authentication/recovery_codes\">{}<label for=\"recovery_codes_current_password\">Current password</label><input id=\"recovery_codes_current_password\" type=\"password\" name=\"current_password\" autocomplete=\"current-password\" required><button type=\"submit\">Regenerate recovery codes</button></form></section>{disable}",
+        hidden_csrf(csrf_token),
+        disable = disable,
+    )
+}
+
+async fn browser_two_factor_disable(
+    State(state): State<WebState>,
+    Extension(parameters): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let session = match required_browser_session(&state, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if !browser_csrf_is_valid(&parameters, &headers) {
+        return browser_settings_error_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The two-factor form could not be verified. Please try again.",
+        );
+    }
+    let Some(current_password) = browser_scalar(&parameters, "current_password") else {
+        return browser_settings_error_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Enter your current password.",
+        );
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    match writer
+        .disable_two_factor_authentication(session.user_id, current_password)
+        .await
+    {
+        Ok(()) => browser_redirect_response("/settings/otp_authentication"),
+        Err(WriteError::Unauthorized) => browser_settings_error_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The current password is incorrect.",
+        ),
+        Err(WriteError::NotFound) => record_not_found(),
+        Err(WriteError::InvalidInput(_) | WriteError::Validation(_)) => {
+            browser_settings_error_response(
+                &state,
+                &headers,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Two-factor authentication could not be disabled.",
+            )
+        }
+        Err(_) => internal_error(),
+    }
+}
+
+async fn browser_otp_authentication_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let session = match required_browser_session(&state, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let user = match state.repository.user(session.user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    if user.otp_required_for_login {
+        return browser_redirect_response("/settings/two_factor_authentication_methods");
+    }
+    browser_otp_setup_page_response(&state, &headers, StatusCode::OK, None)
+}
+
+async fn browser_otp_authentication_start(
+    State(state): State<WebState>,
+    Extension(parameters): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let session = match required_browser_session(&state, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if !browser_csrf_is_valid(&parameters, &headers) {
+        return browser_otp_setup_page_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some("The two-factor setup form could not be verified. Please try again."),
+        );
+    }
+    let Some(current_password) = browser_scalar(&parameters, "current_password") else {
+        return browser_otp_setup_page_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some("Enter your current password."),
+        );
+    };
+    let user = match state.repository.user(session.user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    if user.otp_required_for_login {
+        return browser_redirect_response("/settings/two_factor_authentication_methods");
+    }
+    if !verify_password(current_password, user.encrypted_password.as_str()) {
+        return browser_otp_setup_page_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some("The current password is incorrect."),
+        );
+    }
+    let secret = random_totp_secret();
+    browser_otp_confirmation_page_response(
+        &state,
+        &headers,
+        StatusCode::OK,
+        &user.email,
+        &secret,
+        None,
+    )
+}
+
+async fn browser_otp_confirmation_redirect(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if let Err(response) = required_browser_session(&state, &headers).await {
+        return response;
+    }
+    browser_redirect_response("/settings/otp_authentication")
+}
+
+async fn browser_otp_confirmation(
+    State(state): State<WebState>,
+    Extension(parameters): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let session = match required_browser_session(&state, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let user = match state.repository.user(session.user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    let Some(secret) = browser_scalar(&parameters, "otp_secret") else {
+        return browser_redirect_response("/settings/otp_authentication");
+    };
+    if !browser_csrf_is_valid(&parameters, &headers) {
+        return browser_otp_confirmation_page_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &user.email,
+            secret,
+            Some("The two-factor confirmation form could not be verified. Please try again."),
+        );
+    }
+    let Some(current_password) = browser_scalar(&parameters, "current_password") else {
+        return browser_otp_confirmation_page_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &user.email,
+            secret,
+            Some("Enter your current password."),
+        );
+    };
+    if !verify_password(current_password, user.encrypted_password.as_str()) {
+        return browser_otp_confirmation_page_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &user.email,
+            secret,
+            Some("The current password is incorrect."),
+        );
+    }
+    let Some(attempt) = browser_scalar(&parameters, "otp_attempt") else {
+        return browser_otp_confirmation_page_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &user.email,
+            secret,
+            Some("Enter the six-digit code from your authenticator."),
+        );
+    };
+    if !matches!(
+        verify_two_factor(Some(secret), &[], attempt, Utc::now().timestamp(), None),
+        TwoFactorVerification::Totp(_)
+    ) {
+        return browser_otp_confirmation_page_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &user.email,
+            secret,
+            Some("The authentication code is incorrect."),
+        );
+    }
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    match writer
+        .enable_two_factor_authentication(session.user_id, secret)
+        .await
+    {
+        Ok(backup_codes) => browser_two_factor_recovery_codes_page(&state, &headers, &backup_codes),
+        Err(WriteError::NotFound) => record_not_found(),
+        Err(WriteError::InvalidInput(_) | WriteError::Validation(_)) => {
+            browser_otp_confirmation_page_response(
+                &state,
+                &headers,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &user.email,
+                secret,
+                Some("Two-factor authentication could not be enabled."),
+            )
+        }
+        Err(_) => internal_error(),
+    }
+}
+
+async fn browser_two_factor_recovery_codes(
+    State(state): State<WebState>,
+    Extension(parameters): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let session = match required_browser_session(&state, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if !browser_csrf_is_valid(&parameters, &headers) {
+        return browser_settings_error_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The recovery-code form could not be verified. Please try again.",
+        );
+    }
+    let Some(current_password) = browser_scalar(&parameters, "current_password") else {
+        return browser_settings_error_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Enter your current password.",
+        );
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    match writer
+        .regenerate_two_factor_backup_codes(session.user_id, current_password)
+        .await
+    {
+        Ok(backup_codes) => browser_two_factor_recovery_codes_page(&state, &headers, &backup_codes),
+        Err(WriteError::Unauthorized) => browser_settings_error_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The current password is incorrect.",
+        ),
+        Err(WriteError::NotFound) => record_not_found(),
+        Err(WriteError::InvalidInput(_) | WriteError::Validation(_)) => {
+            browser_settings_error_response(
+                &state,
+                &headers,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Recovery codes could not be regenerated.",
+            )
+        }
+        Err(_) => internal_error(),
+    }
+}
+
+fn browser_otp_setup_page_response(
+    state: &WebState,
+    headers: &HeaderMap,
+    status: StatusCode,
+    error: Option<&str>,
+) -> Response<Body> {
+    let (csrf_token, csrf_cookie) = browser_page_csrf(headers, state.origin.scheme() == "https");
+    let error = error.map_or_else(String::new, |message| {
+        format!(
+            "<p role=\"alert\">{}</p>",
+            html_escape::encode_text(message)
+        )
+    });
+    let content = format!(
+        "{error}<p>Set up two-factor authentication with an authenticator application. You will confirm a generated secret before it is stored.</p><form method=\"post\" action=\"/settings/otp_authentication\">{}<label for=\"setup_current_password\">Current password</label><input id=\"setup_current_password\" type=\"password\" name=\"current_password\" autocomplete=\"current-password\" required><button type=\"submit\">Set up two-factor authentication</button></form>",
+        hidden_csrf(&csrf_token),
+    );
+    let mut response = browser_settings_page(
+        "Set up two-factor authentication",
+        &content,
+        &csrf_token,
+        csrf_cookie,
+    );
+    *response.status_mut() = status;
+    response
+}
+
+fn browser_otp_confirmation_page_response(
+    state: &WebState,
+    headers: &HeaderMap,
+    status: StatusCode,
+    email: &str,
+    secret: &str,
+    error: Option<&str>,
+) -> Response<Body> {
+    let (csrf_token, csrf_cookie) = browser_page_csrf(headers, state.origin.scheme() == "https");
+    let error = error.map_or_else(String::new, |message| {
+        format!(
+            "<p role=\"alert\">{}</p>",
+            html_escape::encode_text(message)
+        )
+    });
+    let uri = browser_totp_provisioning_uri(secret, email, &state.local_domain);
+    let content = format!(
+        "{error}<p>Scan this provisioning URI in your authenticator application, or enter the secret manually.</p><p><code>{}</code></p><p>Manual secret: <samp>{}</samp></p><form method=\"post\" action=\"/settings/two_factor_authentication/confirmation\">{}<input type=\"hidden\" name=\"otp_secret\" value=\"{}\"><label for=\"confirmation_current_password\">Current password</label><input id=\"confirmation_current_password\" type=\"password\" name=\"current_password\" autocomplete=\"current-password\" required><label for=\"otp_attempt\">Authentication code</label><input id=\"otp_attempt\" type=\"text\" name=\"otp_attempt\" inputmode=\"numeric\" autocomplete=\"one-time-code\" pattern=\"[0-9]{{6}}\" required><button type=\"submit\">Enable two-factor authentication</button></form>",
+        html_escape::encode_text(&uri),
+        html_escape::encode_text(&spaced_totp_secret(secret)),
+        hidden_csrf(&csrf_token),
+        html_escape::encode_quoted_attribute(secret),
+    );
+    let mut response = browser_settings_page(
+        "Confirm two-factor authentication",
+        &content,
+        &csrf_token,
+        csrf_cookie,
+    );
+    *response.status_mut() = status;
+    response
+}
+
+fn browser_two_factor_recovery_codes_page(
+    state: &WebState,
+    headers: &HeaderMap,
+    backup_codes: &[String],
+) -> Response<Body> {
+    let (csrf_token, csrf_cookie) = browser_page_csrf(headers, state.origin.scheme() == "https");
+    let codes = backup_codes.iter().fold(String::new(), |mut codes, code| {
+        let _ = write!(
+            codes,
+            "<li><samp>{}</samp></li>",
+            html_escape::encode_text(code),
+        );
+        codes
+    });
+    let content = format!(
+        "<p><strong>Recovery codes</strong> can be used once each when your authenticator is unavailable. Store them somewhere safe.</p><ol class=\"recovery-codes\">{codes}</ol><p>These codes will not be shown again.</p>{}",
+        hidden_csrf(&csrf_token),
+    );
+    browser_settings_page("Recovery codes", &content, &csrf_token, csrf_cookie)
+}
+
+fn browser_totp_provisioning_uri(secret: &str, email: &str, issuer: &str) -> String {
+    let label_source = format!("{issuer}:{email}");
+    let label = utf8_percent_encode(&label_source, NON_ALPHANUMERIC);
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("secret", secret);
+    query.append_pair("issuer", issuer);
+    query.append_pair("algorithm", "SHA1");
+    query.append_pair("digits", "6");
+    query.append_pair("period", "30");
+    format!("otpauth://totp/{label}?{}", query.finish())
+}
+
+fn spaced_totp_secret(secret: &str) -> String {
+    secret
+        .as_bytes()
+        .chunks(4)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+async fn browser_security_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let session = match required_browser_session(&state, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let user = match state.repository.user(session.user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    let (csrf_token, csrf_cookie) = browser_page_csrf(&headers, state.origin.scheme() == "https");
+    let two_factor = if user.otp_required_for_login {
+        "enabled"
+    } else {
+        "not enabled"
+    };
+    let webauthn = if user.has_webauthn_credentials {
+        "configured"
+    } else {
+        "not configured"
+    };
+    let two_factor_action = if user.otp_required_for_login {
+        "<a href=\"/settings/two_factor_authentication_methods\">Manage two-factor authentication</a>"
+    } else {
+        "<a href=\"/settings/otp_authentication\">Set up two-factor authentication</a>"
+    };
+    let content = format!(
+        "<p>Signed in as <strong>{}</strong>.</p><section aria-labelledby=\"two-factor\"><h2 id=\"two-factor\">Two-factor authentication</h2><p>One-time password authentication is {two_factor}; security keys are {webauthn}. The login form accepts a TOTP or backup code.</p><p>{two_factor_action}</p></section><section aria-labelledby=\"password\"><h2 id=\"password\">Change password</h2><form method=\"post\" action=\"/settings/security\">{}<label for=\"current_password\">Current password</label><input id=\"current_password\" type=\"password\" name=\"current_password\" autocomplete=\"current-password\" required><label for=\"password\">New password</label><input id=\"password\" type=\"password\" name=\"password\" autocomplete=\"new-password\" required><label for=\"password_confirmation\">Confirm new password</label><input id=\"password_confirmation\" type=\"password\" name=\"password_confirmation\" autocomplete=\"new-password\" required><button type=\"submit\">Change password</button></form></section>",
+        html_escape::encode_text(&user.email),
+        hidden_csrf(&csrf_token),
+    );
+    browser_settings_page("Security", &content, &csrf_token, csrf_cookie)
+}
+
+async fn browser_security_update(
+    State(state): State<WebState>,
+    Extension(parameters): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let session = match required_browser_session(&state, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if !browser_csrf_is_valid(&parameters, &headers) {
+        return browser_settings_error_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The security form could not be verified. Please try again.",
+        );
+    }
+    let Some(current_password) = browser_scalar(&parameters, "current_password") else {
+        return browser_settings_error_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Enter your current password.",
+        );
+    };
+    let Some(password) = browser_scalar(&parameters, "password") else {
+        return browser_settings_error_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Enter a new password.",
+        );
+    };
+    if browser_scalar(&parameters, "password_confirmation") != Some(password) {
+        return browser_settings_error_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The new password confirmation does not match.",
+        );
+    }
+    let user = match state.repository.user(session.user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    if !verify_password(current_password, user.encrypted_password.as_str()) {
+        return browser_settings_error_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The current password is incorrect.",
+        );
+    }
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    match writer
+        .reset_user_password_by_email(&user.email, password)
+        .await
+    {
+        Ok(true) => browser_redirect_response("/auth/sign_in"),
+        Ok(false) | Err(WriteError::InvalidInput(_) | WriteError::Validation(_)) => {
+            browser_settings_error_response(
+                &state,
+                &headers,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "The new password could not be saved.",
+            )
+        }
+        Err(_) => internal_error(),
+    }
+}
+
+async fn browser_delete_page(State(state): State<WebState>, headers: HeaderMap) -> Response<Body> {
+    let session = match required_browser_session(&state, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let user = match state.repository.user(session.user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    browser_delete_page_response(
+        state.origin.scheme() == "https",
+        &headers,
+        StatusCode::OK,
+        &user,
+        None,
+    )
+}
+
+async fn browser_delete(
+    State(state): State<WebState>,
+    Extension(parameters): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let session = match required_browser_session(&state, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let account = match state.repository.account(session.account_id).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    let user = match state.repository.user(session.user_id).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    if !browser_csrf_is_valid(&parameters, &headers) {
+        return browser_delete_page_response(
+            state.origin.scheme() == "https",
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &user,
+            Some("The deletion form could not be verified. Please try again."),
+        );
+    }
+    let challenge_passed = if user.encrypted_password.is_present() {
+        browser_scalar(&parameters, "password")
+            .is_some_and(|password| verify_password(password, user.encrypted_password.as_str()))
+    } else {
+        browser_scalar(&parameters, "username").is_some_and(|username| username == account.username)
+    };
+    if !challenge_passed {
+        return browser_delete_page_response(
+            state.origin.scheme() == "https",
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &user,
+            Some("The password or username confirmation is incorrect."),
+        );
+    }
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let actor_uri = activitypub::actor_url(&state.origin, &account);
+    match writer
+        .request_account_deletion(session.account_id, &actor_uri)
+        .await
+    {
+        Ok(()) => {}
+        Err(WriteError::InvalidInput(_) | WriteError::Validation(_)) => {
+            return browser_delete_page_response(
+                state.origin.scheme() == "https",
+                &headers,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &user,
+                Some("The account could not be scheduled for deletion."),
+            );
+        }
+        Err(WriteError::NotFound) => return record_not_found(),
+        Err(_) => return internal_error(),
+    }
+    let Some(session_id) = request_cookie(&headers, BROWSER_SESSION_COOKIE) else {
+        return internal_error();
+    };
+    if writer.delete_browser_session(session_id).await.is_err() {
+        return internal_error();
+    }
+    browser_signed_out_redirect_response(state.origin.scheme() == "https")
+}
+
+fn browser_delete_page_response(
+    secure: bool,
+    headers: &HeaderMap,
+    status: StatusCode,
+    user: &User,
+    error: Option<&str>,
+) -> Response<Body> {
+    let (csrf_token, csrf_cookie) = browser_page_csrf(headers, secure);
+    let error = error.map_or_else(String::new, |message| {
+        format!(
+            "<p role=\"alert\">{}</p>",
+            html_escape::encode_text(message)
+        )
+    });
+    let content = format!(
+        "{error}<p>Deleting your account is irreversible. Your account will become unavailable immediately and the deletion request will be queued for processing.</p>{}",
+        browser_delete_form(user.encrypted_password.is_present(), &csrf_token),
+    );
+    let mut response = browser_settings_page("Delete account", &content, &csrf_token, csrf_cookie);
+    *response.status_mut() = status;
+    response
+}
+
+fn browser_delete_form(has_password: bool, csrf_token: &str) -> String {
+    let challenge = if has_password {
+        "<label for=\"password\">Password</label><input id=\"password\" type=\"password\" name=\"password\" autocomplete=\"current-password\" required>"
+            .to_owned()
+    } else {
+        "<label for=\"username\">Username</label><input id=\"username\" type=\"text\" name=\"username\" autocomplete=\"off\" required>"
+            .to_owned()
+    };
+    format!(
+        "<form method=\"post\" action=\"/settings/delete\">{}{challenge}<button type=\"submit\">Delete account</button></form>",
+        hidden_csrf(csrf_token),
+    )
+}
+
+async fn browser_settings_account_update(
+    state: WebState,
+    parameters: RackParameters,
+    headers: HeaderMap,
+    redirect: &'static str,
+) -> Response<Body> {
+    let session = match required_browser_session(&state, &headers).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if !browser_csrf_is_valid(&parameters, &headers) {
+        return browser_settings_error_response(
+            &state,
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The settings form could not be verified. Please try again.",
+        );
+    }
+    let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", session.access_token.as_str()))
+    else {
+        return internal_error();
+    };
+    let error_state = state.clone();
+    let error_headers = headers.clone();
+    let mut api_headers = headers;
+    api_headers.insert(AUTHORIZATION, value);
+    let response = update_credentials(State(state), Extension(parameters), api_headers).await;
+    if response.status().is_success() {
+        browser_redirect_response(redirect)
+    } else {
+        browser_settings_error_response(
+            &error_state,
+            &error_headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The settings could not be saved.",
+        )
+    }
+}
+
+async fn browser_password_reset_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    browser_password_reset_page_response(
+        state.origin.scheme() == "https",
+        &headers,
+        StatusCode::OK,
+        None,
+        None,
+    )
+}
+
+async fn browser_password_reset_edit(
+    State(state): State<WebState>,
+    Extension(parameters): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let Some(token) = browser_scalar(&parameters, "reset_password_token")
+        .filter(|token| !token.trim().is_empty())
+    else {
+        return browser_redirect_response("/auth/password/new");
+    };
+    browser_password_reset_page_response(
+        state.origin.scheme() == "https",
+        &headers,
+        StatusCode::OK,
+        Some(token),
+        None,
+    )
+}
+
+fn browser_password_reset_page_response(
+    secure: bool,
+    headers: &HeaderMap,
+    status: StatusCode,
+    reset_token: Option<&str>,
+    error: Option<&str>,
+) -> Response<Body> {
+    let (csrf_token, set_cookie) = browser_page_csrf(headers, secure);
+    let mut response = html_response(
+        status,
+        browser_password_reset_document(&csrf_token, reset_token, error),
+    );
+    if let Some(cookie) = set_cookie {
+        append_cookie(&mut response, &cookie);
+    }
+    response
+}
+
+fn browser_password_reset_document(
+    csrf_token: &str,
+    reset_token: Option<&str>,
+    error: Option<&str>,
+) -> String {
+    let error = error.map_or_else(String::new, |message| {
+        format!(
+            "<p role=\"alert\">{}</p>",
+            html_escape::encode_text(message)
+        )
+    });
+    let csrf_token = html_escape::encode_quoted_attribute(csrf_token);
+    match reset_token {
+        Some(reset_token) => format!(
+            "<!doctype html><title>Choose a new password</title><main><h1>Choose a new password</h1>{error}<form method=\"post\" action=\"/auth/password\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf_token}\"><input type=\"hidden\" name=\"reset_password_token\" value=\"{}\"><label>New password<input type=\"password\" name=\"user[password]\" autocomplete=\"new-password\" required></label><label>Confirm password<input type=\"password\" name=\"user[password_confirmation]\" autocomplete=\"new-password\" required></label><button type=\"submit\">Change password</button></form></main>",
+            html_escape::encode_quoted_attribute(reset_token),
+        ),
+        None => format!(
+            "<!doctype html><title>Reset password</title><main><h1>Reset password</h1>{error}<p>If the account exists, instructions will be sent.</p><form method=\"post\" action=\"/auth/password\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf_token}\"><label>Email<input type=\"email\" name=\"user[email]\" autocomplete=\"email\" required></label><button type=\"submit\">Send reset instructions</button></form></main>",
+        ),
+    }
+}
+
+fn browser_sign_in_error_response(
+    secure: bool,
+    headers: &HeaderMap,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    email: Option<&str>,
+    return_to: Option<&str>,
+) -> Response<Body> {
+    if !accepts_html(headers) {
+        return browser_auth_error_response(status, code);
+    }
+    let (csrf_token, set_cookie) = browser_page_csrf(headers, secure);
+    let mut response = html_response(
+        status,
+        browser_sign_in_document(&csrf_token, email, Some(message), return_to),
+    );
+    if let Some(cookie) = set_cookie {
+        append_cookie(&mut response, &cookie);
+    }
+    response
+}
+
+fn browser_password_reset_error_response(
+    secure: bool,
+    headers: &HeaderMap,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    reset_token: Option<&str>,
+) -> Response<Body> {
+    if !accepts_html(headers) {
+        return browser_auth_error_response(status, code);
+    }
+    browser_password_reset_page_response(secure, headers, status, reset_token, Some(message))
+}
+
+fn browser_confirmation_error_response(
+    headers: &HeaderMap,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) -> Response<Body> {
+    if !accepts_html(headers) {
+        return browser_auth_error_response(status, code);
+    }
+    html_response(
+        status,
+        format!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Confirmation error</title></head><body><main><h1>Confirmation error</h1><p role=\"alert\">{}</p><p><a href=\"/auth/sign_in\">Return to log in</a></p></main></body></html>",
+            html_escape::encode_text(message),
+        ),
+    )
+}
+
+fn browser_sign_in_rate_limited_response(
+    secure: bool,
+    headers: &HeaderMap,
+    limited: RateLimitExceeded,
+    return_to: Option<&str>,
+) -> Response<Body> {
+    let mut response = browser_sign_in_error_response(
+        secure,
+        headers,
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        "Too many login attempts. Please try again later.",
+        None,
+        return_to,
+    );
+    add_rate_limit_headers(&mut response, limited);
+    response
+}
+
+fn browser_password_reset_rate_limited_response(
+    secure: bool,
+    headers: &HeaderMap,
+    limited: RateLimitExceeded,
+) -> Response<Body> {
+    let mut response = browser_password_reset_error_response(
+        secure,
+        headers,
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        "Too many password reset requests. Please try again later.",
+        None,
+    );
+    add_rate_limit_headers(&mut response, limited);
+    response
+}
+
+async fn browser_password_reset_request(
+    State(state): State<WebState>,
+    Extension(parameters): Extension<RackParameters>,
+    Extension(metadata): Extension<RequestMetadata>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if !browser_csrf_is_valid(&parameters, &headers) {
+        return browser_password_reset_error_response(
+            state.origin.scheme() == "https",
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_csrf_token",
+            "The reset form could not be verified. Please try again.",
+            None,
+        );
+    }
+    let Some(email) = browser_scalar(&parameters, "email").filter(|email| !email.trim().is_empty())
+    else {
+        return browser_password_reset_error_response(
+            state.origin.scheme() == "https",
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_request",
+            "Enter your email address.",
+            None,
+        );
+    };
+    if matches!(state.mail_config.as_ref(), Some(config) if !config.is_enabled()) {
+        return browser_password_reset_error_response(
+            state.origin.scheme() == "https",
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "mail_unavailable",
+            "Password reset email is currently unavailable.",
+            None,
+        );
+    }
+    if let Err(limited) = state
+        .password_reset_limiter
+        .check_shared(
+            state.shared_rate_limiter.as_ref(),
+            metadata.client_ip,
+            email,
+        )
+        .await
+    {
+        return browser_password_reset_rate_limited_response(
+            state.origin.scheme() == "https",
+            &headers,
+            limited,
+        );
+    }
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let result = match state.mail_config.as_ref() {
+        Some(mail_config) if mail_config.is_enabled() => {
+            writer
+                .create_password_reset_token_with_job(
+                    email,
+                    Some(mail_config.token_digest_secret()),
+                    |token| {
+                        mail_config
+                            .password_reset_job(email, token)
+                            .map_err(|_| WriteError::Validation("reset mail job is invalid"))
+                    },
+                )
+                .await
+        }
+        Some(_) => unreachable!("disabled SMTP was rejected before token creation"),
+        None => writer.create_password_reset_token(email).await,
+    };
+    if result.is_err() {
+        return internal_error();
+    }
+    browser_redirect_response("/auth/password/new")
+}
+
+async fn browser_confirmation(
+    State(state): State<WebState>,
+    Extension(parameters): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let Some(token) =
+        browser_scalar(&parameters, "confirmation_token").filter(|token| !token.trim().is_empty())
+    else {
+        return browser_confirmation_error_response(
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_confirmation_token",
+            "The confirmation link is invalid or has expired.",
+        );
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let result = match state.mail_config.as_ref() {
+        Some(mail_config) => {
+            writer
+                .confirm_user_with_token_and_secret(token, mail_config.token_digest_secret())
+                .await
+        }
+        None => writer.confirm_user_with_token(token).await,
+    };
+    match result {
+        Ok(true) => browser_redirect_response("/auth/sign_in"),
+        Ok(false) | Err(WriteError::InvalidInput(_) | WriteError::Validation(_)) => {
+            browser_confirmation_error_response(
+                &headers,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_confirmation_token",
+                "The confirmation link is invalid or has expired.",
+            )
+        }
+        Err(_) => internal_error(),
+    }
+}
+
+async fn browser_password_reset_update(
+    State(state): State<WebState>,
+    Extension(parameters): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if !browser_csrf_is_valid(&parameters, &headers) {
+        return browser_password_reset_error_response(
+            state.origin.scheme() == "https",
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_csrf_token",
+            "The reset form could not be verified. Please try again.",
+            browser_scalar(&parameters, "reset_password_token"),
+        );
+    }
+    let Some(token) = browser_scalar(&parameters, "reset_password_token")
+        .filter(|token| !token.trim().is_empty())
+    else {
+        return browser_password_reset_error_response(
+            state.origin.scheme() == "https",
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_reset_token",
+            "The reset link is invalid or has expired.",
+            None,
+        );
+    };
+    let Some(password) = browser_scalar(&parameters, "password") else {
+        return browser_password_reset_error_response(
+            state.origin.scheme() == "https",
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_password",
+            "Enter a new password.",
+            Some(token),
+        );
+    };
+    if browser_scalar(&parameters, "password_confirmation") != Some(password) {
+        return browser_password_reset_error_response(
+            state.origin.scheme() == "https",
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "password_confirmation_mismatch",
+            "The password confirmation does not match.",
+            Some(token),
+        );
+    }
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let result = match state.mail_config.as_ref() {
+        Some(mail_config) => {
+            writer
+                .reset_password_with_token_and_secret(
+                    token,
+                    password,
+                    mail_config.token_digest_secret(),
+                )
+                .await
+        }
+        None => writer.reset_password_with_token(token, password).await,
+    };
+    match result {
+        Ok(true) => browser_redirect_response("/auth/sign_in"),
+        Ok(false) | Err(WriteError::InvalidInput(_) | WriteError::Validation(_)) => {
+            browser_password_reset_error_response(
+                state.origin.scheme() == "https",
+                &headers,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_reset_token",
+                "The reset link is invalid or has expired.",
+                Some(token),
+            )
+        }
+        Err(_) => internal_error(),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn browser_sign_in(
+    State(state): State<WebState>,
+    Extension(parameters): Extension<RackParameters>,
+    Extension(metadata): Extension<RequestMetadata>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let return_to = valid_browser_return_to(browser_scalar(&parameters, "return_to"));
+    if !browser_csrf_is_valid(&parameters, &headers) {
+        return browser_sign_in_error_response(
+            state.origin.scheme() == "https",
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_csrf_token",
+            "The login form could not be verified. Please try again.",
+            None,
+            return_to,
+        );
+    }
+    let Some(email) = browser_scalar(&parameters, "email").filter(|value| !value.trim().is_empty())
+    else {
+        return browser_sign_in_error_response(
+            state.origin.scheme() == "https",
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Enter your email address.",
+            None,
+            return_to,
+        );
+    };
+    let Some(password) = browser_scalar(&parameters, "password") else {
+        return browser_sign_in_error_response(
+            state.origin.scheme() == "https",
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Enter your password.",
+            Some(email),
+            return_to,
+        );
+    };
+    if let Err(limited) = state
+        .browser_login_limiter
+        .check_shared(
+            state.shared_rate_limiter.as_ref(),
+            metadata.client_ip,
+            email,
+        )
+        .await
+    {
+        return browser_sign_in_rate_limited_response(
+            state.origin.scheme() == "https",
+            &headers,
+            limited,
+            return_to,
+        );
+    }
+    let otp_attempt = browser_scalar(&parameters, "otp_attempt");
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let ip = IpNetwork::from(metadata.client_ip);
+    let user_agent = headers
+        .get(USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let authentication = match writer
+        .authenticate_browser_user(
+            email,
+            password,
+            otp_attempt,
+            Utc::now().timestamp(),
+            ip,
+            user_agent,
+        )
+        .await
+    {
+        Ok(authentication) => authentication,
+        Err(error) => {
+            return browser_authentication_error_response(
+                state.origin.scheme() == "https",
+                &headers,
+                email,
+                &error,
+                return_to,
+            );
+        }
+    };
+    let Ok(session_id) = writer
+        .create_browser_session(authentication.user_id, ip, user_agent)
+        .await
+    else {
+        return internal_error();
+    };
+    let csrf_token = random_auth_token(32);
+    let mut response = browser_redirect_response(return_to.unwrap_or("/"));
+    let secure = state.origin.scheme() == "https";
+    append_cookie(
+        &mut response,
+        &browser_cookie(
+            BROWSER_SESSION_COOKIE,
+            &session_id,
+            BROWSER_SESSION_MAX_AGE,
+            true,
+            secure,
+        ),
+    );
+    append_cookie(
+        &mut response,
+        &browser_cookie(
+            BROWSER_CSRF_COOKIE,
+            &csrf_token,
+            BROWSER_SESSION_MAX_AGE,
+            false,
+            secure,
+        ),
+    );
+    response
+}
+
+async fn browser_session(State(state): State<WebState>, headers: HeaderMap) -> Response<Body> {
+    let Some(session_id) = request_cookie(&headers, BROWSER_SESSION_COOKIE) else {
+        return browser_auth_error_response(StatusCode::UNAUTHORIZED, "unauthenticated");
+    };
+    let session = match state.repository.browser_session(session_id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return browser_auth_error_response(StatusCode::UNAUTHORIZED, "unauthenticated");
+        }
+        Err(_) => return internal_error(),
+    };
+    if let Some(writer) = state.write_repository.as_ref()
+        && !writer
+            .touch_browser_session(session_id)
+            .await
+            .is_ok_and(|touched| touched)
+    {
+        return browser_auth_error_response(StatusCode::UNAUTHORIZED, "unauthenticated");
+    }
+    let value = serde_json::json!({
+        "authenticated": true,
+        "user_id": session.user_id.to_string(),
+        "account_id": session.account_id.to_string(),
+        "last_seen_at": session.updated_at.and_utc().to_rfc3339(),
+    });
+    browser_json_response(StatusCode::OK, &value)
+}
+
+async fn browser_sign_out(
+    State(state): State<WebState>,
+    Extension(parameters): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let Some(session_id) = request_cookie(&headers, BROWSER_SESSION_COOKIE) else {
+        return if accepts_html(&headers) {
+            browser_signed_out_redirect_response(state.origin.scheme() == "https")
+        } else {
+            browser_signed_out_response(state.origin.scheme() == "https")
+        };
+    };
+    if !browser_sign_out_csrf_is_valid(&parameters, &headers) {
+        return browser_sign_out_error_response(&state, &headers);
+    }
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    if writer.delete_browser_session(session_id).await.is_err() {
+        return internal_error();
+    }
+    if accepts_html(&headers) {
+        browser_signed_out_redirect_response(state.origin.scheme() == "https")
+    } else {
+        browser_signed_out_response(state.origin.scheme() == "https")
+    }
+}
+
+fn browser_sign_out_csrf_is_valid(parameters: &RackParameters, headers: &HeaderMap) -> bool {
+    browser_csrf_is_valid(parameters, headers)
+        || request_cookie(headers, BROWSER_CSRF_COOKIE).is_some_and(|csrf_cookie| {
+            headers
+                .get("x-csrf-token")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|csrf_header| {
+                    constant_time_equal(csrf_cookie.as_bytes(), csrf_header.as_bytes())
+                })
+        })
+}
+
+fn browser_sign_out_error_response(state: &WebState, headers: &HeaderMap) -> Response<Body> {
+    if accepts_html(headers) {
+        browser_settings_error_response(
+            state,
+            headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The sign-out form could not be verified. Please try again.",
+        )
+    } else {
+        browser_auth_error_response(StatusCode::FORBIDDEN, "invalid_csrf_token")
+    }
+}
+
+fn browser_scalar<'a>(parameters: &'a RackParameters, name: &str) -> Option<&'a str> {
+    let value = parameters
+        .get(name)
+        .or_else(|| match parameters.get("user") {
+            Some(RackValue::Object(values)) => values.get(name),
+            _ => None,
+        })?;
+    match value {
+        RackValue::Scalar(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn browser_csrf_is_valid(parameters: &RackParameters, headers: &HeaderMap) -> bool {
+    let Some(cookie) = request_cookie(headers, BROWSER_CSRF_COOKIE) else {
+        return false;
+    };
+    let Some(attempt) = browser_scalar(parameters, BROWSER_CSRF_COOKIE) else {
+        return false;
+    };
+    constant_time_equal(cookie.as_bytes(), attempt.as_bytes())
+}
+
+fn browser_authentication_error_response(
+    secure: bool,
+    headers: &HeaderMap,
+    email: &str,
+    error: &BrowserAuthenticationError,
+    return_to: Option<&str>,
+) -> Response<Body> {
+    match error {
+        BrowserAuthenticationError::InvalidCredentials => browser_sign_in_error_response(
+            secure,
+            headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_credentials",
+            "Invalid email or password.",
+            Some(email),
+            return_to,
+        ),
+        BrowserAuthenticationError::Unconfirmed
+        | BrowserAuthenticationError::PendingApproval
+        | BrowserAuthenticationError::Memorialized => browser_sign_in_redirect(return_to),
+        BrowserAuthenticationError::TwoFactorRequired => browser_sign_in_error_response(
+            secure,
+            headers,
+            StatusCode::OK,
+            "two_factor_required",
+            "Enter your two-factor or recovery code.",
+            Some(email),
+            return_to,
+        ),
+        BrowserAuthenticationError::InvalidTwoFactor => browser_sign_in_error_response(
+            secure,
+            headers,
+            StatusCode::OK,
+            "invalid_two_factor",
+            "The two-factor or recovery code is invalid.",
+            Some(email),
+            return_to,
+        ),
+        BrowserAuthenticationError::RateLimited => browser_sign_in_error_response(
+            secure,
+            headers,
+            StatusCode::OK,
+            "rate_limited",
+            "Too many two-factor attempts. Please try again later.",
+            Some(email),
+            return_to,
+        ),
+        BrowserAuthenticationError::Database(_) => internal_error(),
+    }
+}
+
+fn browser_redirect_response(location: &str) -> Response<Body> {
+    let mut response = Response::builder()
+        .status(StatusCode::FOUND)
+        .header(LOCATION, location)
+        .body(Body::empty())
+        .expect("browser redirect response headers are valid");
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response
+        .headers_mut()
+        .insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    response
+}
+
+fn valid_browser_return_to(value: Option<&str>) -> Option<&str> {
+    let value = value?;
+    if value.is_empty()
+        || !value.starts_with('/')
+        || value.starts_with("//")
+        || value.contains('\\')
+        || value.contains(['\r', '\n'])
+    {
+        return None;
+    }
+    value.parse::<Uri>().ok().map(|_| value)
+}
+
+fn browser_sign_in_redirect(return_to: Option<&str>) -> Response<Body> {
+    let Some(return_to) = valid_browser_return_to(return_to) else {
+        return browser_redirect_response("/auth/sign_in");
+    };
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("return_to", return_to);
+    browser_redirect_response(&format!("/auth/sign_in?{}", query.finish()))
+}
+
+fn oauth_authorize_sign_in_redirect(parameters: &RackParameters) -> Response<Body> {
+    let query = parameters.to_query();
+    let return_to = if query.is_empty() {
+        "/oauth/authorize".to_owned()
+    } else {
+        format!("/oauth/authorize?{query}")
+    };
+    browser_sign_in_redirect(Some(&return_to))
+}
+
+fn browser_auth_error_response(status: StatusCode, error: &str) -> Response<Body> {
+    let value = serde_json::json!({ "error": error });
+    let mut response = browser_json_response(status, &value);
+    if status == StatusCode::UNAUTHORIZED {
+        response.headers_mut().insert(
+            WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"Rustodon\""),
+        );
+    }
+    response
+}
+
+fn browser_json_response(status: StatusCode, value: &serde_json::Value) -> Response<Body> {
+    let mut response = json_response(
+        status,
+        serde_json::to_vec(&value).expect("browser authentication response is serializable"),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response
+        .headers_mut()
+        .insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    response
+}
+
+fn browser_signed_out_response(secure: bool) -> Response<Body> {
+    let value = serde_json::json!({ "redirect_to": "/auth/sign_in" });
+    let mut response = browser_json_response(StatusCode::OK, &value);
+    append_cookie(
+        &mut response,
+        &browser_cookie(BROWSER_SESSION_COOKIE, "", 0, true, secure),
+    );
+    append_cookie(
+        &mut response,
+        &browser_cookie(BROWSER_CSRF_COOKIE, "", 0, false, secure),
+    );
+    response
+}
+
+fn browser_signed_out_redirect_response(secure: bool) -> Response<Body> {
+    let mut response = browser_redirect_response("/auth/sign_in");
+    append_cookie(
+        &mut response,
+        &browser_cookie(BROWSER_SESSION_COOKIE, "", 0, true, secure),
+    );
+    append_cookie(
+        &mut response,
+        &browser_cookie(BROWSER_CSRF_COOKIE, "", 0, false, secure),
+    );
+    response
+}
+
+fn request_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value.split(';').find_map(|cookie| {
+                let (cookie_name, cookie_value) = cookie.trim().split_once('=')?;
+                (cookie_name == name).then_some(cookie_value)
+            })
+        })
+}
+
+fn browser_cookie(name: &str, value: &str, max_age: i64, http_only: bool, secure: bool) -> String {
+    let mut cookie = format!("{name}={value}; Path=/; Max-Age={max_age}; SameSite=Lax");
+    if http_only {
+        cookie.push_str("; HttpOnly");
+    }
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+fn append_cookie(response: &mut Response<Body>, cookie: &str) {
+    if let Ok(value) = HeaderValue::from_str(cookie) {
+        response.headers_mut().append(SET_COOKIE, value);
+    }
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        difference |= usize::from(left.get(index).copied().unwrap_or_default())
+            ^ usize::from(right.get(index).copied().unwrap_or_default());
+    }
+    difference == 0
+}
+
+fn oauth_scalar<'a>(parameters: &'a RackParameters, name: &str) -> Result<Option<&'a str>, ()> {
+    match parameters.get(name) {
+        None | Some(RackValue::Null) => Ok(None),
+        Some(RackValue::Scalar(value)) => Ok(Some(value)),
+        Some(_) => Err(()),
+    }
+}
+
+fn oauth_client_credentials(
+    parameters: &RackParameters,
+    headers: &HeaderMap,
+) -> Result<(String, String), ()> {
+    if headers.contains_key(AUTHORIZATION) {
+        return oauth_basic_client_credentials(headers);
+    }
+    let client_id = oauth_scalar(parameters, "client_id")?.ok_or(())?;
+    let client_secret = oauth_scalar(parameters, "client_secret")?.ok_or(())?;
+    if client_id.is_empty() || client_secret.is_empty() {
+        return Err(());
+    }
+    Ok((client_id.to_owned(), client_secret.to_owned()))
+}
+
+fn oauth_basic_client_credentials(headers: &HeaderMap) -> Result<(String, String), ()> {
+    let mut values = headers.get_all(AUTHORIZATION).iter();
+    let value = values.next().ok_or(())?;
+    if values.next().is_some() {
+        return Err(());
+    }
+    let value = value.to_str().map_err(|_| ())?;
+    let (scheme, encoded) = value.split_once(' ').ok_or(())?;
+    if !scheme.eq_ignore_ascii_case("Basic") || encoded.is_empty() {
+        return Err(());
+    }
+    let decoded = STANDARD.decode(encoded).map_err(|_| ())?;
+    let decoded = String::from_utf8(decoded).map_err(|_| ())?;
+    let (client_id, client_secret) = decoded.split_once(':').ok_or(())?;
+    if client_id.is_empty() || client_secret.is_empty() {
+        return Err(());
+    }
+    Ok((client_id.to_owned(), client_secret.to_owned()))
+}
+
+fn oauth_token_error(status: StatusCode, code: &str, description: &str) -> Response<Body> {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "error": code,
+        "error_description": description,
+    }))
+    .expect("OAuth error response is serializable");
+    let mut response = json_response(status, body);
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    let challenge = format!(
+        "Bearer realm=\"Doorkeeper\", error=\"{code}\", error_description=\"{description}\""
+    );
+    if let Ok(value) = HeaderValue::from_str(&challenge) {
+        response.headers_mut().insert(WWW_AUTHENTICATE, value);
+    }
+    response
+}
+
+fn oauth_revoke_error() -> Response<Body> {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "error": "unauthorized_client",
+        "error_description": "You are not authorized to revoke this token",
+    }))
+    .expect("OAuth revocation error response is serializable");
+    json_response(StatusCode::FORBIDDEN, body)
+}
+
+async fn app_create(
+    State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Extension(rack): Extension<RackParameters>,
+) -> Response<Body> {
+    if let Err(limited) = state
+        .oauth_application_limiter
+        .check_shared(state.shared_rate_limiter.as_ref(), metadata.client_ip)
+        .await
+    {
+        return rate_limited_response(limited);
+    }
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let Ok(Some(name)) = app_string_parameter(&rack, "client_name") else {
+        return error_response(StatusCode::UNPROCESSABLE_ENTITY, "Validation failed");
+    };
+    let Ok(Some(redirect_uri)) = app_redirect_uri_parameter(&rack) else {
+        return error_response(StatusCode::UNPROCESSABLE_ENTITY, "Validation failed");
+    };
+    let Ok(scopes) = app_scopes_parameter(&rack) else {
+        return error_response(StatusCode::UNPROCESSABLE_ENTITY, "Validation failed");
+    };
+    let Ok(website) = app_string_parameter(&rack, "website") else {
+        return error_response(StatusCode::UNPROCESSABLE_ENTITY, "Validation failed");
+    };
+    let registration = crate::mastodon::OAuthApplicationRegistration {
+        name,
+        redirect_uri,
+        scopes,
+        website,
+    };
+    let result = match writer.register_oauth_application(&registration).await {
+        Ok(result) => result,
+        Err(WriteError::Validation(message)) => {
+            return error_response(StatusCode::UNPROCESSABLE_ENTITY, message);
+        }
+        Err(_) => return internal_error(),
+    };
+    let application = result.application;
+    let redirect_uris = application
+        .redirect_uri
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let body = serde_json::json!({
+        "id": application.id.to_string(),
+        "name": application.name,
+        "website": application.website.as_deref().filter(|website| !website.trim().is_empty()),
+        "scopes": application.scopes.split_whitespace().collect::<Vec<_>>(),
+        "redirect_uris": redirect_uris,
+        "vapid_key": state.instance_runtime.vapid_public_key,
+        "redirect_uri": application.redirect_uri,
+        "client_id": application.uid,
+        "client_secret": result.client_secret,
+        "client_secret_expires_at": 0,
+    });
+    match serde_json::to_vec(&body) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(_) => internal_error(),
+    }
+}
+
+async fn app_verify_credentials(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match state.authenticator.authenticate(&headers, NO_SCOPE).await {
+        Ok(authenticated) => authenticated,
+        Err(OAuthAuthenticationError::OAuth(error)) => {
+            return error.into_http_response().map(Body::from);
+        }
+        Err(OAuthAuthenticationError::Repository(_)) => return internal_error(),
+    };
+    let Some(application_id) = authenticated.application_id() else {
+        return OAuthError::Unauthenticated
+            .into_http_response()
+            .map(Body::from);
+    };
+    let application = match state.repository.oauth_application(application_id).await {
+        Ok(Some(application)) => application,
+        Ok(None) => {
+            return OAuthError::Unauthenticated
+                .into_http_response()
+                .map(Body::from);
+        }
+        Err(_) => return internal_error(),
+    };
+    let redirect_uris = application
+        .redirect_uri
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let redirect_uri = redirect_uris.first().copied();
+    let body = serde_json::json!({
+        "id": application.id.to_string(),
+        "name": application.name,
+        "website": application.website.as_deref().filter(|website| !website.trim().is_empty()),
+        "scopes": application.scopes.split_whitespace().collect::<Vec<_>>(),
+        "redirect_uris": redirect_uris,
+        "vapid_key": state.instance_runtime.vapid_public_key,
+        "redirect_uri": redirect_uri,
+    });
+    match serde_json::to_vec(&body) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(_) => internal_error(),
+    }
+}
+
+fn app_string_parameter(parameters: &RackParameters, name: &str) -> Result<Option<String>, ()> {
+    match parameters.get(name) {
+        None | Some(RackValue::Null) => Ok(None),
+        Some(RackValue::Scalar(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(()),
+    }
+}
+
+fn app_redirect_uri_parameter(parameters: &RackParameters) -> Result<Option<String>, ()> {
+    match parameters.get("redirect_uris") {
+        None | Some(RackValue::Null) => Ok(None),
+        Some(RackValue::Scalar(value)) => Ok(Some(value.clone())),
+        Some(RackValue::Array(_)) => {
+            let values = rack_array_values(parameters, "redirect_uris");
+            if values.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(values.join("\n")))
+            }
+        }
+        Some(_) => Err(()),
+    }
+}
+
+fn app_scopes_parameter(parameters: &RackParameters) -> Result<String, ()> {
+    match parameters.get("scopes") {
+        None | Some(RackValue::Null | RackValue::Array(_)) => Ok("read".to_owned()),
+        Some(RackValue::Scalar(value)) if !value.trim().is_empty() => Ok(value.clone()),
+        Some(_) => Err(()),
     }
 }
 
@@ -3230,6 +11255,2405 @@ async fn markers(
         .collect::<BTreeMap<_, _>>();
     match serde_json::to_vec(&values) {
         Ok(body) => json_response(StatusCode::OK, body),
+        Err(_) => internal_error(),
+    }
+}
+
+async fn marker_update(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_STATUSES).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let mut updates = Vec::new();
+    for timeline in ["home", "notifications"] {
+        let last_read_id = match marker_last_read_id(&rack, timeline) {
+            Ok(Some(MarkerParameter::Value(last_read_id))) => Some(last_read_id),
+            Ok(Some(MarkerParameter::Default)) => None,
+            Ok(None) => continue,
+            Err(()) => return error_response(StatusCode::BAD_REQUEST, "Invalid marker parameters"),
+        };
+        updates.push((timeline.to_owned(), last_read_id));
+    }
+    let markers = match writer.update_markers(&authenticated, &updates).await {
+        Ok(markers) => markers,
+        Err(WriteError::Conflict) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "Conflict during update, please try again",
+            );
+        }
+        Err(WriteError::Unauthorized) => {
+            return error_response(StatusCode::UNAUTHORIZED, "Unauthorized");
+        }
+        Err(WriteError::InvalidInput(_)) => {
+            return error_response(StatusCode::BAD_REQUEST, "Invalid marker parameters");
+        }
+        Err(
+            WriteError::Sqlx(_)
+            | WriteError::Job(_)
+            | WriteError::Filesystem(_)
+            | WriteError::NotFound
+            | WriteError::RateLimited
+            | WriteError::Validation(_),
+        ) => {
+            return internal_error();
+        }
+    };
+    let mut values = BTreeMap::new();
+    for marker in markers {
+        values.insert(
+            marker.timeline.clone(),
+            RestMarker {
+                last_read_id: DecimalId::new(marker.last_read_id),
+                version: marker.lock_version,
+                updated_at: ApiDateTime::new(marker.updated_at),
+            },
+        );
+    }
+    match serde_json::to_vec(&values) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(_) => internal_error(),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn report_create(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_REPORTS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let owner = match authenticated.require_user() {
+        Ok(owner) => owner.account_id(),
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let target_account_id = match report_id_parameter(&rack, "account_id") {
+        Ok(ids) if ids.len() == 1 => ids[0],
+        _ => {
+            return report_response_with_rate_limit(
+                writer,
+                owner,
+                error_response(StatusCode::BAD_REQUEST, "Invalid account_id"),
+            )
+            .await;
+        }
+    };
+    let Ok(comment) = report_string_parameter(&rack, "comment") else {
+        return report_response_with_rate_limit(
+            writer,
+            owner,
+            error_response(StatusCode::BAD_REQUEST, "Invalid comment"),
+        )
+        .await;
+    };
+    let Ok(category) = report_string_parameter(&rack, "category") else {
+        return report_response_with_rate_limit(
+            writer,
+            owner,
+            error_response(StatusCode::BAD_REQUEST, "Invalid category"),
+        )
+        .await;
+    };
+    let Ok(status_ids) = report_id_parameter(&rack, "status_ids") else {
+        return report_response_with_rate_limit(
+            writer,
+            owner,
+            error_response(StatusCode::BAD_REQUEST, "Invalid status_ids"),
+        )
+        .await;
+    };
+    let Ok(collection_ids) = report_id_parameter(&rack, "collection_ids") else {
+        return report_response_with_rate_limit(
+            writer,
+            owner,
+            error_response(StatusCode::BAD_REQUEST, "Invalid collection_ids"),
+        )
+        .await;
+    };
+    let Ok(rule_ids) = report_id_parameter(&rack, "rule_ids") else {
+        return report_response_with_rate_limit(
+            writer,
+            owner,
+            error_response(StatusCode::BAD_REQUEST, "Invalid rule_ids"),
+        )
+        .await;
+    };
+    let forward = optional_boolean_parameter(&rack, "forward");
+    let Ok(forward_to_domains) = report_forward_domains_parameter(&rack) else {
+        return report_response_with_rate_limit(
+            writer,
+            owner,
+            error_response(StatusCode::BAD_REQUEST, "Invalid forward_to_domains"),
+        )
+        .await;
+    };
+    let report_id = match writer
+        .create_report(
+            &authenticated,
+            target_account_id,
+            comment.as_deref().unwrap_or_default(),
+            category.as_deref(),
+            &status_ids,
+            &collection_ids,
+            &rule_ids,
+            forward,
+            forward_to_domains.as_deref(),
+            state.origin.as_str(),
+            state
+                .mail_config
+                .as_ref()
+                .is_some_and(MailConfig::is_enabled),
+        )
+        .await
+    {
+        Ok(report_id) => report_id,
+        Err(WriteError::RateLimited) => {
+            return rate_limited_response(RateLimitExceeded {
+                limit: usize::try_from(REPORT_RATE_LIMIT).unwrap_or_default(),
+                period: REPORT_RATE_LIMIT_PERIOD,
+            });
+        }
+        Err(error) => {
+            return report_response_with_rate_limit(writer, owner, report_write_error(&error))
+                .await;
+        }
+    };
+    let report = match state.loader(Some(owner)).report(report_id).await {
+        Ok(Some(report)) => report,
+        Ok(None) => {
+            return report_response_with_rate_limit(writer, owner, record_not_found()).await;
+        }
+        Err(_) => {
+            return report_response_with_rate_limit(writer, owner, internal_error()).await;
+        }
+    };
+    let Some(body) = state
+        .serializer()
+        .report(&report)
+        .ok()
+        .and_then(|value| serde_json::to_vec(&value).ok())
+    else {
+        return report_response_with_rate_limit(writer, owner, internal_error()).await;
+    };
+    report_response_with_rate_limit(writer, owner, json_response(StatusCode::OK, body)).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn status_create(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_STATUSES).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let parameter = |name: &str| -> Result<Option<String>, ()> {
+        match rack.get(name) {
+            None | Some(RackValue::Null) => Ok(None),
+            Some(RackValue::Scalar(value)) => Ok(Some(value.clone())),
+            Some(RackValue::Number(value)) => Ok(Some(ruby_json_number(value))),
+            Some(RackValue::Boolean(value)) => Ok(Some(value.to_string())),
+            Some(RackValue::Array(_) | RackValue::Object(_) | RackValue::Upload(_)) => Err(()),
+        }
+    };
+    let text = match parameter("status") {
+        Ok(Some(value)) => value,
+        Ok(None) => String::new(),
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "Invalid status"),
+    };
+    let Ok(media_ids) = status_media_ids(&rack) else {
+        return error_response(StatusCode::BAD_REQUEST, "Invalid media_ids");
+    };
+    let Ok(spoiler_text) = parameter("spoiler_text") else {
+        return error_response(StatusCode::BAD_REQUEST, "Invalid spoiler_text");
+    };
+    let Ok(visibility) = parameter("visibility") else {
+        return error_response(StatusCode::BAD_REQUEST, "Invalid visibility");
+    };
+    let Ok(language) = parameter("language") else {
+        return error_response(StatusCode::BAD_REQUEST, "Invalid language");
+    };
+    let Ok(quote_approval_policy) = parameter("quote_approval_policy") else {
+        return error_response(StatusCode::BAD_REQUEST, "Invalid quote_approval_policy");
+    };
+    let sensitive = optional_boolean_parameter(&rack, "sensitive");
+    let Ok(in_reply_to_id) = integer_parameter(&rack, "in_reply_to_id") else {
+        return error_response(StatusCode::BAD_REQUEST, "Invalid in_reply_to_id");
+    };
+    let owner = match authenticated.require_user() {
+        Ok(owner) => owner.account_id(),
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    let idempotency_key = match headers.get("Idempotency-Key") {
+        None => None,
+        Some(value) => match value.to_str() {
+            Ok(value) => Some(value.to_owned()),
+            Err(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid Idempotency-Key"),
+        },
+    };
+    let idempotency_fingerprint = idempotency_key.as_deref().map(|_| {
+        status_idempotency_fingerprint(
+            &text,
+            &media_ids,
+            spoiler_text.as_deref(),
+            visibility.as_deref(),
+            language.as_deref(),
+            quote_approval_policy.as_deref(),
+            sensitive,
+            in_reply_to_id,
+        )
+    });
+    let idempotency_scope = status_idempotency_scope(owner);
+    let idempotency =
+        idempotency_key
+            .as_deref()
+            .zip(idempotency_fingerprint)
+            .map(|(key, fingerprint)| IdempotencyKey {
+                scope: &idempotency_scope,
+                key,
+                fingerprint,
+                expires_at: Utc::now() + ChronoDuration::hours(1),
+            });
+    if let Some(in_reply_to_id) = in_reply_to_id {
+        match state
+            .loader(Some(owner))
+            .authorized_status(in_reply_to_id)
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => return record_not_found(),
+            Err(_) => return internal_error(),
+        }
+    }
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let outcome = match writer
+        .create_status_with_quote_policy(
+            &authenticated,
+            &text,
+            &media_ids,
+            spoiler_text.as_deref(),
+            sensitive,
+            visibility.as_deref(),
+            language.as_deref(),
+            quote_approval_policy.as_deref(),
+            in_reply_to_id,
+            idempotency,
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => return status_saved_write_error(&error),
+    };
+    let status = match state
+        .loader(Some(owner))
+        .authorized_status(outcome.status_id)
+        .await
+    {
+        Ok(Some(status)) => status,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    match state
+        .serializer()
+        .status(&status, StatusShape::Full)
+        .ok()
+        .and_then(|value| serde_json::to_vec(&value).ok())
+    {
+        Some(body) => json_response(StatusCode::OK, body),
+        None => internal_error(),
+    }
+}
+
+async fn status_update(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_STATUSES).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, status_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let owner = match authenticated.require_user() {
+        Ok(owner) => owner.account_id(),
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    let parameter = |name: &str| -> Result<Option<String>, ()> {
+        match rack.get(name) {
+            None | Some(RackValue::Null) => Ok(None),
+            Some(RackValue::Scalar(value)) => Ok(Some(value.clone())),
+            Some(RackValue::Number(value)) => Ok(Some(ruby_json_number(value))),
+            Some(RackValue::Boolean(value)) => Ok(Some(value.to_string())),
+            Some(RackValue::Array(_) | RackValue::Object(_) | RackValue::Upload(_)) => Err(()),
+        }
+    };
+    let text = match parameter("status") {
+        Ok(value) => Some(value.unwrap_or_default()),
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "Invalid status"),
+    };
+    let spoiler_text = match parameter("spoiler_text") {
+        Ok(value) => Some(value.unwrap_or_default()),
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "Invalid spoiler_text"),
+    };
+    let language = match parameter("language") {
+        Ok(value) => Some(value.unwrap_or_default()),
+        Err(()) => return error_response(StatusCode::BAD_REQUEST, "Invalid language"),
+    };
+    let sensitive = Some(
+        optional_boolean_parameter(&rack, "sensitive").unwrap_or(false)
+            || spoiler_text
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty()),
+    );
+    let Ok(media_ids) = status_media_ids(&rack) else {
+        return error_response(StatusCode::BAD_REQUEST, "Invalid media_ids");
+    };
+    let Ok(media_attributes) = status_media_attributes(&rack) else {
+        return error_response(StatusCode::BAD_REQUEST, "Invalid media_attributes");
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let update = StatusUpdate {
+        text,
+        spoiler_text,
+        sensitive,
+        language,
+        media_ids: Some(media_ids),
+        media_attributes,
+    };
+    if let Err(error) = writer
+        .update_status(&authenticated, status_id, &update)
+        .await
+    {
+        return status_saved_write_error(&error);
+    }
+    let status = match state.loader(Some(owner)).authorized_status(status_id).await {
+        Ok(Some(status)) => status,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    match state
+        .serializer()
+        .status(&status, StatusShape::Full)
+        .ok()
+        .and_then(|value| serde_json::to_vec(&value).ok())
+    {
+        Some(body) => json_response(StatusCode::OK, body),
+        None => internal_error(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn status_idempotency_fingerprint(
+    text: &str,
+    media_ids: &[i64],
+    spoiler_text: Option<&str>,
+    visibility: Option<&str>,
+    language: Option<&str>,
+    quote_approval_policy: Option<&str>,
+    sensitive: Option<bool>,
+    in_reply_to_id: Option<i64>,
+) -> [u8; 32] {
+    let reply_id = in_reply_to_id.map(|id| id.to_string());
+    let values = [
+        Some(text.trim()),
+        spoiler_text.map(str::trim),
+        visibility,
+        language,
+        quote_approval_policy,
+        sensitive.map(|value| if value { "true" } else { "false" }),
+        reply_id.as_deref(),
+    ];
+    let mut digest = Sha256::new();
+    for value in values {
+        if let Some(value) = value {
+            digest.update(value.as_bytes());
+        }
+        digest.update([0]);
+    }
+    digest.update(b"media_ids");
+    digest.update([0]);
+    for media_id in media_ids {
+        digest.update(media_id.to_string().as_bytes());
+        digest.update([0]);
+    }
+    digest.finalize().into()
+}
+
+fn status_media_ids(parameters: &RackParameters) -> Result<Vec<i64>, ()> {
+    match parameters.get("media_ids") {
+        None | Some(RackValue::Null) => Ok(Vec::new()),
+        Some(RackValue::Array(values)) => values
+            .iter()
+            .map(|value| match value {
+                RackValue::Scalar(value) => value.parse::<i64>().map_err(|_| ()),
+                RackValue::Number(value) => value.as_i64().ok_or(()),
+                _ => Err(()),
+            })
+            .collect(),
+        Some(
+            RackValue::Scalar(_)
+            | RackValue::Number(_)
+            | RackValue::Boolean(_)
+            | RackValue::Object(_)
+            | RackValue::Upload(_),
+        ) => Err(()),
+    }
+}
+
+fn status_media_attributes(
+    parameters: &RackParameters,
+) -> Result<Option<Vec<StatusMediaAttributeUpdate>>, ()> {
+    let Some(value) = parameters.get("media_attributes") else {
+        return Ok(None);
+    };
+    let RackValue::Array(values) = value else {
+        return Err(());
+    };
+    values
+        .iter()
+        .map(|value| {
+            let RackValue::Object(fields) = value else {
+                return Err(());
+            };
+            let id = match fields.get("id") {
+                Some(RackValue::Scalar(value)) => value.parse::<i64>().map_err(|_| ())?,
+                Some(RackValue::Number(value)) => value.as_i64().ok_or(())?,
+                _ => return Err(()),
+            };
+            Ok(StatusMediaAttributeUpdate {
+                id,
+                description: media_description_value(fields.get("description")).map_err(|_| ())?,
+                focus: media_focus_value(fields.get("focus")).map_err(|_| ())?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn report_id_parameter(parameters: &RackParameters, name: &str) -> Result<Vec<i64>, ()> {
+    match parameters.get(name) {
+        None | Some(RackValue::Null) => Ok(Vec::new()),
+        Some(RackValue::Array(values)) => values.iter().map(report_id_value).collect(),
+        Some(value @ (RackValue::Scalar(_) | RackValue::Number(_))) => {
+            Ok(vec![report_id_value(value)?])
+        }
+        Some(RackValue::Boolean(_) | RackValue::Object(_) | RackValue::Upload(_)) => Err(()),
+    }
+}
+
+fn report_string_parameter(parameters: &RackParameters, name: &str) -> Result<Option<String>, ()> {
+    match parameters.get(name) {
+        None | Some(RackValue::Null) => Ok(None),
+        Some(RackValue::Scalar(value)) => Ok(Some(value.clone())),
+        Some(RackValue::Number(value)) => Ok(Some(ruby_json_number(value))),
+        Some(
+            RackValue::Boolean(_)
+            | RackValue::Array(_)
+            | RackValue::Object(_)
+            | RackValue::Upload(_),
+        ) => Err(()),
+    }
+}
+
+fn report_forward_domains_parameter(
+    parameters: &RackParameters,
+) -> Result<Option<Vec<String>>, ()> {
+    let Some(value) = parameters.get("forward_to_domains") else {
+        return Ok(None);
+    };
+    let values = match value {
+        RackValue::Array(values) => values,
+        RackValue::Null => return Ok(None),
+        RackValue::Scalar(_)
+        | RackValue::Number(_)
+        | RackValue::Boolean(_)
+        | RackValue::Object(_)
+        | RackValue::Upload(_) => return Err(()),
+    };
+    let mut domains = Vec::new();
+    for value in values {
+        let RackValue::Scalar(value) = value else {
+            return Err(());
+        };
+        let domain = canonical_remote_domain(value).map_err(|_| ())?;
+        if !domains
+            .iter()
+            .any(|candidate: &String| candidate.eq_ignore_ascii_case(&domain))
+        {
+            domains.push(domain);
+        }
+    }
+    Ok(Some(domains))
+}
+
+fn report_id_value(value: &RackValue) -> Result<i64, ()> {
+    match value {
+        RackValue::Scalar(value) => value.parse::<i64>().map_err(|_| ()),
+        RackValue::Number(value) => value.as_i64().ok_or(()),
+        RackValue::Null
+        | RackValue::Boolean(_)
+        | RackValue::Array(_)
+        | RackValue::Object(_)
+        | RackValue::Upload(_) => Err(()),
+    }
+}
+
+fn status_idempotency_scope(account_id: i64) -> String {
+    format!("status:create:{account_id}")
+}
+
+async fn media_create_v1(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    media_create(state, rack, headers).await
+}
+
+async fn media_create_v2(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    media_create(state, rack, headers).await
+}
+
+async fn media_create(state: WebState, rack: RackParameters, headers: HeaderMap) -> Response<Body> {
+    let rate_limit_user_id = match optional_authenticated_user_id(&state, &headers).await {
+        Ok(user_id) => user_id,
+        Err(response) => return response,
+    };
+    if let Some(user_id) = rate_limit_user_id
+        && let Err(limited) = state
+            .media_upload_limiter
+            .check_shared(state.shared_rate_limiter.as_ref(), user_id)
+            .await
+    {
+        return rate_limited_response(limited);
+    }
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_MEDIA).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let owner = match authenticated.require_user() {
+        Ok(owner) => owner,
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    let Some(RackValue::Upload(upload)) = rack.get("file") else {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "File type of uploaded media could not be verified",
+        );
+    };
+    let prepared = match prepare_media_attachment(
+        owner.account_id(),
+        &upload.file_name,
+        &upload.content_type,
+        &upload.bytes,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => return media_upload_error(error),
+    };
+    let description = match media_description_parameter(&rack, "description") {
+        Ok(AccountProfileValue::Unchanged | AccountProfileValue::Null) => None,
+        Ok(AccountProfileValue::Value(value)) => Some(value),
+        Err(error) => return error_response(StatusCode::UNPROCESSABLE_ENTITY, error),
+    };
+    let focus = match media_focus_parameter(&rack, "focus") {
+        Ok(focus) => focus,
+        Err(error) => return error_response(StatusCode::UNPROCESSABLE_ENTITY, error),
+    };
+    let create = MediaAttachmentCreate {
+        file_name: prepared.file_name.clone(),
+        content_type: prepared.content_type.clone(),
+        file_size: prepared.file_size,
+        file_meta: prepared.file_meta.clone(),
+        blurhash: prepared.blurhash.clone(),
+        description,
+        focus,
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let account_id = owner.account_id();
+    match writer
+        .with_account_lock(account_id, || async {
+            let id = writer
+                .create_media_attachment_locked(&authenticated, &create)
+                .await?;
+            let metadata = media_metadata_from_prepared(id, &prepared);
+            let paths = match write_prepared_media(&state.media_root, &metadata, &prepared) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    let _ = writer
+                        .delete_media_attachment_locked(&authenticated, id)
+                        .await;
+                    return Err(WriteError::Filesystem(error));
+                }
+            };
+            let response = media_response_for_id(&state, account_id, id).await;
+            if !response.status().is_success() {
+                remove_written_media(&state.media_root, &paths);
+                let _ = writer
+                    .delete_media_attachment_locked(&authenticated, id)
+                    .await;
+            }
+            Ok(response)
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => media_write_error(&error),
+    }
+}
+
+async fn media_show(State(state): State<WebState>, uri: Uri, headers: HeaderMap) -> Response<Body> {
+    let owner = match required_viewer(&state, &headers, WRITE_MEDIA).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let Some((_, id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    media_response_for_id(&state, owner, id).await
+}
+
+async fn media_update(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_MEDIA).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let owner = match authenticated.require_user() {
+        Ok(owner) => owner,
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    let Some((_, id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let current = match state
+        .repository
+        .media_attachment(owner.account_id(), id)
+        .await
+    {
+        Ok(Some(media)) => media,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    if current
+        .processing
+        .is_some_and(|processing| processing.0 == 3)
+    {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Error processing thumbnail for uploaded media",
+        );
+    }
+    let update = match media_attachment_update(&rack) {
+        Ok(update) => update,
+        Err(error) => return error_response(StatusCode::UNPROCESSABLE_ENTITY, error),
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    if let Err(error) = writer
+        .update_media_attachment(&authenticated, id, &update)
+        .await
+    {
+        return media_write_error(&error);
+    }
+    media_response_for_id(&state, owner.account_id(), id).await
+}
+
+async fn media_delete(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_MEDIA).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let account_id = match authenticated.require_user() {
+        Ok(owner) => owner.account_id(),
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    if let Err(error) = writer
+        .with_account_lock(account_id, || async {
+            let media = writer
+                .delete_media_attachment_locked(&authenticated, id)
+                .await?;
+            remove_media_files(&state.media_root, &media);
+            Ok(())
+        })
+        .await
+    {
+        return media_write_error(&error);
+    }
+    empty_json_response()
+}
+
+async fn media_response_for_id(state: &WebState, account_id: i64, id: i64) -> Response<Body> {
+    let media = match state.repository.media_attachment(account_id, id).await {
+        Ok(Some(media)) => media,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    if media.processing.is_some_and(|processing| processing.0 == 3) {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Error processing thumbnail for uploaded media",
+        );
+    }
+    let status = if media.processing.is_some_and(|processing| processing.0 != 2) {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    let projection = media_projection(&media, media.description.clone());
+    match serde_json::to_vec(&state.serializer().media_attachment(&projection)) {
+        Ok(body) => json_response(status, body),
+        Err(_) => internal_error(),
+    }
+}
+
+fn media_attachment_update(rack: &RackParameters) -> Result<MediaAttachmentUpdate, &'static str> {
+    Ok(MediaAttachmentUpdate {
+        description: media_description_parameter(rack, "description")?,
+        focus: media_focus_parameter(rack, "focus")?,
+    })
+}
+
+fn media_description_parameter(
+    rack: &RackParameters,
+    name: &str,
+) -> Result<AccountProfileValue<String>, &'static str> {
+    media_description_value(rack.get(name))
+}
+
+fn media_description_value(
+    value: Option<&RackValue>,
+) -> Result<AccountProfileValue<String>, &'static str> {
+    match value {
+        None => Ok(AccountProfileValue::Unchanged),
+        Some(RackValue::Null) => Ok(AccountProfileValue::Null),
+        Some(value) => profile_scalar_string(value)
+            .map(AccountProfileValue::Value)
+            .map_err(|()| "Invalid media description"),
+    }
+}
+
+fn media_focus_parameter(
+    rack: &RackParameters,
+    name: &str,
+) -> Result<AccountProfileValue<MediaFocus>, &'static str> {
+    media_focus_value(rack.get(name))
+}
+
+fn media_focus_value(
+    value: Option<&RackValue>,
+) -> Result<AccountProfileValue<MediaFocus>, &'static str> {
+    let Some(value) = value else {
+        return Ok(AccountProfileValue::Unchanged);
+    };
+    if matches!(value, RackValue::Null)
+        || matches!(value, RackValue::Scalar(value) if value.trim().is_empty())
+    {
+        return Ok(AccountProfileValue::Unchanged);
+    }
+    let values = match value {
+        RackValue::Scalar(value) => value.split(',').map(str::to_owned).collect::<Vec<_>>(),
+        RackValue::Array(values) if values.len() == 2 => values
+            .iter()
+            .map(profile_scalar_string)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|()| "Invalid media focus")?,
+        RackValue::Object(values) => ["x", "y"]
+            .into_iter()
+            .map(|key| values.get(key).ok_or(()).and_then(profile_scalar_string))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|()| "Invalid media focus")?,
+        _ => return Err("Invalid media focus"),
+    };
+    if values.len() != 2 {
+        return Err("Invalid media focus");
+    }
+    let x = values[0]
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .ok_or("Invalid media focus")?;
+    let y = values[1]
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .ok_or("Invalid media focus")?;
+    Ok(AccountProfileValue::Value(MediaFocus { x, y }))
+}
+
+fn media_metadata_from_prepared(id: i64, prepared: &PreparedMediaAttachment) -> PaperclipMetadata {
+    PaperclipMetadata {
+        attachment: PaperclipAttachment::MediaFile,
+        id,
+        remote: false,
+        storage_schema_version: Some(1),
+        file_name: prepared.file_name.clone(),
+        content_type: Some(prepared.content_type.clone()),
+        variant: None,
+    }
+}
+
+fn media_metadata_from_record(
+    media: &crate::mastodon::MediaAttachment,
+) -> Option<PaperclipMetadata> {
+    Some(PaperclipMetadata {
+        attachment: PaperclipAttachment::MediaFile,
+        id: media.id,
+        remote: !crate::paperclip::rails_blank(&media.remote_url),
+        storage_schema_version: media.file_storage_schema_version,
+        file_name: media.file_file_name.clone()?,
+        content_type: media.file_content_type.clone(),
+        variant: None,
+    })
+}
+
+fn media_thumbnail_metadata_from_record(
+    media: &crate::mastodon::MediaAttachment,
+) -> Option<PaperclipMetadata> {
+    Some(PaperclipMetadata {
+        attachment: PaperclipAttachment::MediaThumbnail,
+        id: media.id,
+        remote: !media
+            .thumbnail_remote_url
+            .as_deref()
+            .is_none_or(crate::paperclip::rails_blank),
+        storage_schema_version: media.thumbnail_storage_schema_version,
+        file_name: media.thumbnail_file_name.clone()?,
+        content_type: media.thumbnail_content_type.clone(),
+        variant: None,
+    })
+}
+
+fn remove_media_files(root: &PaperclipRoot, media: &crate::mastodon::MediaAttachment) {
+    if let Some(metadata) = media_metadata_from_record(media) {
+        for style in ["original", "small"] {
+            if let Some(path) = metadata.relative_path(style) {
+                let _ = root.remove_file(FsPath::new(&path));
+            }
+        }
+    }
+    if let Some(metadata) = media_thumbnail_metadata_from_record(media)
+        && let Some(path) = metadata.relative_path("original")
+    {
+        let _ = root.remove_file(FsPath::new(&path));
+    }
+}
+
+fn remove_written_media(root: &PaperclipRoot, paths: &[String]) {
+    for path in paths {
+        let _ = root.remove_file(FsPath::new(path));
+    }
+}
+
+fn media_upload_error(error: crate::paperclip::MediaAttachmentError) -> Response<Body> {
+    let message = match error {
+        crate::paperclip::MediaAttachmentError::TooLarge => {
+            "File size of uploaded media is too large"
+        }
+        crate::paperclip::MediaAttachmentError::UnsupportedContentType
+        | crate::paperclip::MediaAttachmentError::InvalidImage
+        | crate::paperclip::MediaAttachmentError::SizeOverflow => {
+            "File type of uploaded media could not be verified"
+        }
+    };
+    error_response(StatusCode::UNPROCESSABLE_ENTITY, message)
+}
+
+fn media_write_error(error: &WriteError) -> Response<Body> {
+    match error {
+        WriteError::Unauthorized => error_response(StatusCode::UNAUTHORIZED, "Unauthorized"),
+        WriteError::NotFound => record_not_found(),
+        WriteError::Validation(message) => {
+            error_response(StatusCode::UNPROCESSABLE_ENTITY, message)
+        }
+        WriteError::InvalidInput(message) => error_response(StatusCode::BAD_REQUEST, message),
+        WriteError::Conflict => error_response(
+            StatusCode::CONFLICT,
+            "Conflict during update, please try again",
+        ),
+        WriteError::RateLimited
+        | WriteError::Sqlx(_)
+        | WriteError::Job(_)
+        | WriteError::Filesystem(_) => internal_error(),
+    }
+}
+
+fn report_write_error(error: &WriteError) -> Response<Body> {
+    match error {
+        WriteError::Unauthorized => error_response(StatusCode::UNAUTHORIZED, "Unauthorized"),
+        WriteError::NotFound => record_not_found(),
+        WriteError::Validation(message) => {
+            error_response(StatusCode::UNPROCESSABLE_ENTITY, message)
+        }
+        WriteError::InvalidInput(message) => error_response(StatusCode::BAD_REQUEST, message),
+        WriteError::Conflict => error_response(
+            StatusCode::CONFLICT,
+            "Conflict during update, please try again",
+        ),
+        WriteError::RateLimited => rate_limited_response(RateLimitExceeded {
+            limit: usize::try_from(REPORT_RATE_LIMIT).unwrap_or_default(),
+            period: REPORT_RATE_LIMIT_PERIOD,
+        }),
+        WriteError::Sqlx(_) | WriteError::Job(_) | WriteError::Filesystem(_) => internal_error(),
+    }
+}
+
+async fn conversations(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let owner = match required_viewer(&state, &headers, READ_STATUSES).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let (max_id, min_id, since_id) = match cursor_triplet(&rack) {
+        Ok(cursors) => cursors,
+        Err(error) => return cursor_parameter_error(&headers, error),
+    };
+    let options = TimelineOptions {
+        max_id,
+        min_id,
+        since_id,
+        limit: match limit_parameter(&rack, 20, 40) {
+            Ok(limit) => limit,
+            Err(()) => return framework_internal_error(),
+        },
+        ..TimelineOptions::default()
+    };
+    let Ok(projections) = state
+        .loader(Some(owner))
+        .conversations(owner, &options)
+        .await
+    else {
+        return internal_error();
+    };
+    let serialized = projections
+        .iter()
+        .map(|projection| serialize_conversation(&state, projection))
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(values) = serialized else {
+        return internal_error();
+    };
+    let first_id = projections
+        .first()
+        .and_then(|conversation| conversation.last_status.as_ref())
+        .map(|status| status.id);
+    let last_id = projections
+        .last()
+        .and_then(|conversation| conversation.last_status.as_ref())
+        .map(|status| status.id);
+    let mut response = match serde_json::to_vec(&values) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(_) => return internal_error(),
+    };
+    let parameters = parameters(query.as_deref());
+    let mut links = Vec::new();
+    if usize::try_from(options.limit).is_ok_and(|limit| projections.len() == limit)
+        && let Some(last_id) = last_id
+        && let Some(url) = pagination_url(
+            &state,
+            "api/v1/conversations",
+            &parameters,
+            "max_id",
+            last_id,
+            &["limit"],
+        )
+    {
+        links.push(format!("<{url}>; rel=\"next\""));
+    }
+    if let Some(first_id) = first_id
+        && let Some(url) = pagination_url(
+            &state,
+            "api/v1/conversations",
+            &parameters,
+            "min_id",
+            first_id,
+            &["limit"],
+        )
+    {
+        links.push(format!("<{url}>; rel=\"prev\""));
+    }
+    set_link_header(&mut response, &links);
+    response
+}
+
+fn serialize_conversation(
+    state: &WebState,
+    projection: &ConversationProjection,
+) -> Result<RestConversation, RestError> {
+    let serializer = state.serializer();
+    Ok(RestConversation {
+        id: DecimalId::new(projection.id),
+        unread: projection.unread,
+        accounts: projection
+            .participant_accounts
+            .iter()
+            .map(|account| serializer.account(account))
+            .collect::<Result<Vec<_>, _>>()?,
+        last_status: projection
+            .last_status
+            .as_ref()
+            .map(|status| serializer.status(status, StatusShape::Full))
+            .transpose()?,
+    })
+}
+
+async fn streaming(
+    State(state): State<WebState>,
+    websocket: WebSocketUpgrade,
+    headers: HeaderMap,
+    uri: Uri,
+    RawQuery(query): RawQuery,
+) -> Response<Body> {
+    let auth_headers = streaming_auth_headers(&headers, query.as_deref());
+    let authenticated = match state
+        .authenticator
+        .authenticate(&auth_headers, NO_SCOPE)
+        .await
+    {
+        Ok(authenticated) => authenticated,
+        Err(OAuthAuthenticationError::OAuth(error)) => {
+            return error.into_http_response().map(Body::from);
+        }
+        Err(OAuthAuthenticationError::Repository(_)) => return internal_error(),
+    };
+    if let Err(error) = authenticated.require_user() {
+        return error.into_http_response().map(Body::from);
+    }
+    let Some(queue) = state.queue.clone() else {
+        return internal_error();
+    };
+    let Ok(cursor) = queue.stream_cursor().await else {
+        return internal_error();
+    };
+    let authenticated = match state
+        .authenticator
+        .authenticate(&auth_headers, NO_SCOPE)
+        .await
+    {
+        Ok(authenticated) => authenticated,
+        Err(OAuthAuthenticationError::OAuth(error)) => {
+            return error.into_http_response().map(Body::from);
+        }
+        Err(OAuthAuthenticationError::Repository(_)) => return internal_error(),
+    };
+    let owner = match authenticated.require_user() {
+        Ok(owner) => owner,
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    let scopes = authenticated.scopes().clone();
+    let initial_stream = streaming_query_parameter(query.as_deref(), "stream")
+        .or_else(|| streaming_path_stream(uri.path()).map(str::to_owned));
+    websocket.on_upgrade(move |socket| {
+        streaming_connection(
+            socket,
+            state,
+            queue,
+            auth_headers,
+            owner.account_id(),
+            authenticated.token_id(),
+            scopes,
+            cursor,
+            initial_stream,
+        )
+    })
+}
+
+fn streaming_auth_headers(headers: &HeaderMap, query: Option<&str>) -> HeaderMap {
+    if headers.contains_key(AUTHORIZATION) {
+        return headers.clone();
+    }
+    let token = streaming_query_parameter(query, "access_token")
+        .filter(|token| !token.is_empty())
+        .or_else(|| {
+            headers
+                .get(SEC_WEBSOCKET_PROTOCOL)
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        });
+    let Some(token) = token else {
+        return headers.clone();
+    };
+    let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}")) else {
+        return headers.clone();
+    };
+    let mut headers = headers.clone();
+    headers.insert(AUTHORIZATION, value);
+    headers
+}
+
+fn streaming_query_parameter(query: Option<&str>, name: &str) -> Option<String> {
+    parameters(query)
+        .into_iter()
+        .find_map(|(key, value)| (key == name).then_some(value))
+}
+
+fn streaming_path_stream(path: &str) -> Option<&'static str> {
+    match path {
+        "/api/v1/streaming/user" => Some("user"),
+        "/api/v1/streaming/user/notification" => Some("user:notification"),
+        "/api/v1/streaming/direct" => Some("direct"),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct StreamingSubscriptions {
+    user: bool,
+    user_notifications: bool,
+    direct: bool,
+}
+
+impl StreamingSubscriptions {
+    fn is_empty(&self) -> bool {
+        !self.user && !self.user_notifications && !self.direct
+    }
+
+    fn insert(&mut self, stream: StreamName) {
+        match stream {
+            StreamName::User => self.user = true,
+            StreamName::UserNotification => self.user_notifications = true,
+            StreamName::Direct => self.direct = true,
+        }
+    }
+
+    fn remove(&mut self, stream: StreamName) {
+        match stream {
+            StreamName::User => self.user = false,
+            StreamName::UserNotification => self.user_notifications = false,
+            StreamName::Direct => self.direct = false,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn streaming_connection(
+    mut socket: WebSocket,
+    state: WebState,
+    queue: Queue,
+    auth_headers: HeaderMap,
+    account_id: i64,
+    token_id: i64,
+    scopes: OAuthScopes,
+    mut cursor: i64,
+    initial_stream: Option<String>,
+) {
+    let mut subscriptions = StreamingSubscriptions::default();
+    let mut system_cursor = cursor;
+    let mut heartbeat = interval(StdDuration::from_secs(30));
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    heartbeat.tick().await;
+    let mut poll = interval(StdDuration::from_millis(100));
+    poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    poll.tick().await;
+    let mut last_pong = Instant::now();
+
+    if let Some(stream) = initial_stream {
+        if let Some(stream) = StreamName::parse(&stream) {
+            if !streaming_subscribe(&mut socket, &mut subscriptions, stream, &scopes).await {
+                return;
+            }
+        } else if !send_stream_error(&mut socket, 400, "Unknown stream type").await {
+            return;
+        }
+    }
+
+    loop {
+        tokio::select! {
+            message = socket.recv() => {
+                let Some(message) = message else {
+                    return;
+                };
+                let Ok(message) = message else {
+                    return;
+                };
+                match message {
+                    Message::Text(text) => match ClientCommand::parse(text.as_str()) {
+                        Some(ClientCommand::Subscribe(stream)) => {
+                            if !streaming_subscribe(
+                                &mut socket,
+                                &mut subscriptions,
+                                stream,
+                                &scopes,
+                            )
+                            .await {
+                                return;
+                            }
+                        }
+                        Some(ClientCommand::Unsubscribe(stream)) => subscriptions.remove(stream),
+                        None => {}
+                    },
+                    Message::Binary(_) => {
+                        let _ = socket
+                            .send(Message::Close(Some(CloseFrame {
+                                code: 1003,
+                                reason: "The mastodon streaming server does not support binary messages".into(),
+                            })))
+                            .await;
+                        return;
+                    }
+                    Message::Pong(_) => last_pong = Instant::now(),
+                    Message::Close(_) => return,
+                    Message::Ping(_) => {}
+                }
+            }
+            _ = heartbeat.tick() => {
+                if last_pong.elapsed() >= StdDuration::from_mins(1) {
+                    return;
+                }
+                let valid = match state.authenticator.authenticate(&auth_headers, NO_SCOPE).await {
+                    Ok(authenticated) => authenticated
+                        .require_user()
+                        .is_ok_and(|owner| owner.account_id() == account_id),
+                    Err(_) => false,
+                };
+                if !valid {
+                    let _ = socket
+                        .send(Message::Close(Some(CloseFrame {
+                            code: 1000,
+                            reason: "Invalid access token".into(),
+                        })))
+                        .await;
+                    return;
+                }
+                if socket.send(Message::Ping(Bytes::new())).await.is_err() {
+                    return;
+                }
+            }
+            _ = poll.tick() => {
+                let Ok(mut kill) =
+                    stream_system_events(&queue, account_id, token_id, &mut system_cursor).await
+                else {
+                    return;
+                };
+                if !kill && !subscriptions.is_empty() {
+                    match stream_pending_events(
+                        &mut socket,
+                        &state,
+                        &queue,
+                        account_id,
+                        token_id,
+                        &scopes,
+                        &subscriptions,
+                        &mut cursor,
+                    )
+                    .await
+                    {
+                        Ok(pending_kill) => kill = pending_kill,
+                        Err(()) => return,
+                    }
+                }
+                if kill {
+                    let _ = socket
+                        .send(Message::Close(Some(CloseFrame {
+                            code: 1000,
+                            reason: "Invalid access token".into(),
+                        })))
+                        .await;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn streaming_subscribe(
+    socket: &mut WebSocket,
+    subscriptions: &mut StreamingSubscriptions,
+    stream: StreamName,
+    scopes: &OAuthScopes,
+) -> bool {
+    if !stream.permits(scopes) {
+        return send_stream_error(
+            socket,
+            401,
+            "Access token does not have the required scopes",
+        )
+        .await;
+    }
+    subscriptions.insert(stream);
+    true
+}
+
+async fn send_stream_error(socket: &mut WebSocket, status: u16, error: &str) -> bool {
+    let message = format!(
+        "{{\"error\":{},\"status\":{status}}}",
+        serde_json::to_string(error).expect("stream error is serializable")
+    );
+    socket.send(Message::Text(message.into())).await.is_ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_pending_events(
+    socket: &mut WebSocket,
+    state: &WebState,
+    queue: &Queue,
+    account_id: i64,
+    token_id: i64,
+    scopes: &OAuthScopes,
+    subscriptions: &StreamingSubscriptions,
+    cursor: &mut i64,
+) -> Result<bool, ()> {
+    let events = queue
+        .stream_events_after(*cursor, STREAM_EVENT_BATCH_SIZE)
+        .await
+        .map_err(|_| ())?;
+    for event in events {
+        *cursor = event.id;
+        if event.account_id != account_id {
+            continue;
+        }
+        if event.event == SYSTEM_KILL_EVENT
+            || (event.event == TOKEN_KILL_EVENT && event.object_id == token_id)
+        {
+            return Ok(true);
+        }
+        if event.event == TOKEN_KILL_EVENT {
+            continue;
+        }
+        let streams = stream_targets(&event, scopes, subscriptions);
+        if streams.is_empty() {
+            continue;
+        }
+        let Some(payload) = stream_event_payload(state, account_id, &event).await? else {
+            continue;
+        };
+        for stream in streams {
+            socket
+                .send(Message::Text(
+                    event_message(stream, stream_protocol_event(&event.event), &payload).into(),
+                ))
+                .await
+                .map_err(|_| ())?;
+        }
+    }
+    Ok(false)
+}
+
+async fn stream_system_events(
+    queue: &Queue,
+    account_id: i64,
+    token_id: i64,
+    cursor: &mut i64,
+) -> Result<bool, ()> {
+    let events = queue
+        .stream_events_after(*cursor, STREAM_EVENT_BATCH_SIZE)
+        .await
+        .map_err(|_| ())?;
+    for event in events {
+        *cursor = event.id;
+        if event.account_id == account_id
+            && (event.event == SYSTEM_KILL_EVENT
+                || (event.event == TOKEN_KILL_EVENT && event.object_id == token_id))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn stream_targets(
+    event: &StreamEvent,
+    scopes: &OAuthScopes,
+    subscriptions: &StreamingSubscriptions,
+) -> Vec<StreamName> {
+    if event.event == STATUS_UPDATE_NOTIFICATION_EVENT {
+        let mut streams = Vec::with_capacity(2);
+        if subscriptions.user && StreamName::User.includes_notifications(scopes) {
+            streams.push(StreamName::User);
+        }
+        if subscriptions.user_notifications && StreamName::UserNotification.permits(scopes) {
+            streams.push(StreamName::UserNotification);
+        }
+        streams
+    } else if event.event == "conversation" {
+        if subscriptions.direct && StreamName::Direct.permits(scopes) {
+            vec![StreamName::Direct]
+        } else {
+            Vec::new()
+        }
+    } else if matches!(
+        event.event.as_str(),
+        "notification" | "notifications_merged"
+    ) {
+        let mut streams = Vec::with_capacity(2);
+        if subscriptions.user && StreamName::User.includes_notifications(scopes) {
+            streams.push(StreamName::User);
+        }
+        if subscriptions.user_notifications && StreamName::UserNotification.permits(scopes) {
+            streams.push(StreamName::UserNotification);
+        }
+        streams
+    } else if subscriptions.user {
+        vec![StreamName::User]
+    } else {
+        Vec::new()
+    }
+}
+
+fn stream_protocol_event(event: &str) -> &str {
+    if event == STATUS_UPDATE_NOTIFICATION_EVENT {
+        "status.update"
+    } else {
+        event
+    }
+}
+
+async fn stream_event_payload(
+    state: &WebState,
+    account_id: i64,
+    event: &StreamEvent,
+) -> Result<Option<String>, ()> {
+    match event.event.as_str() {
+        "delete" => Ok(Some(event.object_id.to_string())),
+        "update" | "status.update" | STATUS_UPDATE_NOTIFICATION_EVENT => {
+            let Some(status) = state
+                .loader(Some(account_id))
+                .authorized_status(event.object_id)
+                .await
+                .map_err(|_| ())?
+            else {
+                return Ok(None);
+            };
+            serde_json::to_string(
+                &state
+                    .serializer()
+                    .status(&status, StatusShape::Full)
+                    .map_err(|_| ())?,
+            )
+            .map(Some)
+            .map_err(|_| ())
+        }
+        "notification" => {
+            let Some(notification) = state
+                .loader(Some(account_id))
+                .notification(account_id, event.object_id)
+                .await
+                .map_err(|_| ())?
+            else {
+                return Ok(None);
+            };
+            serde_json::to_string(
+                &state
+                    .serializer()
+                    .notification(&notification, None)
+                    .map_err(|_| ())?,
+            )
+            .map(Some)
+            .map_err(|_| ())
+        }
+        "notifications_merged" => Ok(Some("1".to_owned())),
+        "conversation" => {
+            let Some(conversation) = state
+                .loader(Some(account_id))
+                .conversation(account_id, event.object_id)
+                .await
+                .map_err(|_| ())?
+            else {
+                return Ok(None);
+            };
+            serde_json::to_string(&serialize_conversation(state, &conversation).map_err(|_| ())?)
+                .map(Some)
+                .map_err(|_| ())
+        }
+        _ => Ok(None),
+    }
+}
+
+async fn conversation_read(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    conversation_unread_state(state, uri, headers, false).await
+}
+
+async fn conversation_unread(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    conversation_unread_state(state, uri, headers, true).await
+}
+
+async fn conversation_unread_state(
+    state: WebState,
+    uri: Uri,
+    headers: HeaderMap,
+    unread: bool,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_CONVERSATIONS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, conversation_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    if let Err(error) = writer
+        .update_conversation_unread(&authenticated, conversation_id, unread)
+        .await
+    {
+        return conversation_write_error(&error);
+    }
+    let owner = match authenticated.require_user() {
+        Ok(owner) => owner.account_id(),
+        Err(_) => return error_response(StatusCode::UNAUTHORIZED, "Unauthorized"),
+    };
+    let Ok(conversation) = state
+        .loader(Some(owner))
+        .conversation(owner, conversation_id)
+        .await
+    else {
+        return internal_error();
+    };
+    let Some(conversation) = conversation else {
+        return record_not_found();
+    };
+    match serialize_conversation(&state, &conversation)
+        .ok()
+        .and_then(|value| serde_json::to_vec(&value).ok())
+    {
+        Some(body) => json_response(StatusCode::OK, body),
+        None => internal_error(),
+    }
+}
+
+async fn conversation_delete(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_CONVERSATIONS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, conversation_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    match writer
+        .delete_conversation(&authenticated, conversation_id)
+        .await
+    {
+        Ok(()) => empty_json_response(),
+        Err(WriteError::NotFound) => record_not_found(),
+        Err(_) => internal_error(),
+    }
+}
+
+fn conversation_write_error(error: &WriteError) -> Response<Body> {
+    match error {
+        WriteError::NotFound => record_not_found(),
+        WriteError::Unauthorized => error_response(StatusCode::UNAUTHORIZED, "Unauthorized"),
+        WriteError::InvalidInput(_) => {
+            error_response(StatusCode::BAD_REQUEST, "Invalid conversation parameters")
+        }
+        WriteError::Validation(message) => error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("Validation failed: {message}"),
+        ),
+        WriteError::Conflict => error_response(
+            StatusCode::CONFLICT,
+            "Conflict during update, please try again",
+        ),
+        WriteError::RateLimited
+        | WriteError::Sqlx(_)
+        | WriteError::Job(_)
+        | WriteError::Filesystem(_) => internal_error(),
+    }
+}
+
+enum MarkerParameter {
+    Default,
+    Value(i64),
+}
+
+fn marker_last_read_id(
+    parameters: &RackParameters,
+    timeline: &str,
+) -> Result<Option<MarkerParameter>, ()> {
+    let Some(value) = parameters.get(timeline) else {
+        return Ok(None);
+    };
+    let RackValue::Object(values) = value else {
+        return Err(());
+    };
+    let Some(value) = values.get("last_read_id") else {
+        return Ok(Some(MarkerParameter::Default));
+    };
+    match value {
+        RackValue::Scalar(value) => value
+            .parse::<i64>()
+            .map(MarkerParameter::Value)
+            .map(Some)
+            .map_err(|_| ()),
+        RackValue::Number(value) => value
+            .as_i64()
+            .map(MarkerParameter::Value)
+            .map(Some)
+            .ok_or(()),
+        RackValue::Null
+        | RackValue::Boolean(_)
+        | RackValue::Array(_)
+        | RackValue::Object(_)
+        | RackValue::Upload(_) => Err(()),
+    }
+}
+
+async fn notifications(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let owner = match required_viewer(&state, &headers, READ_NOTIFICATIONS).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let options = match notification_options(&rack, false) {
+        Ok(options) => options,
+        Err(error) => return cursor_parameter_error(&headers, error),
+    };
+    let supported_types = notification_supported_types(&rack);
+    let Ok(projections) = state
+        .loader(Some(owner))
+        .notifications(owner, &options)
+        .await
+    else {
+        return internal_error();
+    };
+    let serializer = state.serializer();
+    let ids = projections
+        .iter()
+        .map(|notification| notification.id)
+        .collect::<Vec<_>>();
+    let values = projections
+        .iter()
+        .map(|notification| serializer.notification(notification, supported_types.as_deref()))
+        .collect::<Result<Vec<_>, _>>();
+    let Some(body) = values
+        .ok()
+        .and_then(|values| serde_json::to_vec(&values).ok())
+    else {
+        return internal_error();
+    };
+    notification_response(
+        &state,
+        "api/v1/notifications",
+        &parameters(query.as_deref()),
+        &[
+            "limit",
+            "account_id",
+            "types[]",
+            "exclude_types[]",
+            "include_filtered",
+            "supported_types[]",
+        ],
+        &ids,
+        body,
+    )
+}
+
+async fn grouped_notifications(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let owner = match required_viewer(&state, &headers, READ_NOTIFICATIONS).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    if grouped_types_parameter_invalid(&rack) {
+        return framework_internal_error();
+    }
+    let options = match notification_options(&rack, true) {
+        Ok(options) => options,
+        Err(error) => return cursor_parameter_error(&headers, error),
+    };
+    let supported_types = notification_supported_types(&rack);
+    let Some(partial_avatars) = expand_accounts_parameter(&rack) else {
+        return invalid_expand_accounts_response(&rack);
+    };
+    let Ok(grouped) = state
+        .loader(Some(owner))
+        .grouped_notifications(owner, &options)
+        .await
+    else {
+        return internal_error();
+    };
+    let Some(body) = state
+        .serializer()
+        .grouped_notifications(&grouped, partial_avatars, supported_types.as_deref())
+        .ok()
+        .and_then(|value| serde_json::to_vec(&value).ok())
+    else {
+        return internal_error();
+    };
+    let ids = grouped
+        .groups
+        .iter()
+        .map(|group| group.notification.id)
+        .collect::<Vec<_>>();
+    notification_response(
+        &state,
+        "api/v2/notifications",
+        &parameters(query.as_deref()),
+        &[
+            "limit",
+            "types[]",
+            "exclude_types[]",
+            "include_filtered",
+            "grouped_types[]",
+            "supported_types[]",
+        ],
+        &ids,
+        body,
+    )
+}
+
+async fn notification_unread_count(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    notification_unread_count_impl(state, rack, headers, false).await
+}
+
+async fn grouped_notification_unread_count(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    notification_unread_count_impl(state, rack, headers, true).await
+}
+
+async fn notification_unread_count_impl(
+    state: WebState,
+    rack: RackParameters,
+    headers: HeaderMap,
+    grouped: bool,
+) -> Response<Body> {
+    let owner = match required_viewer_owner(&state, &headers, READ_NOTIFICATIONS).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    if grouped && grouped_types_parameter_invalid(&rack) {
+        return framework_internal_error();
+    }
+    let mut options = match notification_options_with_limits(&rack, grouped, 100, 1_000, false) {
+        Ok(options) => options,
+        Err(error) => return cursor_parameter_error(&headers, error),
+    };
+    let marker = match state
+        .repository
+        .rest_markers(owner.user_id(), &["notifications".to_owned()])
+        .await
+    {
+        Ok(markers) => markers
+            .into_iter()
+            .find(|marker| marker.timeline == "notifications")
+            .map(|marker| marker.last_read_id),
+        Err(_) => return internal_error(),
+    };
+    options.max_id = None;
+    options.since_id = None;
+    options.min_id = marker;
+    let Ok(notifications) = state
+        .repository
+        .rest_notifications(owner.account_id(), &options, grouped)
+        .await
+    else {
+        return internal_error();
+    };
+    match serde_json::to_vec(&serde_json::json!({ "count": notifications.len() })) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(_) => internal_error(),
+    }
+}
+
+async fn notification_show(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let owner = match required_viewer(&state, &headers, READ_NOTIFICATIONS).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let Some((_, notification_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let notification = match state
+        .loader(Some(owner))
+        .notification(owner, notification_id)
+        .await
+    {
+        Ok(Some(notification)) => notification,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    let supported_types = notification_supported_types(&rack);
+    match state
+        .serializer()
+        .notification(&notification, supported_types.as_deref())
+        .ok()
+        .and_then(|value| serde_json::to_vec(&value).ok())
+    {
+        Some(body) => json_response(StatusCode::OK, body),
+        None => internal_error(),
+    }
+}
+
+async fn notification_requests(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let owner = match required_viewer(&state, &headers, READ_NOTIFICATIONS).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let (max_id, min_id, since_id) = match cursor_triplet(&rack) {
+        Ok(cursors) => cursors,
+        Err(error) => return cursor_parameter_error(&headers, error),
+    };
+    let Ok(limit) = limit_parameter(&rack, 40, 80) else {
+        return framework_internal_error();
+    };
+    let Ok(requests) = state
+        .loader(Some(owner))
+        .notification_requests(owner, max_id, since_id, min_id, limit)
+        .await
+    else {
+        return internal_error();
+    };
+    let serializer = state.serializer();
+    let Ok(values) = requests
+        .iter()
+        .map(|request| serializer.notification_request(request))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return internal_error();
+    };
+    let Ok(body) = serde_json::to_vec(&values) else {
+        return internal_error();
+    };
+    let ids = requests
+        .iter()
+        .map(|request| request.id)
+        .collect::<Vec<_>>();
+    notification_request_response(
+        &state,
+        "api/v1/notifications/requests",
+        &parameters(query.as_deref()),
+        &["limit"],
+        &ids,
+        body,
+        limit,
+    )
+}
+
+async fn notification_requests_merged(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let owner = match required_viewer(&state, &headers, READ_NOTIFICATIONS).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let merged = match state.queue.as_ref() {
+        Some(queue) => match queue.notification_unfilter_pending(owner).await {
+            Ok(pending) => !pending,
+            Err(_) => return internal_error(),
+        },
+        None => true,
+    };
+    let body = if merged {
+        br#"{"merged":true}"#.to_vec()
+    } else {
+        br#"{"merged":false}"#.to_vec()
+    };
+    json_response(StatusCode::OK, body)
+}
+
+async fn notification_policy_v1(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let (policy, summary) = match notification_policy_data(&state, &headers).await {
+        Ok(data) => data,
+        Err(response) => return response,
+    };
+    notification_policy_response(policy.as_ref(), summary, false)
+}
+
+async fn notification_policy_v2(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let (policy, summary) = match notification_policy_data(&state, &headers).await {
+        Ok(data) => data,
+        Err(response) => return response,
+    };
+    notification_policy_response(policy.as_ref(), summary, true)
+}
+
+async fn notification_policy_v1_update(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let update = NotificationPolicyUpdate {
+        for_bots: optional_boolean_parameter(&rack, "filter_bots").map(i32::from),
+        for_limited_accounts: None,
+        for_new_accounts: optional_boolean_parameter(&rack, "filter_new_accounts").map(i32::from),
+        for_not_followers: optional_boolean_parameter(&rack, "filter_not_followers").map(i32::from),
+        for_not_following: optional_boolean_parameter(&rack, "filter_not_following").map(i32::from),
+        for_private_mentions: optional_boolean_parameter(&rack, "filter_private_mentions")
+            .map(i32::from),
+    };
+    notification_policy_update(state, headers, update, false).await
+}
+
+async fn notification_policy_v2_update(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let Ok(update) = notification_policy_mode_update(&rack) else {
+        return framework_internal_error();
+    };
+    notification_policy_update(state, headers, update, true).await
+}
+
+async fn notification_policy_update(
+    state: WebState,
+    headers: HeaderMap,
+    update: NotificationPolicyUpdate,
+    v2: bool,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_NOTIFICATIONS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let account_id = match authenticated.resource_owner() {
+        Some(owner) => owner.account_id(),
+        None => return internal_error(),
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let Ok(policy) = writer
+        .update_notification_policy(&authenticated, update)
+        .await
+    else {
+        return internal_error();
+    };
+    let Ok(summary) = state
+        .repository
+        .notification_policy_summary(account_id)
+        .await
+    else {
+        return internal_error();
+    };
+    notification_policy_response(Some(&policy), summary, v2)
+}
+
+async fn notification_policy_data(
+    state: &WebState,
+    headers: &HeaderMap,
+) -> Result<(Option<NotificationPolicy>, (i64, i64)), Response<Body>> {
+    let owner = required_viewer(state, headers, READ_NOTIFICATIONS).await?;
+    let policy = state
+        .repository
+        .notification_policy(owner)
+        .await
+        .map_err(|_| internal_error())?;
+    let summary = state
+        .repository
+        .notification_policy_summary(owner)
+        .await
+        .map_err(|_| internal_error())?;
+    Ok((policy, summary))
+}
+
+fn notification_policy_response(
+    policy: Option<&NotificationPolicy>,
+    (pending_requests_count, pending_notifications_count): (i64, i64),
+    v2: bool,
+) -> Response<Body> {
+    let [
+        for_bots,
+        for_limited_accounts,
+        for_new_accounts,
+        for_not_followers,
+        for_not_following,
+        for_private_mentions,
+    ] = notification_policy_values(policy);
+    let summary = serde_json::json!({
+        "pending_requests_count": pending_requests_count,
+        "pending_notifications_count": pending_notifications_count,
+    });
+    let value = if v2 {
+        serde_json::json!({
+            "for_not_following": notification_policy_mode(for_not_following),
+            "for_not_followers": notification_policy_mode(for_not_followers),
+            "for_new_accounts": notification_policy_mode(for_new_accounts),
+            "for_private_mentions": notification_policy_mode(for_private_mentions),
+            "for_limited_accounts": notification_policy_mode(for_limited_accounts),
+            "for_bots": notification_policy_mode(for_bots),
+            "summary": summary,
+        })
+    } else {
+        serde_json::json!({
+            "filter_not_following": for_not_following != 0,
+            "filter_not_followers": for_not_followers != 0,
+            "filter_new_accounts": for_new_accounts != 0,
+            "filter_private_mentions": for_private_mentions != 0,
+            "filter_bots": for_bots != 0,
+            "summary": summary,
+        })
+    };
+    match serde_json::to_vec(&value) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(_) => internal_error(),
+    }
+}
+
+fn notification_policy_values(policy: Option<&NotificationPolicy>) -> [i32; 6] {
+    policy.map_or([0, 1, 0, 0, 0, 1], |policy| {
+        [
+            policy.for_bots.0,
+            policy.for_limited_accounts.0,
+            policy.for_new_accounts.0,
+            policy.for_not_followers.0,
+            policy.for_not_following.0,
+            policy.for_private_mentions.0,
+        ]
+    })
+}
+
+fn notification_policy_mode(value: i32) -> Option<&'static str> {
+    match value {
+        0 => Some("accept"),
+        1 => Some("filter"),
+        2 => Some("drop"),
+        _ => None,
+    }
+}
+
+fn notification_policy_mode_update(
+    parameters: &RackParameters,
+) -> Result<NotificationPolicyUpdate, ()> {
+    Ok(NotificationPolicyUpdate {
+        for_bots: notification_policy_mode_parameter(parameters, "for_bots")?,
+        for_limited_accounts: notification_policy_mode_parameter(
+            parameters,
+            "for_limited_accounts",
+        )?,
+        for_new_accounts: notification_policy_mode_parameter(parameters, "for_new_accounts")?,
+        for_not_followers: notification_policy_mode_parameter(parameters, "for_not_followers")?,
+        for_not_following: notification_policy_mode_parameter(parameters, "for_not_following")?,
+        for_private_mentions: notification_policy_mode_parameter(
+            parameters,
+            "for_private_mentions",
+        )?,
+    })
+}
+
+fn notification_policy_mode_parameter(
+    parameters: &RackParameters,
+    name: &str,
+) -> Result<Option<i32>, ()> {
+    match parameters.get(name) {
+        None | Some(RackValue::Null) => Ok(None),
+        Some(RackValue::Scalar(value)) => match value.as_str() {
+            "accept" => Ok(Some(0)),
+            "filter" => Ok(Some(1)),
+            "drop" => Ok(Some(2)),
+            _ => Err(()),
+        },
+        Some(_) => Err(()),
+    }
+}
+
+async fn notification_request_show(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let owner = match required_viewer(&state, &headers, READ_NOTIFICATIONS).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let Some((_, request_id)) = uri_path_id(&uri, 5) else {
+        return record_not_found();
+    };
+    let Ok(Some(request)) = state
+        .loader(Some(owner))
+        .notification_request(owner, request_id)
+        .await
+    else {
+        return record_not_found();
+    };
+    match state.serializer().notification_request(&request) {
+        Ok(value) => match serde_json::to_vec(&value) {
+            Ok(body) => json_response(StatusCode::OK, body),
+            Err(_) => internal_error(),
+        },
+        Err(_) => internal_error(),
+    }
+}
+
+async fn grouped_notification_show(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let owner = match required_viewer(&state, &headers, READ_NOTIFICATIONS).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let Some(group_key) = uri_path_segment(&uri, 4) else {
+        return record_not_found();
+    };
+    let grouped = match state
+        .loader(Some(owner))
+        .grouped_notification(owner, &group_key)
+        .await
+    {
+        Ok(Some(grouped)) => grouped,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    let supported_types = notification_supported_types(&rack);
+    match state
+        .serializer()
+        .grouped_notifications(&grouped, false, supported_types.as_deref())
+        .ok()
+        .and_then(|value| serde_json::to_vec(&value).ok())
+    {
+        Some(body) => json_response(StatusCode::OK, body),
+        None => internal_error(),
+    }
+}
+
+async fn notification_clear(State(state): State<WebState>, headers: HeaderMap) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_NOTIFICATIONS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    match writer.clear_notifications(&authenticated).await {
+        Ok(()) => empty_json_response(),
+        Err(_) => internal_error(),
+    }
+}
+
+async fn notification_dismiss(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_NOTIFICATIONS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, notification_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    match writer
+        .dismiss_notification(&authenticated, notification_id)
+        .await
+    {
+        Ok(()) => empty_json_response(),
+        Err(crate::mastodon::WriteError::NotFound) => record_not_found(),
+        Err(_) => internal_error(),
+    }
+}
+
+async fn notification_request_accept(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_NOTIFICATIONS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, request_id)) = uri_path_id(&uri, 5) else {
+        return record_not_found();
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    match writer
+        .accept_notification_request(&authenticated, request_id)
+        .await
+    {
+        Ok(()) => empty_json_response(),
+        Err(crate::mastodon::WriteError::NotFound) => record_not_found(),
+        Err(_) => internal_error(),
+    }
+}
+
+async fn notification_request_dismiss(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_NOTIFICATIONS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, request_id)) = uri_path_id(&uri, 5) else {
+        return record_not_found();
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    match writer
+        .dismiss_notification_request(&authenticated, request_id)
+        .await
+    {
+        Ok(()) => empty_json_response(),
+        Err(crate::mastodon::WriteError::NotFound) => record_not_found(),
+        Err(_) => internal_error(),
+    }
+}
+
+async fn notification_requests_accept(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    notification_requests_write(state, rack, headers, true).await
+}
+
+async fn notification_requests_dismiss(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    notification_requests_write(state, rack, headers, false).await
+}
+
+async fn notification_requests_write(
+    state: WebState,
+    rack: RackParameters,
+    headers: HeaderMap,
+    accept: bool,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_NOTIFICATIONS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Ok(request_ids) = relationship_ids(&rack) else {
+        return framework_internal_error();
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let result = if accept {
+        writer
+            .accept_notification_requests(&authenticated, &request_ids)
+            .await
+    } else {
+        writer
+            .dismiss_notification_requests(&authenticated, &request_ids)
+            .await
+    };
+    match result {
+        Ok(()) => empty_json_response(),
+        Err(_) => internal_error(),
+    }
+}
+
+async fn grouped_notification_clear(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    notification_clear(State(state), headers).await
+}
+
+async fn grouped_notification_dismiss(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_NOTIFICATIONS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some(group_key) = uri_path_segment(&uri, 4) else {
+        return record_not_found();
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    match writer
+        .dismiss_notification_group(&authenticated, &group_key)
+        .await
+    {
+        Ok(()) => empty_json_response(),
         Err(_) => internal_error(),
     }
 }
@@ -3272,6 +13696,324 @@ async fn lists(State(state): State<WebState>, headers: HeaderMap) -> Response<Bo
     }
 }
 
+async fn list_show(State(state): State<WebState>, uri: Uri, headers: HeaderMap) -> Response<Body> {
+    let owner = match required_viewer(&state, &headers, READ_LISTS).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let Some((_, list_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let Ok(lists) = state.loader(Some(owner)).lists(owner).await else {
+        return internal_error();
+    };
+    let Some(list) = lists.into_iter().find(|list| list.id == list_id) else {
+        return record_not_found();
+    };
+    match serde_json::to_vec(&state.serializer().list(&list)) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(_) => internal_error(),
+    }
+}
+
+async fn list_accounts(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    RawQuery(query): RawQuery,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let owner = match required_viewer(&state, &headers, READ_LISTS).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let Some((list_path, list_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let is_owned = match state.loader(Some(owner)).lists(owner).await {
+        Ok(lists) => lists.into_iter().any(|list| list.id == list_id),
+        Err(_) => return internal_error(),
+    };
+    if !is_owned {
+        return record_not_found();
+    }
+    let (max_id, since_id) = match cursor_pair(&rack, "max_id", "since_id") {
+        Ok(cursors) => cursors,
+        Err(error) => return cursor_parameter_error(&headers, error),
+    };
+    let Ok(limit) = limit_parameter(&rack, 40, 80) else {
+        return framework_internal_error();
+    };
+    let unlimited = limit == 0;
+    let Ok(account_ids) = state
+        .repository
+        .rest_list_account_ids(
+            list_id,
+            (!unlimited).then_some(max_id).flatten(),
+            (!unlimited).then_some(since_id).flatten(),
+            limit,
+        )
+        .await
+    else {
+        return internal_error();
+    };
+    let Ok(accounts) = state.loader(Some(owner)).accounts(&account_ids).await else {
+        return internal_error();
+    };
+    let serializer = state.serializer();
+    let values = match accounts
+        .iter()
+        .map(|account| serializer.account(account))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(values) => match serde_json::to_vec(&values) {
+            Ok(values) => values,
+            Err(_) => return internal_error(),
+        },
+        Err(_) => return internal_error(),
+    };
+    let mut response = json_response(StatusCode::OK, values);
+    let parameters = parameters(query.as_deref());
+    let route = format!("api/v1/lists/{list_path}/accounts");
+    let mut links = Vec::new();
+    if limit > 0
+        && account_ids.len() == usize::try_from(limit).unwrap_or_default()
+        && let Some(last_id) = account_ids.last()
+        && let Some(url) =
+            pagination_url(&state, &route, &parameters, "max_id", *last_id, &["limit"])
+    {
+        links.push(format!("<{url}>; rel=\"next\""));
+    }
+    if !unlimited
+        && let Some(first_id) = account_ids.first()
+        && let Some(url) = pagination_url(
+            &state,
+            &route,
+            &parameters,
+            "since_id",
+            *first_id,
+            &["limit"],
+        )
+    {
+        links.push(format!("<{url}>; rel=\"prev\""));
+    }
+    set_link_header(&mut response, &links);
+    response
+}
+
+async fn account_lists(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let owner = match required_viewer(&state, &headers, READ_LISTS).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let Some((_, account_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let account = match state.loader(Some(owner)).account(account_id).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    if account.suspended {
+        return json_response(StatusCode::OK, b"[]".to_vec());
+    }
+    let Ok(lists) = state.repository.rest_account_lists(owner, account_id).await else {
+        return internal_error();
+    };
+    let values = lists
+        .into_iter()
+        .map(|list| {
+            state.serializer().list(&ListProjection {
+                id: list.id,
+                title: list.title,
+                replies_policy: list.replies_policy.0,
+                exclusive: list.exclusive,
+            })
+        })
+        .collect::<Vec<_>>();
+    match serde_json::to_vec(&values) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(_) => internal_error(),
+    }
+}
+
+async fn account_collections(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    RawQuery(query): RawQuery,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    account_collection_index(state, rack, query, uri, headers, false).await
+}
+
+async fn account_in_collections(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    RawQuery(query): RawQuery,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    account_collection_index(state, rack, query, uri, headers, true).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn account_collection_index(
+    state: WebState,
+    rack: RackParameters,
+    query: Option<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    in_collections: bool,
+) -> Response<Body> {
+    let viewer = if in_collections {
+        if !headers.contains_key(AUTHORIZATION) {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "This method requires an authenticated user",
+            );
+        }
+        match required_viewer_owner(&state, &headers, READ_COLLECTIONS).await {
+            Ok(viewer) => Some(viewer.account_id()),
+            Err(response) => return response,
+        }
+    } else {
+        match optional_viewer(&state, &headers, READ_COLLECTIONS).await {
+            Ok(viewer) => viewer,
+            Err(response) => return response,
+        }
+    };
+    let Some(account_path) = uri_path_segment(&uri, 4) else {
+        return record_not_found();
+    };
+    let account_id = match route_path_id(&account_path) {
+        Some(account_id) => account_id,
+        None => match state
+            .repository
+            .rest_local_account_id_by_username(&account_path)
+            .await
+        {
+            Ok(Some(account_id)) => account_id,
+            Ok(None) => return record_not_found(),
+            Err(_) => return internal_error(),
+        },
+    };
+    let account = match state.loader(viewer).account(account_id).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    if in_collections && viewer != Some(account_id) {
+        return error_response(StatusCode::FORBIDDEN, "This action is not allowed");
+    }
+    let account_route_path = account.domain.as_deref().map_or_else(
+        || account.username.clone(),
+        |domain| format!("{}@{domain}", account.username),
+    );
+    let offset = match rack.get("offset") {
+        None | Some(RackValue::Null) => 0,
+        Some(RackValue::Scalar(value)) => ruby_integer(value),
+        Some(RackValue::Number(value)) => json_number_integer(value).unwrap_or(0),
+        Some(
+            RackValue::Boolean(_)
+            | RackValue::Array(_)
+            | RackValue::Object(_)
+            | RackValue::Upload(_),
+        ) => return framework_internal_error(),
+    };
+    if offset < 0 {
+        return framework_internal_error();
+    }
+    let Ok(limit) = limit_parameter(&rack, 40, if in_collections { 80 } else { 100 }) else {
+        return framework_internal_error();
+    };
+    let query_limit = if limit == 0 {
+        0
+    } else {
+        limit.saturating_add(1)
+    };
+    let collection_ids = if in_collections {
+        state
+            .repository
+            .rest_account_in_collection_ids(account_id, offset, query_limit)
+            .await
+    } else {
+        state
+            .repository
+            .rest_account_collection_ids(account_id, viewer, offset, query_limit)
+            .await
+    };
+    let Ok(mut collection_ids) = collection_ids else {
+        return internal_error();
+    };
+    let has_next = limit > 0 && collection_ids.len() > usize::try_from(limit).unwrap_or_default();
+    if has_next {
+        collection_ids.truncate(usize::try_from(limit).unwrap_or_default());
+    }
+    let Ok(collections) = state.loader(viewer).collections(&collection_ids).await else {
+        return internal_error();
+    };
+    let route = if in_collections {
+        format!("api/v1/accounts/{account_route_path}/in_collections")
+    } else {
+        format!("api/v1/accounts/{account_route_path}/collections")
+    };
+    let parameters = parameters(query.as_deref());
+    let mut links = Vec::new();
+    if has_next
+        && let Some(url) = pagination_url(
+            &state,
+            &route,
+            &parameters,
+            "offset",
+            offset.saturating_add(limit),
+            &["limit"],
+        )
+    {
+        links.push(format!("<{url}>; rel=\"next\""));
+    }
+    if offset > 0
+        && let Some(url) = pagination_url(
+            &state,
+            &route,
+            &parameters,
+            "offset",
+            offset.saturating_sub(limit),
+            &["limit"],
+        )
+    {
+        links.push(format!("<{url}>; rel=\"prev\""));
+    }
+    let serializer = state.serializer();
+    let Ok(values) = collections
+        .iter()
+        .map(|collection| serializer.collection(collection))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return internal_error();
+    };
+    collection_index_response(&state, &values, Some(links))
+}
+
+fn collection_index_response(
+    _state: &WebState,
+    values: &[impl serde::Serialize],
+    links: Option<Vec<String>>,
+) -> Response<Body> {
+    let mut response = match serde_json::to_vec(&serde_json::json!({ "collections": values })) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(_) => return internal_error(),
+    };
+    if let Some(links) = links {
+        set_link_header(&mut response, &links);
+    }
+    response
+}
+
 async fn featured_tags(State(state): State<WebState>, headers: HeaderMap) -> Response<Body> {
     let owner = match required_viewer(&state, &headers, READ_ACCOUNTS).await {
         Ok(owner) => owner,
@@ -3286,6 +14028,168 @@ async fn featured_tags(State(state): State<WebState>, headers: HeaderMap) -> Res
         .map(|tag| serializer.featured_tag(tag))
         .collect::<Vec<_>>();
     match serde_json::to_vec(&values) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(_) => internal_error(),
+    }
+}
+
+async fn followed_tags(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let owner = match required_viewer(&state, &headers, READ_FOLLOWS).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let (max_id, min_id, since_id) = match cursor_triplet(&rack) {
+        Ok(cursors) => cursors,
+        Err(error) => return cursor_parameter_error(&headers, error),
+    };
+    let options = FollowedTagsOptions {
+        max_id,
+        min_id,
+        since_id,
+        limit: match limit_parameter(&rack, 100, 200) {
+            Ok(limit) => limit,
+            Err(()) => return framework_internal_error(),
+        },
+    };
+    let Ok(page) = state
+        .loader(Some(owner))
+        .followed_tags(owner, &options)
+        .await
+    else {
+        return internal_error();
+    };
+    let serializer = state.serializer();
+    let values = page
+        .tags
+        .iter()
+        .map(|tag| serializer.tag(tag))
+        .collect::<Vec<_>>();
+    let Ok(body) = serde_json::to_vec(&values) else {
+        return internal_error();
+    };
+    let mut response = json_response(StatusCode::OK, body);
+    let parameters = parameters(query.as_deref());
+    let mut links = Vec::new();
+    if usize::try_from(options.limit).is_ok_and(|limit| page.tags.len() == limit)
+        && let Some(last_id) = page.last_cursor
+        && let Some(url) = pagination_url(
+            &state,
+            "api/v1/followed_tags",
+            &parameters,
+            "max_id",
+            last_id,
+            &["limit"],
+        )
+    {
+        links.push(format!("<{url}>; rel=\"next\""));
+    }
+    if let Some(first_id) = page.first_cursor
+        && let Some(url) = pagination_url(
+            &state,
+            "api/v1/followed_tags",
+            &parameters,
+            "since_id",
+            first_id,
+            &["limit"],
+        )
+    {
+        links.push(format!("<{url}>; rel=\"prev\""));
+    }
+    set_link_header(&mut response, &links);
+    response
+}
+
+async fn follow_requests(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let owner = match required_viewer(&state, &headers, READ_FOLLOWS).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let (max_id, since_id) = match cursor_pair(&rack, "max_id", "since_id") {
+        Ok(cursors) => cursors,
+        Err(error) => return cursor_parameter_error(&headers, error),
+    };
+    let options = FollowCollectionOptions {
+        max_id,
+        since_id,
+        limit: match limit_parameter(&rack, 40, 80) {
+            Ok(limit) => limit,
+            Err(()) => return framework_internal_error(),
+        },
+    };
+    let Ok(page) = state
+        .loader(Some(owner))
+        .follow_requests(owner, &options)
+        .await
+    else {
+        return internal_error();
+    };
+    let serializer = state.serializer();
+    let accounts = page
+        .accounts
+        .iter()
+        .map(|account| serializer.account(account))
+        .collect::<Result<Vec<_>, _>>();
+    let mut response = match accounts
+        .ok()
+        .and_then(|values| serde_json::to_vec(&values).ok())
+    {
+        Some(body) => json_response(StatusCode::OK, body),
+        None => return internal_error(),
+    };
+    let parameters = parameters(query.as_deref());
+    let mut links = Vec::new();
+    if usize::try_from(options.limit).is_ok_and(|limit| page.accounts.len() == limit)
+        && let Some(last_cursor) = page.last_cursor
+        && let Some(url) = pagination_url(
+            &state,
+            "api/v1/follow_requests",
+            &parameters,
+            "max_id",
+            last_cursor,
+            &["limit"],
+        )
+    {
+        links.push(format!("<{url}>; rel=\"next\""));
+    }
+    if let Some(first_cursor) = page.first_cursor
+        && let Some(url) = pagination_url(
+            &state,
+            "api/v1/follow_requests",
+            &parameters,
+            "since_id",
+            first_cursor,
+            &["limit"],
+        )
+    {
+        links.push(format!("<{url}>; rel=\"prev\""));
+    }
+    set_link_header(&mut response, &links);
+    response
+}
+
+async fn preferences(State(state): State<WebState>, headers: HeaderMap) -> Response<Body> {
+    let owner = match required_viewer_owner(&state, &headers, READ_ACCOUNTS).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let Ok(Some(preferences)) = state
+        .loader(Some(owner.account_id()))
+        .preferences(owner.user_id(), owner.account_id())
+        .await
+    else {
+        return internal_error();
+    };
+    match serde_json::to_vec(&state.serializer().preferences(&preferences)) {
         Ok(body) => json_response(StatusCode::OK, body),
         Err(_) => internal_error(),
     }
@@ -3389,6 +14293,289 @@ fn account_response(
     }
 }
 
+async fn follow_account(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    account_relationship_write(state, rack, uri, headers, true).await
+}
+
+async fn authorize_follow_request(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_FOLLOWS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, source_account_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    match writer
+        .authorize_follow_request_with_origin(
+            &authenticated,
+            source_account_id,
+            Some(state.origin.as_str()),
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => return status_saved_write_error(&error),
+    };
+    relationship_response(&state, &authenticated, source_account_id).await
+}
+
+async fn reject_follow_request(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_FOLLOWS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, source_account_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    if let Err(error) = writer
+        .reject_follow_request_with_origin(
+            &authenticated,
+            source_account_id,
+            Some(state.origin.as_str()),
+        )
+        .await
+    {
+        return status_saved_write_error(&error);
+    }
+    relationship_response(&state, &authenticated, source_account_id).await
+}
+
+async fn remove_from_followers(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_FOLLOWS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, follower_account_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    if let Err(error) = writer
+        .remove_follower_with_origin(
+            &authenticated,
+            follower_account_id,
+            Some(state.origin.as_str()),
+        )
+        .await
+    {
+        return status_saved_write_error(&error);
+    }
+    relationship_response(&state, &authenticated, follower_account_id).await
+}
+
+async fn block_account(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    account_block_write(state, uri, headers, true).await
+}
+
+async fn unblock_account(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    account_block_write(state, uri, headers, false).await
+}
+
+async fn mute_account(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    account_mute_write(state, rack, uri, headers, true).await
+}
+
+async fn unmute_account(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    account_mute_write(state, RackParameters::default(), uri, headers, false).await
+}
+
+async fn unfollow_account(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    account_relationship_write(state, RackParameters::default(), uri, headers, false).await
+}
+
+async fn account_relationship_write(
+    state: WebState,
+    rack: RackParameters,
+    uri: Uri,
+    headers: HeaderMap,
+    following: bool,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_FOLLOWS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, target_account_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let (reblogs, notify, languages) = if following {
+        let languages = match rack.get("languages") {
+            None | Some(RackValue::Null) => None,
+            Some(RackValue::Scalar(_) | RackValue::Array(_)) => {
+                Some(rack_array_values(&rack, "languages"))
+            }
+            Some(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid languages"),
+        };
+        (
+            optional_boolean_parameter(&rack, "reblogs"),
+            optional_boolean_parameter(&rack, "notify"),
+            languages,
+        )
+    } else {
+        (None, None, None)
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    match writer
+        .set_follow_with_origin(
+            &authenticated,
+            target_account_id,
+            following,
+            reblogs,
+            notify,
+            languages,
+            Some(state.origin.as_str()),
+            state.instance_runtime.limited_federation,
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => return status_saved_write_error(&error),
+    };
+    relationship_response(&state, &authenticated, target_account_id).await
+}
+
+async fn account_block_write(
+    state: WebState,
+    uri: Uri,
+    headers: HeaderMap,
+    blocking: bool,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_BLOCKS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, target_account_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    if let Err(error) = writer
+        .set_block_with_origin(
+            &authenticated,
+            target_account_id,
+            blocking,
+            Some(state.origin.as_str()),
+        )
+        .await
+    {
+        return status_saved_write_error(&error);
+    }
+    relationship_response(&state, &authenticated, target_account_id).await
+}
+
+async fn account_mute_write(
+    state: WebState,
+    rack: RackParameters,
+    uri: Uri,
+    headers: HeaderMap,
+    muting: bool,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_MUTES).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, target_account_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let (hide_notifications, duration) = if muting {
+        let duration = match integer_parameter(&rack, "duration") {
+            Ok(duration) if duration.unwrap_or_default() >= 0 => duration,
+            _ => return error_response(StatusCode::BAD_REQUEST, "Invalid duration"),
+        };
+        (optional_boolean_parameter(&rack, "notifications"), duration)
+    } else {
+        (None, None)
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    if let Err(error) = writer
+        .set_mute(
+            &authenticated,
+            target_account_id,
+            muting,
+            hide_notifications,
+            duration,
+        )
+        .await
+    {
+        return status_saved_write_error(&error);
+    }
+    relationship_response(&state, &authenticated, target_account_id).await
+}
+
+async fn relationship_response(
+    state: &WebState,
+    authenticated: &AuthenticatedBearer,
+    target_account_id: i64,
+) -> Response<Body> {
+    let owner = match authenticated.require_user() {
+        Ok(owner) => owner.account_id(),
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    let Ok(mut values) = state
+        .loader(Some(owner))
+        .relationships(&[target_account_id], false)
+        .await
+    else {
+        return internal_error();
+    };
+    let Some(value) = values.pop() else {
+        return record_not_found();
+    };
+    match serde_json::to_vec(&state.serializer().relationship(&value)) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(_) => internal_error(),
+    }
+}
+
 async fn relationships(
     State(state): State<WebState>,
     Extension(rack): Extension<RackParameters>,
@@ -3425,6 +14612,177 @@ async fn verify_credentials(State(state): State<WebState>, headers: HeaderMap) -
         Ok(owner) => owner,
         Err(response) => return response,
     };
+    credential_account_response(&state, owner).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn update_credentials(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_ACCOUNTS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let owner = match authenticated.require_user() {
+        Ok(owner) => owner,
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let account_id = owner.account_id();
+    let mut update = match account_profile_update(&rack) {
+        Ok(update) => update,
+        Err(field) => return error_response(StatusCode::BAD_REQUEST, field),
+    };
+    let avatar = match profile_media_change(
+        &rack,
+        "avatar",
+        PaperclipAttachment::AccountAvatar,
+        owner.account_id(),
+    ) {
+        Ok(change) => change,
+        Err(error) => return error_response(StatusCode::UNPROCESSABLE_ENTITY, error),
+    };
+    let header = match profile_media_change(
+        &rack,
+        "header",
+        PaperclipAttachment::AccountHeader,
+        owner.account_id(),
+    ) {
+        Ok(change) => change,
+        Err(error) => return error_response(StatusCode::UNPROCESSABLE_ENTITY, error),
+    };
+    update.avatar = avatar.update;
+    update.header = header.update;
+    let result = writer
+        .with_account_lock(account_id, || async {
+            writer.ensure_account_write_allowed(account_id).await?;
+            let old_avatar = state
+                .repository
+                .paperclip_metadata(PaperclipAttachment::AccountAvatar, account_id)
+                .await?;
+            let old_header = state
+                .repository
+                .paperclip_metadata(PaperclipAttachment::AccountHeader, account_id)
+                .await?;
+            let avatar_paths = write_prepared_profile_media(
+                &state.media_root,
+                PaperclipAttachment::AccountAvatar,
+                account_id,
+                avatar.prepared.as_ref(),
+            )
+            .map_err(WriteError::Filesystem)?;
+            let header_paths = match write_prepared_profile_media(
+                &state.media_root,
+                PaperclipAttachment::AccountHeader,
+                account_id,
+                header.prepared.as_ref(),
+            ) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    remove_written_profile_media(
+                        &state.media_root,
+                        &avatar_paths,
+                        old_avatar.as_ref(),
+                    );
+                    return Err(WriteError::Filesystem(error));
+                }
+            };
+            if let Err(error) = writer
+                .update_account_profile_locked(&authenticated, &update)
+                .await
+            {
+                remove_written_profile_media(&state.media_root, &avatar_paths, old_avatar.as_ref());
+                remove_written_profile_media(&state.media_root, &header_paths, old_header.as_ref());
+                return Err(error);
+            }
+            if !matches!(&update.avatar, AccountMediaUpdate::Unchanged) {
+                remove_replaced_profile_media(
+                    &state.media_root,
+                    old_avatar.as_ref(),
+                    &avatar_paths,
+                );
+            }
+            if !matches!(&update.header, AccountMediaUpdate::Unchanged) {
+                remove_replaced_profile_media(
+                    &state.media_root,
+                    old_header.as_ref(),
+                    &header_paths,
+                );
+            }
+            Ok(())
+        })
+        .await;
+    if let Err(error) = result {
+        return status_saved_write_error(&error);
+    }
+    credential_account_response(&state, owner).await
+}
+
+async fn delete_profile_avatar(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    delete_profile_media(state, headers, PaperclipAttachment::AccountAvatar).await
+}
+
+async fn delete_profile_header(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    delete_profile_media(state, headers, PaperclipAttachment::AccountHeader).await
+}
+
+async fn delete_profile_media(
+    state: WebState,
+    headers: HeaderMap,
+    attachment: PaperclipAttachment,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_ACCOUNTS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let owner = match authenticated.require_user() {
+        Ok(owner) => owner,
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let mut update = AccountProfileUpdate::default();
+    match attachment {
+        PaperclipAttachment::AccountAvatar => update.avatar = AccountMediaUpdate::Remove,
+        PaperclipAttachment::AccountHeader => update.header = AccountMediaUpdate::Remove,
+        _ => return internal_error(),
+    }
+    let account_id = owner.account_id();
+    let result = writer
+        .with_account_lock(account_id, || async {
+            writer.ensure_account_write_allowed(account_id).await?;
+            let old = state
+                .repository
+                .paperclip_metadata(attachment, account_id)
+                .await?;
+            writer
+                .update_account_profile_locked(&authenticated, &update)
+                .await?;
+            remove_replaced_profile_media(&state.media_root, old.as_ref(), &[]);
+            Ok(())
+        })
+        .await;
+    if let Err(error) = result {
+        return status_saved_write_error(&error);
+    }
+    credential_account_response(&state, owner).await
+}
+
+async fn credential_account_response(
+    state: &WebState,
+    owner: OAuthResourceOwner,
+) -> Response<Body> {
     let credential = match state
         .loader(Some(owner.account_id()))
         .credential_account(owner.user_id(), owner.account_id())
@@ -3442,6 +14800,318 @@ async fn verify_credentials(State(state): State<WebState>, headers: HeaderMap) -
     {
         Some(body) => json_response(StatusCode::OK, body),
         None => internal_error(),
+    }
+}
+
+fn account_profile_update(rack: &RackParameters) -> Result<AccountProfileUpdate, &'static str> {
+    let display_name = profile_text_parameter(rack, "display_name")?;
+    let note = profile_text_parameter(rack, "note")?;
+    let avatar_description = profile_text_parameter(rack, "avatar_description")?;
+    let header_description = profile_text_parameter(rack, "header_description")?;
+    let attribution_domains = profile_string_array(rack, "attribution_domains")?;
+    let fields = profile_fields_parameter(rack)?;
+    let source = profile_source_parameter(rack)?;
+    Ok(AccountProfileUpdate {
+        display_name,
+        note,
+        avatar_description,
+        header_description,
+        avatar: AccountMediaUpdate::Unchanged,
+        header: AccountMediaUpdate::Unchanged,
+        bot: nullable_boolean_parameter(rack, "bot"),
+        locked: optional_boolean_parameter(rack, "locked"),
+        discoverable: nullable_boolean_parameter(rack, "discoverable"),
+        hide_collections: nullable_boolean_parameter(rack, "hide_collections"),
+        indexable: optional_boolean_parameter(rack, "indexable"),
+        attribution_domains,
+        fields,
+        source,
+    })
+}
+
+struct ProfileMediaChange {
+    update: AccountMediaUpdate,
+    prepared: Option<PreparedAccountMedia>,
+}
+
+fn profile_media_change(
+    parameters: &RackParameters,
+    name: &str,
+    attachment: PaperclipAttachment,
+    account_id: i64,
+) -> Result<ProfileMediaChange, &'static str> {
+    match parameters.get(name) {
+        None => Ok(ProfileMediaChange {
+            update: AccountMediaUpdate::Unchanged,
+            prepared: None,
+        }),
+        Some(RackValue::Null) => Ok(ProfileMediaChange {
+            update: AccountMediaUpdate::Remove,
+            prepared: None,
+        }),
+        Some(RackValue::Upload(upload)) => {
+            let prepared = prepare_account_media(
+                attachment,
+                account_id,
+                &upload.file_name,
+                &upload.content_type,
+                &upload.bytes,
+            )
+            .map_err(|_| "Invalid account image")?;
+            Ok(ProfileMediaChange {
+                update: AccountMediaUpdate::Replace {
+                    file_name: prepared.file_name.clone(),
+                    content_type: prepared.content_type.clone(),
+                    file_size: prepared.file_size,
+                    storage_schema_version: 1,
+                },
+                prepared: Some(prepared),
+            })
+        }
+        Some(_) => Err("Invalid account image"),
+    }
+}
+
+fn write_prepared_profile_media(
+    root: &PaperclipRoot,
+    attachment: PaperclipAttachment,
+    account_id: i64,
+    prepared: Option<&PreparedAccountMedia>,
+) -> std::io::Result<Vec<String>> {
+    let Some(prepared) = prepared else {
+        return Ok(Vec::new());
+    };
+    let metadata = PaperclipMetadata {
+        attachment,
+        id: account_id,
+        remote: false,
+        storage_schema_version: Some(1),
+        file_name: prepared.file_name.clone(),
+        content_type: Some(prepared.content_type.clone()),
+        variant: None,
+    };
+    let original = metadata.relative_path("original").ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid media path")
+    })?;
+    let mut paths = vec![original];
+    root.write_file(FsPath::new(&paths[0]), &prepared.original_bytes)?;
+    if let Some(static_bytes) = prepared.static_bytes.as_ref() {
+        let Some(static_path) = metadata.relative_path("static") else {
+            let _ = root.remove_file(FsPath::new(&paths[0]));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid static media path",
+            ));
+        };
+        if let Err(error) = root.write_file(FsPath::new(&static_path), static_bytes) {
+            let _ = root.remove_file(FsPath::new(&paths[0]));
+            return Err(error);
+        }
+        paths.push(static_path);
+    }
+    Ok(paths)
+}
+
+fn remove_written_profile_media(
+    root: &PaperclipRoot,
+    paths: &[String],
+    protected: Option<&PaperclipMetadata>,
+) {
+    for path in paths {
+        if protected.is_some_and(|metadata| {
+            ["original", "static"].iter().any(|style| {
+                metadata
+                    .relative_path(style)
+                    .is_some_and(|old_path| old_path == *path)
+            })
+        }) {
+            continue;
+        }
+        let _ = root.remove_file(FsPath::new(path));
+    }
+}
+
+fn remove_replaced_profile_media(
+    root: &PaperclipRoot,
+    old: Option<&PaperclipMetadata>,
+    new_paths: &[String],
+) {
+    let Some(old) = old else {
+        return;
+    };
+    for style in ["original", "static"] {
+        let Some(path) = old.relative_path(style) else {
+            continue;
+        };
+        if !new_paths.iter().any(|new_path| new_path == &path) {
+            let _ = root.remove_file(FsPath::new(&path));
+        }
+    }
+}
+
+fn profile_text_parameter(
+    parameters: &RackParameters,
+    name: &str,
+) -> Result<Option<String>, &'static str> {
+    match parameters.get(name) {
+        None => Ok(None),
+        Some(RackValue::Null) => Err("Invalid profile text"),
+        Some(value) => profile_scalar_string(value)
+            .map(Some)
+            .map_err(|()| "Invalid profile text"),
+    }
+}
+
+fn profile_string_array(
+    parameters: &RackParameters,
+    name: &str,
+) -> Result<Option<Vec<String>>, &'static str> {
+    let Some(value) = parameters.get(name) else {
+        return Ok(None);
+    };
+    let RackValue::Array(values) = value else {
+        return Err("Invalid profile domain list");
+    };
+    values
+        .iter()
+        .map(|value| match value {
+            RackValue::Null => Ok(String::new()),
+            value => profile_scalar_string(value).map_err(|()| "Invalid profile domain list"),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn profile_fields_parameter(
+    parameters: &RackParameters,
+) -> Result<Option<Vec<AccountFieldUpdate>>, &'static str> {
+    let Some(value) = parameters.get("fields_attributes") else {
+        return Ok(None);
+    };
+    let values = match value {
+        RackValue::Null => Vec::new(),
+        RackValue::Array(values) => values.iter().collect::<Vec<_>>(),
+        RackValue::Object(values)
+            if values.contains_key("name") || values.contains_key("value") =>
+        {
+            vec![value]
+        }
+        RackValue::Object(values) => values.values().collect::<Vec<_>>(),
+        _ => return Err("Invalid profile fields"),
+    };
+    values
+        .into_iter()
+        .map(profile_field)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn profile_field(value: &RackValue) -> Result<AccountFieldUpdate, &'static str> {
+    let RackValue::Object(values) = value else {
+        return Err("Invalid profile field");
+    };
+    let name = profile_object_string(values.get("name"))?;
+    let value = profile_object_string(values.get("value"))?;
+    Ok(AccountFieldUpdate { name, value })
+}
+
+fn profile_source_parameter(
+    parameters: &RackParameters,
+) -> Result<Option<AccountSourceUpdate>, &'static str> {
+    let Some(value) = parameters.get("source") else {
+        return Ok(None);
+    };
+    let RackValue::Object(values) = value else {
+        return if matches!(value, RackValue::Null) {
+            Ok(None)
+        } else {
+            Err("Invalid profile source")
+        };
+    };
+    Ok(Some(AccountSourceUpdate {
+        privacy: profile_object_nullable_string(values.get("privacy"))?,
+        sensitive: profile_object_boolean(values.get("sensitive"))?,
+        language: profile_object_nullable_string(values.get("language"))?,
+        quote_policy: profile_object_nullable_string(values.get("quote_policy"))?,
+    }))
+}
+
+fn profile_object_string(value: Option<&RackValue>) -> Result<String, &'static str> {
+    match value {
+        None | Some(RackValue::Null) => Ok(String::new()),
+        Some(value) => profile_scalar_string(value).map_err(|()| "Invalid profile field"),
+    }
+}
+
+fn profile_object_nullable_string(
+    value: Option<&RackValue>,
+) -> Result<AccountProfileValue<String>, &'static str> {
+    match value {
+        None => Ok(AccountProfileValue::Unchanged),
+        Some(RackValue::Null) => Ok(AccountProfileValue::Null),
+        Some(value) => profile_scalar_string(value)
+            .map(AccountProfileValue::Value)
+            .map_err(|()| "Invalid profile source"),
+    }
+}
+
+fn profile_object_boolean(
+    value: Option<&RackValue>,
+) -> Result<AccountProfileValue<bool>, &'static str> {
+    match value {
+        None => Ok(AccountProfileValue::Unchanged),
+        Some(RackValue::Null) => Ok(AccountProfileValue::Null),
+        Some(RackValue::Array(_) | RackValue::Object(_) | RackValue::Upload(_)) => {
+            Err("Invalid profile source")
+        }
+        Some(value) => Ok(AccountProfileValue::Value(boolean_value(value))),
+    }
+}
+
+fn profile_scalar_string(value: &RackValue) -> Result<String, ()> {
+    match value {
+        RackValue::Scalar(value) => Ok(value.clone()),
+        RackValue::Number(value) => Ok(ruby_json_number(value)),
+        RackValue::Boolean(value) => Ok(value.to_string()),
+        RackValue::Null | RackValue::Array(_) | RackValue::Object(_) | RackValue::Upload(_) => {
+            Err(())
+        }
+    }
+}
+
+fn boolean_value(value: &RackValue) -> bool {
+    match value {
+        RackValue::Null => false,
+        RackValue::Scalar(value) => {
+            !value.is_empty()
+                && !matches!(
+                    value.as_str(),
+                    "0" | "f" | "F" | "false" | "FALSE" | "off" | "OFF"
+                )
+                && !value.parse::<f64>().is_ok_and(|value| value == 0.0)
+        }
+        RackValue::Number(value) => {
+            if value.is_i64() {
+                value.as_i64().is_some_and(|value| value != 0)
+            } else if value.is_u64() {
+                value.as_u64().is_some_and(|value| value != 0)
+            } else {
+                true
+            }
+        }
+        RackValue::Array(_) | RackValue::Object(_) | RackValue::Upload(_) => true,
+        RackValue::Boolean(value) => *value,
+    }
+}
+
+fn nullable_boolean_parameter(
+    parameters: &RackParameters,
+    name: &str,
+) -> AccountProfileValue<bool> {
+    match parameters.get(name) {
+        None => AccountProfileValue::Unchanged,
+        Some(RackValue::Null) => AccountProfileValue::Null,
+        Some(value) => AccountProfileValue::Value(boolean_value(value)),
     }
 }
 
@@ -3714,6 +15384,75 @@ async fn status_source(
     }
 }
 
+async fn status_quotes(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    RawQuery(query): RawQuery,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let viewer = match required_scope_owner(&state, &headers, READ_STATUSES).await {
+        Ok(viewer) => viewer,
+        Err(response) => return response,
+    };
+    let Some((status_path, status_id)) = uri_path_id(&uri, 4) else {
+        return not_found();
+    };
+    let (max_id, since_id) = match cursor_pair(&rack, "max_id", "since_id") {
+        Ok(cursors) => cursors,
+        Err(error) => return cursor_parameter_error(&headers, error),
+    };
+    let options = FollowCollectionOptions {
+        max_id,
+        since_id,
+        limit: match limit_parameter(&rack, 20, 40) {
+            Ok(limit) => limit,
+            Err(()) => return framework_internal_error(),
+        },
+    };
+    let page = match state
+        .loader(viewer)
+        .status_quotes(status_id, &options)
+        .await
+    {
+        Ok(Some(page)) => page,
+        Ok(None) => return not_found(),
+        Err(_) => return internal_error(),
+    };
+    let mut response = statuses_response(&state, &page.statuses);
+    let parameters = parameters(query.as_deref());
+    let route = format!("api/v1/statuses/{status_path}/quotes");
+    let mut links = Vec::new();
+    if page.records_continue
+        && let Some(last_cursor) = page.last_cursor
+        && let Some(url) = pagination_url(
+            &state,
+            &route,
+            &parameters,
+            "max_id",
+            last_cursor,
+            &["limit"],
+        )
+    {
+        links.push(format!("<{url}>; rel=\"next\""));
+    }
+    if !page.statuses.is_empty()
+        && let Some(first_cursor) = page.first_cursor
+        && let Some(url) = pagination_url(
+            &state,
+            &route,
+            &parameters,
+            "since_id",
+            first_cursor,
+            &["limit"],
+        )
+    {
+        links.push(format!("<{url}>; rel=\"prev\""));
+    }
+    set_link_header(&mut response, &links);
+    response
+}
+
 async fn favourited_by(
     State(state): State<WebState>,
     Extension(rack): Extension<RackParameters>,
@@ -3823,6 +15562,416 @@ async fn status_account_association(
     response
 }
 
+async fn reblog_status(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    status_reblog_write(state, rack, uri, headers, true).await
+}
+
+async fn unreblog_status(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    status_reblog_write(state, rack, uri, headers, false).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn status_reblog_write(
+    state: WebState,
+    rack: RackParameters,
+    uri: Uri,
+    headers: HeaderMap,
+    enabled: bool,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_STATUSES).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, status_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let owner = match authenticated.require_user() {
+        Ok(owner) => owner.account_id(),
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    if enabled {
+        match state.loader(Some(owner)).authorized_status(status_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return record_not_found(),
+            Err(_) => return internal_error(),
+        }
+    }
+    let visibility = if enabled {
+        match rack.get("visibility") {
+            None | Some(RackValue::Null) => None,
+            Some(RackValue::Scalar(value)) => Some(value.as_str()),
+            Some(_) => return error_response(StatusCode::BAD_REQUEST, "Invalid visibility"),
+        }
+    } else {
+        None
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let outcome = match writer
+        .set_reblog_with_origin(
+            &authenticated,
+            status_id,
+            visibility,
+            enabled,
+            Some(state.origin.as_str()),
+            state.instance_runtime.limited_federation,
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => return status_saved_write_error(&error),
+    };
+    if !enabled && !outcome.removed {
+        match state.loader(Some(owner)).authorized_status(status_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return record_not_found(),
+            Err(_) => return internal_error(),
+        }
+    }
+    let response_status_id = if enabled {
+        outcome.status_id
+    } else {
+        outcome.target_status_id
+    };
+    let loaded_status = if !enabled && outcome.removed {
+        state
+            .loader(Some(owner))
+            .status_without_authorization(response_status_id)
+            .await
+    } else {
+        state
+            .loader(Some(owner))
+            .authorized_status(response_status_id)
+            .await
+    };
+    let status = match loaded_status {
+        Ok(Some(status)) => status,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    let mut status = status;
+    if !enabled
+        && outcome.removed
+        && status.account.id == owner
+        && let Some(statuses_count) = outcome.account_statuses_count_before_removal
+    {
+        // Rails renders this response before its asynchronous removal worker
+        // decrements the reblogger's account counter.
+        status.account.statuses_count = statuses_count;
+    }
+    let status = if !enabled && !outcome.removed {
+        status.without_status_relationships()
+    } else {
+        status
+    };
+    let body = state
+        .serializer()
+        .status(&status, StatusShape::Full)
+        .ok()
+        .and_then(|value| {
+            let mut value = serde_json::to_value(value).ok()?;
+            if enabled {
+                value
+                    .as_object_mut()?
+                    .insert("reblogged".to_owned(), serde_json::Value::Bool(true));
+            }
+            serde_json::to_vec(&value).ok()
+        });
+    match body {
+        Some(body) => json_response(StatusCode::OK, body),
+        None => internal_error(),
+    }
+}
+
+async fn bookmark_status(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    status_saved_write(state, uri, headers, false, true).await
+}
+
+async fn unbookmark_status(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    status_saved_write(state, uri, headers, false, false).await
+}
+
+async fn favourite_status(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    status_saved_write(state, uri, headers, true, true).await
+}
+
+async fn unfavourite_status(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    status_saved_write(state, uri, headers, true, false).await
+}
+
+async fn mute_status(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    status_mute_write(state, uri, headers, true).await
+}
+
+async fn unmute_status(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    status_mute_write(state, uri, headers, false).await
+}
+
+async fn pin_status(State(state): State<WebState>, uri: Uri, headers: HeaderMap) -> Response<Body> {
+    status_pin_write(state, uri, headers, true).await
+}
+
+async fn unpin_status(
+    State(state): State<WebState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    status_pin_write(state, uri, headers, false).await
+}
+
+async fn status_mute_write(
+    state: WebState,
+    uri: Uri,
+    headers: HeaderMap,
+    muted: bool,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_MUTES).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, status_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let owner = match authenticated.require_user() {
+        Ok(owner) => owner.account_id(),
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    match state.loader(Some(owner)).authorized_status(status_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    }
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    if let Err(error) = writer
+        .set_status_mute(&authenticated, status_id, muted)
+        .await
+    {
+        return status_saved_write_error(&error);
+    }
+    let status = match state.loader(Some(owner)).authorized_status(status_id).await {
+        Ok(Some(status)) => status,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    match state
+        .serializer()
+        .status(&status, StatusShape::Full)
+        .ok()
+        .and_then(|value| serde_json::to_vec(&value).ok())
+    {
+        Some(body) => json_response(StatusCode::OK, body),
+        None => internal_error(),
+    }
+}
+
+async fn status_pin_write(
+    state: WebState,
+    uri: Uri,
+    headers: HeaderMap,
+    pinned: bool,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_ACCOUNTS).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, status_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let owner = match authenticated.require_user() {
+        Ok(owner) => owner.account_id(),
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    match state.loader(Some(owner)).authorized_status(status_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    }
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    if let Err(error) = writer
+        .set_status_pin(&authenticated, status_id, pinned)
+        .await
+    {
+        return status_saved_write_error(&error);
+    }
+    let status = match state.loader(Some(owner)).authorized_status(status_id).await {
+        Ok(Some(status)) => status,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    match state
+        .serializer()
+        .status(&status, StatusShape::Full)
+        .ok()
+        .and_then(|value| serde_json::to_vec(&value).ok())
+    {
+        Some(body) => json_response(StatusCode::OK, body),
+        None => internal_error(),
+    }
+}
+
+async fn status_saved_write(
+    state: WebState,
+    uri: Uri,
+    headers: HeaderMap,
+    favourite: bool,
+    enabled: bool,
+) -> Response<Body> {
+    let scopes = if favourite {
+        WRITE_FAVOURITES
+    } else {
+        WRITE_BOOKMARKS
+    };
+    let authenticated = match required_write_viewer(&state, &headers, scopes).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, status_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let owner = match authenticated.require_user() {
+        Ok(owner) => owner.account_id(),
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    if enabled {
+        match state.loader(Some(owner)).authorized_status(status_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return record_not_found(),
+            Err(_) => return internal_error(),
+        }
+    }
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let (response_status_id, removed) = if favourite {
+        let outcome = match writer
+            .set_favourite_with_origin(
+                &authenticated,
+                status_id,
+                enabled,
+                Some(state.origin.as_str()),
+                state.instance_runtime.limited_federation,
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return status_saved_write_error(&error),
+        };
+        (
+            if !enabled && outcome.activity_id.is_some() {
+                outcome.status_id
+            } else {
+                status_id
+            },
+            !enabled && outcome.activity_id.is_some(),
+        )
+    } else {
+        let outcome = match writer
+            .set_bookmark(&authenticated, status_id, enabled)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return status_saved_write_error(&error),
+        };
+        (
+            if !enabled && outcome.removed {
+                outcome.status_id
+            } else {
+                status_id
+            },
+            !enabled && outcome.removed,
+        )
+    };
+    if !enabled && !removed {
+        match state.loader(Some(owner)).authorized_status(status_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return record_not_found(),
+            Err(_) => return internal_error(),
+        }
+    }
+    let status = match if !enabled && removed {
+        state
+            .loader(Some(owner))
+            .status_without_authorization(response_status_id)
+            .await
+    } else {
+        state
+            .loader(Some(owner))
+            .authorized_status(response_status_id)
+            .await
+    } {
+        Ok(Some(status)) => status,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    match state
+        .serializer()
+        .status(&status, StatusShape::Full)
+        .ok()
+        .and_then(|value| serde_json::to_vec(&value).ok())
+    {
+        Some(body) => json_response(StatusCode::OK, body),
+        None => internal_error(),
+    }
+}
+
+fn status_saved_write_error(error: &WriteError) -> Response<Body> {
+    match error {
+        WriteError::NotFound => record_not_found(),
+        WriteError::Unauthorized => error_response(StatusCode::UNAUTHORIZED, "Unauthorized"),
+        WriteError::InvalidInput(message) => error_response(StatusCode::BAD_REQUEST, message),
+        WriteError::Validation(message) => {
+            error_response(StatusCode::UNPROCESSABLE_ENTITY, message)
+        }
+        WriteError::Conflict => error_response(
+            StatusCode::CONFLICT,
+            "Conflict during update, please try again",
+        ),
+        WriteError::RateLimited
+        | WriteError::Sqlx(_)
+        | WriteError::Job(_)
+        | WriteError::Filesystem(_) => internal_error(),
+    }
+}
+
 async fn status_show(
     State(state): State<WebState>,
     uri: Uri,
@@ -3846,6 +15995,56 @@ async fn status_show(
         .ok()
         .and_then(|value| serde_json::to_vec(&value).ok())
     {
+        Some(body) => json_response(StatusCode::OK, body),
+        None => internal_error(),
+    }
+}
+
+async fn status_delete(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_STATUSES).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let Some((_, status_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    let owner = match authenticated.require_user() {
+        Ok(owner) => owner.account_id(),
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    let status = match state.loader(Some(owner)).authorized_status(status_id).await {
+        Ok(Some(status)) => status,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    let body = state
+        .serializer()
+        .status(&status, StatusShape::Source)
+        .ok()
+        .and_then(|value| serde_json::to_vec(&value).ok());
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let deleted_media = match writer
+        .delete_status(
+            &authenticated,
+            status_id,
+            boolean_parameter(&rack, "delete_media"),
+        )
+        .await
+    {
+        Ok(media) => media,
+        Err(error) => return status_saved_write_error(&error),
+    };
+    for media in &deleted_media {
+        remove_media_files(&state.media_root, media);
+    }
+    match body {
         Some(body) => json_response(StatusCode::OK, body),
         None => internal_error(),
     }
@@ -4286,6 +16485,84 @@ fn timeline_response(
     response
 }
 
+fn notification_response(
+    state: &WebState,
+    route: &str,
+    parameters: &[(String, String)],
+    preserved_names: &[&str],
+    ids: &[i64],
+    body: Vec<u8>,
+) -> Response<Body> {
+    let mut response = json_response(StatusCode::OK, body);
+    let mut links = Vec::new();
+    if let Some(last_id) = ids.last()
+        && let Some(url) = pagination_url_repeated(
+            state,
+            route,
+            parameters,
+            "max_id",
+            *last_id,
+            preserved_names,
+        )
+    {
+        links.push(format!("<{url}>; rel=\"next\""));
+    }
+    if let Some(first_id) = ids.first()
+        && let Some(url) = pagination_url_repeated(
+            state,
+            route,
+            parameters,
+            "min_id",
+            *first_id,
+            preserved_names,
+        )
+    {
+        links.push(format!("<{url}>; rel=\"prev\""));
+    }
+    set_link_header(&mut response, &links);
+    response
+}
+
+fn notification_request_response(
+    state: &WebState,
+    route: &str,
+    parameters: &[(String, String)],
+    preserved_names: &[&str],
+    ids: &[i64],
+    body: Vec<u8>,
+    limit: i64,
+) -> Response<Body> {
+    let mut response = json_response(StatusCode::OK, body);
+    let mut links = Vec::new();
+    if usize::try_from(limit).is_ok_and(|limit| ids.len() == limit)
+        && let Some(last_id) = ids.last()
+        && let Some(url) = pagination_url_repeated(
+            state,
+            route,
+            parameters,
+            "max_id",
+            *last_id,
+            preserved_names,
+        )
+    {
+        links.push(format!("<{url}>; rel=\"next\""));
+    }
+    if let Some(first_id) = ids.first()
+        && let Some(url) = pagination_url_repeated(
+            state,
+            route,
+            parameters,
+            "min_id",
+            *first_id,
+            preserved_names,
+        )
+    {
+        links.push(format!("<{url}>; rel=\"prev\""));
+    }
+    set_link_header(&mut response, &links);
+    response
+}
+
 fn statuses_response(
     state: &WebState,
     statuses: &[crate::mastodon::rest::StatusProjection],
@@ -4386,6 +16663,22 @@ async fn optional_scope_owner(
     }
 }
 
+async fn optional_authenticated_user_id(
+    state: &WebState,
+    headers: &HeaderMap,
+) -> Result<Option<i64>, Response<Body>> {
+    if !headers.contains_key(AUTHORIZATION) {
+        return Ok(None);
+    }
+    match state.authenticator.authenticate(headers, NO_SCOPE).await {
+        Ok(authenticated) => Ok(authenticated
+            .resource_owner()
+            .map(OAuthResourceOwner::user_id)),
+        Err(OAuthAuthenticationError::OAuth(_)) => Ok(None),
+        Err(OAuthAuthenticationError::Repository(_)) => Err(internal_error()),
+    }
+}
+
 async fn required_viewer(
     state: &WebState,
     headers: &HeaderMap,
@@ -4394,6 +16687,23 @@ async fn required_viewer(
     required_viewer_owner(state, headers, scopes)
         .await
         .map(OAuthResourceOwner::account_id)
+}
+
+async fn required_write_viewer(
+    state: &WebState,
+    headers: &HeaderMap,
+    scopes: RequiredScopes,
+) -> Result<AuthenticatedBearer, Response<Body>> {
+    match state.authenticator.authenticate(headers, scopes).await {
+        Ok(authenticated) => authenticated
+            .require_user()
+            .map(|_| authenticated)
+            .map_err(|error| error.into_http_response().map(Body::from)),
+        Err(OAuthAuthenticationError::OAuth(error)) => {
+            Err(error.into_http_response().map(Body::from))
+        }
+        Err(OAuthAuthenticationError::Repository(_)) => Err(internal_error()),
+    }
 }
 
 fn parameters(query: Option<&str>) -> Vec<(String, String)> {
@@ -4486,10 +16796,48 @@ fn rack_array_values(parameters: &RackParameters, name: &str) -> Vec<String> {
                 RackValue::Scalar(value) => Some(value.clone()),
                 RackValue::Number(value) => Some(ruby_json_number(value)),
                 RackValue::Boolean(value) => Some(value.to_string()),
-                RackValue::Array(_) | RackValue::Object(_) => None,
+                RackValue::Array(_) | RackValue::Object(_) | RackValue::Upload(_) => None,
             })
             .collect(),
-        None | Some(RackValue::Null | RackValue::Object(_)) => Vec::new(),
+        None | Some(RackValue::Null | RackValue::Object(_) | RackValue::Upload(_)) => Vec::new(),
+    }
+}
+
+fn rack_array_parameter(parameters: &RackParameters, name: &str) -> Vec<String> {
+    if matches!(parameters.get(name), Some(RackValue::Array(_))) {
+        rack_array_values(parameters, name)
+    } else {
+        Vec::new()
+    }
+}
+
+fn grouped_types_parameter_invalid(parameters: &RackParameters) -> bool {
+    matches!(
+        parameters.get("grouped_types"),
+        Some(RackValue::Scalar(value)) if !value.trim().is_empty()
+    ) || matches!(
+        parameters.get("grouped_types"),
+        Some(
+            RackValue::Boolean(_)
+                | RackValue::Number(_)
+                | RackValue::Object(_)
+                | RackValue::Upload(_),
+        )
+    )
+}
+
+fn notification_supported_types(parameters: &RackParameters) -> Option<Vec<String>> {
+    match parameters.get("supported_types") {
+        Some(RackValue::Scalar(value)) => Some(vec![value.clone()]),
+        Some(RackValue::Array(_)) => Some(rack_array_values(parameters, "supported_types")),
+        None
+        | Some(
+            RackValue::Null
+            | RackValue::Boolean(_)
+            | RackValue::Number(_)
+            | RackValue::Object(_)
+            | RackValue::Upload(_),
+        ) => None,
     }
 }
 
@@ -4503,11 +16851,13 @@ fn tagged_parameter(parameters: &RackParameters) -> Option<String> {
             RackValue::Scalar(value) if !value.trim().is_empty() => Some(value.clone()),
             RackValue::Number(value) => Some(ruby_json_number(value)),
             RackValue::Boolean(value) => Some(value.to_string()),
-            RackValue::Null | RackValue::Scalar(_) | RackValue::Array(_) | RackValue::Object(_) => {
-                None
-            }
+            RackValue::Null
+            | RackValue::Scalar(_)
+            | RackValue::Array(_)
+            | RackValue::Object(_)
+            | RackValue::Upload(_) => None,
         }),
-        Some(RackValue::Object(_)) => Some(String::new()),
+        Some(RackValue::Object(_) | RackValue::Upload(_)) => Some(String::new()),
     }
 }
 
@@ -4516,16 +16866,129 @@ fn relationship_ids(parameters: &RackParameters) -> Result<Vec<i64>, ()> {
         None | Some(RackValue::Null) => Ok(Vec::new()),
         Some(RackValue::Scalar(value)) => Ok(vec![ruby_integer(value)]),
         Some(RackValue::Number(value)) => Ok(vec![json_number_integer(value)?]),
-        Some(RackValue::Boolean(_) | RackValue::Object(_)) => Err(()),
+        Some(RackValue::Boolean(_) | RackValue::Object(_) | RackValue::Upload(_)) => Err(()),
         Some(RackValue::Array(values)) => values
             .iter()
             .map(|value| match value {
                 RackValue::Null => Ok(0),
                 RackValue::Scalar(value) => Ok(ruby_integer(value)),
                 RackValue::Number(value) => json_number_integer(value),
-                RackValue::Boolean(_) | RackValue::Array(_) | RackValue::Object(_) => Err(()),
+                RackValue::Boolean(_)
+                | RackValue::Array(_)
+                | RackValue::Object(_)
+                | RackValue::Upload(_) => Err(()),
             })
             .collect(),
+    }
+}
+
+fn notification_options(
+    parameters: &RackParameters,
+    grouped: bool,
+) -> Result<NotificationOptions, CursorParameterError> {
+    notification_options_with_limits(parameters, grouped, 40, 80, true)
+}
+
+fn notification_options_with_limits(
+    parameters: &RackParameters,
+    grouped: bool,
+    default_limit: i64,
+    maximum_limit: i64,
+    parse_cursors: bool,
+) -> Result<NotificationOptions, CursorParameterError> {
+    let (max_id, min_id, since_id) = if parse_cursors {
+        cursor_triplet(parameters)?
+    } else {
+        (None, None, None)
+    };
+    let requested_types = rack_array_parameter(parameters, "types");
+    let excluded_types = rack_array_parameter(parameters, "exclude_types");
+    Ok(NotificationOptions {
+        max_id,
+        min_id,
+        since_id,
+        limit: limit_parameter(parameters, default_limit, maximum_limit)
+            .map_err(|()| CursorParameterError::InvalidScalar)?,
+        account_id: if grouped {
+            None
+        } else {
+            integer_parameter(parameters, "account_id")?
+        },
+        types: notification_type_filter_with_exclusions(&requested_types, &excluded_types),
+        exclude_types: Vec::new(),
+        grouped_types: if grouped {
+            rack_array_parameter(parameters, "grouped_types")
+        } else {
+            Vec::new()
+        },
+        include_filtered: boolean_parameter(parameters, "include_filtered"),
+    })
+}
+
+fn expand_accounts_parameter(parameters: &RackParameters) -> Option<bool> {
+    match parameters.get("expand_accounts") {
+        None | Some(RackValue::Null) => Some(false),
+        Some(RackValue::Scalar(value)) => match value.as_str() {
+            "full" => Some(false),
+            "partial_avatars" => Some(true),
+            _ => None,
+        },
+        Some(
+            RackValue::Boolean(_)
+            | RackValue::Number(_)
+            | RackValue::Array(_)
+            | RackValue::Object(_)
+            | RackValue::Upload(_),
+        ) => None,
+    }
+}
+
+fn invalid_expand_accounts_response(parameters: &RackParameters) -> Response<Body> {
+    let value = parameters
+        .get("expand_accounts")
+        .map_or_else(|| "nil".to_owned(), rack_value_display);
+    let message = format!(
+        "Invalid value for 'expand_accounts': '{value}', allowed values are 'full' and 'partial_avatars'"
+    );
+    error_response(StatusCode::BAD_REQUEST, &message)
+}
+
+fn rack_value_display(value: &RackValue) -> String {
+    match value {
+        RackValue::Null => "nil".to_owned(),
+        RackValue::Scalar(value) => value.clone(),
+        RackValue::Number(value) => ruby_json_number(value),
+        RackValue::Boolean(value) => value.to_string(),
+        RackValue::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(rack_value_inspect)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        RackValue::Object(values) => format!(
+            "{{{}}}",
+            values
+                .iter()
+                .map(|(key, value)| {
+                    format!(
+                        "\"{}\"=>{}",
+                        key.replace('"', "\\\""),
+                        rack_value_inspect(value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        RackValue::Upload(upload) => format!("[uploaded file {}]", upload.file_name),
+    }
+}
+
+fn rack_value_inspect(value: &RackValue) -> String {
+    match value {
+        RackValue::Scalar(value) => format!("\"{}\"", value.replace('"', "\\\"")),
+        value => rack_value_display(value),
     }
 }
 
@@ -4692,7 +17155,9 @@ fn integer_parameter(
                 .map_err(|()| CursorParameterError::Overflow);
         }
         Some(RackValue::Boolean(_)) => return Err(CursorParameterError::InvalidScalar),
-        Some(RackValue::Array(_) | RackValue::Object(_)) => return Ok(Some(empty_bound())),
+        Some(RackValue::Array(_) | RackValue::Object(_) | RackValue::Upload(_)) => {
+            return Ok(Some(empty_bound()));
+        }
     };
     checked_integer_prefix(value)
         .map_err(|()| CursorParameterError::Overflow)
@@ -4727,17 +17192,13 @@ fn cursor_parameter_error(_headers: &HeaderMap, error: CursorParameterError) -> 
 }
 
 fn boolean_parameter(parameters: &RackParameters, name: &str) -> bool {
+    parameters.get(name).is_some_and(boolean_value)
+}
+
+fn optional_boolean_parameter(parameters: &RackParameters, name: &str) -> Option<bool> {
     match parameters.get(name) {
-        None | Some(RackValue::Null) => false,
-        Some(RackValue::Scalar(value)) => {
-            !value.is_empty()
-                && !matches!(
-                    value.as_str(),
-                    "0" | "f" | "F" | "false" | "FALSE" | "off" | "OFF"
-                )
-        }
-        Some(RackValue::Number(_) | RackValue::Array(_) | RackValue::Object(_)) => true,
-        Some(RackValue::Boolean(value)) => *value,
+        None | Some(RackValue::Null) => None,
+        Some(_) => Some(boolean_parameter(parameters, name)),
     }
 }
 
@@ -4746,7 +17207,12 @@ fn limit_parameter(parameters: &RackParameters, default: i64, maximum: i64) -> R
         None | Some(RackValue::Null) => Ok(default),
         Some(RackValue::Scalar(value)) => Ok(ruby_integer(value).saturating_abs().min(maximum)),
         Some(RackValue::Number(value)) => json_number_limit(value, maximum),
-        Some(RackValue::Boolean(_) | RackValue::Array(_) | RackValue::Object(_)) => Err(()),
+        Some(
+            RackValue::Boolean(_)
+            | RackValue::Array(_)
+            | RackValue::Object(_)
+            | RackValue::Upload(_),
+        ) => Err(()),
     }
 }
 
@@ -4910,6 +17376,32 @@ fn pagination_url(
     Some(url.to_string())
 }
 
+fn pagination_url_repeated(
+    state: &WebState,
+    route: &str,
+    parameters: &[(String, String)],
+    cursor_name: &str,
+    cursor: i64,
+    preserved_names: &[&str],
+) -> Option<String> {
+    let mut url = state.origin.join(route).ok()?;
+    let cursor = cursor.to_string();
+    let mut preserved = parameters
+        .iter()
+        .filter(|(name, _)| preserved_names.contains(&name.as_str()))
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    preserved.push((cursor_name, &cursor));
+    preserved.sort_by_key(|(name, _)| *name);
+    {
+        let mut pairs = url.query_pairs_mut();
+        for (name, value) in preserved {
+            pairs.append_pair(name, value);
+        }
+    }
+    Some(url.to_string())
+}
+
 fn set_link_header(response: &mut Response<Body>, links: &[String]) {
     if !links.is_empty()
         && let Ok(value) = HeaderValue::from_str(&links.join(", "))
@@ -4926,10 +17418,81 @@ fn json_response(status: StatusCode, body: Vec<u8>) -> Response<Body> {
         .expect("static response headers are valid")
 }
 
+fn empty_json_response() -> Response<Body> {
+    json_response(StatusCode::OK, b"{}".to_vec())
+}
+
 fn error_response(status: StatusCode, message: &str) -> Response<Body> {
     let body = serde_json::to_vec(&serde_json::json!({ "error": message }))
         .expect("an error envelope with one string is serializable");
     json_response(status, body)
+}
+
+fn rate_limited_response(limited: RateLimitExceeded) -> Response<Body> {
+    let mut response = error_response(StatusCode::TOO_MANY_REQUESTS, "Too many requests");
+    add_rate_limit_headers(&mut response, limited);
+    response
+}
+
+async fn report_response_with_rate_limit(
+    writer: &WriteRepository,
+    owner: i64,
+    mut response: Response<Body>,
+) -> Response<Body> {
+    if let Ok(count) = writer.report_rate_limit_count(owner).await {
+        let limit = usize::try_from(REPORT_RATE_LIMIT).unwrap_or_default();
+        let used = usize::try_from(count).unwrap_or(limit);
+        add_rate_limit_status_headers(
+            &mut response,
+            RateLimitStatus {
+                limit,
+                remaining: limit.saturating_sub(used),
+                period: REPORT_RATE_LIMIT_PERIOD,
+            },
+        );
+    }
+    response
+}
+
+fn add_rate_limit_headers(response: &mut Response<Body>, limited: RateLimitExceeded) {
+    add_rate_limit_status_headers(
+        response,
+        RateLimitStatus {
+            limit: limited.limit,
+            remaining: 0,
+            period: limited.period,
+        },
+    );
+}
+
+fn add_rate_limit_status_headers(response: &mut Response<Body>, status: RateLimitStatus) {
+    let period = status.period.as_secs();
+    if period == 0 {
+        return;
+    }
+    let now = unix_timestamp_seconds();
+    let seconds_until_reset = period - now % period;
+    let reset = now.saturating_add(seconds_until_reset);
+    let reset =
+        chrono::DateTime::<Utc>::from_timestamp(i64::try_from(reset).unwrap_or(i64::MAX), 0)
+            .map_or_else(
+                || reset.to_string(),
+                |timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Micros, true),
+            );
+    if let Ok(value) = HeaderValue::from_str(&status.limit.to_string()) {
+        response.headers_mut().insert("x-ratelimit-limit", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&status.remaining.to_string()) {
+        response
+            .headers_mut()
+            .insert("x-ratelimit-remaining", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&reset) {
+        response.headers_mut().insert("x-ratelimit-reset", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&seconds_until_reset.to_string()) {
+        response.headers_mut().insert("retry-after", value);
+    }
 }
 
 fn record_not_found() -> Response<Body> {
@@ -4981,6 +17544,451 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paperclip_media_requires_status_access_unless_moderating_discarded_media() {
+        assert!(paperclip_media_access_allowed(true, false, false));
+        assert!(!paperclip_media_access_allowed(false, false, true));
+        assert!(!paperclip_media_access_allowed(false, true, false));
+        assert!(paperclip_media_access_allowed(false, true, true));
+    }
+
+    #[test]
+    fn frontend_shell_uses_the_pinned_manifest_and_escapes_state() {
+        let frontend =
+            FrontendAssets::load(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("public"))
+                .expect("pinned frontend manifests load");
+        let runtime = InstanceRuntimeConfig {
+            domain: "fixture<example".to_owned(),
+            version: "0.1.0".to_owned(),
+            source_url: "https://example.invalid/rustodon".to_owned(),
+            streaming_api: "wss://fixture.example".to_owned(),
+            vapid_public_key: Some("fixture-vapid-key".to_owned()),
+            thumbnail_url: "/packs/assets/preview.png".to_owned(),
+            thumbnail_description: String::new(),
+            thumbnail_blurhash: None,
+            thumbnail_versions: None,
+            icons: Vec::new(),
+            languages: vec!["en".to_owned()],
+            active_month: 0,
+            active_halfyear: 0,
+            translation_enabled: false,
+            limited_federation: false,
+            single_user_mode: false,
+            terms_of_service_url: None,
+            sso_signup_url: None,
+            wrapstodon: None,
+        };
+        let document = frontend_document(
+            &frontend,
+            &runtime,
+            "/home",
+            None,
+            None,
+            "csrf-value",
+            "csp-nonce",
+        )
+        .expect("pinned frontend entries resolve");
+        assert!(document.contains("id=\"mastodon\""));
+        assert!(document.contains("content=\"/home\""));
+        assert!(document.contains("content=\"csrf-value\""));
+        assert!(document.contains("applicationServerKey"));
+        assert!(document.contains("/packs/"));
+        assert!(document.contains("\\u003c"));
+        assert!(document.contains("nonce=\"csp-nonce\""));
+        let policy = frontend_content_security_policy("csp-nonce");
+        assert!(policy.contains("'nonce-csp-nonce'"));
+        assert!(!policy.contains("unsafe-inline"));
+
+        let manifest = frontend_manifest_value(&frontend, "Fixture <instance>")
+            .expect("pinned frontend icons resolve");
+        assert_eq!(manifest["instance"]["id"], "/home");
+        assert_eq!(manifest["instance"]["name"], "Fixture <instance>");
+        assert_eq!(manifest["instance"]["icons"].as_array().unwrap().len(), 9);
+        assert!(safe_frontend_path("../secret").is_none());
+        assert!(safe_frontend_path("packs\\secret").is_none());
+        assert_eq!(
+            json_script(&serde_json::json!({"value": "</script>"})),
+            Some(r#"{"value":"\u003c/script\u003e"}"#.to_owned())
+        );
+    }
+
+    #[test]
+    fn html_responses_include_security_headers() {
+        let response = html_response(StatusCode::OK, "<main>fixture</main>".to_owned());
+        assert_eq!(response.headers()["x-frame-options"], "DENY");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.headers()["x-xss-protection"], "0");
+        assert_eq!(response.headers()["referrer-policy"], "same-origin");
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:"
+        );
+    }
+
+    #[test]
+    fn signature_sensitive_activity_responses_are_not_shared() {
+        let response =
+            signature_sensitive_activity_response(&HeaderMap::new(), serde_json::json!({}));
+        assert_eq!(response.headers()[VARY], "Accept, Signature");
+        assert!(!response.headers().contains_key(CACHE_CONTROL));
+
+        let mut authorization_headers = HeaderMap::new();
+        authorization_headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer fixture"));
+        let response =
+            signature_sensitive_activity_response(&authorization_headers, serde_json::json!({}));
+        assert!(!response.headers().contains_key(CACHE_CONTROL));
+
+        let mut signature_headers = HeaderMap::new();
+        signature_headers.insert("signature", HeaderValue::from_static("fixture"));
+        let response =
+            signature_sensitive_activity_response(&signature_headers, serde_json::json!({}));
+        assert_eq!(response.headers()[CACHE_CONTROL], PRIVATE_CACHE);
+    }
+
+    #[test]
+    fn status_activitypub_responses_follow_rails_cache_policy() {
+        let response = signature_sensitive_status_response(
+            &HeaderMap::new(),
+            serde_json::json!({}),
+            "https://fixture.invalid/status/1",
+            true,
+            true,
+            ActivityPubStatusDocument::Note {
+                pending_quote: false,
+            },
+        );
+        assert_eq!(response.headers()[VARY], ACTIVITYPUB_STATUS_PUBLIC_VARY);
+        assert_eq!(
+            response.headers()[CACHE_CONTROL],
+            ACTIVITYPUB_STATUS_PUBLIC_CACHE
+        );
+
+        for (name, value) in [
+            ("authorization", "Bearer fixture"),
+            ("signature", "fixture"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, HeaderValue::from_static(value));
+            let response = signature_sensitive_status_response(
+                &headers,
+                serde_json::json!({}),
+                "https://fixture.invalid/status/1",
+                true,
+                true,
+                ActivityPubStatusDocument::Note {
+                    pending_quote: false,
+                },
+            );
+            assert_eq!(response.headers()[VARY], ACTIVITYPUB_STATUS_PUBLIC_VARY);
+            assert_eq!(response.headers()[CACHE_CONTROL], PRIVATE_CACHE);
+        }
+
+        let response = signature_sensitive_status_response(
+            &HeaderMap::new(),
+            serde_json::json!({}),
+            "https://fixture.invalid/status/1",
+            true,
+            false,
+            ActivityPubStatusDocument::Note {
+                pending_quote: false,
+            },
+        );
+        assert_eq!(response.headers()[VARY], ACTIVITYPUB_STATUS_PUBLIC_VARY);
+        assert_eq!(response.headers()[CACHE_CONTROL], PRIVATE_CACHE);
+
+        let response = signature_sensitive_status_response(
+            &HeaderMap::new(),
+            serde_json::json!({}),
+            "https://fixture.invalid/status/1",
+            false,
+            true,
+            ActivityPubStatusDocument::Note {
+                pending_quote: false,
+            },
+        );
+        assert_eq!(response.headers()[VARY], ACTIVITYPUB_STATUS_AUTHORIZED_VARY);
+        assert_eq!(response.headers()[CACHE_CONTROL], PRIVATE_CACHE);
+
+        let response = signature_sensitive_status_response(
+            &HeaderMap::new(),
+            serde_json::json!({}),
+            "https://fixture.invalid/status/1",
+            true,
+            true,
+            ActivityPubStatusDocument::Note {
+                pending_quote: true,
+            },
+        );
+        assert_eq!(
+            response.headers()[CACHE_CONTROL],
+            ACTIVITYPUB_STATUS_PENDING_QUOTE_CACHE
+        );
+
+        let response = signature_sensitive_status_response(
+            &HeaderMap::new(),
+            serde_json::json!({}),
+            "https://fixture.invalid/status/1",
+            true,
+            true,
+            ActivityPubStatusDocument::Activity,
+        );
+        assert_eq!(
+            response.headers()[CACHE_CONTROL],
+            ACTIVITYPUB_STATUS_PUBLIC_CACHE
+        );
+
+        let response = signature_sensitive_status_response(
+            &HeaderMap::new(),
+            serde_json::json!({}),
+            "https://fixture.invalid/status/1",
+            true,
+            false,
+            ActivityPubStatusDocument::Activity,
+        );
+        assert_eq!(
+            response.headers()[CACHE_CONTROL],
+            ACTIVITYPUB_STATUS_PRIVATE_ACTIVITY_CACHE
+        );
+    }
+
+    #[test]
+    fn status_paperclip_cache_variants_are_isolated_by_viewer_credentials() {
+        let (cache_control, vary) =
+            paperclip_response_policy(PaperclipAttachment::MediaFile, &HeaderMap::new());
+        assert_eq!(cache_control, PAPERCLIP_CACHE);
+        assert_eq!(vary, Some(PAPERCLIP_STATUS_VARY));
+
+        for (name, value) in [
+            ("authorization", "Bearer fixture"),
+            ("cookie", "_mastodon_session=fixture"),
+            ("signature", "fixture"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, HeaderValue::from_static(value));
+            let (cache_control, vary) =
+                paperclip_response_policy(PaperclipAttachment::MediaThumbnail, &headers);
+            assert_eq!(cache_control, PRIVATE_CACHE);
+            assert_eq!(vary, Some(PAPERCLIP_STATUS_VARY));
+        }
+
+        let (cache_control, vary) =
+            paperclip_response_policy(PaperclipAttachment::AccountAvatar, &HeaderMap::new());
+        assert_eq!(cache_control, PAPERCLIP_CACHE);
+        assert_eq!(vary, None);
+    }
+
+    #[test]
+    fn activitypub_status_failures_are_not_shared() {
+        for (limited_federation, expected_vary) in [
+            (false, ACTIVITYPUB_STATUS_PUBLIC_VARY),
+            (true, ACTIVITYPUB_STATUS_AUTHORIZED_VARY),
+        ] {
+            let response = finalize_activitypub_status_response(
+                limited_federation,
+                error_response(StatusCode::NOT_FOUND, "Not Found"),
+            );
+            assert_eq!(response.headers()[VARY], expected_vary);
+            assert_eq!(response.headers()[CACHE_CONTROL], PRIVATE_CACHE);
+        }
+
+        let response = finalize_activitypub_status_response(
+            false,
+            activitypub_status_redirect("https://fixture.invalid/status/1"),
+        );
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(response.headers()[VARY], ACTIVITYPUB_STATUS_PUBLIC_VARY);
+        assert_eq!(response.headers()[CACHE_CONTROL], PRIVATE_CACHE);
+    }
+
+    #[test]
+    fn browser_account_documents_escape_values_and_include_csrf_fields() {
+        let sign_in = browser_sign_in_document(
+            "csrf\"value",
+            Some("alice\"@example.invalid"),
+            Some("invalid <credentials>"),
+            Some("/oauth/authorize?client_id=fixture&state=state"),
+        );
+        assert!(sign_in.contains("value=\"csrf&quot;value\""));
+        assert!(sign_in.contains("alice&quot;@example.invalid"));
+        assert!(sign_in.contains("invalid &lt;credentials&gt;"));
+        assert!(sign_in.contains("for=\"otp_attempt\""));
+        assert!(sign_in.contains("/auth/password/new"));
+        assert!(sign_in.contains(
+            "name=\"return_to\" value=\"/oauth/authorize?client_id=fixture&amp;state=state\""
+        ));
+
+        assert_eq!(
+            hidden_csrf("csrf\"value"),
+            "<input type=\"hidden\" name=\"csrf_token\" value=\"csrf&quot;value\">"
+        );
+        let options = settings_options(
+            &[("public", "Public"), ("private", "Followers only")],
+            "private",
+        );
+        assert!(options.contains("value=\"private\" selected"));
+        assert!(!options.contains("value=\"public\" selected"));
+    }
+
+    #[test]
+    fn browser_login_return_targets_are_local_only() {
+        assert_eq!(
+            valid_browser_return_to(Some("/oauth/authorize?state=fixture")),
+            Some("/oauth/authorize?state=fixture")
+        );
+        for target in [
+            "",
+            "oauth/authorize",
+            "//attacker.invalid/oauth/authorize",
+            "/\\attacker.invalid/oauth/authorize",
+            "https://attacker.invalid/oauth/authorize",
+            "/oauth/authorize\r\nLocation: https://attacker.invalid",
+        ] {
+            assert_eq!(valid_browser_return_to(Some(target)), None, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn oauth_login_redirect_preserves_authorization_query() {
+        let parameters = RackParameters::parse(
+            "client_id=fixture-client&redirect_uri=https%3A%2F%2Fclient.invalid%2Fcallback&state=fixture-state",
+        )
+        .expect("OAuth parameters are valid");
+        let response = oauth_authorize_sign_in_redirect(&parameters);
+        let location = response.headers()[LOCATION]
+            .to_str()
+            .expect("redirect location is valid");
+        let query = location.split_once('?').map_or("", |(_, query)| query);
+        let return_to = url::form_urlencoded::parse(query.as_bytes())
+            .find_map(|(name, value)| (name == "return_to").then_some(value.into_owned()));
+        assert_eq!(
+            return_to.as_deref(),
+            Some(
+                "/oauth/authorize?client_id=fixture-client&redirect_uri=https%3A%2F%2Fclient.invalid%2Fcallback&state=fixture-state"
+            )
+        );
+    }
+
+    #[test]
+    fn browser_html_negotiation_respects_accept_quality_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/json, text/html;q=0.8"),
+        );
+        assert!(accepts_html(&headers));
+
+        headers.insert(ACCEPT, HeaderValue::from_static("text/html;q=0"));
+        assert!(!accepts_html(&headers));
+
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        assert!(!accepts_html(&headers));
+    }
+
+    #[tokio::test]
+    async fn browser_form_errors_render_html_and_keep_json_for_api_requests() {
+        let mut html_headers = HeaderMap::new();
+        html_headers.insert(ACCEPT, HeaderValue::from_static("text/html"));
+        let response = browser_sign_in_error_response(
+            false,
+            &html_headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_credentials",
+            "Invalid email or password.",
+            Some("alice@example.invalid"),
+            None,
+        );
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
+        assert!(response.headers().contains_key(SET_COOKIE));
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("sign-in error body is readable");
+        let body = String::from_utf8(body.to_vec()).expect("sign-in error is UTF-8");
+        assert!(body.contains("Invalid email or password."));
+        assert!(body.contains("alice@example.invalid"));
+        assert!(body.contains("name=\"csrf_token\""));
+
+        let mut json_headers = HeaderMap::new();
+        json_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        let response = browser_sign_in_error_response(
+            false,
+            &json_headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_credentials",
+            "Invalid email or password.",
+            Some("alice@example.invalid"),
+            None,
+        );
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            "application/json; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("JSON error body is readable");
+        assert_eq!(body.as_ref(), br#"{"error":"invalid_credentials"}"#);
+
+        let response = browser_password_reset_error_response(
+            false,
+            &html_headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_reset_token",
+            "The reset link is invalid or has expired.",
+            Some("reset-token"),
+        );
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("password error body is readable");
+        let body = String::from_utf8(body.to_vec()).expect("password error is UTF-8");
+        assert!(body.contains("Choose a new password"));
+        assert!(body.contains("The reset link is invalid or has expired."));
+        assert!(body.contains("value=\"reset-token\""));
+
+        let response = browser_confirmation_error_response(
+            &html_headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_confirmation_token",
+            "The confirmation link is invalid or has expired.",
+        );
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("confirmation error body is readable");
+        let body = String::from_utf8(body.to_vec()).expect("confirmation error is UTF-8");
+        assert!(body.contains("The confirmation link is invalid or has expired."));
+        assert!(body.contains("/auth/sign_in"));
+    }
+
+    #[test]
+    fn frontend_paths_only_accept_pinned_spa_routes() {
+        for path in [
+            "/",
+            "/about",
+            "/home",
+            "/@alice/example-status",
+            "/notifications_v2",
+            "/notifications_v2/requests",
+            "/overview/about",
+            "/pinned",
+            "/collections",
+            "/deck",
+            "/links",
+            "/lists",
+            "/start",
+            "/statuses",
+            "/lists/123/edit",
+            "/statuses/123",
+            "/terms-of-service/2026-01-01",
+        ] {
+            assert!(is_frontend_path(path), "{path} should be a frontend path");
+        }
+        for path in ["/api/v1/unknown", "/.well-known/unknown", "/random"] {
+            assert!(
+                !is_frontend_path(path),
+                "{path} should not be a frontend path"
+            );
+        }
+    }
+
+    #[test]
     fn api_route_ids_preserve_rails_prefix_casting_without_relaxing_other_ids() {
         assert_eq!(
             route_path_id("116844606259201001%3Fjunk"),
@@ -5002,6 +18010,302 @@ mod tests {
         );
         assert_eq!(activitypub_path_id("+116844606259201001"), None);
         assert_eq!(activitypub_path_id(" 116844606259201001"), None);
+    }
+
+    #[test]
+    fn media_proxy_accepts_mastodon_path_shapes() {
+        assert_eq!(
+            media_proxy_path("116844606259201001"),
+            Some((116_844_606_259_201_001, false))
+        );
+        assert_eq!(
+            media_proxy_path("116844606259201001/small"),
+            Some((116_844_606_259_201_001, true))
+        );
+        assert_eq!(
+            media_proxy_path("116844606259201001/media/small"),
+            Some((116_844_606_259_201_001, true))
+        );
+        assert_eq!(media_proxy_path("not-an-id/original"), None);
+    }
+
+    #[test]
+    fn remote_media_proxy_accepts_only_supported_media_types() {
+        assert!(crate::remote::content_type_allowed(
+            Some("image/png"),
+            SUPPORTED_MIME_TYPES
+        ));
+        assert!(!crate::remote::content_type_allowed(
+            Some("text/html"),
+            SUPPORTED_MIME_TYPES
+        ));
+        assert!(!crate::remote::content_type_allowed(
+            Some("image/svg+xml"),
+            SUPPORTED_MIME_TYPES
+        ));
+    }
+
+    #[test]
+    fn remote_account_search_only_resolves_exact_non_local_handles() {
+        assert_eq!(
+            remote_account_search_handle(Some("@Alice@remote.example"), "local.example", 0),
+            Some(("Alice".to_owned(), "remote.example".to_owned()))
+        );
+        assert_eq!(
+            remote_account_search_handle(Some("alice@local.example"), "local.example", 0),
+            None
+        );
+        assert_eq!(
+            remote_account_search_handle(Some("alice@remote.example"), "local.example", 1),
+            None
+        );
+        assert_eq!(
+            remote_account_search_handle(Some("alice@remote@example"), "local.example", 0),
+            None
+        );
+        assert_eq!(
+            remote_account_search_handle(Some("alice@BÜCHER.example."), "local.example", 0),
+            Some(("alice".to_owned(), "xn--bcher-kva.example".to_owned()))
+        );
+        assert_eq!(
+            remote_account_search_handle(Some("bad:name@remote.example"), "local.example", 0),
+            None
+        );
+        assert_eq!(
+            remote_account_search_handle(Some("alice..bob@remote.example"), "local.example", 0),
+            Some(("alice..bob".to_owned(), "remote.example".to_owned()))
+        );
+    }
+
+    #[test]
+    fn remote_signature_domains_distinguish_local_and_remote_key_ids() {
+        let origin = Url::parse("https://local.example/").unwrap();
+        assert_eq!(
+            remote_signature_domain("acct:alice@local.example", "local.example", &origin),
+            Ok(None)
+        );
+        assert_eq!(
+            remote_signature_domain(
+                "https://local.example/users/alice#main-key",
+                "local.example",
+                &origin,
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            remote_signature_domain("acct:alice@remote.example", "local.example", &origin),
+            Ok(Some("remote.example".to_owned()))
+        );
+        assert_eq!(
+            remote_signature_domain(
+                "https://remote.example/users/alice",
+                "local.example",
+                &origin,
+            ),
+            Ok(Some("remote.example".to_owned()))
+        );
+        assert_eq!(
+            remote_signature_domain(
+                "http://remote.example:443/users/alice#main-key",
+                "local.example",
+                &origin,
+            ),
+            Ok(Some("remote.example:443".to_owned()))
+        );
+        assert!(remote_signature_domain("not-a-key", "local.example", &origin).is_err());
+    }
+
+    #[test]
+    fn activitypub_inbox_deduplicates_by_activity_id_across_delivery_targets() {
+        let activity = serde_json::json!({
+            "id": "https://remote.example/activities/42",
+            "type": "Create",
+            "actor": "https://remote.example/users/alice"
+        });
+
+        assert_eq!(
+            activitypub_inbox_logical_key(
+                &activity,
+                br#"{"id":"ignored"}"#,
+                "https://remote.example/users/alice",
+            ),
+            activitypub_inbox_logical_key(
+                &activity,
+                br#"{"different":true}"#,
+                "https://remote.example/users/alice",
+            )
+        );
+    }
+
+    #[test]
+    fn activitypub_inbox_activity_ids_are_scoped_to_the_verified_actor() {
+        let alice = serde_json::json!({
+            "id": "https://remote.example/activities/42",
+            "type": "Follow",
+            "actor": "https://remote.example/users/alice"
+        });
+        assert_eq!(
+            activitypub_inbox_logical_key(&alice, b"alice", "https://remote.example/users/alice",),
+            activitypub_inbox_logical_key(&alice, b"alice", "https://remote.example/users/alice",)
+        );
+        assert_eq!(
+            activitypub_inbox_ordering_key("https://remote.example/users/alice"),
+            activitypub_inbox_ordering_key("https://remote.example/users/alice"),
+        );
+        assert_ne!(
+            activitypub_inbox_ordering_key("https://remote.example/users/alice"),
+            activitypub_inbox_ordering_key("https://remote.example/users/bob"),
+        );
+    }
+
+    #[test]
+    fn activitypub_inbox_without_an_id_deduplicates_exact_retries() {
+        let activity = serde_json::json!({"type": "Delete"});
+        let body = br#"{"type":"Delete"}"#;
+
+        assert_eq!(
+            activitypub_inbox_logical_key(&activity, body, "key"),
+            activitypub_inbox_logical_key(&activity, body, "key")
+        );
+        assert_ne!(
+            activitypub_inbox_logical_key(&activity, body, "key"),
+            activitypub_inbox_logical_key(&activity, br#"{"type":"Update"}"#, "key")
+        );
+        assert_ne!(
+            activitypub_inbox_logical_key(&activity, body, "key"),
+            activitypub_inbox_logical_key(&activity, body, "actor-2")
+        );
+    }
+
+    #[test]
+    fn activitypub_inbox_body_limit_matches_mastodon() {
+        assert_eq!(ACTIVITYPUB_INBOX_BODY_LIMIT_BYTES, 1024 * 1024);
+    }
+
+    #[test]
+    fn status_idempotency_binds_account_and_reply_target() {
+        let base = status_idempotency_fingerprint(
+            "fixture status",
+            &[],
+            None,
+            Some("public"),
+            Some("en"),
+            None,
+            Some(false),
+            None,
+        );
+        let reply = status_idempotency_fingerprint(
+            "fixture status",
+            &[],
+            None,
+            Some("public"),
+            Some("en"),
+            None,
+            Some(false),
+            Some(42),
+        );
+        let trimmed = status_idempotency_fingerprint(
+            " fixture status ",
+            &[],
+            Some(" "),
+            Some("public"),
+            Some("en"),
+            None,
+            Some(false),
+            None,
+        );
+        assert_ne!(base, reply);
+        assert_eq!(base, trimmed);
+        assert_ne!(
+            base,
+            status_idempotency_fingerprint(
+                "fixture status",
+                &[],
+                None,
+                Some("public"),
+                Some("en"),
+                Some("nobody"),
+                Some(false),
+                None,
+            )
+        );
+        assert_eq!(status_idempotency_scope(101), "status:create:101");
+        assert_ne!(status_idempotency_scope(101), status_idempotency_scope(102));
+    }
+
+    #[test]
+    fn status_media_ids_require_an_array_of_decimal_ids() {
+        let parameters =
+            RackParameters::parse("media_ids%5B%5D=12&media_ids%5B%5D=-4&media_ids%5B%5D=12")
+                .unwrap();
+        assert_eq!(status_media_ids(&parameters), Ok(vec![12, -4, 12]));
+        assert_eq!(
+            status_media_ids(&RackParameters::parse("media_ids=12").unwrap()),
+            Err(())
+        );
+        assert_eq!(
+            status_media_ids(&RackParameters::parse("media_ids%5B%5D=nope").unwrap()),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn status_media_attributes_parse_nested_description_and_focus() {
+        let parameters = RackParameters::parse(
+            "media_attributes%5B%5D%5Bid%5D=12&media_attributes%5B%5D%5Bdescription%5D=alt+text&media_attributes%5B%5D%5Bfocus%5D=0.25%2C-0.5",
+        )
+        .unwrap();
+        assert_eq!(
+            status_media_attributes(&parameters),
+            Ok(Some(vec![StatusMediaAttributeUpdate {
+                id: 12,
+                description: AccountProfileValue::Value("alt text".to_owned()),
+                focus: AccountProfileValue::Value(MediaFocus { x: 0.25, y: -0.5 }),
+            }]))
+        );
+    }
+
+    #[test]
+    fn report_id_parameters_accept_scalar_or_array_decimal_ids() {
+        let scalar = RackParameters::parse("status_ids=12").unwrap();
+        let array = RackParameters::parse("status_ids%5B%5D=12&status_ids%5B%5D=-4").unwrap();
+        let invalid = RackParameters::parse("status_ids%5B%5D=nope").unwrap();
+        assert_eq!(report_id_parameter(&scalar, "status_ids"), Ok(vec![12]));
+        assert_eq!(report_id_parameter(&array, "status_ids"), Ok(vec![12, -4]));
+        assert_eq!(report_id_parameter(&invalid, "status_ids"), Err(()));
+    }
+
+    #[test]
+    fn report_forward_domains_preserve_omission_and_normalize_arrays() {
+        assert_eq!(
+            report_forward_domains_parameter(&RackParameters::parse("").unwrap()),
+            Ok(None)
+        );
+        assert_eq!(
+            report_forward_domains_parameter(
+                &RackParameters::parse(
+                    "forward_to_domains%5B%5D=Remote.Example.&forward_to_domains%5B%5D=remote.example"
+                )
+                .unwrap()
+            ),
+            Ok(Some(vec!["remote.example".to_owned()]))
+        );
+        assert_eq!(
+            report_forward_domains_parameter(
+                &RackParameters::parse("forward_to_domains=remote.example").unwrap()
+            ),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn boolean_parameters_cast_json_numbers_like_rails() {
+        let false_parameters = RackParameters::from_json(&serde_json::json!({ "value": 0 }));
+        let true_parameters = RackParameters::from_json(&serde_json::json!({ "value": 1 }));
+        let float_parameters = RackParameters::from_json(&serde_json::json!({ "value": 0.0 }));
+        assert!(!boolean_parameter(&false_parameters, "value"));
+        assert!(boolean_parameter(&true_parameters, "value"));
+        assert!(boolean_parameter(&float_parameters, "value"));
     }
 
     #[test]
@@ -5032,11 +18336,16 @@ mod tests {
     }
 
     #[test]
-    fn federation_authority_matching_preserves_explicit_ports() {
+    fn federation_authority_matching_preserves_non_default_ports() {
         let origin = Url::parse("https://example.test:8443/").expect("valid origin");
         assert_eq!(
             federation_url_authority(&origin).as_deref(),
             Some("example.test:8443")
+        );
+        let default_port = Url::parse("https://example.test:443/").expect("valid origin");
+        assert_eq!(
+            federation_url_authority(&default_port).as_deref(),
+            Some("example.test")
         );
     }
 
@@ -5104,12 +18413,23 @@ mod tests {
 
     #[test]
     fn api_route_inventory_is_unique_and_declares_protocol_contracts() {
-        assert_eq!(API_ROUTE_INVENTORY.len(), 34);
+        assert_eq!(API_ROUTE_INVENTORY.len(), 104);
         assert_eq!(REST_BODY_LIMIT_BYTES, 103_809_024);
         assert_eq!(
             API_ROUTE_INVENTORY
                 .iter()
-                .map(|route| route.path)
+                .map(|route| {
+                    (
+                        route.path,
+                        match route.method {
+                            ApiMethod::Get => "GET",
+                            ApiMethod::Post => "POST",
+                            ApiMethod::Delete => "DELETE",
+                            ApiMethod::Patch => "PATCH",
+                            ApiMethod::Put => "PUT",
+                        },
+                    )
+                })
                 .collect::<BTreeSet<_>>()
                 .len(),
             API_ROUTE_INVENTORY.len()
@@ -5132,16 +18452,268 @@ mod tests {
                 .authentication,
             ApiAuthentication::Required(READ_FOLLOWS.as_slice())
         );
-        assert!(
+        assert_eq!(
+            api_route("/api/v1/accounts/update_credentials")
+                .expect("profile updates are inventoried")
+                .authentication,
+            ApiAuthentication::Required(WRITE_ACCOUNTS.as_slice())
+        );
+        for path in ["/api/v1/profile/avatar", "/api/v1/profile/header"] {
+            assert_eq!(
+                api_route(path)
+                    .expect("profile media deletion is inventoried")
+                    .authentication,
+                ApiAuthentication::Required(WRITE_ACCOUNTS.as_slice())
+            );
+        }
+        for path in ["/api/v1/media", "/api/v1/media/9001", "/api/v2/media"] {
+            assert_eq!(
+                api_route(path)
+                    .expect("media API routes are inventoried")
+                    .authentication,
+                ApiAuthentication::Required(WRITE_MEDIA.as_slice())
+            );
+        }
+        assert_eq!(
+            api_route("/api/v1/media/9001")
+                .expect("media update route is inventoried")
+                .authentication,
+            ApiAuthentication::Required(WRITE_MEDIA.as_slice())
+        );
+        assert_eq!(
             API_ROUTE_INVENTORY
                 .iter()
-                .all(|route| route.method == ApiMethod::Get)
+                .find(|route| route.path == "/api/v1/media/{id}" && route.method == ApiMethod::Patch)
+                .expect("media PATCH route is inventoried")
+                .method,
+            ApiMethod::Patch
+        );
+        assert_eq!(
+            API_ROUTE_INVENTORY
+                .iter()
+                .filter(|route| route.method == ApiMethod::Put)
+                .count(),
+            4
+        );
+        assert_eq!(
+            API_ROUTE_INVENTORY
+                .iter()
+                .filter(|route| route.method == ApiMethod::Post)
+                .count(),
+            35
         );
         assert!(api_route("/api/v1/markers").is_some());
     }
 
     #[test]
-    fn cors_preflight_is_limited_to_inventoried_routes() {
+    fn v1_required_api_routes_are_inventoried_with_explicit_support() {
+        for (index, route) in V1_REQUIRED_API_ROUTES.iter().enumerate() {
+            assert!(
+                !V1_REQUIRED_API_ROUTES[..index].contains(route),
+                "v1 route requirement is duplicated: {route:?}"
+            );
+        }
+        for &(path, method, expected_support) in V1_REQUIRED_API_ROUTES {
+            let route = API_ROUTE_INVENTORY
+                .iter()
+                .find(|route| route.path == path && route.method == method)
+                .unwrap_or_else(|| {
+                    panic!("v1 route is missing from the inventory: {method:?} {path}")
+                });
+            assert_eq!(
+                route.support, expected_support,
+                "v1 route has the wrong support declaration: {method:?} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn notification_stream_targets_respect_scopes_and_merged_events() {
+        let subscriptions = StreamingSubscriptions {
+            user: true,
+            user_notifications: true,
+            direct: false,
+        };
+        let event = StreamEvent {
+            id: 1,
+            account_id: 101,
+            event: "notification".to_owned(),
+            object_id: 42,
+        };
+        assert_eq!(
+            stream_targets(
+                &event,
+                &OAuthScopes::parse(Some("read:statuses")),
+                &subscriptions,
+            ),
+            Vec::new()
+        );
+        assert_eq!(
+            stream_targets(&event, &OAuthScopes::parse(Some("read")), &subscriptions,),
+            vec![StreamName::User, StreamName::UserNotification]
+        );
+
+        let merged = StreamEvent {
+            event: "notifications_merged".to_owned(),
+            ..event
+        };
+        assert_eq!(
+            stream_targets(&merged, &OAuthScopes::parse(Some("read")), &subscriptions,),
+            vec![StreamName::User, StreamName::UserNotification]
+        );
+
+        let status_update = StreamEvent {
+            event: STATUS_UPDATE_NOTIFICATION_EVENT.to_owned(),
+            ..event
+        };
+        assert_eq!(
+            stream_targets(
+                &status_update,
+                &OAuthScopes::parse(Some("read")),
+                &subscriptions,
+            ),
+            vec![StreamName::User, StreamName::UserNotification]
+        );
+        assert_eq!(
+            stream_protocol_event(STATUS_UPDATE_NOTIFICATION_EVENT),
+            "status.update"
+        );
+    }
+
+    #[test]
+    fn conversation_stream_targets_use_the_direct_subscription() {
+        let subscriptions = StreamingSubscriptions {
+            direct: true,
+            ..StreamingSubscriptions::default()
+        };
+        let event = StreamEvent {
+            id: 1,
+            account_id: 101,
+            event: "conversation".to_owned(),
+            object_id: 42,
+        };
+        assert_eq!(
+            stream_targets(
+                &event,
+                &OAuthScopes::parse(Some("read:statuses")),
+                &subscriptions,
+            ),
+            vec![StreamName::Direct]
+        );
+
+        let user_subscription = StreamingSubscriptions {
+            user: true,
+            ..StreamingSubscriptions::default()
+        };
+        assert_eq!(
+            stream_targets(
+                &event,
+                &OAuthScopes::parse(Some("read")),
+                &user_subscription,
+            ),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn streaming_authentication_accepts_pinned_token_locations() {
+        let mut subprotocol = HeaderMap::new();
+        subprotocol.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("protocol-token"),
+        );
+        assert_eq!(
+            streaming_auth_headers(&subprotocol, None)[AUTHORIZATION],
+            "Bearer protocol-token"
+        );
+
+        let query = streaming_auth_headers(&subprotocol, Some("access_token=query%2Btoken"));
+        assert_eq!(query[AUTHORIZATION], "Bearer query+token");
+
+        let mut explicit = subprotocol.clone();
+        explicit.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer explicit-token"),
+        );
+        assert_eq!(
+            streaming_auth_headers(&explicit, Some("access_token=query-token"))[AUTHORIZATION],
+            "Bearer explicit-token"
+        );
+    }
+
+    #[test]
+    fn streaming_paths_select_supported_initial_streams() {
+        assert_eq!(
+            streaming_path_stream("/api/v1/streaming/user"),
+            Some("user")
+        );
+        assert_eq!(
+            streaming_path_stream("/api/v1/streaming/user/notification"),
+            Some("user:notification")
+        );
+        assert_eq!(
+            streaming_path_stream("/api/v1/streaming/direct"),
+            Some("direct")
+        );
+        assert_eq!(streaming_path_stream("/api/v1/streaming/public"), None);
+    }
+
+    #[tokio::test]
+    async fn multipart_parameters_preserve_uploaded_profile_files() {
+        let boundary = "rustodon-test-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"display_name\"\r\n\r\nAlice\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"avatar.gif\"\r\nContent-Type: image/gif\r\n\r\nGIF89a\r\n--{boundary}--\r\n"
+        );
+        let request = Request::builder()
+            .uri("/api/v1/accounts/update_credentials")
+            .header(
+                CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body.clone()))
+            .expect("multipart request is valid");
+        assert_eq!(
+            multipart_boundary(request.headers()[CONTENT_TYPE].to_str().unwrap()),
+            Some(boundary.to_owned())
+        );
+        let raw_body = body.as_bytes();
+        let marker = format!("--{boundary}");
+        let header_start = marker.len() + 2;
+        let header_end = find_bytes(&raw_body[header_start..], b"\r\n\r\n").unwrap();
+        assert!(
+            parse_multipart_headers(&raw_body[header_start..header_start + header_end]).is_ok()
+        );
+        let mut request = bounded_request(request, REST_BODY_LIMIT_BYTES)
+            .await
+            .expect("request is within the body limit");
+        merge_request_parameters(&mut request).expect("multipart parameters parse");
+        let parameters = request
+            .extensions()
+            .get::<RackParameters>()
+            .expect("parameters are attached");
+        assert!(matches!(
+            parameters.get("display_name"),
+            Some(RackValue::Scalar(value)) if value == "Alice"
+        ));
+        assert!(matches!(
+            parameters.get("avatar"),
+            Some(RackValue::Upload(upload))
+                if upload.file_name == "avatar.gif"
+                    && upload.content_type == "image/gif"
+                    && upload.bytes == b"GIF89a"
+        ));
+
+        let removal = RackParameters::parse("avatar").expect("empty file fields parse");
+        assert!(matches!(
+            profile_media_change(&removal, "avatar", PaperclipAttachment::AccountAvatar, 101)
+                .expect("empty file removes the avatar")
+                .update,
+            AccountMediaUpdate::Remove
+        ));
+    }
+
+    #[test]
+    fn cors_preflight_matches_supported_routes() {
         let mut headers = HeaderMap::new();
         headers.insert(ORIGIN, HeaderValue::from_static("https://client.example"));
         headers.insert(
@@ -5174,6 +18746,26 @@ mod tests {
             HeaderValue::from_static("POST"),
         );
         assert!(cors_preflight_response("/api/v1/timelines/home", &headers).is_some());
+        headers.insert(
+            ACCESS_CONTROL_REQUEST_METHOD,
+            HeaderValue::from_static("GET"),
+        );
+        assert!(cors_preflight_response("/.well-known/nodeinfo", &headers).is_some());
+        assert!(cors_preflight_response("/users/alice", &headers).is_some());
+        assert!(cors_preflight_response("/@alice", &headers).is_some());
+        assert!(cors_preflight_response("/oauth/authorize", &headers).is_none());
+        headers.insert(
+            ACCESS_CONTROL_REQUEST_METHOD,
+            HeaderValue::from_static("POST"),
+        );
+        assert!(cors_preflight_response("/oauth/token", &headers).is_some());
+        assert!(cors_preflight_response("/oauth/revoke", &headers).is_some());
+        assert!(cors_preflight_response("/oauth/userinfo", &headers).is_some());
+        headers.insert(
+            ACCESS_CONTROL_REQUEST_METHOD,
+            HeaderValue::from_static("GET"),
+        );
+        assert!(cors_preflight_response("/oauth/userinfo", &headers).is_some());
     }
 
     #[test]
@@ -5206,6 +18798,496 @@ mod tests {
         );
         assert_eq!(account.headers()[CACHE_CONTROL], "private, no-store");
         assert_eq!(account.headers()[VARY], "Authorization, Origin");
+
+        let mut activity = Response::new(Body::empty());
+        activity
+            .headers_mut()
+            .insert(VARY, HeaderValue::from_static("Accept, Signature"));
+        let activity = finalize_external_cors_response(
+            "/users/alice",
+            &Method::GET,
+            &request_headers,
+            activity,
+        );
+        assert_eq!(activity.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(
+            activity.headers()[ACCESS_CONTROL_EXPOSE_HEADERS],
+            CORS_EXPOSE_HEADERS
+        );
+        assert_eq!(activity.headers()[VARY], "Accept, Signature");
+        assert!(
+            !finalize_external_cors_response(
+                "/oauth/authorize",
+                &Method::GET,
+                &request_headers,
+                Response::new(Body::empty())
+            )
+            .headers()
+            .contains_key(ACCESS_CONTROL_ALLOW_ORIGIN)
+        );
+    }
+
+    #[test]
+    fn parameter_bearer_tokens_fill_missing_or_non_bearer_authorization_headers() {
+        let mut request = Request::builder()
+            .uri("/api/v1/apps/verify_credentials")
+            .body(Body::empty())
+            .expect("request is valid");
+        request.extensions_mut().insert(
+            RackParameters::parse("bearer_token=fixture-bearer-token-v4-6-5")
+                .expect("bearer parameter is valid"),
+        );
+        inject_parameter_bearer(&mut request);
+        assert_eq!(
+            request.headers()[AUTHORIZATION],
+            "Bearer fixture-bearer-token-v4-6-5"
+        );
+
+        let mut request = Request::builder()
+            .uri("/api/v1/apps/verify_credentials")
+            .header(AUTHORIZATION, "Bearer explicit")
+            .body(Body::empty())
+            .expect("request is valid");
+        request.extensions_mut().insert(
+            RackParameters::parse("access_token=fixture-bearer-token-v4-6-5")
+                .expect("access parameter is valid"),
+        );
+        inject_parameter_bearer(&mut request);
+        assert_eq!(request.headers()[AUTHORIZATION], "Bearer explicit");
+
+        let mut request = Request::builder()
+            .uri("/api/v1/apps/verify_credentials")
+            .header(AUTHORIZATION, "Basic Y2xpZW50OnNlY3JldA==")
+            .body(Body::empty())
+            .expect("request is valid");
+        request.extensions_mut().insert(
+            RackParameters::parse("access_token=fixture-bearer-token-v4-6-5")
+                .expect("access parameter is valid"),
+        );
+        inject_parameter_bearer(&mut request);
+        assert_eq!(
+            request.headers()[AUTHORIZATION],
+            "Bearer fixture-bearer-token-v4-6-5"
+        );
+
+        let mut request = Request::builder()
+            .uri("/api/v1/apps/verify_credentials")
+            .header(AUTHORIZATION, "Bearer first")
+            .body(Body::empty())
+            .expect("request is valid");
+        request
+            .headers_mut()
+            .append(AUTHORIZATION, HeaderValue::from_static("Bearer second"));
+        request.extensions_mut().insert(
+            RackParameters::parse("access_token=fixture-bearer-token-v4-6-5")
+                .expect("access parameter is valid"),
+        );
+        inject_parameter_bearer(&mut request);
+        assert_eq!(request.headers().get_all(AUTHORIZATION).iter().count(), 2);
+
+        let parameters =
+            RackParameters::parse("access_token=&bearer_token=fixture-bearer-token-v4-6-5")
+                .expect("fallback parameters are valid");
+        assert_eq!(
+            parameter_bearer(&parameters),
+            Some("fixture-bearer-token-v4-6-5")
+        );
+    }
+
+    #[test]
+    fn browser_auth_parameters_support_nested_and_flat_forms() {
+        let nested = RackParameters::parse(
+            "user%5Bemail%5D=alice%40fixture.invalid&user%5Bpassword%5D=secret",
+        )
+        .expect("nested browser parameters are valid");
+        assert_eq!(
+            browser_scalar(&nested, "email"),
+            Some("alice@fixture.invalid")
+        );
+        assert_eq!(browser_scalar(&nested, "password"), Some("secret"));
+
+        let flat = RackParameters::parse("email=alice%40fixture.invalid&password=secret")
+            .expect("flat browser parameters are valid");
+        assert_eq!(
+            browser_scalar(&flat, "email"),
+            Some("alice@fixture.invalid")
+        );
+        assert_eq!(browser_scalar(&flat, "missing"), None);
+    }
+
+    #[test]
+    fn browser_sign_in_requires_a_matching_double_submit_csrf_token() {
+        let parameters =
+            RackParameters::parse("csrf_token=csrf-value").expect("CSRF parameters are valid");
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, HeaderValue::from_static("csrf_token=csrf-value"));
+        assert!(browser_csrf_is_valid(&parameters, &headers));
+
+        headers.insert(COOKIE, HeaderValue::from_static("csrf_token=other-value"));
+        assert!(!browser_csrf_is_valid(&parameters, &headers));
+        assert!(!browser_csrf_is_valid(
+            &RackParameters::parse("").expect("empty parameters are valid"),
+            &headers
+        ));
+    }
+
+    #[test]
+    fn browser_sign_out_accepts_form_or_header_csrf_tokens() {
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, HeaderValue::from_static("csrf_token=csrf-value"));
+        assert!(browser_sign_out_csrf_is_valid(
+            &RackParameters::parse("csrf_token=csrf-value").expect("form parameters are valid"),
+            &headers
+        ));
+
+        headers.insert("x-csrf-token", HeaderValue::from_static("csrf-value"));
+        assert!(browser_sign_out_csrf_is_valid(
+            &RackParameters::parse("").expect("empty parameters are valid"),
+            &headers
+        ));
+
+        headers.insert("x-csrf-token", HeaderValue::from_static("wrong-value"));
+        assert!(!browser_sign_out_csrf_is_valid(
+            &RackParameters::parse("").expect("empty parameters are valid"),
+            &headers
+        ));
+    }
+
+    #[test]
+    fn browser_cookies_are_secure_and_logout_clears_them() {
+        let session = browser_cookie(BROWSER_SESSION_COOKIE, "session", 60, true, true);
+        assert!(session.contains("HttpOnly"));
+        assert!(session.contains("Secure"));
+        assert!(session.contains("SameSite=Lax"));
+        let cleared = browser_cookie(BROWSER_CSRF_COOKIE, "", 0, false, false);
+        assert!(!cleared.contains("HttpOnly"));
+        assert!(cleared.contains("Max-Age=0"));
+        assert!(constant_time_equal(b"same", b"same"));
+        assert!(!constant_time_equal(b"same", b"different"));
+    }
+
+    #[test]
+    fn browser_settings_navigation_exposes_a_csrf_protected_logout_form() {
+        let navigation = browser_settings_navigation("csrf<&");
+        assert!(navigation.contains("method=\"post\" action=\"/auth/sign_out\""));
+        assert!(navigation.contains("name=\"csrf_token\" value=\"csrf&lt;&amp;\""));
+        assert!(navigation.contains("type=\"submit\">Log out</button>"));
+    }
+
+    #[test]
+    fn password_reset_limiter_matches_ip_and_email_boundaries() {
+        let limiter = PasswordResetLimiter::default();
+        let ip = "192.0.2.1".parse().expect("fixture IP is valid");
+        for _ in 0..5 {
+            assert!(limiter.check(ip, "person@example.invalid").is_ok());
+        }
+        assert!(limiter.check(ip, "person@example.invalid").is_err());
+
+        for index in 0..20 {
+            assert!(
+                limiter
+                    .check(ip, &format!("person-{index}@example.invalid"))
+                    .is_ok()
+            );
+        }
+        assert!(limiter.check(ip, "another@example.invalid").is_err());
+        assert_eq!(
+            attempt_ip_bucket("2001:db8:1::1".parse().unwrap()),
+            attempt_ip_bucket("2001:db8:1::ffff".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn attempt_limiter_uses_fixed_epoch_buckets_and_bounds_state() {
+        let limiter = AttemptLimiter::default();
+        let key = "fixture".to_owned();
+        let limits = [(key.clone(), 1, StdDuration::from_mins(1))];
+        assert!(limiter.allow_at(limits.clone(), 59));
+        assert!(!limiter.allow_at(limits.clone(), 59));
+        assert!(limiter.allow_at(limits, 60));
+
+        let limiter = AttemptLimiter::default();
+        for index in 0..MAX_RATE_LIMIT_WINDOWS {
+            assert!(limiter.allow_at([(format!("key-{index}"), 1, StdDuration::from_mins(1))], 0));
+        }
+        assert!(!limiter.allow_at(
+            [("one-too-many".to_owned(), 1, StdDuration::from_mins(1))],
+            0
+        ));
+    }
+
+    #[test]
+    fn browser_login_limiter_matches_mastodon_boundaries() {
+        let limiter = BrowserLoginLimiter::default();
+        let ip = "192.0.2.1".parse().expect("fixture IP is valid");
+        for index in 0..25 {
+            assert!(
+                limiter
+                    .check(ip, &format!("person-{index}@example.invalid"))
+                    .is_ok()
+            );
+        }
+        assert!(limiter.check(ip, "another@example.invalid").is_err());
+
+        let limiter = BrowserLoginLimiter::default();
+        for index in 0..25 {
+            let ip = format!("198.51.100.{}", index + 1)
+                .parse()
+                .expect("fixture IP is valid");
+            assert!(limiter.check(ip, "person@example.invalid").is_ok());
+        }
+        assert!(
+            limiter
+                .check(
+                    "198.51.100.26".parse().expect("fixture IP is valid"),
+                    "person@example.invalid"
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn oauth_application_limiter_matches_mastodon_boundary() {
+        let limiter = OAuthApplicationLimiter::default();
+        let ip = "192.0.2.1".parse().expect("fixture IP is valid");
+        for _ in 0..5 {
+            assert!(limiter.check(ip).is_ok());
+        }
+        assert!(limiter.check(ip).is_err());
+    }
+
+    #[test]
+    fn media_proxy_limiter_matches_mastodon_boundary() {
+        let limiter = MediaProxyLimiter::default();
+        let ip = "192.0.2.1".parse().expect("fixture IP is valid");
+        for _ in 0..30 {
+            assert!(limiter.check(ip).is_ok());
+        }
+        let rate_limited = limiter
+            .check(ip)
+            .expect_err("the 31st media proxy request must be limited");
+        assert_eq!(rate_limited.limit, 30);
+        assert_eq!(rate_limited.period, StdDuration::from_mins(10));
+        let response = rate_limited_response(rate_limited);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["x-ratelimit-limit"], "30");
+        assert_eq!(response.headers()["x-ratelimit-remaining"], "0");
+        assert!(response.headers().contains_key("x-ratelimit-reset"));
+        assert!(response.headers().contains_key("retry-after"));
+    }
+
+    #[test]
+    fn media_upload_limiter_matches_mastodon_boundary() {
+        let limiter = MediaUploadLimiter::default();
+        for _ in 0..30 {
+            assert!(limiter.check(101).is_ok());
+        }
+        let rate_limited = limiter
+            .check(101)
+            .expect_err("the 31st media upload request must be limited");
+        assert_eq!(rate_limited.limit, 30);
+        assert_eq!(rate_limited.period, StdDuration::from_mins(30));
+    }
+
+    #[tokio::test]
+    #[ignore = "starts a disposable PostgreSQL fixture through Mise"]
+    #[allow(clippy::too_many_lines)]
+    async fn shared_rate_limiter_coordinates_independent_pools()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let url = std::env::var("RUSTODON_OPERATIONAL_DATABASE_URL")?;
+        let first_pool = PgPool::connect(&url).await?;
+        let second_pool = PgPool::connect(&url).await?;
+        let key = "test:shared-rate-limiter";
+        sqlx::query("DELETE FROM rustodon.rate_limit_windows WHERE window_key = $1")
+            .bind(key)
+            .execute(&first_pool)
+            .await?;
+        let first = SharedRateLimiter::new(first_pool.clone());
+        let second = SharedRateLimiter::new(second_pool);
+        for _ in 0..30 {
+            first
+                .try_allow([(
+                    key.to_owned(),
+                    MEDIA_UPLOAD_RATE_LIMIT,
+                    MEDIA_UPLOAD_RATE_LIMIT_PERIOD,
+                )])
+                .await
+                .expect("the first pool can consume the shared window");
+        }
+        assert!(
+            second
+                .try_allow([(
+                    key.to_owned(),
+                    MEDIA_UPLOAD_RATE_LIMIT,
+                    MEDIA_UPLOAD_RATE_LIMIT_PERIOD,
+                )])
+                .await
+                .is_err(),
+            "the second pool must observe the first pool's attempts"
+        );
+        sqlx::query("DELETE FROM rustodon.rate_limit_windows WHERE window_key = $1")
+            .bind(key)
+            .execute(&first_pool)
+            .await?;
+
+        let circuit_ip = "198.51.100.74".parse().expect("fixture IP is valid");
+        let other_circuit_ip = "198.51.100.75".parse().expect("fixture IP is valid");
+        let circuit_key = signature_fetch_circuit_key(circuit_ip);
+        let other_circuit_key = signature_fetch_circuit_key(other_circuit_ip);
+        for circuit_key in [&circuit_key, &other_circuit_key] {
+            sqlx::query("DELETE FROM rustodon.rate_limit_windows WHERE window_key = $1")
+                .bind(circuit_key)
+                .execute(&first_pool)
+                .await?;
+        }
+        assert!(!first.circuit_open(&circuit_key).await?);
+        assert!(!remote_signature_fetch_should_trip(
+            &RemoteFetchError::UnexpectedStatus(StatusCode::NOT_FOUND)
+        ));
+        assert!(!second.circuit_open(&circuit_key).await?);
+        first
+            .record_circuit_failure(&circuit_key, SIGNATURE_FETCH_COOL_OFF)
+            .await?;
+        assert!(second.circuit_open(&circuit_key).await?);
+        assert!(!second.circuit_open(&other_circuit_key).await?);
+        sqlx::query(
+            "UPDATE rustodon.rate_limit_windows \
+             SET expires_at = clock_timestamp() - INTERVAL '1 second' \
+             WHERE window_key = $1",
+        )
+        .bind(&circuit_key)
+        .execute(&first_pool)
+        .await?;
+        assert!(!first.circuit_open(&circuit_key).await?);
+        for circuit_key in [&circuit_key, &other_circuit_key] {
+            sqlx::query("DELETE FROM rustodon.rate_limit_windows WHERE window_key = $1")
+                .bind(circuit_key)
+                .execute(&first_pool)
+                .await?;
+        }
+
+        let collision_ip = "198.51.100.73".parse().expect("fixture IP is valid");
+        let password_limiter = PasswordResetLimiter::default();
+        let browser_limiter = BrowserLoginLimiter::default();
+        let mut collision_keys = Vec::new();
+        for index in 0..25 {
+            let email = format!("collision-{index}@example.invalid");
+            collision_keys.extend(
+                PasswordResetLimiter::keys(collision_ip, &email)
+                    .into_iter()
+                    .map(|(key, _, _)| key),
+            );
+            password_limiter
+                .check_shared(Some(&first), collision_ip, &email)
+                .await
+                .expect("password-reset attempts should consume their own IP window");
+        }
+        let browser_email = "browser@example.invalid";
+        collision_keys.extend(
+            BrowserLoginLimiter::keys(collision_ip, browser_email)
+                .into_iter()
+                .map(|(key, _, _)| key),
+        );
+        browser_limiter
+            .check_shared(Some(&second), collision_ip, browser_email)
+            .await
+            .expect("password-reset traffic must not consume the browser-login IP window");
+        for collision_key in collision_keys {
+            sqlx::query("DELETE FROM rustodon.rate_limit_windows WHERE window_key = $1")
+                .bind(collision_key)
+                .execute(&first_pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn activitypub_inbox_limiter_bounds_each_client_ip() {
+        let limiter = ActivityPubInboxLimiter::default();
+        let ip = "192.0.2.1".parse().expect("fixture IP is valid");
+        for _ in 0..ACTIVITYPUB_INBOX_RATE_LIMIT {
+            assert!(limiter.check(ip).is_ok());
+        }
+        let rate_limited = limiter
+            .check(ip)
+            .expect_err("the request after the inbox limit must be limited");
+        assert_eq!(rate_limited.limit, ACTIVITYPUB_INBOX_RATE_LIMIT);
+        assert_eq!(rate_limited.period, ACTIVITYPUB_INBOX_RATE_LIMIT_PERIOD);
+
+        let other_ip = "192.0.2.2".parse().expect("fixture IP is valid");
+        assert!(limiter.check(other_ip).is_ok());
+
+        let ipv6_limiter = ActivityPubInboxLimiter::default();
+        let ipv6_first = "2001:db8::1".parse().expect("fixture IP is valid");
+        for _ in 0..ACTIVITYPUB_INBOX_RATE_LIMIT {
+            assert!(ipv6_limiter.check(ipv6_first).is_ok());
+        }
+        assert!(
+            ipv6_limiter
+                .check("2001:db8::2".parse().expect("fixture IP is valid"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_account_resolution_limiter_bounds_each_handle() {
+        let limiter = RemoteAccountResolutionLimiter::default();
+        let ip = "192.0.2.1".parse().expect("fixture IP is valid");
+        assert!(limiter.check(ip, "alice", "remote.example").is_ok());
+        assert!(limiter.check(ip, "ALICE", "REMOTE.EXAMPLE").is_err());
+        assert!(limiter.check(ip, "bob", "remote.example").is_ok());
+    }
+
+    #[test]
+    fn signature_fetch_circuit_cools_off_per_client_ip() {
+        let circuit = SignatureFetchCircuit::default();
+        let ip = "192.0.2.1".parse().expect("fixture IP is valid");
+        let other_ip = "192.0.2.2".parse().expect("fixture IP is valid");
+        let now = 1_000;
+
+        assert!(remote_signature_fetch_should_trip(
+            &RemoteFetchError::Request
+        ));
+        assert!(!remote_signature_fetch_should_trip(
+            &RemoteFetchError::UnexpectedStatus(StatusCode::NOT_FOUND)
+        ));
+        assert_eq!(
+            remote_signature_fetch_failure(&RemoteFetchError::Request).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(!remote_signature_fetch_should_trip(
+            &RemoteFetchError::DomainBudgetExceeded
+        ));
+        assert_eq!(
+            remote_signature_fetch_failure(&RemoteFetchError::DomainBudgetExceeded).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            remote_signature_fetch_failure(&RemoteFetchError::UnexpectedStatus(
+                StatusCode::NOT_FOUND
+            ))
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(circuit.allow_at(ip, now));
+        circuit.record_failure_at(ip, now);
+        assert!(!circuit.allow_at(ip, now));
+        assert!(!circuit.allow_at(ip, now + SIGNATURE_FETCH_COOL_OFF.as_secs() - 1));
+        assert!(circuit.allow_at(ip, now + SIGNATURE_FETCH_COOL_OFF.as_secs()));
+        assert!(circuit.allow_at(other_ip, now));
+    }
+
+    #[test]
+    fn rate_limited_responses_expose_mastodon_reset_headers() {
+        let response = rate_limited_response(RateLimitExceeded {
+            limit: 5,
+            period: StdDuration::from_mins(10),
+        });
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["x-ratelimit-limit"], "5");
+        assert_eq!(response.headers()["x-ratelimit-remaining"], "0");
+        assert!(response.headers().contains_key("x-ratelimit-reset"));
+        assert!(response.headers().contains_key("retry-after"));
     }
 
     #[test]
@@ -5302,6 +19384,120 @@ mod tests {
         assert_eq!(body, "body");
     }
 
+    #[tokio::test]
+    async fn request_body_timeout_rejects_stalled_bodies() {
+        let request = Request::builder()
+            .uri("/api/v2/instance")
+            .body(Body::from_stream(futures_util::stream::pending::<
+                Result<Bytes, std::convert::Infallible>,
+            >()))
+            .expect("static request is valid");
+        let response = bounded_request_with_timeout(request, 4, StdDuration::from_millis(1))
+            .await
+            .expect_err("stalled request is rejected");
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn large_api_bodies_require_authenticated_admission() {
+        let route = api_route_for_method(&Method::POST, "/api/v1/statuses")
+            .expect("status creation route is inventoried");
+        let unauthenticated = HeaderMap::new();
+        let unauthenticated_request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/statuses")
+            .body(Body::empty())
+            .expect("request is valid");
+        assert_eq!(
+            api_request_body_limit(
+                "/api/v1/statuses",
+                Some(route),
+                &unauthenticated,
+                &unauthenticated_request
+            ),
+            PUBLIC_REQUEST_BODY_LIMIT_BYTES
+        );
+        assert!(!api_request_requires_preauthentication(
+            Some(route),
+            &unauthenticated,
+            &unauthenticated_request
+        ));
+
+        let mut authenticated = HeaderMap::new();
+        authenticated.insert(AUTHORIZATION, HeaderValue::from_static("Bearer fixture"));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/statuses")
+            .header(
+                CONTENT_LENGTH,
+                (PUBLIC_REQUEST_BODY_LIMIT_BYTES + 1).to_string(),
+            )
+            .body(Body::empty())
+            .expect("request is valid");
+        assert!(api_request_requires_preauthentication(
+            Some(route),
+            &authenticated,
+            &request
+        ));
+        assert!(content_length_exceeds_limit(
+            request.headers(),
+            PUBLIC_REQUEST_BODY_LIMIT_BYTES
+        ));
+        assert_eq!(
+            api_request_body_limit("/api/v1/statuses", Some(route), &authenticated, &request),
+            REST_BODY_LIMIT_BYTES
+        );
+
+        let mut query_authenticated = HeaderMap::new();
+        inject_query_parameter_bearer(
+            &mut query_authenticated,
+            Some("access_token=fixture-bearer-token-v4-6-5"),
+        );
+        assert_eq!(
+            query_authenticated[AUTHORIZATION],
+            "Bearer fixture-bearer-token-v4-6-5"
+        );
+        assert_eq!(
+            api_request_body_limit(
+                "/api/v1/statuses",
+                Some(route),
+                &query_authenticated,
+                &request
+            ),
+            REST_BODY_LIMIT_BYTES
+        );
+
+        let get_route = api_route_for_method(&Method::GET, "/api/v1/markers")
+            .expect("marker reads are inventoried");
+        let get_request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/markers")
+            .body(Body::empty())
+            .expect("request is valid");
+        assert!(!api_request_requires_preauthentication(
+            Some(get_route),
+            &authenticated,
+            &get_request
+        ));
+        assert_eq!(
+            api_request_body_limit(
+                "/api/v1/markers",
+                Some(get_route),
+                &authenticated,
+                &get_request
+            ),
+            PUBLIC_REQUEST_BODY_LIMIT_BYTES
+        );
+
+        let public_route = api_route_for_method(&Method::POST, "/api/v1/apps")
+            .expect("app registration route is inventoried");
+        assert!(required_api_scopes(Some(public_route)).is_none());
+        assert_eq!(
+            api_request_body_limit("/api/v1/apps", Some(public_route), &authenticated, &request),
+            PUBLIC_REQUEST_BODY_LIMIT_BYTES
+        );
+    }
+
     #[test]
     fn query_validation_rejects_bad_escapes_and_utf8() {
         assert!(valid_query("limit=2&tagged=fixturetag"));
@@ -5337,6 +19533,68 @@ mod tests {
         let nested = RackParameters::parse("max_id%5B%5D=1").unwrap();
         assert_eq!(integer_parameter(&nested, "max_id"), Ok(Some(i64::MIN)));
         assert!(RackParameters::parse("max_id=1&max_id%5B%5D=2").is_err());
+    }
+
+    #[test]
+    fn account_profile_updates_parse_nested_fields_and_source_settings() {
+        let parameters = RackParameters::parse(
+            "display_name=Profile+Name&note=Hello%21&bot=0&locked=false&discoverable=1&indexable=true&fields_attributes%5B%5D%5Bname%5D=Website&fields_attributes%5B%5D%5Bvalue%5D=https%3A%2F%2Fexample.com&source%5Bprivacy%5D=unlisted&source%5Bsensitive%5D=1&source%5Blanguage%5D=fr&source%5Bquote_policy%5D=followers",
+        )
+        .unwrap();
+        let update = account_profile_update(&parameters).unwrap();
+        assert_eq!(update.display_name.as_deref(), Some("Profile Name"));
+        assert_eq!(update.note.as_deref(), Some("Hello!"));
+        assert_eq!(update.bot, AccountProfileValue::Value(false));
+        assert_eq!(update.locked, Some(false));
+        assert_eq!(update.discoverable, AccountProfileValue::Value(true));
+        assert_eq!(update.indexable, Some(true));
+        assert_eq!(
+            update.fields,
+            Some(vec![AccountFieldUpdate {
+                name: "Website".to_owned(),
+                value: "https://example.com".to_owned(),
+            }])
+        );
+        assert_eq!(
+            update.source,
+            Some(AccountSourceUpdate {
+                privacy: AccountProfileValue::Value("unlisted".to_owned()),
+                sensitive: AccountProfileValue::Value(true),
+                language: AccountProfileValue::Value("fr".to_owned()),
+                quote_policy: AccountProfileValue::Value("followers".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn media_updates_parse_descriptions_and_focus_coordinates() {
+        let parameters = RackParameters::parse("description=Alt+text&focus=0.25%2C-0.5").unwrap();
+        let update = media_attachment_update(&parameters).unwrap();
+        assert_eq!(
+            update.description,
+            AccountProfileValue::Value("Alt text".to_owned())
+        );
+        assert_eq!(
+            update.focus,
+            AccountProfileValue::Value(MediaFocus { x: 0.25, y: -0.5 })
+        );
+
+        let clear = RackParameters::parse("description=&focus%5B%5D=0&focus%5B%5D=1").unwrap();
+        let update = media_attachment_update(&clear).unwrap();
+        assert_eq!(
+            update.description,
+            AccountProfileValue::Value(String::new())
+        );
+        assert_eq!(
+            update.focus,
+            AccountProfileValue::Value(MediaFocus { x: 0.0, y: 1.0 })
+        );
+
+        for encoded in ["focus=", "focus"] {
+            let unchanged = RackParameters::parse(encoded).unwrap();
+            let update = media_attachment_update(&unchanged).unwrap();
+            assert_eq!(update.focus, AccountProfileValue::Unchanged);
+        }
     }
 
     #[test]

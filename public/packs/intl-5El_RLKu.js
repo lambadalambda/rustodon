@@ -1,0 +1,2 @@
+import{t as e}from"./jsx-runtime-SsSjplwM.js";import{c as t}from"./react-intl-Cop388b4.js";var n=e(),r=({component:e,props:r})=>{let i=t();return(0,n.jsx)(e,{...r,intl:i})},i=e=>{let t=t=>(0,n.jsx)(r,{component:e,props:t});return t.displayName=`injectIntl(${(e.displayName??e.name)||`Component`})`,t};export{i as t};
+//# sourceMappingURL=intl-5El_RLKu.js.map

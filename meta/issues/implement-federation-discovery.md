@@ -38,5 +38,57 @@ servers identify existing local accounts and retrieve their public content.
 
 - Depends on `implement-core-rest-serializers.md` and
   `implement-visibility-correct-account-status-reads.md`.
-- HTTP signature verification, signed GET policy, inboxes, and delivery are
+- Optional legacy signed-GET verification now protects existing actor reads;
+  mandatory signed-GET policy, inboxes, remote-key fetching, and delivery remain
   separate federation-transport issues after this public discovery slice.
+
+## Progress
+
+- Implemented the supported discovery routes and serializers in
+  `src/mastodon/activitypub.rs` and `src/web.rs`.
+- Added the guarded `federation_discovery` differential case and focused helper
+  tests; the differential case passes against the pinned fixture.
+- Hardened reviewed boundaries for suspended actor serialization, explicit
+  WebFinger authorities, numeric local quote URIs, suspended collection
+  members, collection page presence, Accept quality values, and outbox query
+  failures.
+- Verified `mise run check`, targeted and full differential compatibility, and
+  startup integration after the hardening pass. The guarded discovery case now
+ covers WebFinger, host-meta, NodeInfo, signed and unsigned actor reads,
+ public Note JSON-LD, paginated collections, privacy-aware members, and HTML
+ negotiation against the pinned fixture.
+- ActivityPub Note and local outbox pages now reuse the REST status authorization
+  policy for optional OAuth or signed viewers. Followers can retrieve authorized
+  private statuses, mentioned accounts can retrieve direct/limited statuses, and
+  blocked viewers cannot receive public content; the guarded federation case
+  covers username/numeric Notes and signed outbox pagination.
+- Added the Rails status collection surface for username and numeric ActivityPub
+  routes: standalone `replies` pages serialize local Notes and remote URI items,
+  while `likes` and `shares` expose status-stat totals. Parent status policy is
+  applied before every collection response, and the guarded case covers
+  pagination, nullable local reply URIs, private/direct access, and blocked
+  viewers.
+- Boost object GETs now redirect to the original status, while boost collection
+  URLs remain on the status route without the `/activity` suffix. Status object
+  and activity responses emit Mastodon-compatible alternate `Link` headers.
+- Status object responses now match Rails cache policy: distributable public
+  statuses use a three-minute public cache in normal fetch mode, while private
+  status objects and authorized-fetch responses remain non-shareable. Activity
+  responses preserve Rails' three-minute private cache behavior for
+  non-distributable statuses.
+- Status errors and boost redirects now receive the Rails private cache default
+  and the corresponding public or authorized-fetch `Vary` header before they
+  leave the status route.
+- Browser-cookie sessions now authorize ActivityPub status and collection reads
+  with the same precedence as Rails' web session, while limited federation still
+  requires a valid request signature.
+- Public distributable status Notes with pending quotes now use Rails'
+  five-second response cache window; Activity objects retain the three-minute
+  cache window.
+- Public-fetch status reads now treat failed optional signatures as anonymous,
+  matching Rails while preserving errors in limited/authorized-fetch mode.
+- WebFinger URL resources now recognize mixed-case HTTP(S) schemes, matching
+  Rails' resource parser; the guarded differential case covers the behavior.
+- Note serialization now includes reply Atom URIs and conversation/context
+  metadata, including the local OStatus fallback for reply parents; the same
+  metadata is carried by outbound worker Notes.

@@ -4,12 +4,34 @@ use std::str::FromStr;
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::time::Duration as StdDuration;
 
+use crate::streaming::{STREAM_EVENT_KIND, StreamEvent};
+
 const DEFAULT_MAX_ATTEMPTS: i32 = 25;
 const MAX_ERROR_BYTES: usize = 4 * 1024;
+pub const ACTIVITYPUB_INBOX_JOB_KIND: &str = "rustodon.activitypub.process_inbox";
+pub const ACTIVITYPUB_INBOX_ORDERING_KIND: &str = "rustodon.activitypub.inbox";
+pub const ACTIVITYPUB_DELIVERY_ORDERING_KIND: &str = "rustodon.activitypub.delivery";
+pub const ACTIVITYPUB_INBOX_IDEMPOTENCY_SCOPE: &str = "rustodon.activitypub.inbox";
+pub const ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND: &str = "rustodon.activitypub.distribute_status";
+pub const ACTIVITYPUB_ACCOUNT_UPDATE_JOB_KIND: &str = "rustodon.activitypub.update_account";
+pub const ACTIVITYPUB_ACCOUNT_DELETE_JOB_KIND: &str = "rustodon.activitypub.delete_account";
+pub const MASTODON_ACCOUNT_PURGE_JOB_KIND: &str = "rustodon.mastodon.purge_account";
+pub const MASTODON_DOMAIN_BLOCK_JOB_KIND: &str = "rustodon.mastodon.domain_block";
+pub const ACTIVITYPUB_DELIVERY_JOB_KIND: &str = "rustodon.activitypub.deliver";
+pub const ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND: &str = "rustodon.activitypub.resolve_thread";
+pub const ACTIVITYPUB_ANNOUNCE_RESOLVE_JOB_KIND: &str = "rustodon.activitypub.resolve_announce";
+pub const ACTIVITYPUB_MEDIA_FETCH_JOB_KIND: &str = "rustodon.activitypub.fetch_media";
+pub const NOTIFICATION_CREATE_JOB_KIND: &str = "rustodon.mastodon.notify_activity";
+pub const NOTIFICATION_UNFILTER_JOB_KIND: &str = "rustodon.mastodon.unfilter_notifications";
+pub const NOTIFICATION_CLEANUP_JOB_KIND: &str = "rustodon.mastodon.cleanup_filtered_notifications";
+pub const ACCOUNT_DELETION_DELAY_DAYS: i64 = 30;
+pub const MASTODON_DOMAIN_PURGE_JOB_KIND: &str = "rustodon.mastodon.purge_domain";
+const STREAM_EVENT_ORDERING_LOCK_KEY: &str = "rustodon.mastodon.stream_event.commit_order";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Lane {
@@ -102,9 +124,34 @@ impl JobSpec {
     }
 
     #[must_use]
+    pub const fn run_at_value(&self) -> DateTime<Utc> {
+        self.run_at
+    }
+
+    #[must_use]
     pub const fn max_attempts(mut self, max_attempts: i32) -> Self {
         self.max_attempts = max_attempts;
         self
+    }
+
+    #[must_use]
+    pub const fn lane(&self) -> Lane {
+        self.lane
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    #[must_use]
+    pub const fn arguments(&self) -> &Value {
+        &self.arguments
+    }
+
+    #[must_use]
+    pub fn logical_key_value(&self) -> Option<&str> {
+        self.logical_key.as_deref()
     }
 
     fn validate(&self) -> Result<(), JobError> {
@@ -232,6 +279,7 @@ impl Readiness {
 #[derive(Debug)]
 pub enum JobError {
     Sqlx(sqlx::Error),
+    Conflict(&'static str),
     InvalidInput(&'static str),
     InvalidData(&'static str),
 }
@@ -240,7 +288,7 @@ impl fmt::Display for JobError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Sqlx(_) => formatter.write_str("PostgreSQL rejected a durable-job operation"),
-            Self::InvalidInput(message) | Self::InvalidData(message) => {
+            Self::Conflict(message) | Self::InvalidInput(message) | Self::InvalidData(message) => {
                 formatter.write_str(message)
             }
         }
@@ -251,7 +299,7 @@ impl std::error::Error for JobError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Sqlx(error) => Some(error),
-            Self::InvalidInput(_) | Self::InvalidData(_) => None,
+            Self::Conflict(_) | Self::InvalidInput(_) | Self::InvalidData(_) => None,
         }
     }
 }
@@ -290,6 +338,89 @@ impl Queue {
         Ok(id)
     }
 
+    /// Enqueues a job while serializing jobs sharing an ordering key.
+    ///
+    /// The marker and durable job are committed together, so a request cannot advertise an
+    /// ordering position that was not durably accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid job metadata or a rejected database operation.
+    pub async fn enqueue_ordered(
+        &self,
+        spec: &JobSpec,
+        ordering_key: &[u8; 32],
+    ) -> Result<i64, JobError> {
+        let mut transaction = self.pool.begin().await?;
+        let id = enqueue_ordered_in(&mut transaction, spec, ordering_key).await?;
+        transaction.commit().await?;
+        Ok(id)
+    }
+
+    /// Enqueues one logical `ActivityPub` activity, retaining its deduplication marker after the
+    /// durable job is acknowledged by a worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid job metadata or a rejected database operation.
+    pub async fn enqueue_ordered_once(
+        &self,
+        spec: &JobSpec,
+        ordering_key: &[u8; 32],
+        fingerprint: &[u8; 32],
+    ) -> Result<bool, JobError> {
+        spec.validate()?;
+        let logical_key = spec.logical_key_value().ok_or(JobError::InvalidInput(
+            "deduplicated jobs require a logical key",
+        ))?;
+        let mut transaction = self.pool.begin().await?;
+        let inserted = sqlx::query_scalar::<_, String>(
+            "INSERT INTO rustodon.idempotency_keys \
+                (scope, key, fingerprint, result, expires_at) \
+             VALUES ($1, $2, $3, $4, clock_timestamp() + interval '30 days') \
+             ON CONFLICT (scope, key) DO UPDATE SET \
+                fingerprint = EXCLUDED.fingerprint, result = EXCLUDED.result, \
+                created_at = clock_timestamp(), expires_at = EXCLUDED.expires_at \
+             WHERE rustodon.idempotency_keys.expires_at <= clock_timestamp() \
+             RETURNING key",
+        )
+        .bind(ACTIVITYPUB_INBOX_IDEMPOTENCY_SCOPE)
+        .bind(logical_key)
+        .bind(fingerprint.as_slice())
+        .bind(json!({}))
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if inserted.is_none() {
+            let existing_fingerprint = sqlx::query_scalar::<_, Vec<u8>>(
+                "SELECT fingerprint FROM rustodon.idempotency_keys \
+                 WHERE scope = $1 AND key = $2",
+            )
+            .bind(ACTIVITYPUB_INBOX_IDEMPOTENCY_SCOPE)
+            .bind(logical_key)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if existing_fingerprint.as_deref() != Some(fingerprint.as_slice()) {
+                return Err(JobError::Conflict(
+                    "ActivityPub activity body conflicts with an existing logical activity",
+                ));
+            }
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        let id = enqueue_ordered_in(&mut transaction, spec, ordering_key).await?;
+        sqlx::query(
+            "UPDATE rustodon.idempotency_keys SET result = jsonb_build_object('job_id', $3) \
+             WHERE scope = $1 AND key = $2",
+        )
+        .bind(ACTIVITYPUB_INBOX_IDEMPOTENCY_SCOPE)
+        .bind(logical_key)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(true)
+    }
+
     /// Claims one due job while fencing stale workers with a lease generation.
     ///
     /// # Errors
@@ -310,11 +441,22 @@ impl Queue {
         let mut transaction = self.pool.begin().await?;
         let row = sqlx::query(
             "WITH candidate AS ( \
-               SELECT id FROM rustodon.durable_jobs \
-               WHERE dead_at IS NULL AND run_at <= clock_timestamp() \
-                 AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp()) \
-                 AND lane = ANY($1) \
-               ORDER BY run_at, id FOR UPDATE SKIP LOCKED LIMIT 1) \
+               SELECT job.id FROM rustodon.durable_jobs job \
+               WHERE job.dead_at IS NULL AND job.run_at <= clock_timestamp() \
+                 AND (job.lease_expires_at IS NULL OR job.lease_expires_at <= clock_timestamp()) \
+                 AND job.lane = ANY($1) \
+                 AND NOT EXISTS ( \
+                   SELECT 1 FROM rustodon.durable_jobs predecessor \
+                   WHERE predecessor.id = CASE \
+                     WHEN job.arguments ->> '_rustodon_ordering_predecessor' ~ '^[0-9]+$' \
+                     THEN (job.arguments ->> '_rustodon_ordering_predecessor')::bigint \
+                    ELSE NULL \
+                   END \
+                     AND predecessor.dead_at IS NULL \
+                     AND (predecessor.arguments ->> '_rustodon_ordering_key' IS NULL \
+                          OR predecessor.arguments ->> '_rustodon_ordering_key' = \
+                             job.arguments ->> '_rustodon_ordering_key')) \
+               ORDER BY job.run_at, job.id FOR UPDATE OF job SKIP LOCKED LIMIT 1) \
              UPDATE rustodon.durable_jobs job \
               SET attempts = CASE WHEN attempts < max_attempts THEN attempts + 1 ELSE attempts END, \
                  lease_generation = lease_generation + 1, \
@@ -361,6 +503,36 @@ impl Queue {
         .bind(lease_owner)
         .bind(generation)
         .bind(lease_duration.num_milliseconds())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Merges durable metadata into a live job while retaining the lease fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-object patch or a rejected database update.
+    pub async fn merge_job_arguments(
+        &self,
+        job: &ClaimedJob,
+        patch: &Value,
+    ) -> Result<bool, JobError> {
+        if !patch.is_object() {
+            return Err(JobError::InvalidInput(
+                "durable-job argument patches must be JSON objects",
+            ));
+        }
+        let result = sqlx::query(
+            "UPDATE rustodon.durable_jobs \
+                SET arguments = arguments || $4::jsonb, updated_at = clock_timestamp() \
+              WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3 \
+                AND dead_at IS NULL AND lease_expires_at > clock_timestamp()",
+        )
+        .bind(job.id)
+        .bind(&job.lease_owner)
+        .bind(job.generation)
+        .bind(patch)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
@@ -522,13 +694,25 @@ impl Queue {
         let mut transaction = self.pool.begin().await?;
         let rows = sqlx::query(
             "SELECT event.id, event.kind, event.logical_key, event.payload \
-             FROM rustodon.outbox_events event WHERE event.dispatched_at IS NULL \
-               AND (event.logical_key IS NULL OR NOT EXISTS ( \
-                 SELECT 1 FROM rustodon.durable_jobs job \
-                 WHERE job.kind = event.kind AND job.logical_key = event.logical_key \
-                   AND job.dead_at IS NULL)) \
-             ORDER BY event.id FOR UPDATE OF event SKIP LOCKED LIMIT $1",
+              FROM rustodon.outbox_events event WHERE event.dispatched_at IS NULL \
+                AND event.kind <> $1 \
+                AND NOT EXISTS ( \
+                  SELECT 1 FROM rustodon.outbox_events previous \
+                   WHERE event.kind = $2 AND previous.kind = event.kind \
+                     AND previous.dispatched_at IS NULL AND previous.id < event.id \
+                     AND previous.payload #>> '{arguments,source_account_id}' = \
+                         event.payload #>> '{arguments,source_account_id}' \
+                     AND previous.payload #>> '{arguments,inbox_url}' = \
+                         event.payload #>> '{arguments,inbox_url}' \
+                ) \
+                AND (event.logical_key IS NULL OR NOT EXISTS ( \
+                   SELECT 1 FROM rustodon.durable_jobs job \
+                   WHERE job.kind = event.kind AND job.logical_key = event.logical_key \
+                    AND job.dead_at IS NULL)) \
+                ORDER BY event.id FOR UPDATE OF event SKIP LOCKED LIMIT $3",
         )
+        .bind(STREAM_EVENT_KIND)
+        .bind(ACTIVITYPUB_DELIVERY_JOB_KIND)
         .bind(limit)
         .fetch_all(&mut *transaction)
         .await?;
@@ -539,7 +723,19 @@ impl Queue {
             let logical_key: Option<String> = row.try_get("logical_key")?;
             let payload: Value = row.try_get("payload")?;
             let spec = outbox_spec(kind, logical_key, &payload)?;
-            if enqueue_outbox_in(&mut transaction, &spec).await? {
+            let inserted = if let Some(ordering_key) = activitypub_delivery_ordering_key(&spec) {
+                enqueue_ordered_kind_in(
+                    &mut transaction,
+                    &spec,
+                    &ordering_key,
+                    ACTIVITYPUB_DELIVERY_ORDERING_KIND,
+                )
+                .await
+                .map(|_| true)?
+            } else {
+                enqueue_outbox_in(&mut transaction, &spec).await?
+            };
+            if inserted {
                 sqlx::query(
                     "UPDATE rustodon.outbox_events SET dispatched_at = clock_timestamp() \
                      WHERE id = $1 AND dispatched_at IS NULL",
@@ -552,6 +748,91 @@ impl Queue {
         }
         transaction.commit().await?;
         Ok(dispatched)
+    }
+
+    /// Reports whether notification unfilter work is still queued for an account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `PostgreSQL` cannot read the operational queue.
+    pub async fn notification_unfilter_pending(&self, account_id: i64) -> Result<bool, JobError> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS ( \
+                SELECT 1 FROM rustodon.outbox_events event \
+                 WHERE event.kind = $1 AND event.dispatched_at IS NULL \
+                   AND event.payload #>> '{arguments,account_id}' = $2 \
+                UNION ALL \
+                SELECT 1 FROM rustodon.durable_jobs job \
+                 WHERE job.kind = $1 AND job.dead_at IS NULL \
+                   AND job.arguments ->> 'account_id' = $2 \
+            )",
+        )
+        .bind(NOTIFICATION_UNFILTER_JOB_KIND)
+        .bind(account_id.to_string())
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// Returns the latest committed stream-event cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `PostgreSQL` cannot read the stream-event table.
+    pub async fn stream_cursor(&self) -> Result<i64, JobError> {
+        let mut transaction = self.pool.begin().await?;
+        lock_stream_event_order(&mut transaction).await?;
+        let cursor = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT max(id) FROM rustodon.outbox_events WHERE kind = $1",
+        )
+        .bind(STREAM_EVENT_KIND)
+        .fetch_one(&mut *transaction)
+        .await?
+        .unwrap_or_default();
+        transaction.commit().await?;
+        Ok(cursor)
+    }
+
+    /// Reads immutable stream events after a cursor without consuming them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid cursor parameters or when `PostgreSQL` rejects the read.
+    pub async fn stream_events_after(
+        &self,
+        cursor: i64,
+        limit: i64,
+    ) -> Result<Vec<StreamEvent>, JobError> {
+        if cursor < 0 || limit <= 0 {
+            return Err(JobError::InvalidInput(
+                "stream cursor must be non-negative and limit must be positive",
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        lock_stream_event_order(&mut transaction).await?;
+        let rows = sqlx::query(
+            "SELECT id, (payload ->> 'account_id')::bigint AS account_id, \
+                    payload ->> 'event' AS event, \
+                    (payload ->> 'object_id')::bigint AS object_id \
+               FROM rustodon.outbox_events \
+              WHERE kind = $1 AND id > $2 \
+              ORDER BY id LIMIT $3",
+        )
+        .bind(STREAM_EVENT_KIND)
+        .bind(cursor)
+        .bind(limit)
+        .fetch_all(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(StreamEvent {
+                    id: row.try_get("id")?,
+                    account_id: row.try_get("account_id")?,
+                    event: row.try_get("event")?,
+                    object_id: row.try_get("object_id")?,
+                })
+            })
+            .collect()
     }
 
     /// Upserts a worker or scheduler heartbeat.
@@ -753,6 +1034,131 @@ pub async fn enqueue_in(
     .await?)
 }
 
+async fn enqueue_ordered_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    spec: &JobSpec,
+    ordering_key: &[u8; 32],
+) -> Result<i64, JobError> {
+    enqueue_ordered_kind_in(
+        transaction,
+        spec,
+        ordering_key,
+        ACTIVITYPUB_INBOX_ORDERING_KIND,
+    )
+    .await
+}
+
+async fn enqueue_ordered_kind_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    spec: &JobSpec,
+    ordering_key: &[u8; 32],
+    ordering_kind: &str,
+) -> Result<i64, JobError> {
+    sqlx::query(
+        "INSERT INTO rustodon.ordering_markers \
+             (kind, key_hash, ordering_at, payload, created_at, expires_at) \
+          VALUES ($1, $2, $3, '{}'::jsonb, clock_timestamp(), \
+                  GREATEST(clock_timestamp() + interval '30 days', $3 + interval '30 days')) \
+          ON CONFLICT (kind, key_hash) DO NOTHING",
+    )
+    .bind(ordering_kind)
+    .bind(ordering_key.as_slice())
+    .bind(spec.run_at_value())
+    .execute(&mut **transaction)
+    .await?;
+    let previous = sqlx::query_as::<_, (DateTime<Utc>, Option<i64>)>(
+        "SELECT ordering_at, (payload ->> 'job_id')::bigint AS previous_job_id \
+           FROM rustodon.ordering_markers \
+          WHERE kind = $1 AND key_hash = $2 \
+          FOR UPDATE",
+    )
+    .bind(ordering_kind)
+    .bind(ordering_key.as_slice())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let predecessor_id = previous.as_ref().and_then(|previous| previous.1);
+    let run_at = previous
+        .as_ref()
+        .filter(|(_, predecessor_id)| predecessor_id.is_some())
+        .map_or(spec.run_at_value(), |previous| {
+            std::cmp::max(spec.run_at_value(), previous.0 + Duration::microseconds(1))
+        });
+    let ordered_spec = with_ordering_metadata(spec, ordering_key, predecessor_id, run_at)?;
+    let id = enqueue_in(transaction, &ordered_spec).await?;
+    sqlx::query(
+        "INSERT INTO rustodon.ordering_markers \
+            (kind, key_hash, ordering_at, payload, created_at, expires_at) \
+         VALUES ($1, $2, $3, jsonb_build_object('job_id', $4), \
+                 clock_timestamp(), \
+                 GREATEST(clock_timestamp() + interval '30 days', $3 + interval '30 days')) \
+         ON CONFLICT (kind, key_hash) DO UPDATE SET \
+            ordering_at = EXCLUDED.ordering_at, payload = EXCLUDED.payload, \
+            expires_at = EXCLUDED.expires_at",
+    )
+    .bind(ordering_kind)
+    .bind(ordering_key.as_slice())
+    .bind(run_at)
+    .bind(id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(id)
+}
+
+fn with_ordering_metadata(
+    spec: &JobSpec,
+    ordering_key: &[u8; 32],
+    predecessor_id: Option<i64>,
+    run_at: DateTime<Utc>,
+) -> Result<JobSpec, JobError> {
+    let Value::Object(mut arguments) = spec.arguments.clone() else {
+        return Err(JobError::InvalidInput(
+            "ordered job arguments must be an object",
+        ));
+    };
+    arguments.insert(
+        "_rustodon_ordering_key".to_owned(),
+        Value::String(hex(ordering_key)),
+    );
+    if let Some(predecessor_id) = predecessor_id {
+        arguments.insert(
+            "_rustodon_ordering_predecessor".to_owned(),
+            json!(predecessor_id),
+        );
+    } else {
+        arguments.remove("_rustodon_ordering_predecessor");
+    }
+    Ok(JobSpec {
+        arguments: Value::Object(arguments),
+        ..spec.clone().run_at(run_at)
+    })
+}
+
+fn activitypub_delivery_ordering_key(spec: &JobSpec) -> Option<[u8; 32]> {
+    if spec.kind != ACTIVITYPUB_DELIVERY_JOB_KIND {
+        return None;
+    }
+    let arguments = spec.arguments.as_object()?;
+    let source_account_id = arguments.get("source_account_id")?.as_i64()?;
+    let inbox_url = arguments.get("inbox_url")?.as_str()?.trim();
+    if inbox_url.is_empty() {
+        return None;
+    }
+    Some(
+        Sha256::digest(format!("activitypub-delivery:{source_account_id}:{inbox_url}").as_bytes())
+            .into(),
+    )
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut value, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    value
+}
+
 async fn enqueue_outbox_in(
     transaction: &mut Transaction<'_, Postgres>,
     spec: &JobSpec,
@@ -806,6 +1212,111 @@ pub async fn record_outbox_in(
     .bind(payload)
     .fetch_one(&mut **transaction)
     .await?)
+}
+
+/// Records a durable outbox event only once for its logical key.
+///
+/// This variant is for immutable activities whose already-dispatched payload must not be reset by
+/// a retrying fan-out job.
+///
+/// # Errors
+///
+/// Returns an error for invalid metadata or a rejected database operation.
+pub async fn record_outbox_once_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    spec: &JobSpec,
+) -> Result<bool, JobError> {
+    spec.validate()?;
+    let payload = json!({
+        "lane": spec.lane.as_str(),
+        "arguments": spec.arguments,
+        "run_at": spec.run_at.to_rfc3339(),
+        "max_attempts": spec.max_attempts,
+    });
+    Ok(sqlx::query_scalar::<_, i64>(
+        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload) \
+          VALUES ($1, $2, $3) \
+          ON CONFLICT (kind, logical_key) WHERE logical_key IS NOT NULL \
+          DO NOTHING RETURNING id",
+    )
+    .bind(&spec.kind)
+    .bind(&spec.logical_key)
+    .bind(payload)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some())
+}
+
+/// Records one immutable Mastodon stream event in the application transaction.
+///
+/// Stream rows intentionally remain pending in `outbox_events`; the durable-job dispatcher excludes
+/// [`STREAM_EVENT_KIND`] so polling never consumes or rewrites them.
+///
+/// # Errors
+///
+/// Returns an error for invalid event metadata or a rejected database operation.
+pub async fn record_stream_event_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    account_id: i64,
+    event: &str,
+    object_id: i64,
+    logical_key: &str,
+) -> Result<i64, JobError> {
+    if account_id <= 0 || object_id == 0 {
+        return Err(JobError::InvalidInput(
+            "stream event account ID must be positive and object ID must be non-zero",
+        ));
+    }
+    if !(1..=128).contains(&event.len()) {
+        return Err(JobError::InvalidInput(
+            "stream event name must contain 1-128 bytes",
+        ));
+    }
+    if !(1..=1024).contains(&logical_key.len()) {
+        return Err(JobError::InvalidInput(
+            "stream event logical key must contain 1-1024 bytes",
+        ));
+    }
+    lock_stream_event_order(transaction).await?;
+    let payload = json!({
+        "account_id": account_id,
+        "event": event,
+        "object_id": object_id,
+    });
+    if let Some(id) = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload) \
+          VALUES ($1, $2, $3) ON CONFLICT (kind, logical_key) WHERE logical_key IS NOT NULL \
+          DO NOTHING RETURNING id",
+    )
+    .bind(STREAM_EVENT_KIND)
+    .bind(logical_key)
+    .bind(payload)
+    .fetch_optional(&mut **transaction)
+    .await?
+    {
+        return Ok(id);
+    }
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM rustodon.outbox_events WHERE kind = $1 AND logical_key = $2",
+    )
+    .bind(STREAM_EVENT_KIND)
+    .bind(logical_key)
+    .fetch_one(&mut **transaction)
+    .await?)
+}
+
+async fn lock_stream_event_order(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_xact_lock(
+            pg_catalog.hashtextextended($1, 0)
+         )",
+    )
+    .bind(STREAM_EVENT_ORDERING_LOCK_KEY)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 fn claimed_job(row: &sqlx::postgres::PgRow) -> Result<ClaimedJob, JobError> {

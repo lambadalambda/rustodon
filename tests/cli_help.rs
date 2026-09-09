@@ -95,6 +95,16 @@ fn admin_help_exposes_operational_schema_migration() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("migrate-operational-schema"));
     assert!(String::from_utf8_lossy(&output.stdout).contains("worker-readiness"));
     assert!(String::from_utf8_lossy(&output.stdout).contains("dead-jobs"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("reset-password"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("create-user"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("resolve-report"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("delete-status"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("reconcile-account-stats"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("suspend-account"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("unsuspend-account"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("block-domain"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("unblock-domain"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("purge-domain"));
 }
 
 #[test]

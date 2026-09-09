@@ -4881,6 +4881,7 @@ COPY public.account_domain_blocks (id, account_id, created_at, domain, updated_a
 --
 
 COPY public.account_migrations (id, account_id, acct, created_at, followers_count, target_account_id, updated_at) FROM stdin;
+8700	116844606259201001	deleted@remote.fixture.invalid	2026-07-01 17:35:00	3	\N	2026-07-01 17:35:00
 \.
 
 
@@ -4959,6 +4960,7 @@ COPY public.account_warning_presets (id, created_at, text, title, updated_at) FR
 
 COPY public.account_warnings (id, account_id, action, created_at, overruled_at, report_id, status_ids, target_account_id, text, updated_at) FROM stdin;
 8401	116844606259201002	0	2026-07-01 17:20:00	\N	\N	{116844842188805001}	116844606259201001	Readable fixture moderation warning	2026-07-01 17:20:00
+8402	116844606259201002	0	2026-07-01 17:25:00	\N	\N	{}	116844606259201001	Preserved fixture appeal warning	2026-07-01 17:25:00
 \.
 
 
@@ -5023,6 +5025,7 @@ COPY public.announcement_reactions (id, account_id, announcement_id, created_at,
 --
 
 COPY public.announcements (id, all_day, created_at, ends_at, notification_sent_at, published, published_at, scheduled_at, starts_at, status_ids, text, updated_at) FROM stdin;
+8701	f	2026-07-01 17:36:00	2026-07-03 00:00:00	2026-07-01 17:37:00	t	2026-07-01 17:36:00	\N	2026-07-01 17:36:00	{116844842188805001}	Preserved fixture announcement	2026-07-01 17:37:00
 \.
 
 
@@ -5039,6 +5042,7 @@ COPY public.annual_report_statuses_per_account_counts (id, account_id, statuses_
 --
 
 COPY public.appeals (id, account_id, account_warning_id, approved_at, approved_by_account_id, created_at, rejected_at, rejected_by_account_id, text, updated_at) FROM stdin;
+8702	116844606259201001	8402	\N	\N	2026-07-01 17:38:00	\N	\N	Preserved fixture appeal	2026-07-01 17:38:00
 \.
 
 
@@ -5057,6 +5061,7 @@ schema_sha1	c7b4869d1d9d5614d86e2723464402c4976f6075	2026-07-01 00:00:00	2026-07
 --
 
 COPY public.backups (id, created_at, dump_content_type, dump_file_name, dump_file_size, dump_updated_at, processed, updated_at, user_id) FROM stdin;
+8703	2026-07-01 17:39:00	\N	\N	\N	\N	f	2026-07-01 17:39:00	101
 \.
 
 
@@ -5087,6 +5092,7 @@ COPY public.bookmarks (id, account_id, created_at, status_id, updated_at) FROM s
 --
 
 COPY public.bulk_import_rows (id, bulk_import_id, created_at, data, updated_at) FROM stdin;
+8705	8704	2026-07-01 17:40:30	{"acct": "missing@remote.fixture.invalid"}	2026-07-01 17:40:30
 \.
 
 
@@ -5095,6 +5101,7 @@ COPY public.bulk_import_rows (id, bulk_import_id, created_at, data, updated_at) 
 --
 
 COPY public.bulk_imports (id, account_id, created_at, finished_at, imported_items, likely_mismatched, missing_status, original_filename, overwrite, processed_items, state, total_items, type, updated_at) FROM stdin;
+8704	116844606259201001	2026-07-01 17:40:00	2026-07-01 17:41:00	0	f	f	following.csv	f	1	3	1	0	2026-07-01 17:41:00
 \.
 
 
@@ -5610,7 +5617,7 @@ COPY public.oauth_access_tokens (id, application_id, created_at, expires_in, las
 414	301	2026-07-01 12:00:00	\N	2026-07-01 12:30:00	192.0.2.10	\N	101	\N	read:bookmarks	fixture-bearer-read-bookmarks-v4-6-5
 415	301	2026-07-01 12:00:00	\N	2026-07-01 12:30:00	192.0.2.10	\N	101	\N	read:blocks	fixture-bearer-read-blocks-v4-6-5
 416	301	2026-07-01 12:00:00	\N	2026-07-01 12:30:00	192.0.2.10	\N	101	\N	read:mutes	fixture-bearer-read-mutes-v4-6-5
-417	301	2026-07-01 12:00:00	\N	2026-07-01 12:30:00	192.0.2.10	\N	101	\N	follow	fixture-bearer-follow-v4-6-5
+417	301	2026-07-01 12:00:00	\N	2026-07-01 12:30:00	192.0.2.10	\N	101	\N	follow write:blocks write:mutes	fixture-bearer-follow-v4-6-5
 \.
 
 
@@ -5724,6 +5731,7 @@ COPY public.relays (id, created_at, follow_activity_id, inbox_url, state, update
 --
 
 COPY public.report_notes (id, account_id, content, created_at, report_id, updated_at) FROM stdin;
+8602	116844606259201002	Preserved fixture report note	2026-07-01 17:15:00	8601	2026-07-01 17:15:00
 \.
 
 
@@ -5732,7 +5740,7 @@ COPY public.report_notes (id, account_id, content, created_at, report_id, update
 --
 
 COPY public.reports (id, account_id, action_taken_at, action_taken_by_account_id, application_id, assigned_account_id, category, comment, created_at, forwarded, rule_ids, status_ids, target_account_id, updated_at, uri) FROM stdin;
-8601	116844606259201001	\N	\N	\N	\N	1000	Readable fixture report	2026-07-01 17:10:00	f	\N	{116845105643525105}	116844606259202001	2026-07-01 17:10:00	https://fixture-v4-6-5.rustodon.invalid/users/alice/reports/8601
+8601	116844606259201001	\N	\N	\N	\N	1000	Readable fixture report	2026-07-01 17:10:00	f	\N	{116845105643525105}	116844606259202001	2026-07-01 17:15:00	https://fixture-v4-6-5.rustodon.invalid/users/alice/reports/8601
 \.
 
 
@@ -6678,6 +6686,7 @@ COPY public.users (id, account_id, age_verified_at, approved, chosen_languages, 
 --
 
 COPY public.web_push_subscriptions (id, access_token_id, created_at, data, endpoint, key_auth, key_p256dh, standard, updated_at, user_id) FROM stdin;
+8706	401	2026-07-01 17:42:00	{"policy":"all","alerts":{"mention":true}}	https://fcm.googleapis.com/fcm/send/fixture-alice	eH_C8rq2raXqlcBVDa1gLg==	BEm_a0bdPDhf0SOsrnB2-ategf1hHoCnpXgQsFj5JCkcoMrMt2WHoPfEYOYPzOIs9mZE8ZUaD7VA5vouy0kEkr8=	t	2026-07-01 17:42:00	101
 \.
 
 
@@ -6738,7 +6747,7 @@ SELECT pg_catalog.setval('public.account_domain_blocks_id_seq', 9504, true);
 -- Name: account_migrations_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.account_migrations_id_seq', 1, false);
+SELECT pg_catalog.setval('public.account_migrations_id_seq', 8700, true);
 
 
 --
@@ -6794,7 +6803,7 @@ SELECT pg_catalog.setval('public.account_warning_presets_id_seq', 1, false);
 -- Name: account_warnings_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.account_warnings_id_seq', 8401, true);
+SELECT pg_catalog.setval('public.account_warnings_id_seq', 8402, true);
 
 
 --
@@ -6829,7 +6838,7 @@ SELECT pg_catalog.setval('public.announcement_reactions_id_seq', 1, false);
 -- Name: announcements_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.announcements_id_seq', 1, false);
+SELECT pg_catalog.setval('public.announcements_id_seq', 8701, true);
 
 
 --
@@ -6843,14 +6852,14 @@ SELECT pg_catalog.setval('public.annual_report_statuses_per_account_counts_id_se
 -- Name: appeals_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.appeals_id_seq', 1, false);
+SELECT pg_catalog.setval('public.appeals_id_seq', 8702, true);
 
 
 --
 -- Name: backups_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.backups_id_seq', 1, false);
+SELECT pg_catalog.setval('public.backups_id_seq', 8703, true);
 
 
 --
@@ -6871,14 +6880,14 @@ SELECT pg_catalog.setval('public.bookmarks_id_seq', 9511, true);
 -- Name: bulk_import_rows_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.bulk_import_rows_id_seq', 1, false);
+SELECT pg_catalog.setval('public.bulk_import_rows_id_seq', 8705, true);
 
 
 --
 -- Name: bulk_imports_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.bulk_imports_id_seq', 1, false);
+SELECT pg_catalog.setval('public.bulk_imports_id_seq', 8704, true);
 
 
 --
@@ -7270,7 +7279,7 @@ SELECT pg_catalog.setval('public.relays_id_seq', 1, false);
 -- Name: report_notes_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.report_notes_id_seq', 1, false);
+SELECT pg_catalog.setval('public.report_notes_id_seq', 8602, true);
 
 
 --
@@ -7452,7 +7461,7 @@ SELECT pg_catalog.setval('public.users_id_seq', 107, true);
 -- Name: web_push_subscriptions_id_seq; Type: SEQUENCE SET; Schema: public; Owner: -
 --
 
-SELECT pg_catalog.setval('public.web_push_subscriptions_id_seq', 1, false);
+SELECT pg_catalog.setval('public.web_push_subscriptions_id_seq', 8706, true);
 
 
 --

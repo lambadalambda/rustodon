@@ -202,4 +202,22 @@ raise 'grouped favourite notification fixture is incomplete' unless Notification
 raise 'legacy null-type notification mapping is unreadable' unless Notification.find(10_025).type == :reblog
 raise 'notification grouping stress fixture is incomplete' unless Notification.where(group_key: 'follow-api-moderator-stress').count == 41
 
-puts 'fixture Rails verification passed: notifications, suspended senders, status edits, and local media are readable'
+migration = AccountMigration.find(8700)
+raise 'account migration preservation fixture mismatch' unless migration.account_id == 116_844_606_259_201_001 && migration.target_account_id.nil? && migration.acct == 'deleted@remote.fixture.invalid'
+report = Report.find(8601)
+raise 'report preservation fixture mismatch' unless report.comment == 'Readable fixture report' && report.target_account_id == 116_844_606_259_202_001 && report.updated_at == Time.utc(2026, 7, 1, 17, 15)
+raise 'warning preservation fixture mismatch' unless AccountWarning.find(8401).text == 'Readable fixture moderation warning' && AccountWarning.find(8401).target_account_id == 116_844_606_259_201_001
+raise 'relationship severance preservation fixture mismatch' unless RelationshipSeveranceEvent.find(8301).target_name == 'blocked.fixture.invalid' && SeveredRelationship.find(8303).relationship_severance_event_id == 8301 && AccountRelationshipSeveranceEvent.find(8302).account_id == 116_844_606_259_201_001
+announcement = Announcement.find(8701)
+raise 'announcement preservation fixture mismatch' unless announcement.published? && announcement.text == 'Preserved fixture announcement' && announcement.status_ids == [116_844_842_188_805_001] && announcement.notification_sent_at == Time.utc(2026, 7, 1, 17, 37) && announcement.updated_at == Time.utc(2026, 7, 1, 17, 37)
+appeal = Appeal.find(8702)
+raise 'appeal preservation fixture mismatch' unless appeal.account_warning_id == 8402 && appeal.account_id == 116_844_606_259_201_001 && appeal.pending? && appeal.text == 'Preserved fixture appeal'
+backup = Backup.find(8703)
+raise 'backup preservation fixture mismatch' unless backup.user_id == 101 && !backup.processed? && backup.dump_file_name.nil? && backup.dump_file_size.nil?
+bulk_import = BulkImport.find(8704)
+raise 'bulk import preservation fixture mismatch' unless bulk_import.account_id == 116_844_606_259_201_001 && bulk_import.type == 'following' && bulk_import.state_finished? && bulk_import.imported_items == 0 && bulk_import.processed_items == 1 && bulk_import.rows.find(8705).data == { 'acct' => 'missing@remote.fixture.invalid' }
+raise 'report note preservation fixture mismatch' unless ReportNote.find(8602).content == 'Preserved fixture report note'
+push_subscription = Web::PushSubscription.find(8706)
+raise 'Web Push preservation fixture mismatch' unless push_subscription.user_id == 101 && push_subscription.access_token_id == 401 && push_subscription.standard? && push_subscription.endpoint == 'https://fcm.googleapis.com/fcm/send/fixture-alice' && push_subscription.key_auth == 'eH_C8rq2raXqlcBVDa1gLg==' && push_subscription.key_p256dh == 'BEm_a0bdPDhf0SOsrnB2-ategf1hHoCnpXgQsFj5JCkcoMrMt2WHoPfEYOYPzOIs9mZE8ZUaD7VA5vouy0kEkr8=' && push_subscription.data['policy'] == 'all' && push_subscription.valid?
+
+puts 'fixture Rails verification passed: notifications, preservation rows, suspended senders, status edits, and local media are readable'

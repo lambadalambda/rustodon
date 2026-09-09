@@ -269,6 +269,24 @@ pub struct RestCredentialAccount {
     pub role: RestRole,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RestPreferences {
+    #[serde(rename = "posting:default:visibility")]
+    pub posting_default_visibility: String,
+    #[serde(rename = "posting:default:sensitive")]
+    pub posting_default_sensitive: bool,
+    #[serde(rename = "posting:default:language")]
+    pub posting_default_language: String,
+    #[serde(rename = "posting:default:quote_policy")]
+    pub posting_default_quote_policy: String,
+    #[serde(rename = "reading:expand:media")]
+    pub reading_default_sensitive_media: String,
+    #[serde(rename = "reading:expand:spoilers")]
+    pub reading_default_sensitive_text: bool,
+    #[serde(rename = "reading:autoplay:gifs")]
+    pub reading_autoplay_gifs: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct RestRelationship {
@@ -521,6 +539,16 @@ pub struct RestCollectionWithAccounts {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RestNotificationRequest {
+    pub id: DecimalId,
+    pub created_at: ApiDateTime,
+    pub updated_at: ApiDateTime,
+    pub notifications_count: String,
+    pub account: RestAccount,
+    pub last_status: Option<RestStatus>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RestStatusSource {
     pub id: DecimalId,
     pub text: String,
@@ -736,4 +764,12 @@ pub struct RestMarker {
     pub last_read_id: DecimalId,
     pub version: i32,
     pub updated_at: ApiDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RestConversation {
+    pub id: DecimalId,
+    pub unread: bool,
+    pub accounts: Vec<RestAccount>,
+    pub last_status: Option<RestStatus>,
 }

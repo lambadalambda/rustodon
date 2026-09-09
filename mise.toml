@@ -65,6 +65,10 @@ run = "tools/mastodon-fixture startup-test"
 description = "Run canonical and rejection preflight cases against fixture clones"
 run = "tools/mastodon-fixture preflight-test"
 
+[tasks.cutover-integration]
+description = "Rehearse Rustodon cutover, smoke checks, rollback, and Mastodon reopen"
+run = "tools/mastodon-fixture cutover-test"
+
 [tasks.differential]
 description = "Run all or one Rails-versus-Rust differential compatibility case"
 run = "tools/mastodon-fixture differential-test"

@@ -1,0 +1,148 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    printf '%s\n' \
+        'Usage: RUSTODON_SMOKE_TOKEN=TOKEN tools/rustodon-smoke BASE_URL ACCOUNT_ID USERNAME MEDIA_URL' \
+        '' \
+        'BASE_URL must be the Rustodon web origin.' \
+        'MEDIA_URL must identify one existing local media file; it is checked with HEAD.' \
+        'RUSTODON_SMOKE_DOMAIN may override the host used for the WebFinger resource.' \
+        'RUSTODON_SMOKE_HOST may override the HTTP Host header used for local fixture requests.' \
+        'RUSTODON_SMOKE_CHECK_READY may disable the Rustodon /ready check for Mastodon reopen tests.' \
+        'RUSTODON_SMOKE_FORWARD_PROTO may set the trusted proxy protocol for local HTTPS termination tests.'
+}
+
+fail() {
+    printf 'smoke check failed: %s\n' "$1" >&2
+    exit 1
+}
+
+if [ "$#" -eq 1 ] && [ "$1" = '--help' ]; then
+    usage
+    exit 0
+fi
+
+[ "$#" -eq 4 ] || {
+    usage >&2
+    exit 2
+}
+
+base_url=${1%/}
+account_id=$2
+username=$3
+media_url=$4
+token=${RUSTODON_SMOKE_TOKEN:-}
+token_header_file=''
+
+case "$base_url" in
+    http://*|https://*) ;;
+    *) fail 'BASE_URL must use http or https' ;;
+esac
+base_authority=${base_url#*://}
+case "$base_authority" in
+    ''|*'/'*|*'?'*|*'#'*|*'@'*)
+        fail 'BASE_URL must be an origin without a path, query, fragment, or user info'
+        ;;
+esac
+smoke_domain=${RUSTODON_SMOKE_DOMAIN:-$base_authority}
+smoke_host=${RUSTODON_SMOKE_HOST:-$base_authority}
+check_ready=${RUSTODON_SMOKE_CHECK_READY:-true}
+forwarded_proto=${RUSTODON_SMOKE_FORWARD_PROTO:-}
+case "$smoke_domain" in
+    ''|*'/'*|*'?'*|*'#'*|*'@'*)
+        fail 'RUSTODON_SMOKE_DOMAIN must be a domain without a path, query, fragment, or user info'
+        ;;
+esac
+case "$smoke_host" in
+    ''|*'/'*|*'?'*|*'#'*|*'@'*)
+        fail 'RUSTODON_SMOKE_HOST must be a host without a path, query, fragment, or user info'
+        ;;
+esac
+case "$check_ready" in
+    true|false) ;;
+    *) fail 'RUSTODON_SMOKE_CHECK_READY must be true or false' ;;
+esac
+case "$forwarded_proto" in
+    ''|http|https) ;;
+    *) fail 'RUSTODON_SMOKE_FORWARD_PROTO must be empty, http, or https' ;;
+esac
+[ -n "$token" ] || fail 'RUSTODON_SMOKE_TOKEN is required'
+[ -n "$account_id" ] || fail 'ACCOUNT_ID is required'
+[ -n "$username" ] || fail 'USERNAME is required'
+[ -n "$media_url" ] || fail 'MEDIA_URL is required'
+
+cleanup() {
+    if [ -n "$token_header_file" ]; then
+        rm -f "$token_header_file"
+    fi
+}
+trap cleanup EXIT HUP INT TERM
+umask 077
+token_header_file=$(mktemp "${TMPDIR:-/tmp}/rustodon-smoke.XXXXXX") ||
+    fail 'could not create a temporary authorization header file'
+printf 'Authorization: Bearer %s\n' "$token" > "$token_header_file"
+
+curl_request() {
+    method=$1
+    url=$2
+    shift 2
+    set -- \
+        --silent --show-error --output /dev/null --write-out '%{http_code}' \
+        --connect-timeout 5 --max-time 15 \
+        --header "Host: $smoke_host" "$@"
+    if [ -n "$forwarded_proto" ]; then
+        set -- "$@" --header "X-Forwarded-Proto: $forwarded_proto"
+    fi
+    if [ "$method" = 'HEAD' ]; then
+        set -- "$@" --head
+    else
+        set -- "$@" --request "$method"
+    fi
+    curl "$@" "$url"
+}
+
+expect_public() {
+    label=$1
+    method=$2
+    url=$3
+    shift 3
+    status=$(curl_request "$method" "$url" "$@") || fail "$label could not connect"
+    [ "$status" = '200' ] || fail "$label returned HTTP $status"
+    printf 'ok: %s\n' "$label"
+}
+
+expect_authenticated() {
+    label=$1
+    method=$2
+    url=$3
+    shift 3
+    status=$(curl_request "$method" "$url" \
+        --header "@$token_header_file" "$@") || fail "$label could not connect"
+    [ "$status" = '200' ] || fail "$label returned HTTP $status"
+    printf 'ok: %s\n' "$label"
+}
+
+expect_public 'health' GET "$base_url/health"
+if [ "$check_ready" = true ]; then
+    expect_public 'web readiness' GET "$base_url/ready"
+fi
+expect_public 'instance read' GET "$base_url/api/v1/instance"
+expect_authenticated 'credential authentication' GET \
+    "$base_url/api/v1/accounts/verify_credentials"
+expect_authenticated 'account read' GET "$base_url/api/v1/accounts/$account_id"
+expect_authenticated 'status read' GET \
+    "$base_url/api/v1/accounts/$account_id/statuses?limit=1"
+expect_authenticated 'marker read' GET "$base_url/api/v1/markers"
+
+# An empty marker submission authenticates the write pool without changing a marker row.
+expect_authenticated 'no-op marker write' POST "$base_url/api/v1/markers" \
+    --header 'Content-Type: application/x-www-form-urlencoded' --data ''
+
+expect_public 'local media read' HEAD "$media_url"
+expect_public 'WebFinger discovery' GET "$base_url/.well-known/webfinger" \
+    --get --data-urlencode "resource=acct:$username@$smoke_domain"
+expect_public 'ActivityPub actor discovery' GET "$base_url/users/$username" \
+    --header 'Accept: application/activity+json'
+
+printf '%s\n' 'Rustodon smoke checks passed.'

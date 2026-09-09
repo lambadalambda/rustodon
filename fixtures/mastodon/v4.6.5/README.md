@@ -41,6 +41,10 @@ Pending and unconfirmed local accounts cover account-show suppression. Multi-row
 follow and pin collections, an edited-out media row, and blocked/domain-blocked
 thread members cover read pagination and visibility edges. A silenced local
 viewer's own reply proves context filtering retains self-authored statuses.
+Preservation-only rows cover an unresolved account migration, published
+announcement, pending appeal, unprocessed backup, finished following import
+with a retained failed row, report note, and valid Web Push subscription; SQL
+and Rails verification assert their foreign-key links and values after restore.
 
 ## Test identities
 

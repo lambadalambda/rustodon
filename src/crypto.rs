@@ -11,10 +11,11 @@ use pbkdf2::pbkdf2_hmac;
 use rsa::pkcs1::{DecodeRsaPrivateKey, DecodeRsaPublicKey};
 use rsa::pkcs1v15::{SigningKey, VerifyingKey};
 use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
-use rsa::signature::{Signer, Verifier};
+use rsa::rand_core::{OsRng, RngCore};
+use rsa::signature::{SignatureEncoding, Signer, Verifier};
 use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha1::Sha1;
 use sha2::Sha256;
 use zeroize::Zeroizing;
@@ -28,6 +29,7 @@ const GCM_TAG_LENGTH: usize = 16;
 const SIGNING_CHALLENGE: &[u8] = b"rustodon-preflight-signing-key-check-v1";
 
 /// Required Rails Active Record encryption secrets.
+#[derive(Clone)]
 pub struct ActiveRecordEncryptionConfig {
     primary_key: SecretString,
     deterministic_key: SecretString,
@@ -102,6 +104,39 @@ impl ActiveRecordEncryptionConfig {
             }
             secret_from_utf8(&plaintext)
         }
+    }
+
+    /// Encrypts a UTF-8 string in the compact Rails Active Record envelope format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an opaque encryption or serialization failure without exposing the
+    /// plaintext or key material.
+    pub fn encrypt_string(&self, plaintext: &str) -> Result<String, ActiveRecordEncryptionError> {
+        let mut key = Zeroizing::new([0_u8; AES_KEY_LENGTH]);
+        pbkdf2_hmac::<Sha256>(
+            self.primary_key.expose_secret().as_bytes(),
+            self.key_derivation_salt.expose_secret().as_bytes(),
+            PBKDF2_ITERATIONS,
+            &mut *key,
+        );
+        let cipher = Aes256Gcm::new_from_slice(&key[..])
+            .map_err(|_| ActiveRecordEncryptionError::EncryptionFailed)?;
+        let mut iv = [0_u8; GCM_IV_LENGTH];
+        OsRng.fill_bytes(&mut iv);
+        let mut payload = Zeroizing::new(plaintext.as_bytes().to_vec());
+        let tag = cipher
+            .encrypt_in_place_detached(Nonce::from_slice(&iv), b"", &mut payload)
+            .map_err(|_| ActiveRecordEncryptionError::EncryptionFailed)?;
+        serde_json::to_string(&json!({
+            "p": STANDARD.encode(&*payload),
+            "h": {
+                "iv": STANDARD.encode(iv),
+                "at": STANDARD.encode(tag),
+                "e": STANDARD.encode(b"UTF-8"),
+            },
+        }))
+        .map_err(|_| ActiveRecordEncryptionError::SerializationFailed)
     }
 }
 
@@ -184,6 +219,26 @@ impl fmt::Display for ActiveRecordDecryptionError {
 }
 
 impl Error for ActiveRecordDecryptionError {}
+
+/// Safe Rails encrypted-string encryption failure classes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActiveRecordEncryptionError {
+    /// AES-GCM could not encrypt the plaintext.
+    EncryptionFailed,
+    /// The compact envelope could not be serialized.
+    SerializationFailed,
+}
+
+impl fmt::Display for ActiveRecordEncryptionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::EncryptionFailed => "encrypted-string encryption failed",
+            Self::SerializationFailed => "encrypted-string serialization failed",
+        })
+    }
+}
+
+impl Error for ActiveRecordEncryptionError {}
 
 struct Envelope {
     payload: Vec<u8>,
@@ -437,4 +492,30 @@ fn parse_public_key(pem: &str) -> Result<RsaPublicKey, RsaKeyError> {
     RsaPublicKey::from_public_key_pem(pem)
         .or_else(|_| RsaPublicKey::from_pkcs1_pem(pem))
         .map_err(|_| RsaKeyError::CorruptPublicKey)
+}
+
+pub(crate) fn sign_rsa_sha256(pem: &str, message: &[u8]) -> Result<Vec<u8>, RsaKeyError> {
+    let private_key = parse_private_key(pem)?;
+    private_key
+        .validate()
+        .map_err(|_| RsaKeyError::CorruptPrivateKey)?;
+
+    SigningKey::<Sha256>::new(private_key)
+        .try_sign(message)
+        .map(|signature| signature.to_vec())
+        .map_err(|_| RsaKeyError::SigningFailed)
+}
+
+pub(crate) fn verify_rsa_sha256(
+    pem: &str,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), RsaKeyError> {
+    let public_key = parse_public_key(pem)?;
+    let signature = rsa::pkcs1v15::Signature::try_from(signature)
+        .map_err(|_| RsaKeyError::SignatureVerificationFailed)?;
+
+    VerifyingKey::<Sha256>::new(public_key)
+        .verify(message, &signature)
+        .map_err(|_| RsaKeyError::SignatureVerificationFailed)
 }

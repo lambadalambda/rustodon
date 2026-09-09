@@ -80,6 +80,7 @@ pub fn operational_failure() -> Diagnostic {
 /// Validates all production runtime requirements without Redis or persistent side effects.
 pub async fn validate(config: &Config) -> StartupReport {
     let mut diagnostics = preflight::runtime_diagnostics(config).await;
+    diagnostics.extend(preflight::writer_diagnostics(config).await);
     let operational = async {
         let options = preflight::postgres_options(config).map_err(|_| ())?;
         let mut connection = tokio::time::timeout(
@@ -89,6 +90,17 @@ pub async fn validate(config: &Config) -> StartupReport {
         .await
         .map_err(|_| ())?
         .map_err(|_| ())?;
+        if let Some(writer) = config
+            .write_database
+            .as_ref()
+            .and_then(preflight::postgres_username_for)
+        {
+            sqlx::query("SELECT pg_catalog.set_config('rustodon.writer_role', $1, false)")
+                .bind(writer)
+                .execute(&mut connection)
+                .await
+                .map_err(|_| ())?;
+        }
         operational_schema::validate(&mut connection)
             .await
             .map_err(|_| ())

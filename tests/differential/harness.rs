@@ -83,6 +83,11 @@ impl RequestSpec {
             body,
         })
     }
+
+    pub(crate) fn with_query(mut self, query: impl Into<String>) -> Self {
+        self.query = Some(query.into());
+        self
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +162,23 @@ pub(crate) async fn send_identically(
         mastodon: mastodon?,
         rust: rust?,
     })
+}
+
+pub(crate) async fn send_single(
+    target: &Url,
+    request: &RequestSpec,
+    side: &'static str,
+) -> Result<CapturedResponse, HarnessError> {
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .pool_max_idle_per_host(0)
+        .build()
+        .map_err(HarnessError::Client)?;
+    let target_request = build_request(&client, target, request)?;
+    send_one(&client, target_request, side).await
 }
 
 fn build_request(

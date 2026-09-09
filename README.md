@@ -11,10 +11,11 @@ cache state.
 
 ## Status
 
-Rustodon is in its initial read-only compatibility phase. A production Axum web
-process now serves Mastodon 4.6.5 account, status, relationship, timeline,
-collection, and instance reads directly from PostgreSQL, but writes,
-federation, workers, and operations are not complete enough for a cutover.
+Rustodon now covers the core authenticated REST, local media, durable worker,
+and ActivityPub paths against the Mastodon 4.6.5 fixture. The matching Mastodon
+4.6.5 web bundle is now packaged and served, but cutover is not yet complete:
+a live Mastodon peer, browser/mobile startup proof, full failure hardening, and
+the complete acceptance matrix remain outstanding.
 
 The first compatibility target is Mastodon 4.6.5. Supporting one stable schema
 first keeps the initial implementation testable; additional Mastodon releases
@@ -51,7 +52,9 @@ the full Mastodon administration surface are intentionally deferred. Existing
 quote and collection data remains readable and preserved.
 
 See [the detailed v1 scope](docs/v1-scope.md) for the compatibility boundary,
-implementation order, and acceptance criteria.
+implementation order, and acceptance criteria. See the [v1 acceptance
+matrix](docs/v1-acceptance-matrix.md) for requirement traceability and current
+proof status.
 
 ## Development
 
@@ -80,10 +83,14 @@ mise run deny
 
 The `rustodon::mastodon` library exposes focused PostgreSQL reads for the v1
 account, status, relationship, notification, policy, setting, quote,
-collection, poll, and signing-key data. It is intentionally read-only: its
-SQLx pool is private, connections default to UTC/read-only operation, normal
-status reads exclude soft-deleted rows, and there are no save, update, callback,
-or generic ORM APIs. IDs remain signed `i64` values and open wrappers retain
+collection, poll, and signing-key data. The read repository remains intentionally
+read-only: its SQLx pool is private, connections default to UTC/read-only
+operation, normal status reads exclude soft-deleted rows, and there are no save,
+update, callback, or generic ORM APIs. A separate typed writer boundary now
+covers authenticated marker, status, media, relationship, notification, policy,
+profile, conversation, and OAuth app transactions. It is wired into the web
+process when an optional writer pool is configured while the default runtime
+remains read-only. IDs remain signed `i64` values and open wrappers retain
 unknown enum strings/integers and permission bits.
 
 SQLx is built only for PostgreSQL with Tokio, Chrono, JSON, and `inet` support;
@@ -110,21 +117,32 @@ disabled translation languages, account show/lookup/search/credentials/
 relationships, account statuses/followers/following, markers, status
 show/source/history/context, reverse favourite/boost actor reads,
 account filters/lists/featured tags, public account featured tags,
-PostgreSQL-backed home/public/tag/list timelines, and
-favourites/bookmarks/blocks/mutes. Root status authorization is kept separate
-from account-status and context filtering;
+PostgreSQL-backed home/public/tag/list timelines, favourites/bookmarks/blocks/
+mutes, app registration/application verification, and v1/v2 notification index,
+unread-count, and show reads. Root status
+authorization is kept separate from account-status and context filtering;
 public, unlisted, private, direct, and limited visibility is checked against
 current follows, active or silent mentions, blocks, domain blocks, suspended
 authors, and soft deletion. Pagination and authorization are differentially
 checked against Mastodon 4.6.5 through dedicated fixture cases.
 
 The router also centralizes Mastodon-compatible REST protocol behavior for its
- explicit 34-route inventory: CORS and preflight handling, trailing slashes,
-cache and `Vary` headers, JSON error envelopes, the 99 MiB body limit, and
-endpoint cursor contracts. Query, form, and registered JSON request bodies use
-bounded Rack-compatible scalar/array/hash parsing, including Rails parameter
-limits and malformed-shape behavior. Unsupported routes are never advertised
-by preflight responses.
+explicit 104-route inventory: CORS and preflight handling, trailing slashes,
+cache and `Vary` headers, JSON error envelopes, a 4 MiB public-request cap,
+authenticated 99 MiB body limits, and a bounded 30-second body-read deadline,
+and endpoint cursor contracts. Recognized required routes admit larger bodies
+only after header or query bearer authentication; browser profile uploads first
+require a valid session. Query,
+form, and registered JSON request bodies use bounded Rack-compatible
+scalar/array/hash parsing, including Rails parameter limits and malformed-shape
+behavior. Unsupported routes are never advertised by preflight responses.
+
+The root web surface serves the pinned production Vite bundle from
+`public/packs`, including hashed chunks, themes, locales, icons, the PWA
+manifest, favicon, and service worker. It renders the Mastodon shell with
+escaped initial state, CSRF/VAPID metadata, and guarded SPA deep-link fallback.
+The bundle provenance and checksums are recorded in
+[`public/packs/BUILD.md`](public/packs/BUILD.md).
 
 The web process also serves database-referenced local Paperclip media from the
 existing filesystem tree. Account avatars and headers, media files and
@@ -209,6 +227,7 @@ mise run differential -- status_authorization_matrix
 mise run differential -- core_rest_serializers
 mise run differential -- rest_protocol_contracts
 mise run differential -- federation_discovery
+mise run differential -- local_web_client_shell
 ```
 
 Mismatch output identifies the status, header, JSON path, table/key, or media
@@ -227,10 +246,18 @@ remediation hints. It is read-only against PostgreSQL and Redis and performs no
 media writes. The minimal environment surface is:
 
 - `LOCAL_DOMAIN`, optional `WEB_DOMAIN` and `ALTERNATE_DOMAINS`
+- optional `LIMITED_FEDERATION_MODE=true` (or legacy `WHITELIST_MODE=true`) to
+  use the Mastodon domain allow-list
 - `PRIMARY_DATABASE_URL`, `DATABASE_URL`, or Mastodon's `DB_*` variables
+- optional explicit `WRITE_DATABASE_URL` for the separate typed writer pool;
+  omitting it preserves the read-only web default
 - absolute `PAPERCLIP_ROOT_PATH` and optional `PAPERCLIP_ROOT_URL`
 - optional explicit `TRUSTED_PROXY_IP` CIDRs and SMTP variables; forwarded
   metadata is ignored when no trusted proxies are configured
+- optional `USER_ACTIVE_DAYS` to match Mastodon's configurable active-follower
+  notification window (default `7`)
+- ActivityPub inbox requests are bounded to `300` per trusted client IP in five
+  minutes before body buffering or signature-key work
 - `SECRET_KEY_BASE` and the three `ACTIVE_RECORD_ENCRYPTION_*` secrets
 - optional `SIDEKIQ_REDIS_*` or `REDIS_*` settings for the queue-drain check
 
@@ -248,9 +275,9 @@ rustodon admin migrate-operational-schema
 
 The command is transactional and idempotent. It serializes with Rustodon and
 Active Record migrations, validates the pinned Mastodon schema before and after
-DDL, and creates only `rustodon.schema_migrations` plus the six operational
+DDL, and creates only `rustodon.schema_migrations` plus the eight operational
 tables for durable jobs, outbox events, idempotency keys, ordering markers,
-domain health, and process heartbeats. It never performs automatic web-startup
+domain health, process heartbeats, shared rate-limit windows, and remote-fetch leases. It never performs automatic web-startup
 DDL or changes objects under `public`. The migration role needs database
 `CONNECT` and `CREATE`, `USAGE` on `public`, and `SELECT` on its tables and
 sequences; it does not need superuser, role-management, or Mastodon write
@@ -261,11 +288,10 @@ migration, an administrator must revoke inherited database/schema creation
 rights and grant the runtime role only Mastodon reads plus Rustodon's operational
 DML and identity-sequence use. Worker startup validates that exact boundary,
 including direct and `PUBLIC` grants, and refuses privileged or drifted roles.
-The built-in process currently registers only the maintenance handler, so
-`WORKER_LANES` defaults to `maintenance`; configuring a lane without a registered
-handler fails startup rather than publishing false readiness. Later feature
-milestones register ingress, core, push, pull, and mail handlers with their
-corresponding lanes.
+The production process registers maintenance, core, push, pull, and mail
+handlers when their corresponding dependencies are configured. `WORKER_LANES`
+defaults to the configured supported set; configuring a lane without a
+registered handler fails startup rather than publishing false readiness.
 
 Operational inspection is available through:
 
@@ -280,6 +306,10 @@ repeat the job.
 See the [fixture documentation](fixtures/mastodon/v4.6.5/README.md) for test
 identities, key/media provenance, normalization, and the later-release update
 process.
+
+The operational cutover sequence, smoke checks, rollback triggers, and
+Mastodon restart procedure are documented in
+[`docs/cutover.md`](docs/cutover.md).
 
 Inspect the planned process modes with:
 

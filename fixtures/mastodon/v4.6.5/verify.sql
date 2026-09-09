@@ -397,7 +397,8 @@ BEGIN
      OR NOT EXISTS (SELECT 1 FROM statuses_tags WHERE status_id = 116845314048005201 AND tag_id = 9201)
      OR NOT EXISTS (SELECT 1 FROM oauth_access_tokens WHERE id = 412 AND scopes = 'read:lists')
      OR NOT EXISTS (SELECT 1 FROM oauth_access_tokens WHERE id = 416 AND scopes = 'read:mutes')
-     OR NOT EXISTS (SELECT 1 FROM oauth_access_tokens WHERE id = 417 AND scopes = 'follow') THEN
+      OR NOT EXISTS (SELECT 1 FROM oauth_access_tokens
+        WHERE id = 417 AND scopes = 'follow write:blocks write:mutes') THEN
     RAISE EXCEPTION 'timeline and collection compatibility controls are incomplete';
   END IF;
 
@@ -602,6 +603,74 @@ BEGIN
        OR n.from_account_id <> expected.from_account_id
   ) THEN
     RAISE EXCEPTION 'notification activity association/from-account contract is incoherent';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM account_migrations
+    WHERE id = 8700 AND account_id = 116844606259201001
+      AND acct = 'deleted@remote.fixture.invalid'
+      AND followers_count = 3 AND target_account_id IS NULL
+  ) OR NOT EXISTS (
+    SELECT 1 FROM reports
+    WHERE id = 8601 AND account_id = 116844606259201001
+      AND target_account_id = 116844606259202001
+      AND comment = 'Readable fixture report'
+      AND updated_at = TIMESTAMP '2026-07-01 17:15:00'
+  ) OR NOT EXISTS (
+    SELECT 1 FROM account_warnings
+    WHERE id = 8401 AND account_id = 116844606259201002
+      AND target_account_id = 116844606259201001
+      AND text = 'Readable fixture moderation warning'
+  ) OR NOT EXISTS (
+    SELECT 1 FROM relationship_severance_events
+    WHERE id = 8301 AND target_name = 'blocked.fixture.invalid' AND purged = false
+  ) OR NOT EXISTS (
+    SELECT 1 FROM severed_relationships
+    WHERE id = 8303 AND relationship_severance_event_id = 8301
+      AND local_account_id = 116844606259201001
+      AND remote_account_id = 116844606259202002
+  ) OR NOT EXISTS (
+    SELECT 1 FROM account_relationship_severance_events
+    WHERE id = 8302 AND account_id = 116844606259201001
+      AND relationship_severance_event_id = 8301
+  ) OR NOT EXISTS (
+    SELECT 1 FROM announcements
+    WHERE id = 8701 AND published AND text = 'Preserved fixture announcement'
+      AND status_ids = ARRAY[116844842188805001]::bigint[]
+      AND notification_sent_at = TIMESTAMP '2026-07-01 17:37:00'
+      AND updated_at = TIMESTAMP '2026-07-01 17:37:00'
+  ) OR NOT EXISTS (
+    SELECT 1 FROM appeals
+    WHERE id = 8702 AND account_id = 116844606259201001
+      AND account_warning_id = 8402 AND text = 'Preserved fixture appeal'
+      AND approved_at IS NULL AND rejected_at IS NULL
+  ) OR NOT EXISTS (
+    SELECT 1 FROM backups
+    WHERE id = 8703 AND user_id = 101 AND processed = false
+      AND dump_content_type IS NULL AND dump_file_name IS NULL
+      AND dump_file_size IS NULL AND dump_updated_at IS NULL
+  ) OR NOT EXISTS (
+    SELECT 1 FROM bulk_imports
+    WHERE id = 8704 AND account_id = 116844606259201001
+      AND type = 0 AND state = 3 AND original_filename = 'following.csv'
+      AND total_items = 1 AND imported_items = 0 AND processed_items = 1
+  ) OR NOT EXISTS (
+    SELECT 1 FROM bulk_import_rows
+    WHERE id = 8705 AND bulk_import_id = 8704
+      AND data = '{"acct":"missing@remote.fixture.invalid"}'::jsonb
+  ) OR NOT EXISTS (
+    SELECT 1 FROM report_notes
+    WHERE id = 8602 AND account_id = 116844606259201002
+      AND report_id = 8601 AND content = 'Preserved fixture report note'
+  ) OR NOT EXISTS (
+    SELECT 1 FROM web_push_subscriptions
+    WHERE id = 8706 AND access_token_id = 401 AND user_id = 101
+      AND standard AND endpoint = 'https://fcm.googleapis.com/fcm/send/fixture-alice'
+      AND key_auth = 'eH_C8rq2raXqlcBVDa1gLg=='
+      AND key_p256dh = 'BEm_a0bdPDhf0SOsrnB2-ategf1hHoCnpXgQsFj5JCkcoMrMt2WHoPfEYOYPzOIs9mZE8ZUaD7VA5vouy0kEkr8='
+      AND data->>'policy' = 'all'
+  ) THEN
+    RAISE EXCEPTION 'Mastodon-owned preservation rows are incomplete';
   END IF;
 END
 $$;
