@@ -1962,6 +1962,16 @@ EOF
   cutover_web_pid=$!
   wait_for_http "http://127.0.0.1:$cutover_web_port/health"
   wait_for_http "http://127.0.0.1:$cutover_web_port/ready"
+  case "${RUSTODON_BROWSER_SMOKE:-false}" in
+    true)
+      RUSTODON_BROWSER_RECORD="${RUSTODON_BROWSER_RECORD:-}" \
+        RUSTODON_BROWSER_SCREENSHOT="${RUSTODON_BROWSER_SCREENSHOT:-}" \
+        "$ROOT/tools/rustodon-browser-smoke" \
+        "http://$LOCAL_DOMAIN:$cutover_web_port" "$LOCAL_DOMAIN"
+      ;;
+    false) ;;
+    *) die 'RUSTODON_BROWSER_SMOKE must be true or false' ;;
+  esac
   RUSTODON_SMOKE_DOMAIN="$LOCAL_DOMAIN" \
     RUSTODON_SMOKE_HOST="$LOCAL_DOMAIN" \
     RUSTODON_SMOKE_TOKEN='fixture-bearer-token-v4-6-5' \

@@ -13,9 +13,10 @@ cache state.
 
 Rustodon now covers the core authenticated REST, local media, durable worker,
 and ActivityPub paths against the Mastodon 4.6.5 fixture. The matching Mastodon
-4.6.5 web bundle is now packaged and served, but cutover is not yet complete:
-a live Mastodon peer, browser/mobile startup proof, full failure hardening, and
-the complete acceptance matrix remain outstanding.
+4.6.5 web bundle is now packaged and served, and browser startup/navigation is
+proven locally, but cutover is not yet complete: a live Mastodon peer,
+mobile-client startup proof, full failure hardening, and the complete acceptance
+matrix remain outstanding.
 
 The first compatibility target is Mastodon 4.6.5. Supporting one stable schema
 first keeps the initial implementation testable; additional Mastodon releases
@@ -188,6 +189,7 @@ mise run operational-schema-integration
 mise run worker-integration
 mise run preflight-integration
 mise run differential
+mise run browser-integration
 ```
 
 The first restores the checked dump and verifies it through SQL and Mastodon
@@ -237,6 +239,12 @@ tokens before replacing them. The harness compares observable contracts, not
 Rails callbacks, SQL ordering, Redis keys, or Sidekiq payload representation.
 Its databases, media roots, Redis, and HTTP ports are run-marked test resources
 under `target/`; production-looking URLs and unmarked paths are rejected.
+
+The opt-in browser task runs the Rustodon web process inside the cutover fixture,
+drives the pinned frontend in Chromium through `agent-browser`, and checks the
+React mount, Mastodon app body, SPA deep-link navigation, and browser page
+errors. Set `RUSTODON_BROWSER_RECORD` to a WebM path and
+`RUSTODON_BROWSER_SCREENSHOT` to a PNG path when retaining operator evidence.
 
 Before a cutover, run `rustodon preflight` with the Mastodon production
 environment. It exits nonzero for unsupported configuration, schema drift,

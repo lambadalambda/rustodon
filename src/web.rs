@@ -35,7 +35,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_perc
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tower_http::services::{ServeDir, ServeFile};
-use url::Url;
+use url::{Host, Url};
 
 use crate::jobs::{ACTIVITYPUB_INBOX_JOB_KIND, JobError, JobSpec, Lane, Queue};
 use crate::mail::MailConfig;
@@ -1025,10 +1025,14 @@ fn header_text<'a>(
     headers: &'a HeaderMap,
     name: &'static str,
 ) -> Result<Option<&'a str>, ForwardedHeaderError> {
-    headers
-        .get(name)
-        .map(|value| value.to_str().map_err(|_| ForwardedHeaderError))
-        .transpose()
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(ForwardedHeaderError);
+    }
+    value.to_str().map(Some).map_err(|_| ForwardedHeaderError)
 }
 const RAILS_PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'!')
@@ -6416,6 +6420,39 @@ fn raw_response(status: StatusCode, content_type: &str, body: Vec<u8>) -> Respon
         .expect("federation response headers are valid")
 }
 
+fn request_host_authority(value: &str) -> Option<(String, Option<u16>)> {
+    let url = Url::parse(&format!("http://{value}")).ok()?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let host = match url.host()? {
+        Host::Domain(domain) => domain.to_ascii_lowercase(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => format!("[{address}]"),
+    };
+    Some((host, url.port()))
+}
+
+fn request_host_matches_allowed(host: &str, allowed_hosts: &[String]) -> bool {
+    let Some((host, port)) = request_host_authority(host) else {
+        return false;
+    };
+    allowed_hosts.iter().any(|allowed| {
+        let Some((allowed_host, allowed_port)) = request_host_authority(allowed) else {
+            return false;
+        };
+        host == allowed_host
+            && (allowed_port.is_none()
+                || allowed_port == port
+                || port.is_none() && matches!(allowed_port, Some(80 | 443)))
+    })
+}
+
 async fn request_context(
     State(state): State<WebState>,
     mut request: Request,
@@ -6446,17 +6483,16 @@ async fn request_context(
         );
     };
     if has_peer && !matches!(request.uri().path(), "/health" | "/ready") {
-        let direct_host = request
-            .headers()
-            .get(HOST)
-            .and_then(|value| value.to_str().ok());
+        let Ok(direct_host) = header_text(request.headers(), "host") else {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                br#"{"error":"Invalid request host header"}"#.to_vec(),
+            );
+        };
         let effective_host = metadata.host.as_deref().or(direct_host);
-        if effective_host.is_none_or(|host| {
-            !state
-                .allowed_hosts
-                .iter()
-                .any(|allowed| host.eq_ignore_ascii_case(allowed))
-        }) {
+        if effective_host
+            .is_none_or(|host| !request_host_matches_allowed(host, &state.allowed_hosts))
+        {
             return json_response(
                 StatusCode::MISDIRECTED_REQUEST,
                 br#"{"error":"Unrecognized request host"}"#.to_vec(),
@@ -18391,6 +18427,20 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_forwarded_headers_fail_closed() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "x-forwarded-host",
+            HeaderValue::from_static("social.example"),
+        );
+        headers.append(
+            "x-forwarded-host",
+            HeaderValue::from_static("attacker.example"),
+        );
+        assert!(header_text(&headers, "x-forwarded-host").is_err());
+    }
+
+    #[test]
     fn malformed_forwarding_from_a_trusted_peer_fails_closed() {
         let trusted = ["10.0.0.0/8".parse().unwrap()];
         let mut headers = HeaderMap::new();
@@ -18399,16 +18449,45 @@ mod tests {
     }
 
     #[test]
-    fn request_hosts_are_compared_as_exact_authorities() {
+    fn request_hosts_preserve_domain_and_explicit_port_boundaries() {
         let allowed = ["social.example".to_owned(), "web.example:8443".to_owned()];
-        assert!(
-            allowed
-                .iter()
-                .any(|host| host.eq_ignore_ascii_case("SOCIAL.EXAMPLE"))
-        );
-        assert!(allowed.iter().any(|host| host == "web.example:8443"));
-        assert!(!allowed.iter().any(|host| host == "web.example"));
-        assert!(!allowed.iter().any(|host| host == "social.example.evil"));
+        assert!(request_host_matches_allowed(
+            "social.example:18790",
+            &allowed
+        ));
+        assert!(request_host_matches_allowed(
+            "SOCIAL.EXAMPLE:18790",
+            &allowed
+        ));
+        assert!(request_host_matches_allowed("web.example:8443", &allowed));
+        assert!(!request_host_matches_allowed("web.example", &allowed));
+        assert!(!request_host_matches_allowed("web.example:443", &allowed));
+        assert!(!request_host_matches_allowed(
+            "social.example.evil:18790",
+            &allowed
+        ));
+        assert!(!request_host_matches_allowed(
+            "social.example@evil:18790",
+            &allowed
+        ));
+        assert!(!request_host_matches_allowed(
+            "social.example/path",
+            &allowed
+        ));
+
+        let default_port = ["default.example:443".to_owned()];
+        assert!(request_host_matches_allowed(
+            "default.example",
+            &default_port
+        ));
+        assert!(request_host_matches_allowed(
+            "default.example:443",
+            &default_port
+        ));
+        assert!(!request_host_matches_allowed(
+            "default.example:8443",
+            &default_port
+        ));
     }
 
     #[test]

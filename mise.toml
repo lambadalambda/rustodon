@@ -69,6 +69,10 @@ run = "tools/mastodon-fixture preflight-test"
 description = "Rehearse Rustodon cutover, smoke checks, rollback, and Mastodon reopen"
 run = "tools/mastodon-fixture cutover-test"
 
+[tasks.browser-integration]
+description = "Run Chromium startup and SPA navigation against the cutover fixture"
+run = "RUSTODON_BROWSER_SMOKE=true tools/mastodon-fixture cutover-test"
+
 [tasks.differential]
 description = "Run all or one Rails-versus-Rust differential compatibility case"
 run = "tools/mastodon-fixture differential-test"

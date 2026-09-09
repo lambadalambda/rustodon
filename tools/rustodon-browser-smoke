@@ -1,0 +1,147 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    printf '%s\n' \
+        'Usage: tools/rustodon-browser-smoke BASE_URL HOST' \
+        '' \
+        'BASE_URL must be the local Rustodon web origin.' \
+        'HOST is the configured Rustodon LOCAL_DOMAIN.' \
+        'RUSTODON_BROWSER_RECORD may name a WebM recording path.' \
+        'RUSTODON_BROWSER_SCREENSHOT may name a PNG screenshot path.'
+}
+
+fail() {
+    printf 'browser smoke failed: %s\n' "$1" >&2
+    exit 1
+}
+
+if [ "$#" -eq 1 ] && [ "$1" = '--help' ]; then
+    usage
+    exit 0
+fi
+
+[ "$#" -eq 2 ] || {
+    usage >&2
+    exit 2
+}
+
+base_url=${1%/}
+host=$2
+case "$base_url" in
+    http://*|https://*) ;;
+    *) fail 'BASE_URL must use http or https' ;;
+esac
+base_authority=${base_url#*://}
+case "$base_authority" in
+    ''|*'/'*|*'?'*|*'#'*|*'@'*)
+        fail 'BASE_URL must be an origin without a path, query, fragment, or user info'
+        ;;
+esac
+case "$host" in
+    ''|*'/'*|*'?'*|*'#'*|*'@'*|*'"'*)
+        fail 'HOST must be an authority without a path, query, fragment, user info, or quotes'
+        ;;
+esac
+command -v agent-browser >/dev/null 2>&1 || fail 'agent-browser is required'
+
+session=$(agent-browser session id --scope worktree --prefix rustodon-browser)
+browser_args="--host-resolver-rules=MAP $host 127.0.0.1"
+record_path=${RUSTODON_BROWSER_RECORD:-}
+recording=false
+
+browser() {
+    agent-browser \
+        --session "$session" \
+        --pin-tab \
+        --args "$browser_args" \
+        "$@"
+}
+
+cleanup() {
+    if [ "$recording" = true ]; then
+        browser record stop >/dev/null 2>&1 || true
+    fi
+    browser close >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [ -n "$record_path" ]; then
+    command -v ffmpeg >/dev/null 2>&1 || fail 'ffmpeg is required when RUSTODON_BROWSER_RECORD is set'
+    mkdir -p "$(dirname "$record_path")"
+    browser record start "$record_path" >/dev/null
+    recording=true
+fi
+
+browser network requests --clear >/dev/null
+browser open "$base_url/" >/dev/null
+browser wait --load networkidle >/dev/null
+browser wait --fn "Boolean(document.querySelector('#mastodon'))" >/dev/null
+
+debug_dump() {
+    if [ "${RUSTODON_BROWSER_DEBUG:-false}" = true ]; then
+        printf 'browser scripts: '
+        browser eval 'JSON.stringify([...document.scripts].map(script => ({src: script.src, type: script.type})))'
+        printf 'browser packs: %s\n' "$(browser network requests --filter '/packs/')"
+        printf 'browser errors: %s\n' "$(browser errors)"
+        printf 'browser console: %s\n' "$(browser console)"
+    fi
+}
+
+assert_mount() {
+    mount_count=$(browser get count '#mastodon' | tr -d '\r\n')
+    [ "$mount_count" = 1 ] || fail "expected one #mastodon mount, got $mount_count"
+    mount_ready=$(browser eval "Boolean(document.querySelector('#mastodon > :not(noscript)'))")
+    case "$mount_ready" in
+        true) ;;
+        *)
+            debug_dump
+            fail 'Mastodon React mount did not replace the JavaScript fallback'
+            ;;
+    esac
+    mount_text=$(browser get text '#mastodon')
+    case "$mount_text" in
+        '')
+            debug_dump
+            fail 'Mastodon React mount rendered no visible content'
+            ;;
+    esac
+}
+
+assert_mount
+body_class=$(browser eval 'document.body.className')
+case "$body_class" in
+    *app-body*) ;;
+    *) fail "Mastodon app body class is missing: $body_class" ;;
+esac
+
+if [ -n "${RUSTODON_BROWSER_SCREENSHOT:-}" ]; then
+    mkdir -p "$(dirname "$RUSTODON_BROWSER_SCREENSHOT")"
+    browser screenshot "$RUSTODON_BROWSER_SCREENSHOT" >/dev/null
+fi
+
+browser pushstate "$base_url/about" >/dev/null
+browser wait --load networkidle >/dev/null
+current_url=$(browser get url)
+case "$current_url" in
+    "$base_url/about"|"$base_url/about/"*) ;;
+    *) fail "SPA deep-link navigation ended at $current_url" ;;
+esac
+browser wait --fn "Boolean(document.querySelector('#mastodon'))" >/dev/null
+assert_mount
+
+page_errors=$(browser errors --clear)
+case "$page_errors" in
+    ''|*'No page errors'*) ;;
+    *) fail "browser page errors: $page_errors" ;;
+esac
+
+if [ "$recording" = true ]; then
+    browser record stop >/dev/null || fail "browser recording could not be finalized: $record_path"
+    recording=false
+fi
+
+printf 'browser web-client smoke passed: mount, app body, SPA deep link, and page errors\n'

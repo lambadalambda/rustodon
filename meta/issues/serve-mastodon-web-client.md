@@ -25,12 +25,19 @@ Package and serve the exact Mastodon 4.6.5 frontend contract.
   expired browser-session tokens, and restricted remote media proxy MIME types.
 - Added unit coverage, authenticated-shell coverage, and the guarded
   `local_web_client_shell` router case.
+- Added the opt-in `mise run browser-integration` gate. It runs the real web
+  process in the cutover fixture and drives Chromium through `agent-browser` to
+  verify the React mount, app body, SPA deep-link navigation, and page errors;
+  optional WebM and PNG paths retain operator evidence.
+- The browser-backed startup/navigation run passes with a PNG screenshot on the
+  current Linux host. WebM capture is available when `ffmpeg` is installed;
+  mobile-client recording remains external acceptance work.
 
 ## Acceptance Criteria
 
 - The pinned frontend and a recorded mobile-client version complete startup and
-  normal navigation against Rustodon. The mobile-client recording and a
-  browser-backed startup/navigation run remain outstanding.
+  normal navigation against Rustodon. Browser-backed startup/navigation is
+  locally proven; the mobile-client recording remains outstanding.
 - Full Rails `Web::Setting` persistence, Web Push subscription management, and
   non-English locale parity remain outside the current v1 web-client slice;
   essential account settings continue through the Rust REST surface.
