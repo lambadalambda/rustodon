@@ -186,6 +186,32 @@ impl PaperclipWriteFault {
     }
 }
 
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+pub struct PaperclipCommitFault {
+    fail_before_commit: AtomicBool,
+    fail_after_commit: AtomicBool,
+}
+
+#[cfg(feature = "test-support")]
+impl PaperclipCommitFault {
+    #[must_use]
+    pub fn before_and_after() -> Self {
+        Self {
+            fail_before_commit: AtomicBool::new(true),
+            fail_after_commit: AtomicBool::new(true),
+        }
+    }
+
+    fn take_before_commit(&self) -> bool {
+        self.fail_before_commit.swap(false, Ordering::AcqRel)
+    }
+
+    fn take_after_commit(&self) -> bool {
+        self.fail_after_commit.swap(false, Ordering::AcqRel)
+    }
+}
+
 type ProcessedGif = (Vec<u8>, Option<Vec<u8>>, u32, u32);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -685,6 +711,8 @@ pub struct PaperclipRoot {
     directory: Arc<OwnedFd>,
     #[cfg(feature = "test-support")]
     write_fault: Option<Arc<PaperclipWriteFault>>,
+    #[cfg(feature = "test-support")]
+    commit_fault: Option<Arc<PaperclipCommitFault>>,
 }
 
 impl PaperclipRoot {
@@ -729,6 +757,8 @@ impl PaperclipRoot {
             directory: Arc::new(directory),
             #[cfg(feature = "test-support")]
             write_fault: None,
+            #[cfg(feature = "test-support")]
+            commit_fault: None,
         })
     }
 
@@ -737,6 +767,27 @@ impl PaperclipRoot {
     pub fn with_write_fault(mut self, fault: PaperclipWriteFault) -> Self {
         self.write_fault = Some(Arc::new(fault));
         self
+    }
+
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_commit_fault(mut self, fault: PaperclipCommitFault) -> Self {
+        self.commit_fault = Some(Arc::new(fault));
+        self
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn take_commit_before_fault(&self) -> bool {
+        self.commit_fault
+            .as_ref()
+            .is_some_and(|fault| fault.take_before_commit())
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn take_commit_after_fault(&self) -> bool {
+        self.commit_fault
+            .as_ref()
+            .is_some_and(|fault| fault.take_after_commit())
     }
 
     /// Opens a regular file beneath this root without following any symlink component or updating

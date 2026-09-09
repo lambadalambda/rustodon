@@ -29,11 +29,11 @@ use rustodon::mastodon::{
     sign_http_signature_with_headers,
 };
 use rustodon::operational_schema::{MigrationError, validate};
-#[cfg(feature = "test-support")]
-use rustodon::paperclip::PaperclipWriteFault;
 use rustodon::paperclip::{
     PaperclipAttachment, PaperclipMetadata, PaperclipRoot, prepare_media_attachment,
 };
+#[cfg(feature = "test-support")]
+use rustodon::paperclip::{PaperclipCommitFault, PaperclipWriteFault};
 use rustodon::streaming::STREAM_EVENT_KIND;
 use rustodon::worker::{
     ActivityPubDeliveryConfig, HandlerFailure, HandlerRegistry, ResourceClass, WorkerError,
@@ -6346,6 +6346,266 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail()
         .await?;
     drop(executor);
     let _ = fs::remove_dir_all(root_path);
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+#[allow(clippy::too_many_lines)]
+async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
+-> Result<(), Box<dyn std::error::Error>> {
+    const BOB: i64 = 116_844_606_259_202_001;
+    const ORIGIN: &str = "https://fixture-v4-6-5.rustodon.invalid/";
+    const BEFORE_LOGICAL_KEY: &str = "activitypub:test-media-ambiguous-before";
+    const AFTER_LOGICAL_KEY: &str = "activitypub:test-media-ambiguous-after";
+
+    let runtime_url = std::env::var("RUSTODON_WORKER_DATABASE_URL")?;
+    let owner_url = std::env::var("RUSTODON_WORKER_OWNER_DATABASE_URL")?;
+    let runtime_pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&runtime_url)
+        .await?;
+    let writer_pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&owner_url)
+        .await?;
+    reset().await?;
+    let root_path = std::env::temp_dir().join(format!(
+        "rustodon-worker-media-ambiguous-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root_path);
+    fs::create_dir(&root_path)?;
+    let media_root = PaperclipRoot::open(&root_path)?
+        .with_commit_fault(PaperclipCommitFault::before_and_after());
+    let status_id = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM statuses WHERE account_id = $1 AND deleted_at IS NULL ORDER BY id LIMIT 1",
+    )
+    .bind(BOB)
+    .fetch_one(&writer_pool)
+    .await?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = listener.local_addr()?;
+    let body = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/attachment.gif")?;
+    let prepared = prepare_media_attachment(BOB, "remote.gif", "image/gif", &body)?;
+    let before_url = format!(
+        "http://media.fixture.invalid:{}/ambiguous-before.gif",
+        endpoint.port()
+    );
+    let after_url = format!(
+        "http://media.fixture.invalid:{}/ambiguous-after.gif",
+        endpoint.port()
+    );
+    let mut media_ids = Vec::new();
+    for remote_url in [&before_url, &after_url] {
+        media_ids.push(
+            sqlx::query_scalar::<_, i64>(
+                "INSERT INTO media_attachments (
+                     account_id, status_id, type, processing, remote_url, file_content_type, file_meta,
+                     created_at, updated_at)
+                 VALUES ($1, $2, 0, 0, $3, 'image/gif', '{}'::json,
+                         clock_timestamp(), clock_timestamp())
+                 RETURNING id",
+            )
+            .bind(BOB)
+            .bind(status_id)
+            .bind(remote_url)
+            .fetch_one(&writer_pool)
+            .await?,
+        );
+    }
+    let mut server = tokio::spawn(fixture_media_server_for_retries(listener, body.clone(), 3));
+    let config = ActivityPubDeliveryConfig {
+        origin: Url::parse(ORIGIN)?,
+        local_domain: "fixture-v4-6-5.rustodon.invalid".to_owned(),
+        media_root_url: "/system".to_owned(),
+        media_root: Some(media_root.clone()),
+        limited_federation: false,
+        remote_media_endpoint: Some(endpoint),
+        remote_delivery_endpoint: None,
+        remote_fetch_endpoint: None,
+    };
+    let queue = Queue::new(runtime_pool.clone());
+    let handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
+        &queue,
+        Some(writer_pool.clone()),
+        None,
+        Some(config),
+    )?;
+    let executor = WorkerExecutor::new(queue.clone(), handlers, 1, 1)?;
+    let operation = async {
+        queue
+            .enqueue(
+                &JobSpec::new(
+                    Lane::Pull,
+                    ACTIVITYPUB_MEDIA_FETCH_JOB_KIND,
+                    json!({"media_id": media_ids[0]}),
+                )
+                .logical_key(BEFORE_LOGICAL_KEY),
+            )
+            .await?;
+        assert!(
+            executor
+                .process_one(
+                    "ambiguous-before-worker",
+                    &[Lane::Pull],
+                    Duration::seconds(30)
+                )
+                .await?
+        );
+        let before_state = sqlx::query_as::<_, (Option<i32>, Option<String>)>(
+            "SELECT processing, file_file_name FROM media_attachments WHERE id = $1",
+        )
+        .bind(media_ids[0])
+        .fetch_one(&writer_pool)
+        .await?;
+        assert_eq!(before_state, (Some(0), None));
+        let before_metadata = PaperclipMetadata {
+            attachment: PaperclipAttachment::MediaFile,
+            id: media_ids[0],
+            remote: true,
+            storage_schema_version: Some(1),
+            file_name: prepared.file_name.clone(),
+            content_type: Some(prepared.content_type.clone()),
+            variant: None,
+        };
+        for style in ["original", "small"] {
+            let path = before_metadata
+                .relative_path(style)
+                .expect("ambiguous pre-commit path");
+            assert!(
+                media_root.open_file(Path::new(&path)).is_ok(),
+                "files must survive a commit failure before PostgreSQL reports success"
+            );
+        }
+        queue
+            .enqueue(
+                &JobSpec::new(
+                    Lane::Pull,
+                    ACTIVITYPUB_MEDIA_FETCH_JOB_KIND,
+                    json!({"media_id": media_ids[1]}),
+                )
+                .logical_key(AFTER_LOGICAL_KEY),
+            )
+            .await?;
+        assert!(
+            executor
+                .process_one(
+                    "ambiguous-after-worker",
+                    &[Lane::Pull],
+                    Duration::seconds(30)
+                )
+                .await?
+        );
+        let after_state = sqlx::query_as::<_, (Option<i32>, Option<String>)>(
+            "SELECT processing, file_file_name FROM media_attachments WHERE id = $1",
+        )
+        .bind(media_ids[1])
+        .fetch_one(&writer_pool)
+        .await?;
+        assert_eq!(after_state.0, Some(2));
+        assert!(after_state.1.is_some());
+        let after_metadata = PaperclipMetadata {
+            id: media_ids[1],
+            file_name: after_state.1.clone().expect("committed media name"),
+            ..before_metadata.clone()
+        };
+        for style in ["original", "small"] {
+            let path = after_metadata
+                .relative_path(style)
+                .expect("ambiguous post-commit path");
+            assert!(
+                media_root.open_file(Path::new(&path)).is_ok(),
+                "files must survive an error after PostgreSQL committed metadata"
+            );
+        }
+        sqlx::query(
+            "UPDATE rustodon.durable_jobs SET run_at = clock_timestamp() WHERE logical_key = $1",
+        )
+        .bind(AFTER_LOGICAL_KEY)
+        .execute(&runtime_pool)
+        .await?;
+        assert!(
+            executor
+                .process_one(
+                    "ambiguous-after-retry",
+                    &[Lane::Pull],
+                    Duration::seconds(30)
+                )
+                .await?
+        );
+        sqlx::query(
+            "UPDATE rustodon.durable_jobs SET run_at = clock_timestamp() WHERE logical_key = $1",
+        )
+        .bind(BEFORE_LOGICAL_KEY)
+        .execute(&runtime_pool)
+        .await?;
+        assert!(
+            executor
+                .process_one(
+                    "ambiguous-before-retry",
+                    &[Lane::Pull],
+                    Duration::seconds(30)
+                )
+                .await?
+        );
+        let before_reconciled = sqlx::query_as::<_, (Option<i32>, Option<String>)>(
+            "SELECT processing, file_file_name FROM media_attachments WHERE id = $1",
+        )
+        .bind(media_ids[0])
+        .fetch_one(&writer_pool)
+        .await?;
+        assert_eq!(before_reconciled.0, Some(2));
+        assert!(before_reconciled.1.is_some());
+        assert_eq!(queue.queued_count().await?, 0);
+        assert!(queue.dead_letters(10).await?.is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM rustodon.remote_fetch_leases",)
+                .fetch_one(&runtime_pool)
+                .await?,
+            0
+        );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let server_result: Result<(), Box<dyn std::error::Error>> = if operation.is_ok() {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut server).await {
+            Ok(Ok(result)) => result.map_err(|error| Box::new(error) as _),
+            Ok(Err(error)) => Err(Box::new(error)),
+            Err(error) => {
+                server.abort();
+                let _ = server.await;
+                Err(Box::new(error))
+            }
+        }
+    } else {
+        server.abort();
+        let _ = server.await;
+        Ok(())
+    };
+    let cleanup_result = async {
+        sqlx::query("DELETE FROM media_attachments WHERE id = ANY($1)")
+            .bind(&media_ids)
+            .execute(&writer_pool)
+            .await?;
+        sqlx::query("DELETE FROM rustodon.durable_jobs WHERE logical_key = ANY($1)")
+            .bind(vec![
+                BEFORE_LOGICAL_KEY.to_owned(),
+                AFTER_LOGICAL_KEY.to_owned(),
+            ])
+            .execute(&runtime_pool)
+            .await?;
+        drop(executor);
+        drop(media_root);
+        fs::remove_dir_all(root_path)?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    operation?;
+    server_result?;
+    cleanup_result?;
     Ok(())
 }
 

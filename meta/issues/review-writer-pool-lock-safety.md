@@ -153,9 +153,11 @@ startup integration tests successfully.
 - Hard power-loss compensation, disk-full behavior, live SMTP, and live peer
   federation remain outside the proven surface. Account purge ordering and
   retryable filesystem cleanup are covered without claiming OS-level crash proof.
-- No restored-fixture regression test drives an ambiguous metadata commit.
-  Concurrent stale and replacement fetches are not exercised at final persistence;
-  duplicate fetches are serialized there but may still duplicate remote HTTP work.
+- A restored-fixture regression now drives ambiguous metadata commits before and
+  after PostgreSQL `COMMIT`, proving staged files remain available for retry
+  reconciliation. Concurrent stale and replacement fetches are not exercised at
+  final persistence; duplicate fetches are serialized there but may still
+  duplicate remote HTTP work.
 
 ## Coverage
 

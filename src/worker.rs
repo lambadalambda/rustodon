@@ -3247,7 +3247,19 @@ async fn process_activitypub_media(
             // A commit error is ambiguous: PostgreSQL may have committed before the connection
             // failed. Keep the files so a retry can reconcile either database outcome.
             written_files.disarm();
+            #[cfg(feature = "test-support")]
+            if media_root.take_commit_before_fault() {
+                return Err(WriteError::Sqlx(sqlx::Error::Protocol(
+                    "injected ambiguous metadata commit failure".to_owned(),
+                )));
+            }
             transaction.commit().await?;
+            #[cfg(feature = "test-support")]
+            if media_root.take_commit_after_fault() {
+                return Err(WriteError::Sqlx(sqlx::Error::Protocol(
+                    "injected ambiguous metadata commit result".to_owned(),
+                )));
+            }
             Ok(true)
         })
         .await;

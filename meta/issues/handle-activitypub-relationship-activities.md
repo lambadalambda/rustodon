@@ -56,5 +56,5 @@ Process remote relationship and actor lifecycle activities idempotently.
 - Expanded the restored relationship worker matrix with duplicate Accept,
   Reject, Block, and Undo Block deliveries. Each duplicate now has explicit
   convergence assertions for the relationship row; the worker integration gate
-  passes 43/43. Full live-peer duplicate and cross-instance ordering evidence
+  passes 44/44. Full live-peer duplicate and cross-instance ordering evidence
   remains open.

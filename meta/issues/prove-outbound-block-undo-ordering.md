@@ -27,4 +27,4 @@ are competing for the ordered stream.
   `tests/workers.rs`. The restored fixture holds a signed Block POST open,
   records the Undo successor, proves a second Push worker cannot claim it,
   releases the Block, and verifies Block-before-Undo wire order.
-- `mise run worker-integration` passes 43/43, including the new case.
+- `mise run worker-integration` passes 44/44, including the new case.

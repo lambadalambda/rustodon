@@ -41,4 +41,4 @@ Map every authoritative v1 requirement to implementation and proof.
   are locally green while peer-side idempotency remains external evidence.
 - Current acceptance gates also pass for the 35-case Mastodon schema suite,
   operational schema and streaming integration, startup safety, preflight,
-  worker integration (43/43), and the cutover/rollback rehearsal.
+  worker integration (44/44), and the cutover/rollback rehearsal.

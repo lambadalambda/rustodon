@@ -6,6 +6,11 @@
   values beginning with `/\\` could be normalized by browsers as an external
   authority. The validator now rejects backslashes, with a regression test;
   `mise run check` passes.
+- Added restored-fixture coverage for ambiguous remote-media metadata commits.
+  A test-support fault now exercises both a rollback before `COMMIT` and an
+  error after PostgreSQL commits; staged Paperclip files remain available for
+  retry reconciliation, and the durable jobs finish without leaked leases.
+  `mise run worker-integration` passes 44/44.
 
 ## 2026-09-07
 
