@@ -1,6 +1,10 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
+#[cfg(feature = "test-support")]
+use std::sync::Arc;
+#[cfg(feature = "test-support")]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
@@ -317,12 +321,25 @@ impl From<sqlx::Error> for JobError {
 #[derive(Clone)]
 pub struct Queue {
     pool: PgPool,
+    #[cfg(feature = "test-support")]
+    fail_complete_once: Arc<AtomicBool>,
 }
 
 impl Queue {
     #[must_use]
-    pub const fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool) -> Self {
+        Self {
+            pool,
+            #[cfg(feature = "test-support")]
+            fail_complete_once: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_complete_fault(self) -> Self {
+        self.fail_complete_once.store(true, Ordering::SeqCst);
+        self
     }
 
     #[must_use]
@@ -542,6 +559,37 @@ impl Queue {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Initializes absent durable arguments while retaining the lease fence and existing values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-object patch or a rejected database update.
+    pub async fn initialize_job_arguments(
+        &self,
+        job: &ClaimedJob,
+        patch: &Value,
+    ) -> Result<Option<Value>, JobError> {
+        if !patch.is_object() {
+            return Err(JobError::InvalidInput(
+                "durable-job argument patches must be JSON objects",
+            ));
+        }
+        sqlx::query_scalar(
+            "UPDATE rustodon.durable_jobs \
+                SET arguments = $4::jsonb || arguments, updated_at = clock_timestamp() \
+              WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3 \
+                AND dead_at IS NULL AND lease_expires_at > clock_timestamp() \
+              RETURNING arguments",
+        )
+        .bind(job.id)
+        .bind(&job.lease_owner)
+        .bind(job.generation)
+        .bind(patch)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Deletes a completed job only while the caller still owns its lease.
     ///
     /// # Errors
@@ -553,6 +601,12 @@ impl Queue {
         lease_owner: &str,
         generation: i64,
     ) -> Result<bool, JobError> {
+        #[cfg(feature = "test-support")]
+        if self.fail_complete_once.swap(false, Ordering::SeqCst) {
+            return Err(JobError::InvalidData(
+                "injected durable-job completion failure",
+            ));
+        }
         let result = sqlx::query(
             "DELETE FROM rustodon.durable_jobs \
               WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3 AND dead_at IS NULL \

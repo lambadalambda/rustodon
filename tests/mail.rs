@@ -40,6 +40,12 @@ fn password_reset_job_encrypts_the_token_and_keeps_mail_metadata_durable() {
     assert_ne!(job.arguments().to_string(), token);
     assert_eq!(job.arguments()["origin"], "https://example.invalid/");
     assert!(job.arguments()["token"].as_str().is_some());
+    assert!(
+        job.arguments()["message_id_local"]
+            .as_str()
+            .is_some_and(|identity| identity.starts_with("rustodon-mail-") && identity.len() == 46)
+    );
+    assert_eq!(job.arguments()["message_id_domain"], "example.invalid");
 }
 
 #[test]
@@ -52,6 +58,7 @@ fn confirmation_job_uses_a_distinct_mail_kind_and_never_persists_plaintext() {
     assert_eq!(job.lane(), Lane::Mail);
     assert_eq!(job.kind(), CONFIRMATION_JOB_KIND);
     assert_ne!(job.arguments().to_string(), token);
+    assert!(job.arguments()["message_id_local"].as_str().is_some());
 }
 
 #[test]
@@ -79,6 +86,11 @@ fn mail_jobs_use_unique_digest_keys_without_exposing_the_token() {
             .logical_key_value()
             .is_some_and(|key| !key.contains("first-token"))
     );
+    let first_identity = first.arguments()["message_id_local"].as_str().unwrap();
+    let second_identity = second.arguments()["message_id_local"].as_str().unwrap();
+    assert_ne!(first_identity, second_identity);
+    assert!(!first_identity.contains("person"));
+    assert!(!first_identity.contains("first-token"));
 }
 
 #[test]
@@ -99,6 +111,8 @@ fn report_mail_job_preserves_staff_context_without_a_token() {
     assert_eq!(job.arguments()["target"], "target@example.invalid");
     assert_eq!(job.arguments()["reporter"], "reporter@example.invalid");
     assert!(job.arguments().get("token").is_none());
+    assert!(job.arguments()["message_id_local"].as_str().is_some());
+    assert_eq!(job.arguments()["message_id_domain"], "example.invalid");
     assert_eq!(job.logical_key_value(), Some("report-email:42:7"));
 }
 
@@ -161,6 +175,78 @@ async fn a_refused_smtp_connection_is_retryable() {
 }
 
 #[tokio::test]
+async fn malformed_or_missing_persisted_message_identity_fails_closed() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let config = MailConfig::new(
+        SmtpConfig::Enabled(Box::new(SmtpSettings {
+            delivery_method: SmtpDeliveryMethod::Smtp,
+            server: "127.0.0.1".to_owned(),
+            port,
+            login: None,
+            password: None,
+            from: Mailbox {
+                display_name: None,
+                address: "notifications@example.invalid".to_owned(),
+            },
+            reply_to: None,
+            return_path: None,
+            domain: "changed-smtp.example.invalid".to_owned(),
+            authentication: SmtpAuthentication::None,
+            transport: SmtpTransport::Plain,
+            verify_mode: None,
+            ca_file: PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),
+        })),
+        Url::parse("https://example.invalid/").unwrap(),
+        SecretString::new("mail-secret".to_owned()),
+    );
+    let job = config
+        .password_reset_job("person@example.invalid", "password-reset-token")
+        .unwrap();
+    let runtime = config.runtime().unwrap().unwrap();
+
+    for arguments in [
+        {
+            let mut arguments = job.arguments().clone();
+            arguments
+                .as_object_mut()
+                .unwrap()
+                .remove("message_id_local");
+            arguments
+        },
+        {
+            let mut arguments = job.arguments().clone();
+            arguments["message_id_local"] = serde_json::json!("recipient@example.invalid");
+            arguments
+        },
+        {
+            let mut arguments = job.arguments().clone();
+            arguments["message_id_domain"] = serde_json::json!("bad domain\r\nBcc: leak");
+            arguments
+        },
+    ] {
+        let claimed = ClaimedJob {
+            id: 99,
+            lane: job.lane(),
+            kind: job.kind().to_owned(),
+            arguments,
+            logical_key: job.logical_key_value().map(str::to_owned),
+            run_at: Utc::now(),
+            attempt: 1,
+            max_attempts: 25,
+            generation: 1,
+            lease_owner: "mail-test".to_owned(),
+            lease_expires_at: Utc::now() + Duration::minutes(1),
+        };
+        assert!(matches!(
+            runtime.send(&claimed).await,
+            Err(MailError::InvalidJob(_))
+        ));
+    }
+}
+
+#[tokio::test]
 async fn worker_delivers_a_decrypted_reset_message_through_smtp() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -191,6 +277,11 @@ async fn worker_delivers_a_decrypted_reset_message_through_smtp() {
     let job = config
         .password_reset_job("person@example.invalid", "password-reset-token")
         .unwrap();
+    let expected_message_id = format!(
+        "Message-ID: <{}@{}>",
+        job.arguments()["message_id_local"].as_str().unwrap(),
+        job.arguments()["message_id_domain"].as_str().unwrap()
+    );
     let claimed = ClaimedJob {
         id: 1,
         lane: job.lane(),
@@ -221,6 +312,9 @@ async fn worker_delivers_a_decrypted_reset_message_through_smtp() {
         message.contains("To: person@example.invalid"),
         "{message:?}"
     );
+    assert!(message.contains(&expected_message_id), "{message:?}");
+    assert!(!message.contains("rustodon-mail-1@"), "{message:?}");
+    assert!(!message.contains("mail-secret"), "{message:?}");
     assert!(
         message.contains(
             "https://example.invalid/auth/password/edit?reset_password_token=3Dpassword-=\r\nreset-token"
@@ -265,8 +359,13 @@ async fn worker_delivers_a_report_message_through_smtp() {
         "reporter@example.invalid",
         7,
     );
+    let expected_message_id = format!(
+        "Message-ID: <{}@{}>",
+        job.arguments()["message_id_local"].as_str().unwrap(),
+        job.arguments()["message_id_domain"].as_str().unwrap()
+    );
     let claimed = ClaimedJob {
-        id: 1,
+        id: 2,
         lane: job.lane(),
         kind: job.kind().to_owned(),
         arguments: job.arguments().clone(),
@@ -297,6 +396,8 @@ async fn worker_delivers_a_report_message_through_smtp() {
         message.contains("To: moderator@example.invalid"),
         "{message:?}"
     );
+    assert!(message.contains(&expected_message_id), "{message:?}");
+    assert!(!message.contains("rustodon-mail-2@"), "{message:?}");
     assert!(
         message.contains(
             "A new report was submitted for target@example.invalid by reporter@example.i=\r\nnvalid."

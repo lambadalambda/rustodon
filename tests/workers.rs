@@ -8,7 +8,10 @@ use std::time::SystemTime;
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use http::Method as HttpMethod;
 use reqwest::header::{CONTENT_TYPE, HOST, HeaderMap, HeaderValue};
-use rustodon::config::WorkerConfig;
+use rustodon::config::{
+    Mailbox, SmtpAuthentication, SmtpConfig, SmtpDeliveryMethod, SmtpSettings, SmtpTransport,
+    WorkerConfig,
+};
 use rustodon::jobs::{
     ACTIVITYPUB_ACCOUNT_DELETE_JOB_KIND, ACTIVITYPUB_ACCOUNT_UPDATE_JOB_KIND,
     ACTIVITYPUB_ANNOUNCE_RESOLVE_JOB_KIND, ACTIVITYPUB_DELIVERY_JOB_KIND,
@@ -21,7 +24,7 @@ use rustodon::jobs::{
     NOTIFICATION_UNFILTER_JOB_KIND, Queue, RetryResult, WorkerHeartbeat, enqueue_in,
     record_outbox_in, record_outbox_once_in,
 };
-use rustodon::mail::REPORT_JOB_KIND;
+use rustodon::mail::{MailConfig, REPORT_JOB_KIND};
 use rustodon::mastodon::rest::InstanceRuntimeConfig;
 use rustodon::mastodon::{
     AccountProfileUpdate, AccountProfileValue, BearerAuthenticator, HttpSignatureRequest,
@@ -37,6 +40,7 @@ use rustodon::paperclip::{
 };
 #[cfg(feature = "test-support")]
 use rustodon::paperclip::{PaperclipCommitFault, PaperclipRemoveFault, PaperclipWriteFault};
+use rustodon::secret::SecretString;
 use rustodon::streaming::STREAM_EVENT_KIND;
 #[cfg(feature = "test-support")]
 use rustodon::web::cleanup_media_after_response_failure_for_test;
@@ -47,7 +51,7 @@ use rustodon::worker::{
 };
 use serde_json::{Value, json};
 use sqlx::{Connection, PgConnection, Row, postgres::PgPoolOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, oneshot};
 use url::Url;
@@ -251,6 +255,24 @@ async fn durable_queue_recovers_without_losing_or_double_claiming_work()
     assert_eq!(recovered.attempt, 2);
     assert!(recovered.generation > claimed[0].generation);
     assert!(
+        queue
+            .initialize_job_arguments(&claimed[0], &json!({"stale_initialize": true}))
+            .await?
+            .is_none(),
+        "a stale lease cannot initialize durable arguments"
+    );
+    let initialized = queue
+        .initialize_job_arguments(&recovered, &json!({"recovered_initialize": true}))
+        .await?
+        .expect("the reclaimed lease can initialize durable arguments");
+    assert_eq!(initialized["recovered_initialize"], true);
+    assert_eq!(initialized["lease_probe"], true);
+    let initialized_again = queue
+        .initialize_job_arguments(&recovered, &json!({"recovered_initialize": false}))
+        .await?
+        .expect("the current lease remains valid");
+    assert_eq!(initialized_again["recovered_initialize"], true);
+    assert!(
         !queue
             .complete(due, &claimed[0].lease_owner, claimed[0].generation)
             .await?
@@ -437,6 +459,145 @@ async fn worker_reclaims_job_after_database_failure_before_acknowledgement()
         recovery_queue
             .complete(recovered.id, &recovered.lease_owner, recovered.generation)
             .await?
+    );
+    reset().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+#[allow(clippy::too_many_lines)]
+async fn smtp_acceptance_before_job_ack_is_retried_with_the_same_message_id()
+-> Result<(), Box<dyn std::error::Error>> {
+    let url = std::env::var("RUSTODON_WORKER_DATABASE_URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&url)
+        .await?;
+    reset().await?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let first_accepted = Arc::new(Notify::new());
+    let server = tokio::spawn(fixture_retrying_smtp_server(
+        listener,
+        Arc::clone(&first_accepted),
+    ));
+    let mail = worker_mail_config(port, "smtp-first.invalid");
+    let queue = Queue::new(pool.clone()).with_complete_fault();
+    let current_job = mail.password_reset_job("person@example.invalid", "sealed-reset-token")?;
+    let mut legacy_arguments = current_job.arguments().clone();
+    legacy_arguments
+        .as_object_mut()
+        .unwrap()
+        .remove("message_id_local");
+    legacy_arguments
+        .as_object_mut()
+        .unwrap()
+        .remove("message_id_domain");
+    let first_job = JobSpec::new(Lane::Mail, current_job.kind(), legacy_arguments)
+        .logical_key(current_job.logical_key_value().unwrap());
+    let job_id = queue.enqueue(&first_job).await?;
+    let handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
+        &queue,
+        None,
+        mail.runtime()?,
+        None,
+    )?;
+    let executor = WorkerExecutor::new(queue, handlers, 1, 1)?;
+    let first_attempt = tokio::spawn(async move {
+        executor
+            .process_one(
+                "smtp-before-ack",
+                &[Lane::Mail],
+                Duration::milliseconds(100),
+            )
+            .await
+    });
+    first_accepted.notified().await;
+    assert!(matches!(
+        first_attempt.await?,
+        Err(WorkerError::Jobs(JobError::InvalidData(
+            "injected durable-job completion failure"
+        )))
+    ));
+    let persisted_arguments: Value =
+        sqlx::query_scalar("SELECT arguments FROM rustodon.durable_jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await?;
+    let expected = format!(
+        "Message-ID: <{}@{}>",
+        persisted_arguments["message_id_local"].as_str().unwrap(),
+        persisted_arguments["message_id_domain"].as_str().unwrap()
+    );
+    assert_eq!(persisted_arguments["message_id_domain"], "example.invalid");
+
+    tokio::time::sleep(std::time::Duration::from_millis(125)).await;
+    let recovery_pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&url)
+        .await?;
+    let recovery_queue = Queue::new(recovery_pool.clone());
+    let changed_smtp_mail = worker_mail_config(port, "smtp-changed.invalid");
+    let recovery_handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
+        &recovery_queue,
+        None,
+        changed_smtp_mail.runtime()?,
+        None,
+    )?;
+    let recovery = WorkerExecutor::new(recovery_queue.clone(), recovery_handlers, 1, 1)?;
+    assert!(
+        recovery
+            .process_one("smtp-recovery", &[Lane::Mail], Duration::seconds(1))
+            .await?,
+        "the accepted but unacknowledged message must be retried"
+    );
+    let distinct_job = mail.confirmation_job("person@example.invalid", "another-sealed-token")?;
+    let distinct_message_id = format!(
+        "Message-ID: <{}@{}>",
+        distinct_job.arguments()["message_id_local"]
+            .as_str()
+            .unwrap(),
+        distinct_job.arguments()["message_id_domain"]
+            .as_str()
+            .unwrap()
+    );
+    recovery_queue.enqueue(&distinct_job).await?;
+    assert!(
+        recovery
+            .process_one("smtp-distinct", &[Lane::Mail], Duration::seconds(1))
+            .await?
+    );
+    assert!(
+        recovery_queue
+            .claim("smtp-idle", &[Lane::Mail], Duration::seconds(1))
+            .await?
+            .is_none()
+    );
+
+    let messages = server.await??;
+    assert_eq!(messages.len(), 3);
+    for message in &messages[..2] {
+        let message = String::from_utf8_lossy(message);
+        assert!(message.contains(&expected), "{message:?}");
+        assert!(!message.contains("worker-mail-secret"), "{message:?}");
+        assert!(!message.contains("smtp-first.invalid"), "{message:?}");
+        assert!(!message.contains("smtp-changed.invalid"), "{message:?}");
+        assert!(
+            !message.contains(&format!("rustodon-mail-{job_id}@")),
+            "{message:?}"
+        );
+    }
+    assert_eq!(
+        message_id_header(&messages[0]),
+        message_id_header(&messages[1]),
+        "an SMTP duplicate of one durable job must retain its identity"
+    );
+    assert_eq!(message_id_header(&messages[2]), Some(distinct_message_id));
+    assert_ne!(
+        message_id_header(&messages[0]),
+        message_id_header(&messages[2]),
+        "distinct durable messages must have distinct identities"
     );
     reset().await?;
     Ok(())
@@ -16507,6 +16668,107 @@ async fn fixture_delivery_request(
         }
     }
     Ok(request)
+}
+
+async fn fixture_retrying_smtp_server(
+    listener: TcpListener,
+    first_accepted: Arc<Notify>,
+) -> Result<Vec<Vec<u8>>, std::io::Error> {
+    let mut messages = Vec::with_capacity(3);
+    for attempt in 0..3 {
+        let (socket, _) = listener.accept().await?;
+        let mut reader = BufReader::new(socket);
+        reader
+            .get_mut()
+            .write_all(b"220 fixture.test ESMTP\r\n")
+            .await?;
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        assert!(line.to_ascii_uppercase().starts_with("EHLO "), "{line:?}");
+        reader
+            .get_mut()
+            .write_all(b"250-fixture.test\r\n250-8BITMIME\r\n250 OK\r\n")
+            .await?;
+
+        line.clear();
+        reader.read_line(&mut line).await?;
+        assert!(
+            line.to_ascii_uppercase().starts_with("MAIL FROM:"),
+            "{line:?}"
+        );
+        reader
+            .get_mut()
+            .write_all(b"250 2.1.0 accepted\r\n")
+            .await?;
+
+        line.clear();
+        reader.read_line(&mut line).await?;
+        assert!(
+            line.to_ascii_uppercase().starts_with("RCPT TO:"),
+            "{line:?}"
+        );
+        reader
+            .get_mut()
+            .write_all(b"250 2.1.5 accepted\r\n")
+            .await?;
+
+        line.clear();
+        reader.read_line(&mut line).await?;
+        assert!(line.eq_ignore_ascii_case("DATA\r\n"), "{line:?}");
+        reader
+            .get_mut()
+            .write_all(b"354 end with <CRLF>.<CRLF>\r\n")
+            .await?;
+
+        let mut message = Vec::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).await?;
+            if line == ".\r\n" {
+                break;
+            }
+            message.extend_from_slice(line.as_bytes());
+        }
+        reader.get_mut().write_all(b"250 2.0.0 queued\r\n").await?;
+        if attempt == 0 {
+            first_accepted.notify_one();
+        }
+        messages.push(message);
+    }
+    Ok(messages)
+}
+
+fn worker_mail_config(port: u16, smtp_domain: &str) -> MailConfig {
+    MailConfig::new(
+        SmtpConfig::Enabled(Box::new(SmtpSettings {
+            delivery_method: SmtpDeliveryMethod::Smtp,
+            server: "127.0.0.1".to_owned(),
+            port,
+            login: None,
+            password: None,
+            from: Mailbox {
+                display_name: Some("Fixture Notifications".to_owned()),
+                address: "notifications@example.invalid".to_owned(),
+            },
+            reply_to: None,
+            return_path: None,
+            domain: smtp_domain.to_owned(),
+            authentication: SmtpAuthentication::None,
+            transport: SmtpTransport::Plain,
+            verify_mode: None,
+            ca_file: PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),
+        })),
+        Url::parse("https://example.invalid/").unwrap(),
+        SecretString::new("worker-mail-secret".to_owned()),
+    )
+}
+
+fn message_id_header(message: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(message)
+        .lines()
+        .find(|line| line.starts_with("Message-ID:"))
+        .map(str::to_owned)
 }
 
 #[cfg(feature = "test-support")]

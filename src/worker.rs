@@ -407,6 +407,8 @@ impl WorkerExecutor {
         match outcome {
             None => {}
             Some(Ok(())) => {
+                // External acceptance precedes this fence; acknowledgement failure must leave the
+                // durable job reclaimable.
                 self.queue
                     .complete(job.id, &job.lease_owner, job.generation)
                     .await?;
@@ -5621,22 +5623,28 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
     }
     if let Some(mail_runtime) = mail_runtime {
         let mail_runtime = Arc::new(mail_runtime);
+        let mail_queue = queue.clone();
         for kind in [
             crate::mail::PASSWORD_RESET_JOB_KIND,
             crate::mail::CONFIRMATION_JOB_KIND,
             crate::mail::REPORT_JOB_KIND,
         ] {
             let mail_runtime = Arc::clone(&mail_runtime);
+            let mail_queue = mail_queue.clone();
             handlers.register(kind, Lane::Mail, ResourceClass::None, move |job| {
                 let mail_runtime = Arc::clone(&mail_runtime);
+                let mail_queue = mail_queue.clone();
                 async move {
-                    mail_runtime.send(&job).await.map_err(|error| {
-                        if error.retryable() {
-                            HandlerFailure::retry("SMTP delivery failed")
-                        } else {
-                            HandlerFailure::permanent(error.to_string())
-                        }
-                    })
+                    mail_runtime
+                        .send_queued(&mail_queue, job)
+                        .await
+                        .map_err(|error| {
+                            if error.retryable() {
+                                HandlerFailure::retry("SMTP delivery failed")
+                            } else {
+                                HandlerFailure::permanent(error.to_string())
+                            }
+                        })
                 }
             })?;
         }

@@ -1,5 +1,6 @@
 use std::fmt;
 use std::fs;
+use std::net::Ipv6Addr;
 use std::path::Path;
 
 use aes_gcm::aead::{AeadInPlace, KeyInit};
@@ -15,10 +16,10 @@ use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use rsa::rand_core::{OsRng, RngCore};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use url::Url;
+use url::{Host, Url};
 
 use crate::config::{Mailbox, SmtpAuthentication, SmtpConfig, SmtpTransport, SmtpVerifyMode};
-use crate::jobs::{ClaimedJob, JobSpec, Lane};
+use crate::jobs::{ClaimedJob, JobSpec, Lane, Queue};
 use crate::secret::SecretString;
 
 pub const PASSWORD_RESET_JOB_KIND: &str = "rustodon.mail.reset_password";
@@ -29,6 +30,9 @@ const DEFAULT_SMTP_CA_FILE: &str = "/etc/ssl/certs/ca-certificates.crt";
 const MAIL_TOKEN_VERSION: u8 = 1;
 const MAIL_TOKEN_NONCE_BYTES: usize = 12;
 const MAIL_TOKEN_TAG_BYTES: usize = 16;
+const MAIL_MESSAGE_ID_BYTES: usize = 24;
+const MAIL_MESSAGE_ID_PREFIX: &str = "rustodon-mail-";
+const MAIL_MESSAGE_ID_FALLBACK_DOMAIN: &str = "rustodon.invalid";
 
 #[must_use]
 pub fn report_job(
@@ -39,6 +43,7 @@ pub fn report_job(
     reporter: &str,
     staff_account_id: i64,
 ) -> JobSpec {
+    let (message_id_local, message_id_domain) = message_identity(origin);
     JobSpec::new(
         Lane::Mail,
         REPORT_JOB_KIND,
@@ -48,6 +53,8 @@ pub fn report_job(
             "report_id": report_id,
             "target": target,
             "reporter": reporter,
+            "message_id_local": message_id_local,
+            "message_id_domain": message_id_domain,
         }),
     )
     .logical_key(format!("report-email:{report_id}:{staff_account_id}"))
@@ -63,13 +70,15 @@ pub enum MailError {
     Certificate,
     UnsupportedAuthentication,
     TransportConfiguration,
+    Persistence,
+    LeaseLost,
     Transport,
 }
 
 impl MailError {
     #[must_use]
     pub const fn retryable(&self) -> bool {
-        matches!(self, Self::Transport)
+        matches!(self, Self::Persistence | Self::LeaseLost | Self::Transport)
     }
 }
 
@@ -88,6 +97,8 @@ impl fmt::Display for MailError {
             Self::TransportConfiguration => {
                 formatter.write_str("SMTP transport configuration is invalid")
             }
+            Self::Persistence => formatter.write_str("mail job identity persistence failed"),
+            Self::LeaseLost => formatter.write_str("mail job lease was lost"),
             Self::Transport => formatter.write_str("SMTP delivery failed"),
         }
     }
@@ -171,6 +182,7 @@ impl MailConfig {
         }
         let sealed_token = seal_token(kind, token, &self.secret_key_base)?;
         let digest = Sha256::digest(token.as_bytes());
+        let (message_id_local, message_id_domain) = message_identity(self.origin.as_str());
         Ok(JobSpec::new(
             Lane::Mail,
             kind,
@@ -178,6 +190,8 @@ impl MailConfig {
                 "to": recipient,
                 "origin": self.origin.as_str(),
                 "token": sealed_token,
+                "message_id_local": message_id_local,
+                "message_id_domain": message_id_domain,
             }),
         )
         .logical_key(format!("{key_prefix}:{digest:x}")))
@@ -191,6 +205,45 @@ pub struct MailRuntime {
 }
 
 impl MailRuntime {
+    /// Backfills legacy durable identity under the current lease before sending one mail job.
+    ///
+    /// # Errors
+    ///
+    /// Returns a retryable error for persistence or lease failure, a permanent error for malformed
+    /// jobs, and a retryable error for SMTP delivery failure.
+    pub async fn send_queued(&self, queue: &Queue, mut job: ClaimedJob) -> Result<(), MailError> {
+        if !matches!(
+            job.kind.as_str(),
+            PASSWORD_RESET_JOB_KIND | CONFIRMATION_JOB_KIND | REPORT_JOB_KIND
+        ) {
+            return Err(MailError::InvalidJob("unknown mail job kind"));
+        }
+        let object = job.arguments.as_object().ok_or(MailError::InvalidJob(
+            "mail job arguments must be an object",
+        ))?;
+        let has_local = object.contains_key("message_id_local");
+        let has_domain = object.contains_key("message_id_domain");
+        if !has_local && !has_domain {
+            let origin = object
+                .get("origin")
+                .and_then(Value::as_str)
+                .ok_or(MailError::InvalidJob("mail job origin is missing"))?;
+            let (local, domain) = message_identity(origin);
+            job.arguments = queue
+                .initialize_job_arguments(
+                    &job,
+                    &json!({
+                        "message_id_local": local,
+                        "message_id_domain": domain,
+                    }),
+                )
+                .await
+                .map_err(|_| MailError::Persistence)?
+                .ok_or(MailError::LeaseLost)?;
+        }
+        self.send(&job).await
+    }
+
     /// Sends one claimed mail job.
     ///
     /// # Errors
@@ -198,7 +251,7 @@ impl MailRuntime {
     /// Returns a permanent error for malformed durable arguments and a retryable error for an
     /// SMTP delivery failure.
     pub async fn send(&self, job: &ClaimedJob) -> Result<(), MailError> {
-        let message = self.message(&job.kind, &job.arguments)?;
+        let message = self.message(job)?;
         self.sender
             .transport
             .send(message)
@@ -207,10 +260,13 @@ impl MailRuntime {
             .map_err(|_| MailError::Transport)
     }
 
-    fn message(&self, kind: &str, arguments: &Value) -> Result<Message, MailError> {
+    fn message(&self, job: &ClaimedJob) -> Result<Message, MailError> {
+        let kind = job.kind.as_str();
+        let arguments = &job.arguments;
         let object = arguments.as_object().ok_or(MailError::InvalidJob(
             "mail job arguments must be an object",
         ))?;
+        let message_id = message_id(object)?;
         let recipient = object
             .get("to")
             .and_then(Value::as_str)
@@ -284,6 +340,7 @@ impl MailRuntime {
             .from(self.sender.from.clone())
             .to(recipient.clone())
             .subject(subject)
+            .message_id(Some(message_id))
             .header(ContentType::TEXT_PLAIN);
         if let Some(reply_to) = &self.sender.reply_to {
             builder = builder.reply_to(reply_to.clone());
@@ -394,6 +451,77 @@ fn mailbox_from_config(mailbox: &Mailbox) -> Result<LettreMailbox, MailError> {
 
 fn mailbox(value: &str) -> Result<LettreMailbox, MailError> {
     value.parse().map_err(|_| MailError::InvalidAddress)
+}
+
+fn message_identity(origin: &str) -> (String, String) {
+    let mut identity = [0_u8; MAIL_MESSAGE_ID_BYTES];
+    OsRng.fill_bytes(&mut identity);
+    let local = format!(
+        "{MAIL_MESSAGE_ID_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(identity)
+    );
+    let domain = Url::parse(origin)
+        .ok()
+        .and_then(|origin| origin.host().as_ref().map(message_id_domain))
+        .unwrap_or_else(|| MAIL_MESSAGE_ID_FALLBACK_DOMAIN.to_owned());
+    (local, domain)
+}
+
+fn message_id(object: &serde_json::Map<String, Value>) -> Result<String, MailError> {
+    let local = object
+        .get("message_id_local")
+        .and_then(Value::as_str)
+        .ok_or(MailError::InvalidJob(
+            "mail job message identity is missing",
+        ))?;
+    let encoded = local
+        .strip_prefix(MAIL_MESSAGE_ID_PREFIX)
+        .ok_or(MailError::InvalidJob(
+            "mail job message identity is invalid",
+        ))?;
+    let identity = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| MailError::InvalidJob("mail job message identity is invalid"))?;
+    if identity.len() != MAIL_MESSAGE_ID_BYTES || URL_SAFE_NO_PAD.encode(identity) != encoded {
+        return Err(MailError::InvalidJob(
+            "mail job message identity is invalid",
+        ));
+    }
+    let domain = object
+        .get("message_id_domain")
+        .and_then(Value::as_str)
+        .ok_or(MailError::InvalidJob(
+            "mail job message ID domain is missing",
+        ))?;
+    validate_message_id_domain(domain)?;
+    Ok(format!("<{local}@{domain}>"))
+}
+
+fn message_id_domain(host: &Host<&str>) -> String {
+    match host {
+        Host::Domain(domain) => (*domain).to_owned(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => format!("[IPv6:{address}]"),
+    }
+}
+
+fn validate_message_id_domain(domain: &str) -> Result<(), MailError> {
+    if let Some(address) = domain
+        .strip_prefix("[IPv6:")
+        .and_then(|value| value.strip_suffix(']'))
+    {
+        return address
+            .parse::<Ipv6Addr>()
+            .map(|_| ())
+            .map_err(|_| MailError::InvalidJob("mail job message ID domain is invalid"));
+    }
+    match Host::parse(domain) {
+        Ok(Host::Domain(parsed)) if !parsed.is_empty() && parsed == domain => Ok(()),
+        Ok(Host::Ipv4(address)) if address.to_string() == domain => Ok(()),
+        _ => Err(MailError::InvalidJob(
+            "mail job message ID domain is invalid",
+        )),
+    }
 }
 
 fn seal_token(kind: &str, token: &str, secret: &SecretString) -> Result<String, MailError> {
