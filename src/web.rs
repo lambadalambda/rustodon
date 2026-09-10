@@ -4331,22 +4331,8 @@ async fn federation_inbox_request(
         return error_response(StatusCode::BAD_REQUEST, "Invalid ActivityPub JSON");
     };
     let logical_key = activitypub_inbox_logical_key(&activity, body.as_bytes(), actor_uri);
-    let logical_key = if activity
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|kind| matches!(kind, "Create" | "Update" | "Delete"))
-        && activity
-            .get("object")
-            .and_then(serde_json::Value::as_object)
-            .and_then(|object| object.get("type"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|kind| matches!(kind, "Note" | "Tombstone"))
-        && let Some(target_account_id) = target.account_id()
-    {
-        format!("{logical_key}:delivery:{target_account_id}")
-    } else {
-        logical_key
-    };
+    let logical_key =
+        activitypub_inbox_delivery_logical_key(&activity, &logical_key, target.account_id());
     let ordering_key = activitypub_inbox_ordering_key(actor_uri);
     let fingerprint: [u8; 32] = Sha256::digest(body.as_bytes()).into();
     let arguments = serde_json::json!({
@@ -4388,6 +4374,31 @@ fn activitypub_inbox_logical_key(
         |activity_id| format!("{activity_id}\n{verified_actor_uri}"),
     );
     format!("activitypub:{:x}", Sha256::digest(source.as_bytes()))
+}
+
+fn activitypub_inbox_delivery_logical_key(
+    activity: &serde_json::Value,
+    logical_key: &str,
+    delivery_target_account_id: Option<i64>,
+) -> String {
+    let Some(delivery_target_account_id) = delivery_target_account_id else {
+        return logical_key.to_owned();
+    };
+    let kind = activity.get("type").and_then(serde_json::Value::as_str);
+    let object = activity.get("object");
+    let is_note_write = matches!(kind, Some("Create"))
+        && object.is_some_and(serde_json::Value::is_string)
+        || matches!(kind, Some("Create" | "Update" | "Delete"))
+            && object
+                .and_then(serde_json::Value::as_object)
+                .and_then(|object| object.get("type"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| matches!(kind, "Note" | "Tombstone"));
+    if is_note_write {
+        format!("{logical_key}:delivery:{delivery_target_account_id}")
+    } else {
+        logical_key.to_owned()
+    }
 }
 
 fn activitypub_inbox_ordering_key(actor_uri: &str) -> [u8; 32] {
@@ -18540,24 +18551,30 @@ mod tests {
     }
 
     #[test]
-    fn activitypub_inbox_deduplicates_by_activity_id_across_delivery_targets() {
+    fn uri_only_create_inbox_keys_preserve_personal_delivery_targets() {
         let activity = serde_json::json!({
             "id": "https://remote.example/activities/42",
             "type": "Create",
-            "actor": "https://remote.example/users/alice"
+            "actor": "https://remote.example/users/alice",
+            "object": "https://remote.example/statuses/42"
         });
+        let base = activitypub_inbox_logical_key(
+            &activity,
+            br#"{"id":"ignored"}"#,
+            "https://remote.example/users/alice",
+        );
 
         assert_eq!(
-            activitypub_inbox_logical_key(
-                &activity,
-                br#"{"id":"ignored"}"#,
-                "https://remote.example/users/alice",
-            ),
-            activitypub_inbox_logical_key(
-                &activity,
-                br#"{"different":true}"#,
-                "https://remote.example/users/alice",
-            )
+            activitypub_inbox_delivery_logical_key(&activity, &base, Some(7)),
+            activitypub_inbox_delivery_logical_key(&activity, &base, Some(7)),
+        );
+        assert_ne!(
+            activitypub_inbox_delivery_logical_key(&activity, &base, Some(7)),
+            activitypub_inbox_delivery_logical_key(&activity, &base, Some(8)),
+        );
+        assert_ne!(
+            activitypub_inbox_delivery_logical_key(&activity, &base, Some(7)),
+            activitypub_inbox_delivery_logical_key(&activity, &base, None),
         );
     }
 

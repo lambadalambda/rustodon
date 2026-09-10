@@ -22,8 +22,9 @@ use crate::jobs::{
     ACTIVITYPUB_ACCOUNT_DELETE_JOB_KIND, ACTIVITYPUB_ACCOUNT_UPDATE_JOB_KIND,
     ACTIVITYPUB_ANNOUNCE_RESOLVE_JOB_KIND, ACTIVITYPUB_DELIVERY_JOB_KIND,
     ACTIVITYPUB_INBOX_JOB_KIND, ACTIVITYPUB_MEDIA_FETCH_JOB_KIND,
-    ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND, ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND, ClaimedJob,
-    JobError, JobSpec, LOCAL_MEDIA_CLEANUP_JOB_KIND, Lane, MASTODON_ACCOUNT_PURGE_JOB_KIND,
+    ACTIVITYPUB_NOTE_RESOLVE_JOB_KIND, ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
+    ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND, ClaimedJob, JobError, JobSpec,
+    LOCAL_MEDIA_CLEANUP_JOB_KIND, Lane, MASTODON_ACCOUNT_PURGE_JOB_KIND,
     MASTODON_DOMAIN_BLOCK_JOB_KIND, MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND,
     NOTIFICATION_CREATE_JOB_KIND, NOTIFICATION_UNFILTER_JOB_KIND, Queue, WorkerHeartbeat,
     record_outbox_once_in, record_stream_event_in,
@@ -2219,6 +2220,424 @@ fn announce_resolution_logical_key(activity_uri: &str) -> String {
     format!("activitypub:announce:{digest_string}")
 }
 
+fn note_resolution_logical_key(
+    source_account_id: i64,
+    activity_uri: &str,
+    actor_uri: &str,
+    object_uri: &str,
+    delivery_target_account_id: Option<i64>,
+) -> String {
+    let digest = Sha256::digest(
+        format!(
+            "{source_account_id}\n{activity_uri}\n{actor_uri}\n{object_uri}\n{}",
+            delivery_target_account_id.map_or_else(|| "shared".to_owned(), |id| id.to_string())
+        )
+        .as_bytes(),
+    );
+    let mut digest_string = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut digest_string, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    format!("activitypub:note:{digest_string}")
+}
+
+fn validate_create_binding(
+    activity_uri: &str,
+    actor_uri: &str,
+    object_uri: &str,
+) -> Result<(), HandlerFailure> {
+    let activity_location = Url::parse(activity_uri)
+        .map_err(|_| HandlerFailure::permanent("remote Create activity URI is invalid"))?;
+    let actor_location = Url::parse(actor_uri)
+        .map_err(|_| HandlerFailure::permanent("remote Create actor URI is invalid"))?;
+    let object_location = Url::parse(object_uri)
+        .map_err(|_| HandlerFailure::permanent("remote Create object URI is invalid"))?;
+    let actor_host = actor_location.host_str();
+    if actor_host.is_none()
+        || activity_location
+            .host_str()
+            .zip(actor_host)
+            .is_none_or(|(activity_host, actor_host)| {
+                !activity_host.eq_ignore_ascii_case(actor_host)
+            })
+        || object_location
+            .host_str()
+            .zip(actor_host)
+            .is_none_or(|(object_host, actor_host)| !object_host.eq_ignore_ascii_case(actor_host))
+    {
+        return Err(HandlerFailure::permanent(
+            "remote Create activity, actor, and object hosts do not match",
+        ));
+    }
+    Ok(())
+}
+
+fn resolved_create_note(
+    document: &Value,
+    activity_uri: &str,
+    actor_uri: &str,
+    object_uri: &str,
+) -> Result<Value, HandlerFailure> {
+    validate_create_binding(activity_uri, actor_uri, object_uri)?;
+    if document.get("type").and_then(Value::as_str) != Some("Note") {
+        return Err(HandlerFailure::permanent(
+            "remote Create object is not a Note",
+        ));
+    }
+    if remote_uri_value(document.get("id")) != Some(object_uri) {
+        return Err(HandlerFailure::permanent(
+            "remote Create object ID does not match the requested URI",
+        ));
+    }
+    let object = document
+        .as_object()
+        .ok_or_else(|| HandlerFailure::permanent("remote Create Note is not an object"))?;
+    validate_note_object(actor_uri, object)
+        .map_err(|_| HandlerFailure::permanent("remote Create Note is invalid"))?;
+    Ok(document.clone())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn schedule_remote_note_resolution(
+    pool: &PgPool,
+    source_account_id: i64,
+    activity_uri: &str,
+    actor_uri: &str,
+    object_uri: &str,
+    to: &[String],
+    cc: &[String],
+    delivery_target_account_id: Option<i64>,
+    activity: &Value,
+) -> Result<(), HandlerFailure> {
+    let job = JobSpec::new(
+        Lane::Pull,
+        ACTIVITYPUB_NOTE_RESOLVE_JOB_KIND,
+        json!({
+            "source_account_id": source_account_id,
+            "activity_uri": activity_uri,
+            "actor_uri": actor_uri,
+            "object_uri": object_uri,
+            "to": to,
+            "cc": cc,
+            "delivery_target_account_id": delivery_target_account_id,
+            "activity": activity
+        }),
+    )
+    .logical_key(note_resolution_logical_key(
+        source_account_id,
+        activity_uri,
+        actor_uri,
+        object_uri,
+        delivery_target_account_id,
+    ));
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| HandlerFailure::retry("remote Note resolution outbox transaction failed"))?;
+    record_outbox_once_in(&mut transaction, &job)
+        .await
+        .map_err(|_| HandlerFailure::retry("remote Note resolution outbox write failed"))?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| HandlerFailure::retry("remote Note resolution outbox commit failed"))?;
+    Ok(())
+}
+
+fn remote_note_fetch_failure(error: &RemoteFetchError) -> HandlerFailure {
+    match remote_announce_fetch_failure(error).disposition {
+        FailureDisposition::Retry => {
+            HandlerFailure::retry(format!("remote Create Note fetch failed: {error}"))
+        }
+        FailureDisposition::Permanent => {
+            HandlerFailure::permanent(format!("remote Create Note fetch is invalid: {error}"))
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn process_activitypub_note_resolution(
+    pool: PgPool,
+    config: &ActivityPubDeliveryConfig,
+    fetcher: &RemoteFetcher,
+    arguments: &Value,
+) -> Result<(), HandlerFailure> {
+    let source_account_id = arguments
+        .get("source_account_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| HandlerFailure::permanent("Note resolution job is missing its source"))?;
+    let activity_uri = arguments
+        .get("activity_uri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HandlerFailure::permanent("Note resolution job is missing its activity"))?;
+    let actor_uri = arguments
+        .get("actor_uri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HandlerFailure::permanent("Note resolution job is missing its actor"))?;
+    let object_uri = arguments
+        .get("object_uri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HandlerFailure::permanent("Note resolution job is missing its object"))?;
+    let activity = arguments
+        .get("activity")
+        .ok_or_else(|| HandlerFailure::permanent("Note resolution job is missing its payload"))?;
+    let parsed_activity = parse_activity(&activity.to_string())
+        .map_err(|_| HandlerFailure::permanent("Note resolution activity is invalid"))?;
+    let InboxActivity::CreateNoteReference {
+        activity_uri: parsed_activity_uri,
+        actor_uri: parsed_actor_uri,
+        object_uri: parsed_object_uri,
+        to,
+        cc,
+        ..
+    } = parsed_activity
+    else {
+        return Err(HandlerFailure::permanent(
+            "Note resolution payload is not a URI-only Create",
+        ));
+    };
+    if parsed_activity_uri != activity_uri
+        || parsed_actor_uri != actor_uri
+        || parsed_object_uri != object_uri
+        || arguments.get("to") != Some(&json!(to))
+        || arguments.get("cc") != Some(&json!(cc))
+    {
+        return Err(HandlerFailure::permanent(
+            "Note resolution contract does not match its activity",
+        ));
+    }
+    validate_create_binding(activity_uri, actor_uri, object_uri)?;
+    let delivery_target_account_id = parse_delivery_target_account_id(arguments)?;
+    let writer = WriteRepository::from_pool(pool.clone());
+    let resolved = writer
+        .remote_note_reference_is_resolved(source_account_id, actor_uri, object_uri)
+        .await
+        .map_err(|error| {
+            remote_note_write_failure(&error, "remote Note resolution state lookup failed")
+        })?;
+    if resolved {
+        if let Some(delivery_target_account_id) = delivery_target_account_id {
+            writer
+                .ensure_remote_note_reference_delivery(
+                    source_account_id,
+                    actor_uri,
+                    object_uri,
+                    delivery_target_account_id,
+                )
+                .await
+                .map_err(|error| {
+                    remote_note_write_failure(&error, "remote Note delivery target repair failed")
+                })?;
+        }
+        if activity
+            .get("signature")
+            .is_some_and(|signature| !signature.is_null())
+        {
+            writer
+                .record_remote_note_reference_forwarding(actor_uri, object_uri, activity)
+                .await
+                .map_err(|error| {
+                    remote_note_write_failure(&error, "resolved remote Note forwarding failed")
+                })?;
+        }
+        return Ok(());
+    }
+    let target = Url::parse(object_uri)
+        .map_err(|_| HandlerFailure::permanent("remote Create object URI is invalid"))?;
+    if same_url_origin(&target, &config.origin) {
+        return Err(HandlerFailure::permanent(
+            "remote Create object URI is local",
+        ));
+    }
+    let object_domain = inbox_actor_domain(object_uri)
+        .ok_or_else(|| HandlerFailure::permanent("remote Create object has no valid domain"))?;
+    if !Repository::from_pool(pool.clone())
+        .remote_domain_allowed(&object_domain, config.limited_federation)
+        .await
+        .map_err(|_| HandlerFailure::retry("remote Create object policy lookup failed"))?
+    {
+        return Err(HandlerFailure::permanent(
+            "remote Create object domain is not allowed",
+        ));
+    }
+    let signer_account = resolve_note_fetch_signer(
+        &pool,
+        source_account_id,
+        delivery_target_account_id,
+        &to,
+        &cc,
+        &config.origin,
+    )
+    .await?;
+    let private_key = signer_account
+        .private_key
+        .as_ref()
+        .filter(|key| key.is_present())
+        .ok_or_else(|| HandlerFailure::permanent("remote Create signer has no private key"))?;
+    let signer_key_id = format!(
+        "{}#main-key",
+        activitypub::actor_url(&config.origin, &signer_account)
+    );
+    let signer = HttpSignatureSigner {
+        key_id: &signer_key_id,
+        private_key_pem: private_key.as_str(),
+    };
+    let response = {
+        #[cfg(feature = "test-support")]
+        if let Some(endpoint) = config.remote_fetch_endpoint {
+            fetcher
+                .get_for_test_endpoint(target.clone(), THREAD_ACTIVITYPUB_CONTENT_TYPES, endpoint)
+                .await
+        } else {
+            fetcher
+                .get_signed(target.clone(), THREAD_ACTIVITYPUB_CONTENT_TYPES, &signer)
+                .await
+        }
+        #[cfg(not(feature = "test-support"))]
+        fetcher
+            .get_signed(target.clone(), THREAD_ACTIVITYPUB_CONTENT_TYPES, &signer)
+            .await
+    }
+    .map_err(|error| remote_note_fetch_failure(&error))?;
+    if !same_url_origin(&response.url, &target) {
+        return Err(HandlerFailure::permanent(
+            "remote Create object redirected to another origin",
+        ));
+    }
+    let document = serde_json::from_slice::<Value>(&response.body)
+        .map_err(|_| HandlerFailure::permanent("remote Create object JSON is invalid"))?;
+    let object = resolved_create_note(&document, activity_uri, actor_uri, object_uri)?;
+    if !writer
+        .remote_note_is_relevant(
+            source_account_id,
+            actor_uri,
+            &object,
+            delivery_target_account_id,
+            config.origin.as_str(),
+        )
+        .await
+        .map_err(|error| remote_note_write_failure(&error, "remote Note relevance check failed"))?
+    {
+        return Ok(());
+    }
+    writer
+        .apply_remote_note_create(
+            source_account_id,
+            actor_uri,
+            &object,
+            delivery_target_account_id,
+            config.origin.as_str(),
+        )
+        .await
+        .map_err(|error| remote_note_write_failure(&error, "resolved remote Note write failed"))?;
+    if activity
+        .get("signature")
+        .is_some_and(|signature| !signature.is_null())
+    {
+        writer
+            .record_remote_note_reference_forwarding(actor_uri, object_uri, activity)
+            .await
+            .map_err(|error| {
+                remote_note_write_failure(&error, "resolved remote Note forwarding failed")
+            })?;
+    }
+    Ok(())
+}
+
+fn parse_delivery_target_account_id(arguments: &Value) -> Result<Option<i64>, HandlerFailure> {
+    match arguments.get("delivery_target_account_id") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| HandlerFailure::permanent("Note resolution delivery target is invalid")),
+    }
+}
+
+fn preferred_note_fetch_signer_id(
+    delivery_target_account_id: Option<i64>,
+    addressed_account_id: Option<i64>,
+    follower_account_id: Option<i64>,
+) -> Option<i64> {
+    delivery_target_account_id
+        .or(addressed_account_id)
+        .or(follower_account_id)
+}
+
+fn note_fetch_audience<'a>(to: &'a [String], cc: &'a [String]) -> Vec<&'a String> {
+    to.iter().chain(cc).collect()
+}
+
+async fn resolve_note_fetch_signer(
+    pool: &PgPool,
+    source_account_id: i64,
+    delivery_target_account_id: Option<i64>,
+    to: &[String],
+    cc: &[String],
+    origin: &Url,
+) -> Result<Account, HandlerFailure> {
+    let valid_delivery_target = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM accounts
+          WHERE id = $1 AND domain IS NULL
+            AND private_key IS NOT NULL AND private_key <> ''",
+    )
+    .bind(delivery_target_account_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| HandlerFailure::retry("remote Create delivery signer lookup failed"))?;
+    let audience = note_fetch_audience(to, cc);
+    let addressed_account_id = sqlx::query_scalar::<_, i64>(
+        "SELECT account.id
+           FROM unnest($1::text[]) WITH ORDINALITY AS audience(uri, position)
+           JOIN accounts account ON account.domain IS NULL
+             AND account.private_key IS NOT NULL AND account.private_key <> ''
+             AND (
+               account.uri = audience.uri OR account.url = audience.uri
+               OR (audience.uri = $2 || '/actor' AND account.id = -99)
+               OR audience.uri = $2 || '/@' || account.username
+               OR (audience.uri = $2 || '/users/' || account.username
+                   AND account.id_scheme IS DISTINCT FROM 1)
+               OR (audience.uri = $2 || '/ap/users/' || account.id::text
+                   AND account.id_scheme = 1)
+             )
+          ORDER BY audience.position, account.id LIMIT 1",
+    )
+    .bind(&audience)
+    .bind(origin.as_str().trim_end_matches('/'))
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| HandlerFailure::retry("remote Create audience signer lookup failed"))?;
+    let follower_account_id = sqlx::query_scalar::<_, i64>(
+        "SELECT follower.id
+           FROM follows follow
+           JOIN accounts follower ON follower.id = follow.account_id
+          WHERE follow.target_account_id = $1 AND follower.domain IS NULL
+            AND follower.private_key IS NOT NULL AND follower.private_key <> ''
+          ORDER BY follow.id LIMIT 1",
+    )
+    .bind(source_account_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| HandlerFailure::retry("remote Create follower signer lookup failed"))?;
+    let signer_account_id = preferred_note_fetch_signer_id(
+        valid_delivery_target,
+        addressed_account_id,
+        follower_account_id,
+    )
+    .unwrap_or(-99);
+    Repository::from_pool(pool.clone())
+        .account(signer_account_id)
+        .await
+        .map_err(|_| HandlerFailure::retry("remote Create signer account lookup failed"))?
+        .filter(|account| {
+            account
+                .private_key
+                .as_ref()
+                .is_some_and(crate::mastodon::SecretText::is_present)
+        })
+        .ok_or_else(|| HandlerFailure::permanent("remote Create signer is unavailable"))
+}
+
 fn remote_announce_audience(arguments: &Value, field: &str) -> Result<Vec<String>, HandlerFailure> {
     let Some(value) = arguments.get(field) else {
         return Ok(Vec::new());
@@ -3775,6 +4194,7 @@ async fn process_activitypub_inbox(
     }
     let (actor_uri, nested_actor_uri) = match &activity {
         InboxActivity::CreateNote { actor_uri, .. }
+        | InboxActivity::CreateNoteReference { actor_uri, .. }
         | InboxActivity::UpdateNote { actor_uri, .. }
         | InboxActivity::DeleteNote { actor_uri, .. }
         | InboxActivity::Like { actor_uri, .. }
@@ -3947,6 +4367,27 @@ async fn process_activitypub_inbox(
                         )
                     })?;
             }
+        }
+        InboxActivity::CreateNoteReference {
+            activity_uri,
+            actor_uri,
+            object_uri,
+            to,
+            cc,
+            activity,
+        } => {
+            schedule_remote_note_resolution(
+                &pool,
+                source_account_id,
+                &activity_uri,
+                &actor_uri,
+                &object_uri,
+                &to,
+                &cc,
+                job.delivery_target_account_id,
+                &activity,
+            )
+            .await?;
         }
         InboxActivity::UpdateNote {
             actor_uri,
@@ -4556,6 +4997,23 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
         )?;
         if let Some(federation) = federation {
             let remote_fetcher = RemoteFetcher::default().with_operational_pool(pool.clone());
+            let note_pool = mastodon_writer.clone();
+            let note_config = federation.clone();
+            let note_fetcher = remote_fetcher.clone();
+            handlers.register(
+                ACTIVITYPUB_NOTE_RESOLVE_JOB_KIND,
+                Lane::Pull,
+                ResourceClass::RemoteHttp,
+                move |job| {
+                    let pool = note_pool.clone();
+                    let config = note_config.clone();
+                    let fetcher = note_fetcher.clone();
+                    async move {
+                        process_activitypub_note_resolution(pool, &config, &fetcher, &job.arguments)
+                            .await
+                    }
+                },
+            )?;
             let announce_pool = mastodon_writer.clone();
             let announce_config = federation.clone();
             let announce_fetcher = remote_fetcher.clone();
@@ -5080,8 +5538,10 @@ mod tests {
         FailureDisposition, HandlerRegistry, RemoteAnnounceTarget, ResourceClass,
         account_purge_cleanup_paths, account_update_delivery_is_current,
         account_update_delivery_logical_key, delivery_failure, delivery_logical_key,
-        inbox_actor_domain, remote_announce_document, remote_media_fetch_failure,
-        remote_note_document, retry_delay, safe_cleanup_path, update_delivery_logical_key,
+        inbox_actor_domain, note_fetch_audience, note_resolution_logical_key,
+        preferred_note_fetch_signer_id, remote_announce_document, remote_media_fetch_failure,
+        remote_note_document, remote_note_fetch_failure, resolved_create_note, retry_delay,
+        safe_cleanup_path, update_delivery_logical_key,
     };
     use crate::jobs::Lane;
     use crate::remote::RemoteFetchError;
@@ -5298,6 +5758,123 @@ mod tests {
         assert_eq!(object["id"], note_uri);
         assert_eq!(actor_uri, "https://remote.example/users/alice");
         assert_eq!(target_uri, note_uri);
+    }
+
+    #[test]
+    fn note_resolution_keys_preserve_actor_object_and_personal_recipient() {
+        let first = note_resolution_logical_key(
+            1,
+            "https://remote.example/activities/1",
+            "https://remote.example/users/alice",
+            "https://remote.example/statuses/1",
+            Some(7),
+        );
+        assert_eq!(
+            first,
+            note_resolution_logical_key(
+                1,
+                "https://remote.example/activities/1",
+                "https://remote.example/users/alice",
+                "https://remote.example/statuses/1",
+                Some(7),
+            )
+        );
+        assert_ne!(
+            first,
+            note_resolution_logical_key(
+                1,
+                "https://remote.example/activities/1",
+                "https://remote.example/users/alice",
+                "https://remote.example/statuses/1",
+                Some(8),
+            )
+        );
+        assert_ne!(
+            first,
+            note_resolution_logical_key(
+                2,
+                "https://remote.example/activities/1",
+                "https://remote.example/users/mallory",
+                "https://remote.example/statuses/2",
+                Some(7),
+            )
+        );
+    }
+
+    #[test]
+    fn note_fetch_signer_priority_matches_mastodon() {
+        assert_eq!(
+            preferred_note_fetch_signer_id(Some(1), Some(2), Some(3)),
+            Some(1)
+        );
+        assert_eq!(
+            preferred_note_fetch_signer_id(None, Some(2), Some(3)),
+            Some(2)
+        );
+        assert_eq!(preferred_note_fetch_signer_id(None, None, Some(3)), Some(3));
+        assert_eq!(preferred_note_fetch_signer_id(None, None, None), None);
+    }
+
+    #[test]
+    fn note_fetch_signer_considers_shared_inbox_outer_audience_in_order() {
+        let to = vec![
+            "https://local.example/users/first".to_owned(),
+            "https://local.example/users/second".to_owned(),
+        ];
+        let cc = vec!["https://local.example/users/third".to_owned()];
+
+        assert_eq!(note_fetch_audience(&to, &cc), vec![&to[0], &to[1], &cc[0]]);
+    }
+
+    #[test]
+    fn resolved_create_note_rejects_spoofed_identity_actor_and_type() {
+        let activity_uri = "https://remote.example/activities/1";
+        let actor_uri = "https://remote.example/users/alice";
+        let object_uri = "https://remote.example/statuses/1";
+        let valid = json!({
+            "id": object_uri,
+            "type": "Note",
+            "attributedTo": actor_uri,
+            "content": "hello"
+        });
+        assert!(resolved_create_note(&valid, activity_uri, actor_uri, object_uri).is_ok());
+
+        for spoofed in [
+            json!({"id":"https://remote.example/statuses/2","type":"Note","attributedTo":actor_uri,"content":"hello"}),
+            json!({"id":object_uri,"type":"Note","attributedTo":"https://remote.example/users/mallory","content":"hello"}),
+            json!({"id":object_uri,"type":"Article","attributedTo":actor_uri,"content":"hello"}),
+            json!({"id":activity_uri,"type":"Create","actor":actor_uri,"object":valid}),
+        ] {
+            assert_eq!(
+                resolved_create_note(&spoofed, activity_uri, actor_uri, object_uri)
+                    .expect_err("spoofed Notes must fail permanently")
+                    .disposition,
+                FailureDisposition::Permanent
+            );
+        }
+    }
+
+    #[test]
+    fn remote_note_fetch_failures_distinguish_retryable_and_permanent_errors() {
+        assert_eq!(
+            remote_note_fetch_failure(&RemoteFetchError::UnexpectedStatus(
+                StatusCode::SERVICE_UNAVAILABLE
+            ))
+            .disposition,
+            FailureDisposition::Retry
+        );
+        assert_eq!(
+            remote_note_fetch_failure(&RemoteFetchError::UnexpectedStatus(StatusCode::GONE))
+                .disposition,
+            FailureDisposition::Permanent
+        );
+        assert_eq!(
+            remote_note_fetch_failure(&RemoteFetchError::BlockedAddress(
+                "127.0.0.1".parse().expect("loopback address")
+            ))
+            .disposition,
+            FailureDisposition::Permanent
+        );
     }
 
     #[test]

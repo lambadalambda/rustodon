@@ -25,6 +25,7 @@ pub const MASTODON_DOMAIN_BLOCK_JOB_KIND: &str = "rustodon.mastodon.domain_block
 pub const ACTIVITYPUB_DELIVERY_JOB_KIND: &str = "rustodon.activitypub.deliver";
 pub const ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND: &str = "rustodon.activitypub.resolve_thread";
 pub const ACTIVITYPUB_ANNOUNCE_RESOLVE_JOB_KIND: &str = "rustodon.activitypub.resolve_announce";
+pub const ACTIVITYPUB_NOTE_RESOLVE_JOB_KIND: &str = "rustodon.activitypub.resolve_note";
 pub const ACTIVITYPUB_MEDIA_FETCH_JOB_KIND: &str = "rustodon.activitypub.fetch_media";
 pub const NOTIFICATION_CREATE_JOB_KIND: &str = "rustodon.mastodon.notify_activity";
 pub const NOTIFICATION_UNFILTER_JOB_KIND: &str = "rustodon.mastodon.unfilter_notifications";

@@ -2922,6 +2922,85 @@ impl WriteRepository {
         .await?)
     }
 
+    pub(crate) async fn remote_note_reference_is_resolved(
+        &self,
+        account_id: i64,
+        actor_uri: &str,
+        object_uri: &str,
+    ) -> Result<bool, WriteError> {
+        if !same_remote_note_host(actor_uri, object_uri)? {
+            return Err(WriteError::InvalidInput(
+                "remote Note URI does not match its actor host",
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        lock_remote_note(&mut transaction, object_uri).await?;
+        let actor_matches = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1 FROM accounts
+                WHERE id = $1 AND domain IS NOT NULL AND uri = $2)",
+        )
+        .bind(account_id)
+        .bind(actor_uri)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !actor_matches {
+            transaction.commit().await?;
+            return Ok(true);
+        }
+        let resolved = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1 FROM statuses WHERE account_id = $1 AND uri = $2
+                UNION ALL
+                SELECT 1 FROM tombstones WHERE account_id = $1 AND uri = $2)",
+        )
+        .bind(account_id)
+        .bind(object_uri)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(resolved)
+    }
+
+    pub(crate) async fn ensure_remote_note_reference_delivery(
+        &self,
+        account_id: i64,
+        actor_uri: &str,
+        object_uri: &str,
+        delivery_target_account_id: i64,
+    ) -> Result<(), WriteError> {
+        if !same_remote_note_host(actor_uri, object_uri)? {
+            return Err(WriteError::InvalidInput(
+                "remote Note URI does not match its actor host",
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        lock_remote_note(&mut transaction, object_uri).await?;
+        let status_id = sqlx::query_scalar::<_, i64>(
+            "SELECT status.id FROM statuses status
+               JOIN accounts actor ON actor.id = status.account_id
+                                  AND actor.id = $1 AND actor.uri = $2
+                                  AND actor.domain IS NOT NULL
+              WHERE status.uri = $3 AND status.deleted_at IS NULL
+              ORDER BY status.id LIMIT 1",
+        )
+        .bind(account_id)
+        .bind(actor_uri)
+        .bind(object_uri)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(status_id) = status_id {
+            ensure_remote_note_delivery_target(
+                &mut transaction,
+                status_id,
+                delivery_target_account_id,
+            )
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub(crate) async fn remote_announce_target_exists(
         &self,
         object_uri: &str,
@@ -3749,6 +3828,16 @@ impl WriteRepository {
             activity,
         )
         .await
+    }
+
+    pub(crate) async fn record_remote_note_reference_forwarding(
+        &self,
+        actor_uri: &str,
+        object_uri: &str,
+        activity: &Value,
+    ) -> Result<(), WriteError> {
+        self.record_remote_activity_forwarding(actor_uri, object_uri, None, activity)
+            .await
     }
 
     pub(crate) async fn record_remote_note_delete_forwarding(

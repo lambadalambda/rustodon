@@ -13,11 +13,12 @@ use rustodon::jobs::{
     ACTIVITYPUB_ACCOUNT_DELETE_JOB_KIND, ACTIVITYPUB_ACCOUNT_UPDATE_JOB_KIND,
     ACTIVITYPUB_ANNOUNCE_RESOLVE_JOB_KIND, ACTIVITYPUB_DELIVERY_JOB_KIND,
     ACTIVITYPUB_INBOX_JOB_KIND, ACTIVITYPUB_MEDIA_FETCH_JOB_KIND,
-    ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND, ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND, JobError,
-    JobSpec, LOCAL_MEDIA_CLEANUP_JOB_KIND, Lane, MASTODON_ACCOUNT_PURGE_JOB_KIND,
-    MASTODON_DOMAIN_BLOCK_JOB_KIND, MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND,
-    NOTIFICATION_CREATE_JOB_KIND, NOTIFICATION_UNFILTER_JOB_KIND, Queue, RetryResult,
-    WorkerHeartbeat, enqueue_in, record_outbox_in, record_outbox_once_in,
+    ACTIVITYPUB_NOTE_RESOLVE_JOB_KIND, ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
+    ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND, JobError, JobSpec, LOCAL_MEDIA_CLEANUP_JOB_KIND, Lane,
+    MASTODON_ACCOUNT_PURGE_JOB_KIND, MASTODON_DOMAIN_BLOCK_JOB_KIND,
+    MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND, NOTIFICATION_CREATE_JOB_KIND,
+    NOTIFICATION_UNFILTER_JOB_KIND, Queue, RetryResult, WorkerHeartbeat, enqueue_in,
+    record_outbox_in, record_outbox_once_in,
 };
 use rustodon::mail::REPORT_JOB_KIND;
 use rustodon::mastodon::rest::InstanceRuntimeConfig;
@@ -5670,6 +5671,445 @@ async fn activitypub_note_create_update_and_delete_are_processed_idempotently()
         .await?;
     drop(media_root);
     fs::remove_dir_all(&media_root_path)?;
+    result
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+#[allow(clippy::too_many_lines)]
+async fn uri_only_create_is_deduplicated_retried_materialized_and_replayed()
+-> Result<(), Box<dyn std::error::Error>> {
+    const BOB: i64 = 116_844_606_259_202_001;
+    const MODERATOR: i64 = 116_844_606_259_201_002;
+    const API_MODERATOR: i64 = 116_844_606_259_201_004;
+    const ORIGIN: &str = "https://fixture-v4-6-5.rustodon.invalid/";
+    const ACTOR: &str = "https://remote.fixture.invalid/users/bob";
+    const KEY_ID: &str = "https://remote.fixture.invalid/users/bob#secondary-key";
+    const ACTIVITY_URI: &str = "http://remote.fixture.invalid/activities/rustodon-uri-create";
+    const NOTE_URI: &str = "http://remote.fixture.invalid/users/bob/statuses/rustodon-uri-create";
+    const DELETED_ACTIVITY_URI: &str =
+        "http://remote.fixture.invalid/activities/rustodon-uri-create-deleted";
+    const DELETED_NOTE_URI: &str =
+        "http://remote.fixture.invalid/users/bob/statuses/rustodon-uri-create-deleted";
+
+    let runtime_url = std::env::var("RUSTODON_WORKER_DATABASE_URL")?;
+    let owner_url = std::env::var("RUSTODON_WORKER_OWNER_DATABASE_URL")?;
+    let runtime_pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&runtime_url)
+        .await?;
+    let writer_pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&owner_url)
+        .await?;
+    reset().await?;
+    let baseline_statuses_count: i64 =
+        sqlx::query_scalar("SELECT statuses_count FROM account_stats WHERE account_id = $1")
+            .bind(BOB)
+            .fetch_one(&writer_pool)
+            .await?;
+    let (parent_username, parent_id_scheme) = sqlx::query_as::<_, (String, Option<i32>)>(
+        "SELECT username, id_scheme FROM accounts WHERE id = $1",
+    )
+    .bind(MODERATOR)
+    .fetch_one(&writer_pool)
+    .await?;
+    let parent_id: i64 = sqlx::query_scalar(
+        "INSERT INTO statuses (
+             account_id, text, spoiler_text, visibility, local, sensitive, reply,
+             created_at, updated_at)
+         VALUES ($1, 'URI resolver forwarding target', '', 0, true, false, false,
+                 clock_timestamp(), clock_timestamp()) RETURNING id",
+    )
+    .bind(MODERATOR)
+    .fetch_one(&writer_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO status_stats (status_id, created_at, updated_at)
+         VALUES ($1, clock_timestamp(), clock_timestamp())",
+    )
+    .bind(parent_id)
+    .execute(&writer_pool)
+    .await?;
+    let parent_uri = if parent_id_scheme == Some(1) {
+        format!(
+            "{}/ap/users/{MODERATOR}/statuses/{parent_id}",
+            ORIGIN.trim_end_matches('/')
+        )
+    } else {
+        format!(
+            "{}/users/{parent_username}/statuses/{parent_id}",
+            ORIGIN.trim_end_matches('/')
+        )
+    };
+    let previous_parent_follower: Option<Value> = sqlx::query_scalar(
+        "SELECT to_jsonb(follow) FROM follows follow
+          WHERE account_id = $1 AND target_account_id = $2",
+    )
+    .bind(-320_i64)
+    .bind(MODERATOR)
+    .fetch_optional(&writer_pool)
+    .await?;
+    sqlx::query("DELETE FROM follows WHERE account_id = $1 AND target_account_id = $2")
+        .bind(-320_i64)
+        .bind(MODERATOR)
+        .execute(&writer_pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO follows
+             (account_id, target_account_id, show_reblogs, notify, languages, uri,
+              created_at, updated_at)
+         VALUES ($1, $2, true, false, NULL, $3, clock_timestamp(), clock_timestamp())",
+    )
+    .bind(-320_i64)
+    .bind(MODERATOR)
+    .bind("https://account-blocked.fixture.invalid/users/domain_viewer#follows/uri-resolver")
+    .execute(&writer_pool)
+    .await?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = listener.local_addr()?;
+    let note = json!({
+        "id": NOTE_URI,
+        "type": "Note",
+        "attributedTo": ACTOR,
+        "published": "2026-08-25T12:20:00Z",
+        "inReplyTo": parent_uri,
+        "content": "<p>Fetched durable Note</p>",
+        "to": [
+            "https://fixture-v4-6-5.rustodon.invalid/users/moderator",
+            "https://fixture-v4-6-5.rustodon.invalid/users/api_moderator"
+        ],
+        "cc": [],
+        "tag": [],
+        "attachment": []
+    })
+    .to_string()
+    .into_bytes();
+    let server = tokio::spawn(fixture_retry_activitypub_server(listener, note));
+    let queue = Queue::new(runtime_pool.clone());
+    let handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
+        &queue,
+        Some(writer_pool.clone()),
+        None,
+        Some(ActivityPubDeliveryConfig {
+            origin: Url::parse(ORIGIN)?,
+            local_domain: "fixture-v4-6-5.rustodon.invalid".to_owned(),
+            media_root_url: "/system".to_owned(),
+            media_root: None,
+            limited_federation: false,
+            remote_media_endpoint: None,
+            remote_delivery_endpoint: None,
+            remote_fetch_endpoint: Some(endpoint),
+        }),
+    )?;
+    let executor = WorkerExecutor::new(queue.clone(), handlers, 1, 1)?;
+    let body = json!({
+        "id": ACTIVITY_URI,
+        "type": "Create",
+        "actor": ACTOR,
+        "object": NOTE_URI,
+        "to": [
+            "https://fixture-v4-6-5.rustodon.invalid/users/moderator",
+            "https://fixture-v4-6-5.rustodon.invalid/users/api_moderator"
+        ],
+        "cc": [],
+        "signature": {
+            "type": "RsaSignature2017",
+            "creator": KEY_ID,
+            "created": "2026-08-25T12:20:00Z",
+            "signatureValue": "fixture"
+        }
+    })
+    .to_string();
+    let result = async {
+        for (logical_key, delivery_target_account_id) in [
+            ("activitypub:test-uri-create", MODERATOR),
+            ("activitypub:test-uri-create-duplicate", MODERATOR),
+            ("activitypub:test-uri-create-second-recipient", API_MODERATOR),
+        ] {
+            queue
+                .enqueue(
+                    &JobSpec::new(
+                        Lane::Ingress,
+                        ACTIVITYPUB_INBOX_JOB_KIND,
+                        json!({
+                            "body": body,
+                            "signature_key_id": KEY_ID,
+                            "remote_domain": "remote.fixture.invalid",
+                            "delivery_target_account_id": delivery_target_account_id
+                        }),
+                    )
+                    .logical_key(logical_key),
+                )
+                .await?;
+            assert!(
+                executor
+                    .process_one("uri-create-ingress", &[Lane::Ingress], Duration::seconds(30))
+                    .await?
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM rustodon.outbox_events WHERE kind = $1"
+            )
+            .bind(ACTIVITYPUB_NOTE_RESOLVE_JOB_KIND)
+            .fetch_one(&writer_pool)
+            .await?,
+            2,
+            "exact retries must deduplicate without suppressing another personal inbox"
+        );
+        assert_eq!(queue.dispatch_outbox(10).await?, 2);
+        let resolution_arguments: Value = sqlx::query_scalar(
+            "SELECT arguments FROM rustodon.durable_jobs
+              WHERE kind = $1 AND arguments ->> 'delivery_target_account_id' = $2",
+        )
+        .bind(ACTIVITYPUB_NOTE_RESOLVE_JOB_KIND)
+        .bind(MODERATOR.to_string())
+        .fetch_one(&runtime_pool)
+        .await?;
+        assert_eq!(resolution_arguments["activity_uri"], ACTIVITY_URI);
+        assert_eq!(resolution_arguments["actor_uri"], ACTOR);
+        assert_eq!(resolution_arguments["object_uri"], NOTE_URI);
+        assert_eq!(
+            resolution_arguments["delivery_target_account_id"],
+            MODERATOR
+        );
+
+        assert!(
+            executor
+                .process_one("uri-create-pull", &[Lane::Pull], Duration::seconds(30))
+                .await?
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM statuses WHERE uri = $1")
+                .bind(NOTE_URI)
+                .fetch_one(&writer_pool)
+                .await?,
+            0
+        );
+        let retry = sqlx::query_as::<_, (i32, i32, Option<String>)>(
+            "SELECT attempts, max_attempts, last_error FROM rustodon.durable_jobs
+              WHERE kind = $1 AND arguments ->> 'delivery_target_account_id' = $2",
+        )
+        .bind(ACTIVITYPUB_NOTE_RESOLVE_JOB_KIND)
+        .bind(MODERATOR.to_string())
+        .fetch_one(&runtime_pool)
+        .await?;
+        assert_eq!(retry.0, 1);
+        assert_eq!(retry.1, 25);
+        assert!(retry.2.is_some());
+        assert!(
+            executor
+                .process_one("uri-create-second-recipient", &[Lane::Pull], Duration::seconds(30))
+                .await?
+        );
+        sqlx::query(
+            "UPDATE rustodon.durable_jobs SET run_at = clock_timestamp()
+              WHERE kind = $1 AND arguments ->> 'delivery_target_account_id' = $2",
+        )
+        .bind(ACTIVITYPUB_NOTE_RESOLVE_JOB_KIND)
+        .bind(MODERATOR.to_string())
+        .execute(&runtime_pool)
+        .await?;
+        assert!(
+            executor
+                .process_one("uri-create-pull", &[Lane::Pull], Duration::seconds(30))
+                .await?
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM statuses WHERE uri = $1 AND account_id = $2 AND deleted_at IS NULL"
+            )
+            .bind(NOTE_URI)
+            .bind(BOB)
+            .fetch_one(&writer_pool)
+            .await?,
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Vec<i64>>(
+                "SELECT array_agg(account_id ORDER BY account_id) FROM mentions
+                  WHERE status_id = (SELECT id FROM statuses WHERE uri = $1)
+                    AND account_id = ANY($2)",
+            )
+            .bind(NOTE_URI)
+            .bind(vec![MODERATOR, API_MODERATOR])
+            .fetch_one(&writer_pool)
+            .await?,
+            vec![MODERATOR, API_MODERATOR],
+            "each personal delivery must preserve access through a silent mention"
+        );
+
+        sqlx::query("UPDATE statuses SET visibility = 0 WHERE uri = $1")
+            .bind(NOTE_URI)
+            .execute(&writer_pool)
+            .await?;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM rustodon.outbox_events
+              WHERE kind = $1 AND payload -> 'arguments' -> 'body' ->> 'id' = $2",
+            )
+            .bind(ACTIVITYPUB_DELIVERY_JOB_KIND)
+            .bind(ACTIVITY_URI)
+            .fetch_one(&writer_pool)
+            .await?,
+            0,
+            "the simulated crash boundary starts without forwarding work"
+        );
+
+        queue
+            .enqueue(
+                &JobSpec::new(
+                    Lane::Pull,
+                    ACTIVITYPUB_NOTE_RESOLVE_JOB_KIND,
+                    resolution_arguments,
+                )
+                .logical_key("activitypub:test-uri-create-crash-replay"),
+            )
+            .await?;
+        assert!(
+            executor
+                .process_one("uri-create-replay", &[Lane::Pull], Duration::seconds(30))
+                .await?
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM statuses WHERE uri = $1")
+                .bind(NOTE_URI)
+                .fetch_one(&writer_pool)
+                .await?,
+            1,
+            "replay after materialization must not duplicate or refetch the Note"
+        );
+        let forwarding_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM rustodon.outbox_events
+              WHERE kind = $1 AND payload -> 'arguments' -> 'body' ->> 'id' = $2",
+        )
+        .bind(ACTIVITYPUB_DELIVERY_JOB_KIND)
+        .bind(ACTIVITY_URI)
+        .fetch_one(&writer_pool)
+        .await?;
+        assert!(
+            forwarding_count > 0,
+            "replay after the materialization boundary must restore forwarding work"
+        );
+        sqlx::query(
+            "DELETE FROM rustodon.outbox_events
+              WHERE kind = $1 AND payload -> 'arguments' -> 'body' ->> 'id' = $2",
+        )
+        .bind(ACTIVITYPUB_DELIVERY_JOB_KIND)
+        .bind(ACTIVITY_URI)
+        .execute(&writer_pool)
+        .await?;
+        let requests = server.await??;
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| {
+            String::from_utf8_lossy(request).starts_with("GET /users/bob/statuses/rustodon-uri-create")
+        }));
+
+        for (logical_key, activity) in [
+            (
+                "activitypub:test-uri-create-before-delete",
+                json!({
+                    "id": DELETED_ACTIVITY_URI,
+                    "type": "Create",
+                    "actor": ACTOR,
+                    "object": DELETED_NOTE_URI
+                }),
+            ),
+            (
+                "activitypub:test-uri-create-delete",
+                json!({
+                    "type": "Delete",
+                    "actor": ACTOR,
+                    "object": DELETED_NOTE_URI
+                }),
+            ),
+        ] {
+            queue
+                .enqueue(
+                    &JobSpec::new(
+                        Lane::Ingress,
+                        ACTIVITYPUB_INBOX_JOB_KIND,
+                        json!({
+                            "body": activity.to_string(),
+                            "signature_key_id": KEY_ID,
+                            "remote_domain": "remote.fixture.invalid",
+                            "delivery_target_account_id": MODERATOR
+                        }),
+                    )
+                    .logical_key(logical_key),
+                )
+                .await?;
+            assert!(
+                executor
+                    .process_one("uri-create-ordering", &[Lane::Ingress], Duration::seconds(30))
+                    .await?
+            );
+        }
+        assert_eq!(queue.dispatch_outbox(10).await?, 1);
+        assert!(
+            executor
+                .process_one("uri-create-ordering", &[Lane::Pull], Duration::seconds(30))
+                .await?
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM statuses WHERE uri = $1")
+                .bind(DELETED_NOTE_URI)
+                .fetch_one(&writer_pool)
+                .await?,
+            0,
+            "Delete-before-resolution must prevent materialization"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM tombstones WHERE account_id = $1 AND uri = $2"
+            )
+            .bind(BOB)
+            .bind(DELETED_NOTE_URI)
+            .fetch_one(&writer_pool)
+            .await?,
+            1
+        );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    sqlx::query("DELETE FROM statuses WHERE uri = $1")
+        .bind(NOTE_URI)
+        .execute(&writer_pool)
+        .await?;
+    sqlx::query("DELETE FROM tombstones WHERE account_id = $1 AND uri = $2")
+        .bind(BOB)
+        .bind(DELETED_NOTE_URI)
+        .execute(&writer_pool)
+        .await?;
+    sqlx::query("UPDATE account_stats SET statuses_count = $2 WHERE account_id = $1")
+        .bind(BOB)
+        .bind(baseline_statuses_count)
+        .execute(&writer_pool)
+        .await?;
+    sqlx::query("DELETE FROM follows WHERE account_id = $1 AND target_account_id = $2")
+        .bind(-320_i64)
+        .bind(MODERATOR)
+        .execute(&writer_pool)
+        .await?;
+    if let Some(previous_parent_follower) = previous_parent_follower {
+        sqlx::query(
+            "INSERT INTO follows
+             SELECT * FROM jsonb_populate_record(NULL::follows, $1)",
+        )
+        .bind(previous_parent_follower)
+        .execute(&writer_pool)
+        .await?;
+    }
+    sqlx::query("DELETE FROM status_stats WHERE status_id = $1")
+        .bind(parent_id)
+        .execute(&writer_pool)
+        .await?;
+    sqlx::query("DELETE FROM statuses WHERE id = $1")
+        .bind(parent_id)
+        .execute(&writer_pool)
+        .await?;
     result
 }
 
@@ -15770,6 +16210,30 @@ async fn fixture_activitypub_server(
     );
     socket.write_all(headers.as_bytes()).await?;
     socket.write_all(&body).await
+}
+
+#[cfg(feature = "test-support")]
+async fn fixture_retry_activitypub_server(
+    listener: TcpListener,
+    body: Vec<u8>,
+) -> Result<Vec<Vec<u8>>, std::io::Error> {
+    let mut requests = Vec::with_capacity(2);
+    for status in ["503 Service Unavailable", "200 OK"] {
+        let (mut socket, _) = listener.accept().await?;
+        requests.push(fixture_delivery_request(&mut socket).await?);
+        let response_body = if status == "200 OK" {
+            body.as_slice()
+        } else {
+            &[]
+        };
+        let headers = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/activity+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response_body.len()
+        );
+        socket.write_all(headers.as_bytes()).await?;
+        socket.write_all(response_body).await?;
+    }
+    Ok(requests)
 }
 
 async fn reset() -> Result<(), Box<dyn std::error::Error>> {

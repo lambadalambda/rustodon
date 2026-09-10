@@ -17,6 +17,14 @@ pub(crate) enum InboxActivity {
         object: Value,
         activity: Value,
     },
+    CreateNoteReference {
+        activity_uri: String,
+        actor_uri: String,
+        object_uri: String,
+        to: Vec<String>,
+        cc: Vec<String>,
+        activity: Value,
+    },
     UpdateNote {
         actor_uri: String,
         object: Value,
@@ -183,8 +191,21 @@ fn parse_note_create(
 ) -> Result<InboxActivity, InboxParseError> {
     let activity_uri = required_uri(activity.get("id"))?;
     let actor_uri = required_uri(activity.get("actor"))?;
-    let Some(Value::Object(object)) = activity.get("object") else {
-        return Ok(InboxActivity::Unsupported);
+    let Some(object) = activity.get("object") else {
+        return Err(InboxParseError::Activity);
+    };
+    if object.is_string() {
+        return Ok(InboxActivity::CreateNoteReference {
+            activity_uri,
+            actor_uri,
+            object_uri: required_uri(Some(object))?,
+            to: parse_interaction_audience(activity.get("to"))?,
+            cc: parse_interaction_audience(activity.get("cc"))?,
+            activity: Value::Object(activity.clone()),
+        });
+    }
+    let Value::Object(object) = object else {
+        return Err(InboxParseError::Activity);
     };
     if object.get("type").and_then(Value::as_str) != Some("Note") {
         return Ok(InboxActivity::Unsupported);
@@ -807,6 +828,33 @@ mod tests {
                 && atom_uri == "https://remote.example/objects/1"
                 && activity["type"] == "Delete"
         ));
+    }
+
+    #[test]
+    fn parses_uri_only_note_create_as_a_durable_resolution_contract() {
+        let create = parse_activity(
+            r#"{"id":"https://remote.example/activities/create-reference","type":"Create","actor":"https://remote.example/users/alice","object":"https://remote.example/statuses/1","to":["https://local.example/users/bob"],"cc":"https://www.w3.org/ns/activitystreams#Public"}"#,
+        )
+        .expect("URI-only Create should parse");
+
+        assert_eq!(
+            create,
+            InboxActivity::CreateNoteReference {
+                activity_uri: "https://remote.example/activities/create-reference".to_owned(),
+                actor_uri: "https://remote.example/users/alice".to_owned(),
+                object_uri: "https://remote.example/statuses/1".to_owned(),
+                to: vec!["https://local.example/users/bob".to_owned()],
+                cc: vec!["https://www.w3.org/ns/activitystreams#Public".to_owned()],
+                activity: json!({
+                    "id": "https://remote.example/activities/create-reference",
+                    "type": "Create",
+                    "actor": "https://remote.example/users/alice",
+                    "object": "https://remote.example/statuses/1",
+                    "to": ["https://local.example/users/bob"],
+                    "cc": "https://www.w3.org/ns/activitystreams#Public"
+                }),
+            }
+        );
     }
 
     #[test]
