@@ -17,14 +17,14 @@ or a cutover rehearsal. An open row must not be described as complete.
 
 | Surface | Contract and proof | Status |
 | --- | --- | --- |
-| REST inventory | `API_ROUTE_INVENTORY` contains every advertised method/path, rejects duplicate method/path pairs, and `V1_REQUIRED_API_ROUTES` checks every required v1 route. Tests: `web::tests::api_route_inventory_is_unique_and_declares_protocol_contracts`, `web::tests::v1_required_api_routes_are_inventoried_with_explicit_support`. | A |
+| REST inventory | `API_ROUTE_INVENTORY` contains every advertised method/path, rejects duplicate method/path pairs, and `V1_REQUIRED_API_ROUTES` checks every required v1 route. `mise run pinned-source-contracts` independently derives ordinary startup probes from the pinned frontend and checks router/support declarations, including announcements and hashtag search. | A |
 | CLI inventory | `tests/cli_help.rs` checks the process modes and every administrative command exposed by `rustodon --help` and `rustodon admin --help`. | A |
-| Differential compatibility | `mise run differential` runs 18 general Rails-versus-Rust cases plus isolated notification-write and status-authorization phases against independent Mastodon and Rustodon database/media clones and compares responses and state. The complete suite currently passes; `mise run differential -- <case>` runs one case. | A locally; peer convergence remains open |
+| Differential compatibility | `mise run differential` defines 21 unique Rails-versus-Rust cases and performs 22 gate executions: 19 broad cases, isolated notification and authorization phases, and a second actor-media-root configuration. In this review, one broad run passed 17 cases before the local 10-minute command limit; its remaining `rest_protocol_contracts` and `write_transactions` cases passed independently, as did the isolated notification and authorization phases. `mise run differential-ci` runs a high-value fresh-clone subset in CI. | A locally from combined case evidence; peer convergence remains open |
 | Authorized-fetch reads | `mise run differential -- authorized_fetch_read_routes_require_signatures` starts Rustodon with limited federation enabled and checks protected actor, Note, activity, outbox, followers, and following routes reject unsigned reads while `/actor` remains public. | A locally |
 | Fixture and schema | `mise run fixture-verify`, `mise run mastodon-schema-integration`, and `mise run operational-schema-integration`. | A |
 | Fixture cutover and rollback | `mise run cutover-integration` migrates the isolated operational schema, starts Rustodon, runs the operator smoke, reopens the pinned Mastodon web process, and compares stable public state and media. | A locally; live production rehearsal remains open |
 | Browser web-client smoke | `mise run browser-integration` starts the cutover fixture, drives Chromium through `agent-browser`, and checks the React mount, app body, SPA deep link, and page errors. | A locally; mobile-client recording remains open |
-| Workers | `mise run worker-integration` covers enqueue, leases, cancellation, retries, dead letters, resource limits, readiness, shutdown, and crash recovery. | A locally; peer convergence remains open |
+| Workers | `mise run worker-integration` covers 49 restored-fixture cases for enqueue, leases, cancellation, retries, dead letters, resource limits, media reconciliation, URI-only Create resolution, mail acceptance/acknowledgement faults, readiness, shutdown, and crash recovery. | A locally; peer convergence remains open |
 | Startup and preflight | `mise run startup-integration` and `mise run preflight-integration`. | A |
 | Operator smoke | `tools/rustodon-smoke` checks health, readiness, authentication, reads, a no-op write, media, WebFinger, and actor discovery against a running instance. | A locally; live operator run remains open |
 
@@ -56,7 +56,7 @@ surface; their help entries are checked by
 
 ## Supported API Routes
 
-`src/web.rs::API_ROUTE_INVENTORY` is the complete advertised API surface: 104
+`src/web.rs::API_ROUTE_INVENTORY` is the complete advertised API surface: 106
 canonical method/path contracts, with trailing-slash aliases registered by the
 router but not duplicated in the inventory. The inventory and route-contract
 tests check unique method/path pairs, representative authentication and
@@ -94,9 +94,9 @@ owning issue, code surface, or acceptance command.
 | AUTH-01 | Accept existing bearer tokens with revocation, expiry, owner-state, and scope checks. | `src/mastodon/auth.rs`; `tests/oauth.rs`; differential `oauth_bearer_authentication`. | A |
 | AUTH-02 | Password login and logout for existing users. | Rust-owned browser auth routes in `src/web.rs`; lifecycle parity is covered by differential `browser_authentication`, and `mise run browser-integration` proves a fixture-authenticated browser shell plus settings/logout. Full browser form-flow acceptance remains required. | M |
 | AUTH-03 | Existing TOTP and backup-code verification; WebAuthn is not required. | `src/crypto.rs`, `src/mastodon/auth.rs`, browser authentication/settings handlers, auth tests, and guarded `browser_authentication`/`browser_two_factor_management` cases. | M; local fixture proof complete, live browser evidence remains open |
-| AUTH-04 | OAuth authorization code, PKCE, and revocation. | `src/mastodon/oauth.rs`, `src/web.rs`; differential `oauth_authorization_code` and browser lifecycle guard coverage; OAuth tests. | A |
+| AUTH-04 | OAuth authorization code, PKCE, and revocation. | `src/mastodon/oauth.rs`, `src/web.rs`; public applications require RFC 7636 S256 while confidential clients retain compatible optional PKCE; differential `oauth_authorization_code` and OAuth tests. | A |
 | AUTH-05 | Dynamic app registration and application credential verification. | `POST /api/v1/apps`, `/api/v1/apps/verify_credentials`; differential OAuth coverage. | A |
-| AUTH-06 | Password reset, confirmation email when SMTP is configured, and administrator reset. | `src/mail.rs`, browser reset routes, `admin reset-password`; `tests/mail.rs` and CLI tests. | M |
+| AUTH-06 | Password reset, confirmation email when SMTP is configured, and administrator reset. | `src/mail.rs`, browser reset routes, and `admin reset-password`; stable opaque mail identity, legacy-job backfill, mail tests, and worker acceptance-before-ack recovery prove bounded at-least-once semantics. | M |
 | AUTH-07 | Rust-owned browser session format; Rails cookie compatibility is not required. | Browser session handlers and lifecycle session tests in `src/mastodon/repository.rs` and `tests/differential/writes.rs`; browser run remains open. | M |
 
 ### Web Client
@@ -118,22 +118,22 @@ owning issue, code surface, or acceptance command.
 | REST-03 | Status lifecycle, visibility, replies, mentions, media, interactions, history, context, and idempotent creation. | `WriteRepository`, REST handlers, differential write cases, schema and worker integration. | A locally; complete client/peer proof remains open |
 | REST-04 | Timelines, collections, filters, markers, conversations, and relationship lists. | Repository projections, route inventory, schema/differential tests. | A locally; complete client proof remains open |
 | REST-05 | All required notification persistence, serialization, v1/v2 reads, dismissal, clear, and unread counts. | Notification repository/writer, serializer tests, worker/schema/differential coverage. | A locally; complete client proof remains open |
-| REST-06 | Existing and new local Paperclip media, v1/v2 media CRUD, metadata, and descriptions. | `src/paperclip.rs`, media handlers; differential `local_paperclip_media` and media write cases; `mise run cutover-integration` reopens a fresh Rustodon upload through Mastodon. | A locally; production rollback proof remains open |
+| REST-06 | Existing and new local Paperclip media, v1/v2 media CRUD, metadata, and descriptions. | `src/paperclip.rs`, staged media handlers, and durable cleanup workers; fault tests cover publication/deletion ambiguity and fsynced removal; differential media cases and cutover reopen remain green. | A locally; production rollback proof remains open |
 
 ### Federation
 
 | ID | Requirement | Implementation and proof | Status |
 | --- | --- | --- | --- |
-| FED-01 | WebFinger, host-meta, NodeInfo, actors, Notes, and collection representations. | Federation routes in `src/web.rs`; differential `federation_discovery`; HTTP signature tests. | A locally |
+| FED-01 | WebFinger, host-meta, NodeInfo, actors, Notes, emoji resources, and collection representations. | Federation routes in `src/web.rs`; differential `federation_discovery` plus relative/absolute actor-media-root cases; HTTP signature and emoji serializer tests. | A locally |
 | FED-02 | Signed transport, digest/skew checks, inbox enqueue, remote fetch, SSRF checks, shared-inbox deduplication, retries, and domain health. | `src/mastodon/signatures.rs`, `src/remote.rs`, `src/worker.rs`; bounded DNS answer sets, lifecycle-aware 401 classification, bounded per-client-IP signature-key refresh circuit, signed POST DNS/redirect/timeout/response-limit fixtures, signature, remote, and worker tests. | A locally; real peer proof remains open |
-| FED-03 | Follow, Accept, Reject, Undo, Note, Like, Announce, Block, actor Update/Delete, audiences, replies, mentions, media, and tombstones. | ActivityPub inbox/outbox workers and restored-fixture coverage, including duplicate Accept/Reject/Block/Undo convergence, protocol-gated Accept delivery, and local-suspension actor-update reach. | A locally; complete peer/order matrix remains open |
+| FED-03 | Follow, Accept, Reject, Undo, embedded and URI-only Note, Like, Announce, Block, actor Update/Delete, audiences, replies, mentions, media, custom emoji, and tombstones. | ActivityPub inbox/outbox workers and 49-case restored-fixture coverage include URI fetch/retry/deduplication, recipient repair, forwarding replay, emoji fetch/replacement, and existing relationship/order convergence. Pinned-source contracts establish Mastodon's URI dereference behavior; the production Mastodon image lacks RSpec dependencies for a live Rails URI-only test. | A locally; complete peer/order matrix remains open |
 
 ### Durable Work
 
 | ID | Requirement | Implementation and proof | Status |
 | --- | --- | --- | --- |
 | JOB-01 | Ingress, Core, Push, Pull, Mail, and Maintenance lanes. | `src/jobs.rs`, `src/worker.rs`; worker readiness and integration. | A |
-| JOB-02 | Transactional enqueue, at-least-once idempotence, leases, delayed cancellation, retries, dead letters, and separate remote/media limits. | Durable queue and worker integration suite. | A locally; full production failure matrix remains open |
+| JOB-02 | Transactional enqueue, at-least-once idempotence, leases, delayed cancellation, retries, dead letters, and separate remote/media limits. | Durable queue and worker integration suite, including local/emoji file reconciliation and deterministic SMTP acceptance-before-completion failure with stable retry identity. | A locally; full production failure matrix remains open |
 
 ### Timelines and Streaming
 

@@ -9,3 +9,4 @@
 - [ ] [Build the executable v1 acceptance matrix](issues/build-v1-acceptance-matrix.md)
 - [ ] [Prove Mastodon peer federation compatibility](issues/prove-mastodon-peer-federation-compatibility.md)
 - [ ] [Harden the v1 release](issues/harden-v1-release.md)
+- [ ] [Address release-readiness review findings](issues/address-release-readiness-review-findings.md)

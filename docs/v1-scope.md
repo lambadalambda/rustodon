@@ -217,6 +217,8 @@ Required media behavior:
   paths and metadata.
 - Implement v1/v2 media create, show, update, and delete semantics.
 - Preserve descriptions/alt text and image dimensions.
+- Publish local media metadata only after fsynced files exist, and retain durable,
+  idempotent cleanup work across creation, deletion, and process-crash boundaries.
 - New audio/video transcoding is not required, but existing processed audio and
   video remain readable.
 
@@ -244,6 +246,8 @@ Required transport and fetching:
   durable enqueue, and `202 Accepted`.
 - Remote WebFinger, actor, key, and status fetch with strict canonical-ID,
   origin, content-type, redirect, response-size, timeout, and SSRF checks.
+- URI-only `Create Note` objects are resolved by durable signed pull work rather
+  than being acknowledged and dropped.
 - Shared-inbox deduplication, durable outbound delivery, retries/backoff,
   permanent-error classification, and domain health tracking.
 
@@ -259,6 +263,8 @@ Required activity handling:
   tombstones that prevent deleted objects from reappearing.
 - Image attachment metadata and bounded remote image caching. Text remains
   usable if a media download fails.
+- Domain-bound custom emoji metadata, bounded image fetching/decoding, status and
+  poll association, and outbound Emoji tags/resources.
 
 The minimum is intentionally the old, widely compatible federation profile.
 Mastodon itself identifies WebFinger and HTTP signatures as required extensions
@@ -288,6 +294,9 @@ Required semantics:
 - Retry limits and jittered backoff.
 - Dead-letter inspection.
 - Separate concurrency limits for remote HTTP and media work.
+- SMTP effects are bounded at-least-once: acceptance before durable acknowledgement
+  can repeat, retries preserve one opaque `Message-ID`, and exhausted attempts are
+  inspectable dead letters rather than an exactly-once guarantee.
 
 ### 7. Timelines and Streaming
 

@@ -1,5 +1,40 @@
 # Development Log
 
+## 2026-09-10
+
+- Implemented the ten concrete release-readiness fixes. ActivityPub actor
+  avatar/header URLs now honor relative and absolute `PAPERCLIP_ROOT_URL` values;
+  browser CSRF tokens are HMAC-authenticated with `SECRET_KEY_BASE`, use an HTTPS
+  `__Host-` cookie, and reject duplicates; public OAuth clients now require S256
+  PKCE.
+- Added authenticated published announcements and Mastodon-compatible hashtag
+  search for the pinned frontend, including optional `read:search` authentication,
+  pagination rules, tag relationships, and the v2 response shape.
+- Made local media creation and deletion crash-safe with unpublished staging,
+  fsynced Paperclip writes/removals, atomic metadata deletion plus durable cleanup
+  intents, and retryable reconciliation. Restored worker integration covers both
+  database/filesystem publication boundaries.
+- Added durable URI-only ActivityPub `Create Note` resolution with signed bounded
+  fetches, recipient-scoped deduplication, Mastodon-compatible signer selection,
+  tombstone ordering, recipient repair, and replayable forwarding.
+- Added inbound and outbound custom emoji federation, including domain-bound
+  metadata validation, durable remote image fetch/replacement cleanup, bounded GIF
+  decode work, poll-option association, and local emoji ActivityPub resources.
+- Defined mail as bounded at-least-once work. Mail jobs persist an opaque stable
+  `Message-ID`; legacy queued jobs are lease-fenced and lazily backfilled before
+  SMTP. A deterministic post-acceptance completion fault proves that retries may
+  duplicate delivery without silently losing an accepted message.
+- Added pinned-frontend source contracts and CI jobs for schema, operational,
+  worker, and high-value Rails-versus-Rust differential integration. Actor
+  differential coverage exercises avatar and header URLs under relative and
+  absolute media roots. `mise run check`, pinned-source contracts, schema 37/37,
+  worker 49/49, and browser integration pass. The differential suite contains
+  21 unique cases and 22 gate executions; a broad run passed 17 cases before the
+  local command timeout, with its remaining `rest_protocol_contracts` and
+  `write_transactions` cases passing separately. The isolated notification and
+  authorization phases also pass. Live Rails execution of URI-only Create
+  remains open.
+
 ## 2026-09-09
 
 - Closed an authenticated browser-login open-redirect edge case: `return_to`
