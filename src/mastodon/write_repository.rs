@@ -48,12 +48,12 @@ use crate::crypto::ActiveRecordEncryptionConfig;
 use crate::jobs::{
     ACCOUNT_DELETION_DELAY_DAYS, ACTIVITYPUB_ACCOUNT_DELETE_JOB_KIND,
     ACTIVITYPUB_ACCOUNT_UPDATE_JOB_KIND, ACTIVITYPUB_DELIVERY_JOB_KIND,
-    ACTIVITYPUB_MEDIA_FETCH_JOB_KIND, ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
-    ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND, JobError, JobSpec, LOCAL_MEDIA_CLEANUP_JOB_KIND, Lane,
-    MASTODON_ACCOUNT_PURGE_JOB_KIND, MASTODON_DOMAIN_BLOCK_JOB_KIND,
-    MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND, NOTIFICATION_CREATE_JOB_KIND,
-    NOTIFICATION_UNFILTER_JOB_KIND, record_outbox_in, record_outbox_once_in,
-    record_stream_event_in,
+    ACTIVITYPUB_EMOJI_FETCH_JOB_KIND, ACTIVITYPUB_MEDIA_FETCH_JOB_KIND,
+    ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND, ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND, JobError,
+    JobSpec, LOCAL_MEDIA_CLEANUP_JOB_KIND, Lane, MASTODON_ACCOUNT_PURGE_JOB_KIND,
+    MASTODON_DOMAIN_BLOCK_JOB_KIND, MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND,
+    NOTIFICATION_CREATE_JOB_KIND, NOTIFICATION_UNFILTER_JOB_KIND, record_outbox_in,
+    record_outbox_once_in, record_stream_event_in,
 };
 use crate::mail::report_job;
 use crate::paperclip::{PaperclipAttachment, PaperclipMetadata, rails_blank};
@@ -63,6 +63,7 @@ use crate::streaming::{
 };
 
 use super::activitypub;
+use super::activitypub_inbox::parse_note_emojis;
 const MODERATION_PERMISSION_MASK: i64 = (1_i64 << 2)
     | (1_i64 << 3)
     | (1_i64 << 4)
@@ -3723,6 +3724,13 @@ impl WriteRepository {
             transaction.commit().await?;
             return Ok(None);
         }
+        upsert_remote_note_emojis(
+            &mut transaction,
+            domain.as_deref().expect("remote accounts have a domain"),
+            actor_uri,
+            object,
+        )
+        .await?;
         let visibility = remote_note_visibility(&note.audience, &followers_url);
         let (in_reply_to_id, in_reply_to_account_id, conversation_id) =
             remote_note_thread(&mut transaction, &note, origin).await?;
@@ -4171,6 +4179,13 @@ impl WriteRepository {
             transaction.commit().await?;
             return Ok(None);
         }
+        upsert_remote_note_emojis(
+            &mut transaction,
+            domain.as_deref().expect("remote accounts have a domain"),
+            actor_uri,
+            object,
+        )
+        .await?;
         sqlx::query(
             "UPDATE statuses SET text = $2, spoiler_text = $3, sensitive = $4,
                 language = $5, edited_at = $6, updated_at = clock_timestamp()
@@ -11360,6 +11375,102 @@ impl RemoteNoteData {
     }
 }
 
+async fn upsert_remote_note_emojis(
+    transaction: &mut Transaction<'_, Postgres>,
+    domain: &str,
+    actor_uri: &str,
+    object: &Value,
+) -> Result<(), WriteError> {
+    let domain = canonical_remote_domain(domain)
+        .map_err(|_| WriteError::InvalidInput("remote emoji domain is invalid"))?;
+    for emoji in parse_note_emojis(object, actor_uri) {
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock(
+                 pg_catalog.hashtextextended($1 || ':' || $2, 0)
+             )",
+        )
+        .bind(&domain)
+        .bind(&emoji.shortcode)
+        .execute(&mut **transaction)
+        .await?;
+        let existing = sqlx::query_as::<_, (i64, Option<String>, Option<String>, NaiveDateTime)>(
+            "SELECT id, image_remote_url, image_file_name, updated_at
+             FROM custom_emojis WHERE shortcode = $1 AND domain = $2 FOR UPDATE",
+        )
+        .bind(&emoji.shortcode)
+        .bind(&domain)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let (emoji_id, should_fetch) =
+            if let Some((id, remote_url, file_name, updated_at)) = existing {
+                let changed_url = remote_url.as_deref() != Some(emoji.image_url.as_str());
+                let fresh = emoji
+                    .updated_at
+                    .is_some_and(|updated| updated >= updated_at);
+                let (update_metadata, should_fetch) =
+                    remote_emoji_update_decision(changed_url, fresh, file_name.is_some());
+                if !update_metadata && !should_fetch {
+                    continue;
+                }
+                if update_metadata {
+                    sqlx::query(
+                        "UPDATE custom_emojis SET image_remote_url = $2,
+                         uri = COALESCE($3, uri), updated_at = clock_timestamp()
+                     WHERE id = $1",
+                    )
+                    .bind(id)
+                    .bind(&emoji.image_url)
+                    .bind(&emoji.uri)
+                    .execute(&mut **transaction)
+                    .await?;
+                }
+                (id, should_fetch)
+            } else {
+                let id = sqlx::query_scalar::<_, i64>(
+                    "INSERT INTO custom_emojis
+                    (shortcode, domain, uri, image_remote_url, disabled, visible_in_picker,
+                     created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, false, true, clock_timestamp(), clock_timestamp())
+                 ON CONFLICT (shortcode, domain) DO UPDATE SET updated_at = custom_emojis.updated_at
+                 RETURNING id",
+                )
+                .bind(&emoji.shortcode)
+                .bind(&domain)
+                .bind(&emoji.uri)
+                .bind(&emoji.image_url)
+                .fetch_one(&mut **transaction)
+                .await?;
+                (id, true)
+            };
+        if should_fetch {
+            let digest = Sha256::digest(emoji.image_url.as_bytes());
+            let job = JobSpec::new(
+                Lane::Pull,
+                ACTIVITYPUB_EMOJI_FETCH_JOB_KIND,
+                json!({
+                    "emoji_id": emoji_id,
+                    "remote_url": emoji.image_url,
+                    "media_type": emoji.media_type,
+                    "domain": domain
+                }),
+            )
+            .logical_key(format!("activitypub:emoji:{emoji_id}:{digest:x}"))
+            .max_attempts(4);
+            record_outbox_in(transaction, &job).await?;
+        }
+    }
+    Ok(())
+}
+
+fn remote_emoji_update_decision(
+    changed_url: bool,
+    fresh_timestamp: bool,
+    has_file: bool,
+) -> (bool, bool) {
+    // Mastodon accepts fresher metadata at the same URL without downloading an installed file again.
+    (changed_url || fresh_timestamp, changed_url || !has_file)
+}
+
 async fn lock_remote_note(
     transaction: &mut Transaction<'_, Postgres>,
     uri: &str,
@@ -17361,10 +17472,10 @@ mod tests {
         notification_policy_decision_for_type, oauth_grant_pkce_is_valid, oauth_pkce_matches,
         parse_user_active_days, password_reset_digest, quote_approval_policy_for_status,
         random_urlsafe_base64, remote_actor_account_id, remote_domain_lock_scopes,
-        remote_note_attachments, remote_note_object_is_too_old, remote_note_visibility,
-        report_category_value, report_email_enabled, report_uri_matches_domain,
-        status_mention_candidates, two_factor_attempt_is_rate_limited, validate_local_password,
-        validate_oauth_application_registration,
+        remote_emoji_update_decision, remote_note_attachments, remote_note_object_is_too_old,
+        remote_note_visibility, report_category_value, report_email_enabled,
+        report_uri_matches_domain, status_mention_candidates, two_factor_attempt_is_rate_limited,
+        validate_local_password, validate_oauth_application_registration,
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use chrono::NaiveDateTime;
@@ -17453,6 +17564,22 @@ mod tests {
             .expect("legacy interaction counts should use the same bounds");
         assert_eq!(note.favourites_count, Some(0));
         assert_eq!(note.reblogs_count, Some(100_000_000));
+    }
+
+    #[test]
+    fn remote_emoji_refresh_decision_avoids_redundant_same_url_downloads() {
+        for (changed_url, fresh_timestamp, has_file, expected) in [
+            (false, true, true, (true, false)),
+            (false, false, true, (false, false)),
+            (false, false, false, (false, true)),
+            (true, false, true, (true, true)),
+            (true, true, false, (true, true)),
+        ] {
+            assert_eq!(
+                remote_emoji_update_decision(changed_url, fresh_timestamp, has_file),
+                expected
+            );
+        }
     }
 
     #[test]

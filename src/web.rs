@@ -3145,6 +3145,7 @@ pub fn router(state: WebState) -> Router {
         )
         .route("/nodeinfo/2.0", get(federation_nodeinfo))
         .route("/actor", get(federation_actor_instance))
+        .route("/emojis/{id}", get(federation_emoji))
         .route("/actor/inbox", post(federation_inbox_instance))
         .route("/inbox", post(federation_inbox_shared))
         .route("/users/{username}", get(federation_actor_username))
@@ -4673,6 +4674,21 @@ async fn federation_actor_instance(
     federation_actor_response(&state, -99, None, &headers, &uri).await
 }
 
+async fn federation_emoji(State(state): State<WebState>, Path(id): Path<String>) -> Response<Body> {
+    let Some(id) = activitypub_path_id(&id) else {
+        return not_found();
+    };
+    match state.repository.activitypub_emoji(id).await {
+        Ok(Some(emoji)) => activity_response(
+            StatusCode::OK,
+            ACTIVITY_JSON,
+            activitypub::emoji(&state.origin, &state.media_root_url, &emoji),
+        ),
+        Ok(None) => not_found(),
+        Err(_) => internal_error(),
+    }
+}
+
 async fn federation_actor_username(
     State(state): State<WebState>,
     Extension(metadata): Extension<RequestMetadata>,
@@ -5633,6 +5649,11 @@ async fn federation_note_value(
         Err(_) => return Err(()),
     };
     let (favourites_count, reblogs_count) = activitypub_status_counts(state, status.id).await?;
+    let emojis = state
+        .repository
+        .activitypub_status_emojis(status.id)
+        .await
+        .map_err(|_| ())?;
     let Ok(quoted_link) = activitypub_quote_url(state, status.id).await else {
         return Err(());
     };
@@ -5659,6 +5680,7 @@ async fn federation_note_value(
         &media,
         &mentions,
         &hashtags,
+        &emojis,
         quoted_link.as_deref(),
         in_reply_to_url.as_deref(),
         in_reply_to_atom_uri.as_deref(),
@@ -6019,6 +6041,10 @@ async fn federation_outbox_response(
                         Ok(counts) => counts,
                         Err(()) => return internal_error(),
                     };
+                let emojis = match state.repository.activitypub_status_emojis(status.id).await {
+                    Ok(emojis) => emojis,
+                    Err(_) => return internal_error(),
+                };
                 let replies = match activitypub_replies(state, &status_account, &status).await {
                     Ok(replies) => replies,
                     Err(()) => return internal_error(),
@@ -6037,6 +6063,7 @@ async fn federation_outbox_response(
                     &media,
                     &mentions,
                     &hashtags,
+                    &emojis,
                     quoted_link.as_deref(),
                     in_reply_to_url.as_deref(),
                     in_reply_to_atom_uri.as_deref(),

@@ -12,6 +12,7 @@ use rustodon::config::WorkerConfig;
 use rustodon::jobs::{
     ACTIVITYPUB_ACCOUNT_DELETE_JOB_KIND, ACTIVITYPUB_ACCOUNT_UPDATE_JOB_KIND,
     ACTIVITYPUB_ANNOUNCE_RESOLVE_JOB_KIND, ACTIVITYPUB_DELIVERY_JOB_KIND,
+    ACTIVITYPUB_EMOJI_CLEANUP_JOB_KIND, ACTIVITYPUB_EMOJI_FETCH_JOB_KIND,
     ACTIVITYPUB_INBOX_JOB_KIND, ACTIVITYPUB_MEDIA_FETCH_JOB_KIND,
     ACTIVITYPUB_NOTE_RESOLVE_JOB_KIND, ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
     ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND, JobError, JobSpec, LOCAL_MEDIA_CLEANUP_JOB_KIND, Lane,
@@ -896,7 +897,7 @@ async fn activitypub_follow_and_undo_are_processed_through_the_durable_worker()
         &queue,
         Some(writer_pool.clone()),
         None,
-        Some(config),
+        Some(config.clone()),
     )?;
     let executor = WorkerExecutor::new(queue.clone(), handlers, 1, 1)?;
     let follow_body = json!({
@@ -4837,12 +4838,19 @@ async fn activitypub_note_create_update_and_delete_are_processed_idempotently()
             "attributedTo": ACTOR,
             "published": "2026-08-25T12:00:00Z",
              "url": "https://remote.fixture.invalid/@bob/123",
-             "content": "<p>Initial remote note</p>",
+             "content": "<p>Initial remote note :party_blob:</p>",
              "likes": {"type": "Collection", "totalItems": 7},
              "shares": {"type": "Collection", "totalItems": 3},
               "to": ["https://www.w3.org/ns/activitystreams#Public"],
             "cc": [],
-            "tag": [],
+            "tag": [{
+                "id": "https://remote.fixture.invalid/emojis/party_blob",
+                "type": "Emoji",
+                "name": ":party_blob:",
+                "updated": "2026-08-25T12:00:00Z",
+                "icon": {"type": "Image", "mediaType": "image/png",
+                         "url": "https://media.fixture.invalid/party-v1.png"}
+            }],
             "attachment": [{
                 "type": "Document",
                 "mediaType": "image/jpeg",
@@ -4864,10 +4872,17 @@ async fn activitypub_note_create_update_and_delete_are_processed_idempotently()
             "published": "2026-08-25T12:00:00Z",
             "updated": "2026-08-25T12:01:00Z",
             "url": "https://remote.fixture.invalid/@bob/123",
-            "content": "<p>Edited remote note</p>",
+            "content": "<p>Edited remote note :party_blob:</p>",
              "to": ["https://remote.fixture.invalid/users/bob/followers"],
             "cc": [],
-            "tag": [],
+            "tag": [{
+                "id": "https://remote.fixture.invalid/emojis/party_blob",
+                "type": "Emoji",
+                "name": "party_blob",
+                "updated": "2026-08-25T12:01:00Z",
+                "icon": {"type": "Image", "mediaType": "image/png",
+                         "url": "https://media.fixture.invalid/party-v2.png"}
+            }],
             "attachment": [{
                 "type": "Document",
                 "mediaType": "image/jpeg",
@@ -5024,10 +5039,15 @@ async fn activitypub_note_create_update_and_delete_are_processed_idempotently()
                     "type": "Note",
                     "attributedTo": ACTOR,
                     "published": "2026-08-25T12:00:00Z",
-                    "content": "<p>Initial remote note</p>",
+                    "content": "<p>Initial remote note :party_blob:</p>",
                     "to": ["https://www.w3.org/ns/activitystreams#Public"],
                     "cc": [],
-                    "tag": [],
+                    "tag": [{
+                        "id": "https://remote.fixture.invalid/emojis/party_blob",
+                        "type": "Emoji", "name": "party_blob",
+                        "icon": {"mediaType": "image/png",
+                                 "url": "https://media.fixture.invalid/party-v1.png"}
+                    }],
                     "attachment": []
                 }
             }).to_string()),
@@ -5058,6 +5078,33 @@ async fn activitypub_note_create_update_and_delete_are_processed_idempotently()
         .fetch_optional(&writer_pool)
         .await?
         .ok_or("remote Note Create did not persist the status")?;
+    let emoji = sqlx::query_as::<_, (i64, String, bool, bool)>(
+        "SELECT id, image_remote_url, disabled, visible_in_picker
+           FROM custom_emojis WHERE shortcode = 'party_blob' AND domain = 'remote.fixture.invalid'",
+    )
+    .fetch_one(&writer_pool)
+    .await?;
+    assert_eq!(emoji.1, "https://media.fixture.invalid/party-v1.png");
+    assert!(!emoji.2);
+    assert!(emoji.3);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM rustodon.outbox_events
+              WHERE kind = $1 AND payload -> 'arguments' ->> 'emoji_id' = $2",
+        )
+        .bind(ACTIVITYPUB_EMOJI_FETCH_JOB_KIND)
+        .bind(emoji.0.to_string())
+        .fetch_one(&writer_pool)
+        .await?,
+        1,
+        "duplicate Creates must deduplicate emoji fetches",
+    );
+    sqlx::query(
+        "UPDATE custom_emojis SET disabled = true, visible_in_picker = false WHERE id = $1",
+    )
+    .bind(emoji.0)
+    .execute(&writer_pool)
+    .await?;
     let note_media_id: i64 = sqlx::query_scalar(
         "SELECT id FROM media_attachments WHERE status_id = $1 ORDER BY id LIMIT 1",
     )
@@ -5361,7 +5408,7 @@ async fn activitypub_note_create_update_and_delete_are_processed_idempotently()
                 .bind(NOTE_URI)
                 .fetch_one(&writer_pool)
                 .await?,
-            "<p>Initial remote note</p>"
+            "<p>Initial remote note :party_blob:</p>"
         );
         for (logical_key, body) in [
             ("activitypub:test-note-update", update_body),
@@ -5393,6 +5440,17 @@ async fn activitypub_note_create_update_and_delete_are_processed_idempotently()
                     .await?
             );
             if logical_key == "activitypub:test-note-update" {
+                assert_eq!(
+                    sqlx::query_as::<_, (String, bool, bool)>(
+                        "SELECT image_remote_url, disabled, visible_in_picker
+                           FROM custom_emojis WHERE id = $1",
+                    )
+                    .bind(emoji.0)
+                    .fetch_one(&writer_pool)
+                    .await?,
+                    ("https://media.fixture.invalid/party-v2.png".to_owned(), true, false),
+                    "remote emoji refreshes must preserve moderation state",
+                );
                 assert!(queue.dispatch_outbox(100).await? >= 2);
                 while executor
                     .process_one("notification-worker", &[Lane::Core], Duration::seconds(30))
@@ -5453,7 +5511,7 @@ async fn activitypub_note_create_update_and_delete_are_processed_idempotently()
         .bind(NOTE_URI)
         .fetch_one(&writer_pool)
         .await?;
-        assert_eq!(status.0, "<p>Edited remote note</p>");
+        assert_eq!(status.0, "<p>Edited remote note :party_blob:</p>");
         assert!(!status.1);
         assert_eq!(status.2, 0);
         assert!(status.3.is_some());
@@ -5634,6 +5692,11 @@ async fn activitypub_note_create_update_and_delete_are_processed_idempotently()
         .bind(NOTE_URI)
         .execute(&writer_pool)
         .await?;
+    sqlx::query(
+        "DELETE FROM custom_emojis WHERE shortcode = 'party_blob' AND domain = 'remote.fixture.invalid'",
+    )
+    .execute(&writer_pool)
+    .await?;
     let limited_status_id =
         sqlx::query_scalar::<_, Option<i64>>("SELECT id FROM statuses WHERE uri = $1")
             .bind(LIMITED_NOTE_URI)
@@ -6356,6 +6419,257 @@ async fn activitypub_media_fetch_fails_closed_without_losing_the_status()
     assert!(blocked_media_processed);
     assert_eq!(blocked_media_state, (Some(3), None));
     assert_eq!(blocked_status_text, status_text);
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+#[allow(clippy::too_many_lines)]
+async fn activitypub_emoji_fetch_retries_and_installs_original_and_static_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    const OWNER_DOMAIN: &str = "remote.fixture.invalid";
+    const LOGICAL_KEY: &str = "activitypub:test-emoji-fetch-retry";
+    const REPLACEMENT_KEY: &str = "activitypub:test-emoji-replacement";
+    let runtime_url = std::env::var("RUSTODON_WORKER_DATABASE_URL")?;
+    let owner_url = std::env::var("RUSTODON_WORKER_OWNER_DATABASE_URL")?;
+    let runtime_pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&runtime_url)
+        .await?;
+    let writer_pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&owner_url)
+        .await?;
+    reset().await?;
+    let root_path = std::env::temp_dir().join(format!(
+        "rustodon-worker-emoji-success-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root_path);
+    fs::create_dir(&root_path)?;
+    let media_root = PaperclipRoot::open(&root_path)?
+        .with_write_fault(PaperclipWriteFault::storage_full_after(1));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = listener.local_addr()?;
+    let body = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/attachment.gif")?;
+    let remote_url = format!("http://media.fixture.invalid:{}/emoji.gif", endpoint.port());
+    let emoji_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO custom_emojis
+             (shortcode, domain, image_remote_url, disabled, visible_in_picker,
+              created_at, updated_at)
+         VALUES ('retry_blob', $1, $2, false, true, clock_timestamp(), clock_timestamp())
+         RETURNING id",
+    )
+    .bind(OWNER_DOMAIN)
+    .bind(&remote_url)
+    .fetch_one(&writer_pool)
+    .await?;
+    let server = tokio::spawn(fixture_media_server_for_retries(listener, body.clone(), 2));
+    let config = ActivityPubDeliveryConfig {
+        origin: Url::parse("https://fixture-v4-6-5.rustodon.invalid/")?,
+        local_domain: "fixture-v4-6-5.rustodon.invalid".to_owned(),
+        media_root_url: "/system".to_owned(),
+        media_root: Some(media_root.clone()),
+        limited_federation: false,
+        remote_media_endpoint: Some(endpoint),
+        remote_delivery_endpoint: None,
+        remote_fetch_endpoint: None,
+    };
+    let queue = Queue::new(runtime_pool.clone());
+    let handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
+        &queue,
+        Some(writer_pool.clone()),
+        None,
+        Some(config.clone()),
+    )?;
+    let executor = WorkerExecutor::new(queue.clone(), handlers, 1, 1)?;
+    queue
+        .enqueue(
+            &JobSpec::new(
+                Lane::Pull,
+                ACTIVITYPUB_EMOJI_FETCH_JOB_KIND,
+                json!({
+                    "emoji_id": emoji_id,
+                    "remote_url": remote_url,
+                    "media_type": "image/gif",
+                    "domain": OWNER_DOMAIN
+                }),
+            )
+            .logical_key(LOGICAL_KEY)
+            .max_attempts(4),
+        )
+        .await?;
+    assert!(
+        executor
+            .process_one("emoji-worker", &[Lane::Pull], Duration::seconds(30))
+            .await?
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT image_file_name FROM custom_emojis WHERE id = $1",
+        )
+        .bind(emoji_id)
+        .fetch_one(&writer_pool)
+        .await?,
+        None,
+    );
+    sqlx::query(
+        "UPDATE rustodon.durable_jobs SET run_at = clock_timestamp() WHERE logical_key = $1",
+    )
+    .bind(LOGICAL_KEY)
+    .execute(&runtime_pool)
+    .await?;
+    assert!(
+        executor
+            .process_one("emoji-worker-retry", &[Lane::Pull], Duration::seconds(30))
+            .await?
+    );
+    server.await??;
+    let (file_name, content_type) = sqlx::query_as::<_, (String, String)>(
+        "SELECT image_file_name, image_content_type FROM custom_emojis WHERE id = $1",
+    )
+    .bind(emoji_id)
+    .fetch_one(&writer_pool)
+    .await?;
+    let metadata = PaperclipMetadata {
+        attachment: PaperclipAttachment::CustomEmojiImage,
+        id: emoji_id,
+        remote: true,
+        storage_schema_version: Some(1),
+        file_name,
+        content_type: Some(content_type),
+        variant: None,
+    };
+    let original_path = metadata.relative_path("original").expect("original path");
+    let static_path = metadata.relative_path("static").expect("static path");
+    assert!(media_root.open_file(Path::new(&original_path)).is_ok());
+    assert!(media_root.open_file(Path::new(&static_path)).is_ok());
+
+    drop(executor);
+    let replacement_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let replacement_endpoint = replacement_listener.local_addr()?;
+    let replacement_body = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/avatar.gif")?;
+    let replacement_url = format!(
+        "http://media.fixture.invalid:{}/replacement.gif",
+        replacement_endpoint.port()
+    );
+    sqlx::query("UPDATE custom_emojis SET image_remote_url = $2 WHERE id = $1")
+        .bind(emoji_id)
+        .bind(&replacement_url)
+        .execute(&writer_pool)
+        .await?;
+    let faulted_root = PaperclipRoot::open(&root_path)?
+        .with_commit_fault(PaperclipCommitFault::before_and_after())
+        .with_remove_fault(PaperclipRemoveFault::fail_once());
+    let replacement_server = tokio::spawn(fixture_media_server_for_retries(
+        replacement_listener,
+        replacement_body,
+        3,
+    ));
+    let replacement_config = ActivityPubDeliveryConfig {
+        remote_media_endpoint: Some(replacement_endpoint),
+        media_root: Some(faulted_root),
+        ..config
+    };
+    let handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
+        &queue,
+        Some(writer_pool.clone()),
+        None,
+        Some(replacement_config),
+    )?;
+    let executor = WorkerExecutor::new(queue.clone(), handlers, 1, 1)?;
+    queue
+        .enqueue(
+            &JobSpec::new(
+                Lane::Pull,
+                ACTIVITYPUB_EMOJI_FETCH_JOB_KIND,
+                json!({
+                    "emoji_id": emoji_id,
+                    "remote_url": replacement_url,
+                    "media_type": "image/gif",
+                    "domain": OWNER_DOMAIN
+                }),
+            )
+            .logical_key(REPLACEMENT_KEY)
+            .max_attempts(4),
+        )
+        .await?;
+    for worker in [
+        "emoji-replace-before",
+        "emoji-replace-after",
+        "emoji-replace-reconciled",
+    ] {
+        assert!(
+            executor
+                .process_one(worker, &[Lane::Pull], Duration::seconds(30))
+                .await?
+        );
+        sqlx::query(
+            "UPDATE rustodon.durable_jobs SET run_at = clock_timestamp() WHERE logical_key = $1",
+        )
+        .bind(REPLACEMENT_KEY)
+        .execute(&runtime_pool)
+        .await?;
+    }
+    replacement_server.await??;
+    let replacement_file_name =
+        sqlx::query_scalar::<_, String>("SELECT image_file_name FROM custom_emojis WHERE id = $1")
+            .bind(emoji_id)
+            .fetch_one(&writer_pool)
+            .await?;
+    assert_ne!(replacement_file_name, metadata.file_name);
+    let replacement_metadata = PaperclipMetadata {
+        file_name: replacement_file_name,
+        ..metadata.clone()
+    };
+    assert!(
+        executor
+            .process_one(
+                "emoji-cleanup-retry",
+                &[Lane::Maintenance],
+                Duration::seconds(30)
+            )
+            .await?
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM rustodon.durable_jobs
+              WHERE kind = $1 AND attempts = 1 AND dead_at IS NULL",
+        )
+        .bind(ACTIVITYPUB_EMOJI_CLEANUP_JOB_KIND)
+        .fetch_one(&runtime_pool)
+        .await?,
+        1,
+        "a failed obsolete-file unlink remains durably retryable"
+    );
+    sqlx::query("UPDATE rustodon.durable_jobs SET run_at = clock_timestamp() WHERE kind = $1")
+        .bind(ACTIVITYPUB_EMOJI_CLEANUP_JOB_KIND)
+        .execute(&runtime_pool)
+        .await?;
+    while executor
+        .process_one(
+            "emoji-cleanup-reconciled",
+            &[Lane::Maintenance],
+            Duration::seconds(30),
+        )
+        .await?
+    {}
+    for path in [original_path, static_path] {
+        assert!(media_root.open_file(Path::new(&path)).is_err());
+    }
+    for style in ["original", "static"] {
+        let path = replacement_metadata
+            .relative_path(style)
+            .expect("replacement path");
+        assert!(media_root.open_file(Path::new(&path)).is_ok());
+    }
+    sqlx::query("DELETE FROM custom_emojis WHERE id = $1")
+        .bind(emoji_id)
+        .execute(&writer_pool)
+        .await?;
+    drop(executor);
+    let _ = fs::remove_dir_all(root_path);
     Ok(())
 }
 
@@ -7319,6 +7633,7 @@ async fn activitypub_status_update_and_delete_distribution_are_durable()
     const QUOTE_ID: i64 = -99001;
     const PENDING_QUOTE_ID: i64 = -99002;
     const SILENT_MENTION_ID: i64 = -99003;
+    const POLL_ID: i64 = -99004;
     const QUOTE_INBOX: &str = "https://quote.remote.fixture.invalid/inbox";
     const PENDING_QUOTE_INBOX: &str = "https://pending-quote.remote.fixture.invalid/inbox";
     const SILENT_MENTION_INBOX: &str = "https://silent-mention.remote.fixture.invalid/inbox";
@@ -7411,6 +7726,33 @@ async fn activitypub_status_update_and_delete_distribution_are_durable()
     .bind(STATUS_URI)
     .fetch_one(&writer_pool)
     .await?;
+    let emoji_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO custom_emojis (
+             shortcode, domain, image_content_type, image_file_name, image_file_size,
+             image_storage_schema_version, disabled, visible_in_picker, created_at, updated_at)
+         VALUES ('poll_blob', NULL, 'image/png', 'poll-blob.png', 10, 1, false, true,
+                 clock_timestamp(), clock_timestamp())
+         RETURNING id",
+    )
+    .fetch_one(&writer_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO polls (
+             id, account_id, status_id, options, cached_tallies, votes_count, voters_count,
+             multiple, hide_totals, expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, ARRAY['Vote :poll_blob:', 'No'], ARRAY[0, 0]::bigint[], 0, 0,
+                 false, false, NULL, clock_timestamp(), clock_timestamp())",
+    )
+    .bind(POLL_ID)
+    .bind(AUTHOR)
+    .bind(status_id)
+    .execute(&writer_pool)
+    .await?;
+    sqlx::query("UPDATE statuses SET poll_id = $2 WHERE id = $1")
+        .bind(status_id)
+        .bind(POLL_ID)
+        .execute(&writer_pool)
+        .await?;
     sqlx::query(
         "INSERT INTO follows
              (account_id, created_at, languages, notify, show_reblogs,
@@ -7508,6 +7850,10 @@ async fn activitypub_status_update_and_delete_distribution_are_durable()
             .await?
             .ok_or_else(|| std::io::Error::other("status create delivery was not recorded"))?;
             assert_eq!(create_body["type"], "Create");
+            assert!(create_body["object"]["tag"].as_array().is_some_and(|tags| {
+                tags.iter()
+                    .any(|tag| tag["type"] == "Emoji" && tag["name"] == ":poll_blob:")
+            }));
             status_activity_uri = Some(
                 create_body["object"]["id"]
                     .as_str()
@@ -7616,6 +7962,10 @@ async fn activitypub_status_update_and_delete_distribution_are_durable()
     .await?
     .ok_or_else(|| std::io::Error::other("status update delivery was not recorded"))?;
     assert_eq!(update_body["type"], "Update");
+    assert!(update_body["object"]["tag"].as_array().is_some_and(|tags| {
+        tags.iter()
+            .any(|tag| tag["type"] == "Emoji" && tag["name"] == ":poll_blob:")
+    }));
     assert_eq!(
         update_body["id"],
         format!(
@@ -8006,11 +8356,19 @@ async fn activitypub_status_update_and_delete_distribution_are_durable()
         .bind(cleanup_status_id.to_string())
         .execute(&writer_pool)
         .await?;
+        sqlx::query("DELETE FROM polls WHERE status_id = $1")
+            .bind(cleanup_status_id)
+            .execute(&writer_pool)
+            .await?;
         sqlx::query("DELETE FROM statuses WHERE id = $1")
             .bind(cleanup_status_id)
             .execute(&writer_pool)
             .await?;
     }
+    sqlx::query("DELETE FROM custom_emojis WHERE id = $1")
+        .bind(emoji_id)
+        .execute(&writer_pool)
+        .await?;
     for quote_id in [QUOTE_ID, PENDING_QUOTE_ID] {
         sqlx::query("DELETE FROM quotes WHERE id = $1")
             .bind(quote_id)

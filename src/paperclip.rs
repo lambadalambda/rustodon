@@ -42,6 +42,8 @@ const THUMBNAIL_STYLES: &[&str] = &["@1x", "@2x"];
 const ACCOUNT_MEDIA_LIMIT: usize = 8 * 1024 * 1024;
 const MAX_MATRIX_LIMIT: u64 = 33_177_600;
 const GIF_MATRIX_LIMIT: u64 = 921_600;
+const CUSTOM_EMOJI_GIF_MAX_FRAMES: usize = 256;
+const CUSTOM_EMOJI_GIF_MAX_PIXELS: u64 = GIF_MATRIX_LIMIT * 16;
 const MEDIA_MATRIX_LIMIT: u64 = 8_294_400;
 const IMAGE_MAX_ALLOC: u64 = 256 * 1024 * 1024;
 const URL_PATH_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
@@ -138,6 +140,15 @@ pub struct PreparedMediaAttachment {
     pub height: u32,
     pub small_width: u32,
     pub small_height: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedCustomEmoji {
+    pub file_name: String,
+    pub content_type: String,
+    pub file_size: i32,
+    pub original_bytes: Vec<u8>,
+    pub static_bytes: Vec<u8>,
 }
 
 #[cfg(feature = "test-support")]
@@ -488,6 +499,82 @@ pub fn prepare_media_attachment(
         height: original_height,
         small_width,
         small_height,
+    })
+}
+
+/// Validates a federated custom emoji and creates its static PNG style.
+///
+/// # Errors
+///
+/// Returns an error for unsupported, oversized, malformed, or mismatched image data.
+pub fn prepare_custom_emoji(
+    emoji_id: i64,
+    file_name: &str,
+    content_type: &str,
+    bytes: &[u8],
+) -> Result<PreparedCustomEmoji, MediaAttachmentError> {
+    if !matches!(content_type, "image/png" | "image/gif" | "image/webp") {
+        return Err(MediaAttachmentError::UnsupportedContentType);
+    }
+    if bytes.len() >= 256 * 1024 {
+        return Err(MediaAttachmentError::TooLarge);
+    }
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| MediaAttachmentError::InvalidImage)?;
+    let format = reader.format().ok_or(MediaAttachmentError::InvalidImage)?;
+    if image_format_for_content_type(content_type) != Some(format) {
+        return Err(MediaAttachmentError::InvalidImage);
+    }
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|_| MediaAttachmentError::InvalidImage)?;
+    validate_image_matrix(content_type, width, height)
+        .map_err(|_| MediaAttachmentError::InvalidImage)?;
+    let image = if format == ImageFormat::Gif {
+        let mut decoder =
+            GifDecoder::new(Cursor::new(bytes)).map_err(|_| MediaAttachmentError::InvalidImage)?;
+        decoder
+            .set_limits(image_limits())
+            .map_err(|_| MediaAttachmentError::InvalidImage)?;
+        let mut frames = decoder.into_frames();
+        let frame = frames
+            .next()
+            .ok_or(MediaAttachmentError::InvalidImage)?
+            .map_err(|_| MediaAttachmentError::InvalidImage)?;
+        let (frame_width, frame_height) = frame.buffer().dimensions();
+        let mut decoded_pixels = u64::from(frame_width) * u64::from(frame_height);
+        for (index, frame) in frames.enumerate() {
+            if index >= CUSTOM_EMOJI_GIF_MAX_FRAMES - 1 {
+                return Err(MediaAttachmentError::InvalidImage);
+            }
+            let frame = frame.map_err(|_| MediaAttachmentError::InvalidImage)?;
+            let (frame_width, frame_height) = frame.buffer().dimensions();
+            decoded_pixels = decoded_pixels
+                .checked_add(u64::from(frame_width) * u64::from(frame_height))
+                .filter(|pixels| *pixels <= CUSTOM_EMOJI_GIF_MAX_PIXELS)
+                .ok_or(MediaAttachmentError::InvalidImage)?;
+        }
+        image::DynamicImage::ImageRgba8(frame.into_buffer())
+    } else {
+        let mut reader = ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|_| MediaAttachmentError::InvalidImage)?;
+        reader.limits(image_limits());
+        reader
+            .decode()
+            .map_err(|_| MediaAttachmentError::InvalidImage)?
+    };
+    let static_bytes =
+        encode_image(&image, ImageFormat::Png).map_err(|_| MediaAttachmentError::InvalidImage)?;
+    let file_name = media_file_name(file_name, content_type, emoji_id, bytes);
+    let file_size = i32::try_from(bytes.len()).map_err(|_| MediaAttachmentError::SizeOverflow)?;
+    Ok(PreparedCustomEmoji {
+        file_name,
+        content_type: content_type.to_owned(),
+        file_size,
+        original_bytes: bytes.to_vec(),
+        static_bytes,
     })
 }
 
@@ -1078,6 +1165,31 @@ pub fn write_prepared_media(
         return Err(error);
     }
     Ok(vec![original, small])
+}
+
+/// Writes a prepared custom emoji beneath its Paperclip original and static paths.
+///
+/// # Errors
+///
+/// Returns an I/O error if either file cannot be written and verified safely.
+pub fn write_prepared_custom_emoji(
+    root: &PaperclipRoot,
+    metadata: &PaperclipMetadata,
+    prepared: &PreparedCustomEmoji,
+) -> std::io::Result<Vec<String>> {
+    let original = metadata.relative_path("original").ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid emoji path")
+    })?;
+    let static_path = metadata.relative_path("static").ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid emoji path")
+    })?;
+    write_prepared_file(root, Path::new(&original), &prepared.original_bytes)?;
+    if let Err(error) = write_prepared_file(root, Path::new(&static_path), &prepared.static_bytes) {
+        let _ = root.remove_file(Path::new(&original));
+        let _ = root.remove_file(Path::new(&static_path));
+        return Err(error);
+    }
+    Ok(vec![original, static_path])
 }
 
 fn write_prepared_file(root: &PaperclipRoot, relative_path: &Path, bytes: &[u8]) -> io::Result<()> {

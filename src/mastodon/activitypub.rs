@@ -21,9 +21,47 @@ pub const SECURITY_CONTEXT: &str = "https://w3id.org/security/v1";
 pub const WEBFINGER_CONTEXT: &str = "https://purl.archive.org/socialweb/webfinger";
 pub const PUBLIC_ADDRESS: &str = "https://www.w3.org/ns/activitystreams#Public";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CustomEmoji {
+    pub id: i64,
+    pub shortcode: String,
+    pub file_name: String,
+    pub content_type: Option<String>,
+    pub storage_schema_version: Option<i32>,
+    pub updated_at: NaiveDateTime,
+}
+
 #[must_use]
 pub fn is_public_address(uri: &str) -> bool {
     matches!(uri, PUBLIC_ADDRESS | "as:Public" | "Public")
+}
+
+#[must_use]
+pub fn emoji(origin: &Url, media_root_url: &str, emoji: &CustomEmoji) -> Value {
+    let metadata = PaperclipMetadata {
+        attachment: PaperclipAttachment::CustomEmojiImage,
+        id: emoji.id,
+        remote: false,
+        storage_schema_version: emoji.storage_schema_version,
+        file_name: emoji.file_name.clone(),
+        content_type: emoji.content_type.clone(),
+        variant: None,
+    };
+    json!({
+        "@context": [ACTIVITY_STREAMS_CONTEXT, {
+            "toot": "http://joinmastodon.org/ns#",
+            "Emoji": "toot:Emoji"
+        }],
+        "id": origin.join(&format!("emojis/{}", emoji.id)).expect("origin is absolute").to_string(),
+        "type": "Emoji",
+        "name": format!(":{}:", emoji.shortcode),
+        "updated": timestamp(emoji.updated_at),
+        "icon": {
+            "type": "Image",
+            "mediaType": emoji.content_type,
+            "url": paperclip_url(origin, media_root_url, &metadata, "original")
+        }
+    })
 }
 
 #[must_use]
@@ -269,6 +307,7 @@ fn note_context() -> Value {
             "inReplyToAtomUri": "ostatus:inReplyToAtomUri",
             "conversation": "ostatus:conversation",
             "toot": "http://joinmastodon.org/ns#",
+            "Emoji": "toot:Emoji",
             "Hashtag": "as:Hashtag",
             "blurhash": "toot:blurhash",
             "focalPoint": {"@container": "@list", "@id": "toot:focalPoint"},
@@ -668,6 +707,7 @@ pub fn note(
     media: &[MediaAttachment],
     mentions: &[(Mention, Account)],
     hashtags: &[(String, String)],
+    emojis: &[CustomEmoji],
     quoted_url: Option<&str>,
     in_reply_to_url: Option<&str>,
     in_reply_to_atom_uri: Option<&str>,
@@ -747,6 +787,33 @@ pub fn note(
             "type": "Hashtag",
             "href": href,
             "name": format!("#{name}")
+        }))
+    });
+    let emoji_tags = emojis.iter().filter_map(|emoji| {
+        let metadata = PaperclipMetadata {
+            attachment: PaperclipAttachment::CustomEmojiImage,
+            id: emoji.id,
+            remote: false,
+            storage_schema_version: emoji.storage_schema_version,
+            file_name: emoji.file_name.clone(),
+            content_type: emoji.content_type.clone(),
+            variant: None,
+        };
+        let icon_url = paperclip_url(origin, media_root_url, &metadata, "original")?;
+        let id = origin
+            .join(&format!("emojis/{}", emoji.id))
+            .ok()?
+            .to_string();
+        Some(json!({
+            "id": id,
+            "type": "Emoji",
+            "name": format!(":{}:", emoji.shortcode),
+            "updated": timestamp(emoji.updated_at),
+            "icon": {
+                "type": "Image",
+                "mediaType": emoji.content_type,
+                "url": icon_url
+            }
         }))
     });
     let mention_urls = mentions
@@ -840,7 +907,7 @@ pub fn note(
         "atomUri": atom_uri,
         "content": content,
         "attachment": attachments.collect::<Vec<_>>(),
-        "tag": mention_tags.chain(hashtag_tags).collect::<Vec<_>>()
+        "tag": mention_tags.chain(hashtag_tags).chain(emoji_tags).collect::<Vec<_>>()
     });
     if let Some(language) = status.language.as_deref() {
         value["contentMap"] = json!({language: value["content"].clone()});
@@ -1467,14 +1534,14 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        PUBLIC_ADDRESS, accept, actor, actor_url, actor_with_media, announce_with_uris,
-        block_with_uris, create, delete_actor_with_uris, delete_with_uris, follow_with_uris,
-        host_meta, like_with_uris, note, quote_authorization, quote_authorization_url,
-        reject_with_uris, status_activity, status_url, undo_announce_with_uris,
-        undo_block_with_uris, undo_follow_with_uris, undo_like_with_uris, update_actor,
-        update_with_uris,
+        CustomEmoji, PUBLIC_ADDRESS, accept, actor, actor_url, actor_with_media,
+        announce_with_uris, block_with_uris, create, delete_actor_with_uris, delete_with_uris,
+        follow_with_uris, host_meta, like_with_uris, note, quote_authorization,
+        quote_authorization_url, reject_with_uris, status_activity, status_url,
+        undo_announce_with_uris, undo_block_with_uris, undo_follow_with_uris, undo_like_with_uris,
+        update_actor, update_with_uris,
     };
-    use crate::mastodon::records::{Account, MediaAttachment, Status};
+    use crate::mastodon::records::{Account, MediaAttachment, Mention, Status};
     use crate::mastodon::types::{AccountIdScheme, RawI32, RawString, StatusVisibility};
 
     fn account(id_scheme: Option<AccountIdScheme>) -> Account {
@@ -1584,6 +1651,7 @@ mod tests {
             media,
             &[],
             &[],
+            &[],
             None,
             None,
             None,
@@ -1612,6 +1680,7 @@ mod tests {
             status,
             account,
             "/system",
+            &[],
             &[],
             &[],
             &[],
@@ -1783,6 +1852,7 @@ mod tests {
             &status,
             &account,
             "/system",
+            &[],
             &[],
             &[],
             &[],
@@ -1986,6 +2056,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
             None,
             None,
@@ -2014,6 +2085,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             None,
             None,
             None,
@@ -2037,6 +2109,57 @@ mod tests {
         assert_eq!(value["to"], object["to"]);
         assert_eq!(value["cc"], object["cc"]);
         assert_eq!(value["object"], object);
+    }
+
+    #[test]
+    fn note_appends_local_emoji_tags_without_losing_mentions_or_hashtags() {
+        let origin = url::Url::parse("https://example.test/").expect("valid origin");
+        let account = account(Some(AccountIdScheme::Username));
+        let status = status();
+        let emoji = CustomEmoji {
+            id: 12_001,
+            shortcode: "party_blob".to_owned(),
+            file_name: "party.png".to_owned(),
+            content_type: Some("image/png".to_owned()),
+            storage_schema_version: None,
+            updated_at: DateTime::<Utc>::UNIX_EPOCH.naive_utc(),
+        };
+        let mention = Mention {
+            id: 1,
+            account_id: account.id,
+            status_id: status.id,
+            silent: false,
+        };
+        let value = note(
+            &origin,
+            "example.test",
+            &status,
+            &account,
+            "https://media.example/system",
+            &[],
+            &[(mention, account.clone())],
+            &[("rust".to_owned(), "Rust".to_owned())],
+            &[emoji],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0,
+        );
+
+        assert_eq!(value["tag"][0]["type"], "Mention");
+        assert_eq!(value["tag"][1]["type"], "Hashtag");
+        assert_eq!(value["tag"][2]["type"], "Emoji");
+        assert_eq!(value["tag"][2]["name"], ":party_blob:");
+        assert_eq!(value["tag"][2]["id"], "https://example.test/emojis/12001");
+        assert_eq!(
+            value["tag"][2]["icon"]["url"],
+            "https://media.example/system/custom_emojis/images/000/012/001/original/party.png"
+        );
     }
 
     #[test]

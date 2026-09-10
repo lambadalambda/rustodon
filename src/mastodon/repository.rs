@@ -10,6 +10,7 @@ use crate::paperclip::{PaperclipAttachment, PaperclipMetadata};
 use crate::preflight::V1_CRITICAL_TABLES;
 use crate::remote::canonical_remote_host;
 
+use super::activitypub;
 use super::policy::{
     AuthenticatedViewerFacts, AuthorRestriction, StatusAccessFacts, StatusAvailability,
     StatusContextFacts, ViewerFacts, ViewerRestriction, global_domain_policy, status_access,
@@ -44,6 +45,45 @@ struct StatusPolicyRow {
     viewer_blocks_author: bool,
     viewer_domain_blocks_author: bool,
     viewer_mutes_author: bool,
+}
+
+fn activitypub_emoji_shortcodes<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut shortcodes = Vec::new();
+    for text in texts {
+        let bytes = text.as_bytes();
+        let mut start = 0;
+        while let Some(relative) = bytes[start..].iter().position(|byte| *byte == b':') {
+            let opening = start + relative;
+            let content_start = opening + 1;
+            let Some(relative) = bytes[content_start..].iter().position(|byte| *byte == b':')
+            else {
+                break;
+            };
+            let closing = content_start + relative;
+            let shortcode = &bytes[content_start..closing];
+            let valid_boundary = text[..opening]
+                .chars()
+                .next_back()
+                .is_none_or(|character| !character.is_alphanumeric() && character != ':')
+                && text[closing + 1..]
+                    .chars()
+                    .next()
+                    .is_none_or(|character| !character.is_alphanumeric() && character != ':');
+            if shortcode.len() >= 2
+                && shortcode
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                && valid_boundary
+            {
+                let shortcode = String::from_utf8_lossy(shortcode).into_owned();
+                if !shortcodes.contains(&shortcode) {
+                    shortcodes.push(shortcode);
+                }
+            }
+            start = closing + 1;
+        }
+    }
+    shortcodes
 }
 
 #[derive(sqlx::FromRow)]
@@ -2413,6 +2453,115 @@ impl Repository {
         .bind(status_id)
         .fetch_all(&self.pool)
         .await
+    }
+
+    pub(crate) async fn activitypub_status_emojis(
+        &self,
+        status_id: i64,
+    ) -> sqlx::Result<Vec<activitypub::CustomEmoji>> {
+        let text = sqlx::query_as::<_, (String, String, Option<Vec<String>>)>(
+            "SELECT status.text, status.spoiler_text, poll.options FROM statuses status
+             JOIN accounts account ON account.id = status.account_id AND account.domain IS NULL
+             LEFT JOIN polls poll ON poll.id = status.poll_id
+             WHERE status.id = $1 AND status.deleted_at IS NULL",
+        )
+        .bind(status_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((text, spoiler_text, poll_options)) = text else {
+            return Ok(Vec::new());
+        };
+        let mut sources = vec![text.as_str(), spoiler_text.as_str()];
+        if let Some(poll_options) = &poll_options {
+            sources.extend(poll_options.iter().map(String::as_str));
+        }
+        let shortcodes = activitypub_emoji_shortcodes(sources);
+        if shortcodes.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                String,
+                Option<String>,
+                Option<i32>,
+                NaiveDateTime,
+            ),
+        >(
+            "SELECT id, shortcode, image_file_name, image_content_type,
+                    image_storage_schema_version, updated_at
+             FROM custom_emojis
+             WHERE domain IS NULL AND disabled = false AND shortcode = ANY($1)
+               AND image_file_name IS NOT NULL
+             ORDER BY id",
+        )
+        .bind(shortcodes)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(
+                    |(
+                        id,
+                        shortcode,
+                        file_name,
+                        content_type,
+                        storage_schema_version,
+                        updated_at,
+                    )| {
+                        activitypub::CustomEmoji {
+                            id,
+                            shortcode,
+                            file_name,
+                            content_type,
+                            storage_schema_version,
+                            updated_at,
+                        }
+                    },
+                )
+                .collect()
+        })
+    }
+
+    pub(crate) async fn activitypub_emoji(
+        &self,
+        id: i64,
+    ) -> sqlx::Result<Option<activitypub::CustomEmoji>> {
+        sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                String,
+                Option<String>,
+                Option<i32>,
+                NaiveDateTime,
+            ),
+        >(
+            "SELECT id, shortcode, image_file_name, image_content_type,
+                    image_storage_schema_version, updated_at
+             FROM custom_emojis
+             WHERE id = $1 AND domain IS NULL AND image_file_name IS NOT NULL",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(
+                |(id, shortcode, file_name, content_type, storage_schema_version, updated_at)| {
+                    activitypub::CustomEmoji {
+                        id,
+                        shortcode,
+                        file_name,
+                        content_type,
+                        storage_schema_version,
+                        updated_at,
+                    }
+                },
+            )
+        })
     }
 
     pub(crate) async fn rest_tag_search(

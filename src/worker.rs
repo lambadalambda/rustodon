@@ -21,6 +21,7 @@ use crate::config::WorkerConfig;
 use crate::jobs::{
     ACTIVITYPUB_ACCOUNT_DELETE_JOB_KIND, ACTIVITYPUB_ACCOUNT_UPDATE_JOB_KIND,
     ACTIVITYPUB_ANNOUNCE_RESOLVE_JOB_KIND, ACTIVITYPUB_DELIVERY_JOB_KIND,
+    ACTIVITYPUB_EMOJI_CLEANUP_JOB_KIND, ACTIVITYPUB_EMOJI_FETCH_JOB_KIND,
     ACTIVITYPUB_INBOX_JOB_KIND, ACTIVITYPUB_MEDIA_FETCH_JOB_KIND,
     ACTIVITYPUB_NOTE_RESOLVE_JOB_KIND, ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
     ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND, ClaimedJob, JobError, JobSpec,
@@ -40,7 +41,8 @@ use crate::mastodon::{
 };
 use crate::paperclip::{
     PaperclipAttachment, PaperclipMetadata, PaperclipRoot, parse_paperclip_path,
-    prepare_media_attachment, write_prepared_media,
+    prepare_custom_emoji, prepare_media_attachment, write_prepared_custom_emoji,
+    write_prepared_media,
 };
 use crate::remote::{
     RemoteAccountResolver, RemoteFetchError, RemoteFetchLimits, RemoteFetcher,
@@ -614,6 +616,10 @@ async fn distribute_status(
                     .into_iter()
                     .map(|tag| (tag.name, tag.display_name.unwrap_or_default()))
                     .collect::<Vec<_>>();
+                let target_emojis = repository
+                    .activitypub_status_emojis(reblog_of_id)
+                    .await
+                    .map_err(|_| HandlerFailure::retry("private boost emoji lookup failed"))?;
                 let target_stat = repository
                     .status_stat(reblog_of_id)
                     .await
@@ -629,6 +635,7 @@ async fn distribute_status(
                     &target_media,
                     &target_mentions,
                     &target_hashtags,
+                    &target_emojis,
                     quoted_link.as_deref(),
                     None,
                     None,
@@ -717,6 +724,10 @@ async fn distribute_status(
         };
         let (quoted_link, quoted_identifier, quote_authorization) =
             activitypub_quote_parts(&repository, config, status_id).await?;
+        let emojis = repository
+            .activitypub_status_emojis(status_id)
+            .await
+            .map_err(|_| HandlerFailure::retry("status emoji lookup failed"))?;
         let mut object = activitypub::note(
             &config.origin,
             &config.local_domain,
@@ -726,6 +737,7 @@ async fn distribute_status(
             &media,
             &mentions,
             &hashtags,
+            &emojis,
             quoted_link.as_deref(),
             in_reply_to_url.as_deref(),
             in_reply_to_atom_uri.as_deref(),
@@ -1496,6 +1508,83 @@ async fn process_local_media_cleanup_job(
             WriteError::Filesystem(_) => HandlerFailure::retry("local media unlink failed"),
             _ => HandlerFailure::retry("local media cleanup failed"),
         })
+}
+
+async fn process_activitypub_emoji_cleanup_job(
+    pool: PgPool,
+    root: PaperclipRoot,
+    arguments: &Value,
+) -> Result<(), HandlerFailure> {
+    let emoji_id = arguments
+        .get("emoji_id")
+        .and_then(Value::as_i64)
+        .filter(|id| *id > 0)
+        .ok_or_else(|| HandlerFailure::permanent("emoji cleanup ID is invalid"))?;
+    let paths = arguments
+        .get("paths")
+        .and_then(Value::as_array)
+        .ok_or_else(|| HandlerFailure::permanent("emoji cleanup paths are missing"))?
+        .iter()
+        .map(|path| {
+            path.as_str()
+                .filter(|path| safe_cleanup_path(path))
+                .filter(|path| {
+                    parse_paperclip_path(path).is_some_and(|parsed| {
+                        parsed.id() == emoji_id
+                            && parsed.attachment() == PaperclipAttachment::CustomEmojiImage
+                    })
+                })
+                .map(str::to_owned)
+                .ok_or_else(|| HandlerFailure::permanent("emoji cleanup path is invalid"))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if paths.is_empty() {
+        return Err(HandlerFailure::permanent("emoji cleanup paths are missing"));
+    }
+
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| HandlerFailure::retry("emoji cleanup transaction failed"))?;
+    let current =
+        sqlx::query_as::<_, (Option<String>, Option<String>, Option<i32>, Option<String>)>(
+            "SELECT image_file_name, image_content_type, image_storage_schema_version, domain
+           FROM custom_emojis WHERE id = $1 FOR UPDATE",
+        )
+        .bind(emoji_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| HandlerFailure::retry("emoji cleanup lookup failed"))?;
+    let current_paths = current
+        .and_then(
+            |(file_name, content_type, storage_schema_version, domain)| {
+                file_name.map(|file_name| PaperclipMetadata {
+                    attachment: PaperclipAttachment::CustomEmojiImage,
+                    id: emoji_id,
+                    remote: domain.is_some(),
+                    storage_schema_version,
+                    file_name,
+                    content_type,
+                    variant: None,
+                })
+            },
+        )
+        .into_iter()
+        .flat_map(|metadata| {
+            ["original", "static"]
+                .into_iter()
+                .filter_map(move |style| metadata.relative_path(style))
+        })
+        .collect::<BTreeSet<_>>();
+    for path in paths.difference(&current_paths) {
+        root.remove_file(Path::new(path))
+            .map_err(|_| HandlerFailure::retry("emoji cleanup unlink failed"))?;
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|_| HandlerFailure::retry("emoji cleanup commit failed"))?;
+    Ok(())
 }
 
 async fn process_notification_job(pool: PgPool, arguments: &Value) -> Result<(), HandlerFailure> {
@@ -3510,6 +3599,242 @@ async fn process_activitypub_thread_resolution(
 }
 
 #[allow(clippy::too_many_lines)]
+async fn process_activitypub_emoji(
+    pool: PgPool,
+    queue: Queue,
+    config: &ActivityPubDeliveryConfig,
+    fetcher: &RemoteFetcher,
+    media_root: PaperclipRoot,
+    arguments: &Value,
+) -> Result<(), HandlerFailure> {
+    let emoji_id = arguments
+        .get("emoji_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| HandlerFailure::permanent("emoji fetch job has no emoji ID"))?;
+    let expected_url = arguments
+        .get("remote_url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HandlerFailure::permanent("emoji fetch job has no URL"))?;
+    let owner_domain = arguments
+        .get("domain")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HandlerFailure::permanent("emoji fetch job has no domain"))?;
+    let advertised_type = arguments
+        .get("media_type")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| HandlerFailure::permanent("emoji media type is invalid"))
+        })
+        .transpose()?;
+    let remote_url = Url::parse(expected_url)
+        .map_err(|_| HandlerFailure::permanent("emoji fetch URL is invalid"))?;
+    let image_domain = canonical_remote_domain_from_url(&remote_url)
+        .map_err(|_| HandlerFailure::permanent("emoji fetch URL has no valid domain"))?;
+    let repository = Repository::from_pool(pool.clone());
+    for domain in [owner_domain, image_domain.as_str()] {
+        if !repository
+            .remote_media_allowed(domain, config.limited_federation)
+            .await
+            .map_err(|_| HandlerFailure::retry("emoji domain policy lookup failed"))?
+        {
+            return Err(HandlerFailure::permanent(
+                "remote emoji domain is not allowed",
+            ));
+        }
+    }
+    let current = sqlx::query_as::<_, (String, String)>(
+        "SELECT domain, image_remote_url FROM custom_emojis WHERE id = $1",
+    )
+    .bind(emoji_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|_| HandlerFailure::retry("remote emoji lookup failed"))?;
+    let Some((domain, current_url)) = current else {
+        return Ok(());
+    };
+    if domain != owner_domain || current_url != expected_url {
+        return Ok(());
+    }
+    let fetcher = fetcher.with_limits(RemoteFetchLimits {
+        max_response_bytes: 256 * 1024,
+        ..RemoteFetchLimits::default()
+    });
+    #[cfg(feature = "test-support")]
+    let response = match config.remote_media_endpoint {
+        Some(endpoint) => {
+            fetcher
+                .get_for_test_endpoint(remote_url.clone(), REMOTE_MEDIA_CONTENT_TYPES, endpoint)
+                .await
+        }
+        None => {
+            fetcher
+                .get(remote_url.clone(), REMOTE_MEDIA_CONTENT_TYPES)
+                .await
+        }
+    };
+    #[cfg(not(feature = "test-support"))]
+    let response = fetcher
+        .get(remote_url.clone(), REMOTE_MEDIA_CONTENT_TYPES)
+        .await;
+    let response = response.map_err(|error| remote_media_fetch_failure(&error))?;
+    let final_image_domain = canonical_remote_domain_from_url(&response.url)
+        .map_err(|_| HandlerFailure::permanent("emoji response URL has no valid domain"))?;
+    if !repository
+        .remote_media_allowed(&final_image_domain, config.limited_federation)
+        .await
+        .map_err(|_| HandlerFailure::retry("emoji response domain policy lookup failed"))?
+    {
+        return Err(HandlerFailure::permanent(
+            "remote emoji response domain is not allowed",
+        ));
+    }
+    let content_type = response
+        .content_type
+        .as_deref()
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .filter(|value| matches!(value.as_str(), "image/png" | "image/gif" | "image/webp"))
+        .ok_or_else(|| HandlerFailure::permanent("remote emoji content type is invalid"))?;
+    if advertised_type.is_some_and(|advertised| !advertised.eq_ignore_ascii_case(&content_type)) {
+        return Err(HandlerFailure::permanent(
+            "remote emoji content type does not match its metadata",
+        ));
+    }
+    let source_name = remote_url
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("emoji");
+    let prepared = prepare_custom_emoji(emoji_id, source_name, &content_type, &response.body)
+        .map_err(|error| HandlerFailure::permanent(format!("remote emoji is invalid: {error}")))?;
+    let metadata = PaperclipMetadata {
+        attachment: PaperclipAttachment::CustomEmojiImage,
+        id: emoji_id,
+        remote: true,
+        storage_schema_version: Some(1),
+        file_name: prepared.file_name.clone(),
+        content_type: Some(prepared.content_type.clone()),
+        variant: None,
+    };
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| HandlerFailure::retry("remote emoji transaction failed"))?;
+    let current_metadata = sqlx::query_as::<_, (Option<String>, Option<String>, Option<i32>)>(
+        "SELECT image_file_name, image_content_type, image_storage_schema_version
+         FROM custom_emojis WHERE id = $1 AND domain = $2 AND image_remote_url = $3 FOR UPDATE",
+    )
+    .bind(emoji_id)
+    .bind(owner_domain)
+    .bind(expected_url)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|_| HandlerFailure::retry("remote emoji fence lookup failed"))?;
+    let Some((old_file_name, old_content_type, old_storage_schema_version)) = current_metadata
+    else {
+        transaction
+            .rollback()
+            .await
+            .map_err(|_| HandlerFailure::retry("remote emoji rollback failed"))?;
+        return Ok(());
+    };
+    let writer = WriteRepository::from_pool(pool.clone());
+    for domain in [owner_domain, final_image_domain.as_str()] {
+        if !writer
+            .remote_media_allowed_in_transaction(
+                &mut transaction,
+                domain,
+                config.limited_federation,
+            )
+            .await
+            .map_err(|_| HandlerFailure::retry("emoji install policy lookup failed"))?
+        {
+            return Err(HandlerFailure::permanent(
+                "remote emoji domain became disallowed",
+            ));
+        }
+    }
+    let old_metadata = old_file_name.clone().map(|file_name| PaperclipMetadata {
+        attachment: PaperclipAttachment::CustomEmojiImage,
+        id: emoji_id,
+        remote: true,
+        storage_schema_version: old_storage_schema_version,
+        file_name,
+        content_type: old_content_type,
+        variant: None,
+    });
+    let replacing = old_file_name.as_deref() != Some(prepared.file_name.as_str());
+    let mut written_files = if replacing {
+        let reconciliation_paths = old_metadata
+            .iter()
+            .chain(std::iter::once(&metadata))
+            .flat_map(|metadata| {
+                ["original", "static"]
+                    .into_iter()
+                    .filter_map(|style| metadata.relative_path(style))
+            })
+            .collect::<BTreeSet<_>>();
+        queue
+            .enqueue(&JobSpec::new(
+                Lane::Maintenance,
+                ACTIVITYPUB_EMOJI_CLEANUP_JOB_KIND,
+                json!({"emoji_id": emoji_id, "paths": reconciliation_paths}),
+            ))
+            .await
+            .map_err(|_| HandlerFailure::retry("emoji reconciliation could not be queued"))?;
+        let paths = write_prepared_custom_emoji(&media_root, &metadata, &prepared)
+            .map_err(|_| HandlerFailure::retry("remote emoji file write failed"))?;
+        Some(WrittenMediaFiles::new(&media_root, paths))
+    } else {
+        None
+    };
+    let updated = sqlx::query(
+        "UPDATE custom_emojis SET image_content_type = $3, image_file_name = $4,
+             image_file_size = $5, image_storage_schema_version = 1,
+             image_updated_at = clock_timestamp(), updated_at = clock_timestamp()
+         WHERE id = $1 AND image_remote_url = $2",
+    )
+    .bind(emoji_id)
+    .bind(expected_url)
+    .bind(&prepared.content_type)
+    .bind(&prepared.file_name)
+    .bind(prepared.file_size)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| HandlerFailure::retry("remote emoji metadata update failed"))?;
+    if updated.rows_affected() == 0 {
+        if let Some(files) = &mut written_files {
+            files.cleanup();
+        }
+        transaction
+            .rollback()
+            .await
+            .map_err(|_| HandlerFailure::retry("remote emoji rollback failed"))?;
+        return Ok(());
+    }
+    if let Some(files) = &mut written_files {
+        files.disarm();
+    }
+    // A commit error is ambiguous. The reconciliation job keeps whichever file set the row names.
+    #[cfg(feature = "test-support")]
+    if media_root.take_commit_before_fault() {
+        return Err(HandlerFailure::retry("remote emoji commit failed"));
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|_| HandlerFailure::retry("remote emoji commit failed"))?;
+    #[cfg(feature = "test-support")]
+    if media_root.take_commit_after_fault() {
+        return Err(HandlerFailure::retry("remote emoji commit failed"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
 async fn process_activitypub_media(
     pool: PgPool,
     config: &ActivityPubDeliveryConfig,
@@ -5059,6 +5384,49 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
                 },
             )?;
             if let Some(media_root) = federation.media_root.clone() {
+                let emoji_cleanup_pool = mastodon_writer.clone();
+                let emoji_cleanup_root = media_root.clone();
+                handlers.register(
+                    ACTIVITYPUB_EMOJI_CLEANUP_JOB_KIND,
+                    Lane::Maintenance,
+                    ResourceClass::Media,
+                    move |job| {
+                        let pool = emoji_cleanup_pool.clone();
+                        let media_root = emoji_cleanup_root.clone();
+                        async move {
+                            process_activitypub_emoji_cleanup_job(pool, media_root, &job.arguments)
+                                .await
+                        }
+                    },
+                )?;
+                let emoji_pool = mastodon_writer.clone();
+                let emoji_queue = queue.clone();
+                let emoji_config = federation.clone();
+                let emoji_fetcher = remote_fetcher.clone();
+                let emoji_root = media_root.clone();
+                handlers.register(
+                    ACTIVITYPUB_EMOJI_FETCH_JOB_KIND,
+                    Lane::Pull,
+                    ResourceClass::Media,
+                    move |job| {
+                        let pool = emoji_pool.clone();
+                        let queue = emoji_queue.clone();
+                        let config = emoji_config.clone();
+                        let fetcher = emoji_fetcher.clone();
+                        let media_root = emoji_root.clone();
+                        async move {
+                            process_activitypub_emoji(
+                                pool,
+                                queue,
+                                &config,
+                                &fetcher,
+                                media_root,
+                                &job.arguments,
+                            )
+                            .await
+                        }
+                    },
+                )?;
                 let media_pool = mastodon_writer.clone();
                 let media_config = federation.clone();
                 let media_fetcher = remote_fetcher.clone();

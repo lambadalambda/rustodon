@@ -1,5 +1,20 @@
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde_json::Value;
 use url::Url;
+
+const MAX_REMOTE_EMOJIS: usize = 100;
+const MAX_REMOTE_TAGS: usize = 1_000;
+const MAX_REMOTE_EMOJI_SHORTCODE: usize = 2_048;
+const MAX_REMOTE_EMOJI_URL: usize = 2_048;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RemoteEmojiTag {
+    pub(crate) shortcode: String,
+    pub(crate) uri: Option<String>,
+    pub(crate) image_url: String,
+    pub(crate) media_type: Option<String>,
+    pub(crate) updated_at: Option<NaiveDateTime>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InboxJob {
@@ -475,7 +490,7 @@ pub(crate) fn validate_note_object(
     for (field, limit) in [
         ("to", 100_usize),
         ("cc", 100),
-        ("tag", 100),
+        ("tag", MAX_REMOTE_TAGS),
         ("attachment", 16),
     ] {
         if object
@@ -488,6 +503,130 @@ pub(crate) fn validate_note_object(
     }
     let _ = object_uri;
     Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn parse_note_emojis(object: &Value, actor_uri: &str) -> Vec<RemoteEmojiTag> {
+    let Some(actor_host) = Url::parse(actor_uri)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+    else {
+        return Vec::new();
+    };
+    let Some(tags) = object.get("tag") else {
+        return Vec::new();
+    };
+    let tags: Vec<&Value> = tags
+        .as_array()
+        .map_or_else(|| vec![tags], |tags| tags.iter().collect());
+    let mut emojis = Vec::new();
+    for tag in tags.into_iter().take(MAX_REMOTE_TAGS) {
+        let Some(tag) = tag
+            .as_object()
+            .filter(|tag| value_includes_text(tag.get("type"), "Emoji"))
+        else {
+            continue;
+        };
+        let Some(shortcode) = tag
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| name.trim_matches(':'))
+            .filter(|name| {
+                (2..=MAX_REMOTE_EMOJI_SHORTCODE).contains(&name.len())
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            })
+        else {
+            continue;
+        };
+        let uri = match tag.get("id").filter(|value| !value.is_null()) {
+            Some(Value::String(uri)) if uri.len() <= MAX_REMOTE_EMOJI_URL => {
+                let Some(url) = Url::parse(uri).ok().filter(|url| {
+                    matches!(url.scheme(), "http" | "https")
+                        && url
+                            .host_str()
+                            .is_some_and(|host| host.eq_ignore_ascii_case(&actor_host))
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.fragment().is_none()
+                }) else {
+                    continue;
+                };
+                Some(url.to_string())
+            }
+            None => None,
+            Some(_) => continue,
+        };
+        let Some(icon) = tag.get("icon").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(image_url) = icon
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|url| url.len() <= MAX_REMOTE_EMOJI_URL)
+            .and_then(|url| Url::parse(url).ok())
+            .filter(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.fragment().is_none()
+            })
+        else {
+            continue;
+        };
+        let media_type = match icon.get("mediaType").filter(|value| !value.is_null()) {
+            Some(Value::String(value)) => {
+                let value = value.to_ascii_lowercase();
+                if !matches!(value.as_str(), "image/png" | "image/gif" | "image/webp") {
+                    continue;
+                }
+                Some(value)
+            }
+            None => None,
+            Some(_) => continue,
+        };
+        let updated_at = match tag.get("updated").filter(|value| !value.is_null()) {
+            Some(Value::String(value)) => {
+                let Ok(updated) = DateTime::parse_from_rfc3339(value) else {
+                    continue;
+                };
+                let updated = updated.naive_utc();
+                if updated > Utc::now().naive_utc() + chrono::Duration::hours(24) {
+                    continue;
+                }
+                Some(updated)
+            }
+            None => None,
+            Some(_) => continue,
+        };
+        if emojis
+            .iter()
+            .any(|emoji: &RemoteEmojiTag| emoji.shortcode == shortcode)
+        {
+            continue;
+        }
+        emojis.push(RemoteEmojiTag {
+            shortcode: shortcode.to_owned(),
+            uri,
+            image_url: image_url.to_string(),
+            media_type,
+            updated_at,
+        });
+        if emojis.len() == MAX_REMOTE_EMOJIS {
+            break;
+        }
+    }
+    emojis
+}
+
+fn value_includes_text(value: Option<&Value>, expected: &str) -> bool {
+    match value {
+        Some(Value::String(value)) => value == expected,
+        Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some(expected)),
+        _ => false,
+    }
 }
 
 fn parse_follow_decision(
@@ -670,9 +809,13 @@ fn value_or_id(value: Option<&Value>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::DateTime;
     use serde_json::json;
 
-    use super::{InboxActivity, InboxParseError, parse_activity, parse_job_arguments};
+    use super::{
+        InboxActivity, InboxParseError, MAX_REMOTE_EMOJIS, MAX_REMOTE_TAGS, RemoteEmojiTag,
+        parse_activity, parse_job_arguments, parse_note_emojis,
+    };
 
     #[test]
     fn parses_the_durable_inbox_job_contract() {
@@ -828,6 +971,83 @@ mod tests {
                 && atom_uri == "https://remote.example/objects/1"
                 && activity["type"] == "Delete"
         ));
+    }
+
+    #[test]
+    fn parses_and_bounds_remote_emoji_metadata_without_trusting_its_domain() {
+        let object = json!({
+            "tag": [
+                {"type": "Mention", "name": "@bob", "href": "https://elsewhere.example/@bob"},
+                {"id": "https://remote.example/emojis/blobcat", "type": ["Emoji"],
+                 "name": ":blobcat:", "updated": "2026-08-25T12:01:00Z",
+                 "icon": {"type": "Image", "mediaType": "image/png",
+                          "url": "https://cdn.example/blobcat.png"}},
+                {"type": "Emoji", "name": "blobcat",
+                 "icon": {"url": "https://cdn.example/duplicate.png"}},
+                {"id": "https://attacker.example/emojis/spoof", "type": "Emoji", "name": "spoof",
+                 "icon": {"url": "https://cdn.example/spoof.png"}},
+                {"type": "Emoji", "name": "bad-name", "icon": {"url": "https://cdn.example/bad.png"}},
+                {"type": "Emoji", "name": "jpeg", "icon": {"mediaType": "image/jpeg", "url": "https://cdn.example/bad.jpg"}}
+            ]
+        });
+
+        assert_eq!(
+            parse_note_emojis(&object, "https://remote.example/users/alice"),
+            vec![RemoteEmojiTag {
+                shortcode: "blobcat".to_owned(),
+                uri: Some("https://remote.example/emojis/blobcat".to_owned()),
+                image_url: "https://cdn.example/blobcat.png".to_owned(),
+                media_type: Some("image/png".to_owned()),
+                updated_at: Some(
+                    DateTime::parse_from_rfc3339("2026-08-25T12:01:00Z")
+                        .expect("timestamp")
+                        .naive_utc()
+                ),
+            }]
+        );
+    }
+
+    #[test]
+    fn remote_emoji_limit_counts_accepted_emojis_not_preceding_tags() {
+        let mut tags = (0..101)
+            .map(|index| json!({"type": "Mention", "name": format!("@user{index}")}))
+            .collect::<Vec<_>>();
+        tags.extend((0..101).map(|index| {
+            json!({
+                "type": "Emoji",
+                "name": format!(":emoji_{index}:"),
+                "icon": {"url": format!("https://cdn.example/emoji-{index}.png")}
+            })
+        }));
+
+        let emojis = parse_note_emojis(&json!({"tag": tags}), "https://remote.example/users/alice");
+
+        assert_eq!(emojis.len(), MAX_REMOTE_EMOJIS);
+        assert_eq!(
+            emojis.first().map(|emoji| emoji.shortcode.as_str()),
+            Some("emoji_0")
+        );
+        assert_eq!(
+            emojis.last().map(|emoji| emoji.shortcode.as_str()),
+            Some("emoji_99")
+        );
+    }
+
+    #[test]
+    fn remote_emoji_tag_traversal_remains_bounded() {
+        let mut tags = (0..MAX_REMOTE_TAGS)
+            .map(|index| json!({"type": "Mention", "name": format!("@user{index}")}))
+            .collect::<Vec<_>>();
+        tags.push(json!({
+            "type": "Emoji",
+            "name": ":too_late:",
+            "icon": {"url": "https://cdn.example/too-late.png"}
+        }));
+
+        assert!(
+            parse_note_emojis(&json!({"tag": tags}), "https://remote.example/users/alice")
+                .is_empty()
+        );
     }
 
     #[test]
