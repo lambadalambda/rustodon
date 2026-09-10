@@ -10,7 +10,10 @@
   A test-support fault now exercises both a rollback before `COMMIT` and an
   error after PostgreSQL commits; staged Paperclip files remain available for
   retry reconciliation, and the durable jobs finish without leaked leases.
-  `mise run worker-integration` passes 44/44.
+  `mise run worker-integration` passes 45/45.
+- Added an eight-wave, twenty-user durable-worker executor soak with four remote HTTP
+  permits, retry-after-commit idempotency, exact-key, dead-letter, and queue
+  drain assertions. End-to-end production load remains open by design.
 
 ## 2026-09-07
 

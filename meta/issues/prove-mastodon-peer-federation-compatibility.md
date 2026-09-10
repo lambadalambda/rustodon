@@ -19,7 +19,7 @@ Exercise the complete v1 federation profile against a pinned Mastodon 4.6.5 peer
 
 - Local federation behavior is covered by the 20-phase Rails-versus-Rust
   differential suite, signed transport and SSRF fixtures, durable worker
-  integration (44/44), duplicate/out-of-order relationship tests, and cutover
+  integration (45/45), duplicate/out-of-order relationship tests, and cutover
   reopen verification against the pinned Mastodon 4.6.5 source.
 - Live peer discovery, bidirectional state convergence, and peer-side
   idempotency remain unverified; this issue stays open until that external run

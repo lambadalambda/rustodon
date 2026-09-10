@@ -92,7 +92,7 @@ owning issue, code surface, or acceptance command.
 | ID | Requirement | Implementation and proof | Status |
 | --- | --- | --- | --- |
 | AUTH-01 | Accept existing bearer tokens with revocation, expiry, owner-state, and scope checks. | `src/mastodon/auth.rs`; `tests/oauth.rs`; differential `oauth_bearer_authentication`. | A |
-| AUTH-02 | Password login and logout for existing users. | Rust-owned browser auth routes in `src/web.rs`; lifecycle parity is covered by differential `browser_authentication`, while live browser acceptance remains required. | M |
+| AUTH-02 | Password login and logout for existing users. | Rust-owned browser auth routes in `src/web.rs`; lifecycle parity is covered by differential `browser_authentication`, and `mise run browser-integration` proves a fixture-authenticated browser shell plus settings/logout. Full browser form-flow acceptance remains required. | M |
 | AUTH-03 | Existing TOTP and backup-code verification; WebAuthn is not required. | `src/crypto.rs`, `src/mastodon/auth.rs`, browser authentication/settings handlers, auth tests, and guarded `browser_authentication`/`browser_two_factor_management` cases. | M; local fixture proof complete, live browser evidence remains open |
 | AUTH-04 | OAuth authorization code, PKCE, and revocation. | `src/mastodon/oauth.rs`, `src/web.rs`; differential `oauth_authorization_code` and browser lifecycle guard coverage; OAuth tests. | A |
 | AUTH-05 | Dynamic app registration and application credential verification. | `POST /api/v1/apps`, `/api/v1/apps/verify_credentials`; differential OAuth coverage. | A |
@@ -106,7 +106,7 @@ owning issue, code surface, or acceptance command.
 | WEB-01 | Reuse exact pinned Mastodon frontend assets. | `public/packs/BUILD.md`; fixture provenance and checksum verification. | A |
 | WEB-02 | Render the HTML shell, initial state, CSRF data, VAPID metadata, and mount point. | `src/web.rs`; differential `local_web_client_shell`. | A |
 | WEB-03 | Serve packs, themes, locales, service worker, and uploaded files. | Frontend asset routes and Paperclip routes; shell/media tests. | A |
-| WEB-04 | Provide login, reset, and essential account settings UI. | Rust-owned `/auth/*` and `/settings/*` routes, including encrypted TOTP/recovery-code management; browser flow recording remains open. | M |
+| WEB-04 | Provide login, reset, and essential account settings UI. | Rust-owned `/auth/*` and `/settings/*` routes, including encrypted TOTP/recovery-code management; the fixture-authenticated browser shell proves profile settings, while browser form-flow recording remains open. | M |
 | WEB-05 | Advertise unsupported optional features as disabled and return stable empty probes. | Disabled route contracts, including translation languages; route inventory test. | A |
 
 ### Core REST API
@@ -188,11 +188,11 @@ owning issue, code surface, or acceptance command.
 | --- | --- | --- | --- |
 | ACCEPT-01 | Preflight passes without user-data transformation. | `mise run preflight-integration` plus production smoke run. | M |
 | ACCEPT-02 | Stop Mastodon, drain Sidekiq, start Rustodon, and retain database/media/domain/secrets. | Rehearsed fixture cutover using [`cutover.md`](cutover.md); the local rehearsal passes, while a production-window run remains required. | M |
-| ACCEPT-03 | Existing users log in with password/TOTP and existing OAuth clients remain authorized. | Guarded browser authentication and 2FA-management cases plus differential OAuth cases; live browser recording remains open. | M |
+| ACCEPT-03 | Existing users log in with password/TOTP and existing OAuth clients remain authorized. | Guarded browser authentication and 2FA-management cases, local `mise run browser-integration` server-authenticated password/backup-code shell and settings/logout proof, plus differential OAuth cases; full browser recording remains open. | M |
 | ACCEPT-04 | Pinned web frontend and recorded mobile client publish and read normal v1 content. | Browser recording plus a versioned mobile-client recording. | O |
 | ACCEPT-05 | Public/private/direct content remains visible only to correct viewers. | Differential `status_authorization_matrix`, policy unit tests, REST/timeline/schema coverage, and streaming suppression coverage. | A locally |
 | ACCEPT-06 | A pinned Mastodon 4.6.5 peer discovers, follows, receives, replies, likes, boosts, updates, and deletes in both directions. | `prove-mastodon-peer-federation-compatibility` fixture and peer run. | O |
-| ACCEPT-07 | Worker crashes and duplicate deliveries do not duplicate effects. | Restored worker integration now covers all-lane abort recovery, database failure before acknowledgement, a twenty-job bounded-concurrency burst, duplicate relationship activities, delivery replay, live-lease Follow/Undo and Block/Undo ordering cases, and ambiguous remote-media metadata commits before and after PostgreSQL commit; peer-side idempotency, true sustained load, and hard-power-loss proof remain open. | M |
+| ACCEPT-07 | Worker crashes and duplicate deliveries do not duplicate effects. | Restored worker integration now covers all-lane abort recovery, database failure before acknowledgement, a twenty-job bounded-concurrency burst, an eight-wave twenty-user worker-executor soak, duplicate relationship activities, delivery replay, live-lease Follow/Undo and Block/Undo ordering cases, and ambiguous remote-media metadata commits before and after PostgreSQL commit; peer-side idempotency, end-to-end sustained 1-20-user load, and hard-power-loss proof remain open. | M |
 | ACCEPT-08 | Existing media works and newly uploaded images reopen after Mastodon rollback. | Media differential plus `mise run cutover-integration`, which uploads through Rustodon and verifies the row and original/small files through reopened Mastodon. | M |
 | ACCEPT-09 | Unsupported active configurations fail preflight. | Preflight rejection matrix and integration task. | A |
 | ACCEPT-10 | Redis can be removed and Mastodon can be restored without data migration reversal. | `mise run cutover-integration` removes the old Redis container and restores pinned Mastodon with a fresh empty Redis instance while preserving the database/media baseline. | M |

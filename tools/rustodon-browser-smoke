@@ -7,6 +7,8 @@ usage() {
         '' \
         'BASE_URL must be the local Rustodon web origin.' \
         'HOST is the configured Rustodon LOCAL_DOMAIN.' \
+        'RUSTODON_BROWSER_AUTH=true enables the fixture server-authenticated browser-shell flow.' \
+        'RUSTODON_BROWSER_EMAIL, _PASSWORD, and _OTP provide its test credentials.' \
         'RUSTODON_BROWSER_RECORD may name a WebM recording path.' \
         'RUSTODON_BROWSER_SCREENSHOT may name a PNG screenshot path.'
 }
@@ -28,6 +30,9 @@ fi
 
 base_url=${1%/}
 host=$2
+auth=${RUSTODON_BROWSER_AUTH:-false}
+cookie_jar=''
+header_file=''
 case "$base_url" in
     http://*|https://*) ;;
     *) fail 'BASE_URL must use http or https' ;;
@@ -42,6 +47,18 @@ case "$host" in
     ''|*'/'*|*'?'*|*'#'*|*'@'*|*'"'*)
         fail 'HOST must be an authority without a path, query, fragment, user info, or quotes'
         ;;
+esac
+case "$auth" in
+    false) ;;
+    true)
+        browser_email=${RUSTODON_BROWSER_EMAIL:-}
+        browser_password=${RUSTODON_BROWSER_PASSWORD:-}
+        browser_otp=${RUSTODON_BROWSER_OTP:-}
+        [ -n "$browser_email" ] || fail 'RUSTODON_BROWSER_EMAIL is required when browser auth is enabled'
+        [ -n "$browser_password" ] || fail 'RUSTODON_BROWSER_PASSWORD is required when browser auth is enabled'
+        [ -n "$browser_otp" ] || fail 'RUSTODON_BROWSER_OTP is required when browser auth is enabled'
+        ;;
+    *) fail 'RUSTODON_BROWSER_AUTH must be true or false' ;;
 esac
 command -v agent-browser >/dev/null 2>&1 || fail 'agent-browser is required'
 
@@ -63,6 +80,12 @@ cleanup() {
         browser record stop >/dev/null 2>&1 || true
     fi
     browser close >/dev/null 2>&1 || true
+    if [ -n "$cookie_jar" ]; then
+        rm -f "$cookie_jar"
+    fi
+    if [ -n "$header_file" ]; then
+        rm -f "$header_file"
+    fi
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
@@ -123,6 +146,125 @@ if [ -n "${RUSTODON_BROWSER_SCREENSHOT:-}" ]; then
     browser screenshot "$RUSTODON_BROWSER_SCREENSHOT" >/dev/null
 fi
 
+if [ "$auth" = true ]; then
+    printf '%s\n' 'browser auth: opening sign-in page' >&2
+    browser open "$base_url/auth/sign_in" >/dev/null
+    if ! browser wait --load networkidle >/dev/null; then
+        debug_dump
+        fail 'sign-in page did not become idle'
+    fi
+    printf '%s\n' 'browser auth: submitting fixture credentials' >&2
+    browser fill '#email' "$browser_email"
+    browser fill '#password' "$browser_password"
+    browser fill '#otp_attempt' "$browser_otp"
+    csrf_token=$(browser eval 'document.querySelector("input[name=csrf_token]").value')
+    [ -n "$csrf_token" ] || fail 'browser sign-in form did not expose a CSRF token'
+    csrf_cookie=$csrf_token
+    case "$base_authority" in
+        *:*)
+            base_host=${base_authority%:*}
+            base_port=${base_authority##*:}
+            ;;
+        *) fail 'authenticated browser smoke requires an explicit BASE_URL port' ;;
+    esac
+    case "$base_port" in
+        ''|*[!0-9]*) fail "invalid BASE_URL port: $base_port" ;;
+    esac
+    command -v curl >/dev/null 2>&1 || fail 'curl is required when browser auth is enabled'
+    cookie_jar=$(mktemp "${TMPDIR:-/tmp}/rustodon-browser-cookies.XXXXXX")
+    header_file=$(mktemp "${TMPDIR:-/tmp}/rustodon-browser-headers.XXXXXX")
+    printf '%s\n' 'browser auth: submitting fixture credentials through the local form endpoint' >&2
+    # The fixture has a canonical HTTPS origin, while this browser endpoint is loopback HTTP.
+    login_result=$(curl --silent --show-error --max-time 30 \
+        --resolve "$base_host:$base_port:127.0.0.1" \
+        --header "Host: $host" \
+        --header 'X-Forwarded-Proto: https' \
+        --header 'Content-Type: application/x-www-form-urlencoded' \
+        --cookie "csrf_token=$csrf_cookie" \
+        --cookie-jar "$cookie_jar" \
+        --data-urlencode "csrf_token=$csrf_token" \
+        --data-urlencode "user[email]=$browser_email" \
+        --data-urlencode "user[password]=$browser_password" \
+        --data-urlencode "user[otp_attempt]=$browser_otp" \
+        --dump-header "$header_file" \
+        --write-out '%{http_code}|%{redirect_url}' \
+        --output /dev/null \
+        "$base_url/auth/sign_in")
+    login_status=${login_result%%|*}
+    login_redirect=${login_result#*|}
+    case "$login_status" in
+        3??) ;;
+        *) fail "browser sign-in returned HTTP $login_status ($login_redirect)" ;;
+    esac
+    browser_session=$(awk 'tolower($0) ~ /^[^:]+:[[:space:]]*_mastodon_session=/ { line = $0; sub(/^[^:]+:[[:space:]]*_mastodon_session=/, "", line); sub(/;.*/, "", line); print line; exit }' "$header_file")
+    if [ -z "$browser_session" ]; then
+        cookie_names=$(awk 'NF >= 7 { printf "%s ", $6 }' "$cookie_jar")
+        fail "browser sign-in did not return a session cookie (HTTP $login_status; redirect: $login_redirect; cookies: $cookie_names)"
+    fi
+    browser cookies set _mastodon_session "$browser_session" --url "$base_url/" --path / >/dev/null
+    printf '%s\n' 'browser auth: waiting for authenticated shell' >&2
+    browser open "$base_url/" >/dev/null
+    if ! browser wait --load networkidle >/dev/null; then
+        debug_dump
+        fail 'authenticated page did not become idle'
+    fi
+    browser wait --fn "Boolean(document.querySelector('#mastodon'))" >/dev/null
+    authenticated_me=$(browser eval "document.getElementById('initial-state')?.textContent.includes('116844606259201001')")
+    case "$authenticated_me" in
+        true) ;;
+        *) fail 'authenticated shell did not contain the fixture account' ;;
+    esac
+    assert_mount
+
+    printf '%s\n' 'browser auth: checking profile settings' >&2
+    browser open "$base_url/settings/profile" >/dev/null
+    if ! browser wait --load networkidle >/dev/null; then
+        debug_dump
+        fail 'profile settings page did not become idle'
+    fi
+    settings_text=$(browser get text body)
+    case "$settings_text" in
+        *'Profile details'*'Save changes'*) ;;
+        *) fail 'authenticated profile settings page did not render expected controls' ;;
+    esac
+    printf '%s\n' 'browser auth: submitting logout' >&2
+    logout_csrf=$(browser eval 'document.querySelector("nav form input[name=csrf_token]").value')
+    logout_status=$(curl --silent --show-error --fail --max-time 30 \
+        --resolve "$base_host:$base_port:127.0.0.1" \
+        --header "Host: $host" \
+        --header 'X-Forwarded-Proto: https' \
+        --header 'Content-Type: application/x-www-form-urlencoded' \
+        --cookie "csrf_token=$logout_csrf; _mastodon_session=$browser_session" \
+        --data-urlencode "csrf_token=$logout_csrf" \
+        --write-out '%{http_code}' \
+        --output /dev/null \
+        "$base_url/auth/sign_out")
+    [ "$logout_status" = 302 ] || fail "browser logout returned HTTP $logout_status"
+    logout_probe=$(curl --silent --show-error --max-time 30 \
+        --resolve "$base_host:$base_port:127.0.0.1" \
+        --header "Host: $host" \
+        --header 'X-Forwarded-Proto: https' \
+        --cookie "_mastodon_session=$browser_session" \
+        --write-out '%{http_code}|%{redirect_url}' \
+        --output /dev/null \
+        "$base_url/settings/profile")
+    logout_probe_status=${logout_probe%%|*}
+    logout_probe_redirect=${logout_probe#*|}
+    [ "$logout_probe_status" = 302 ] ||
+        fail "server-side logout probe returned HTTP $logout_probe_status"
+    case "$logout_probe_redirect" in
+        */auth/sign_in*) ;;
+        *) fail "server-side logout probe did not redirect to sign-in: $logout_probe_redirect" ;;
+    esac
+    printf '%s\n' 'browser auth: clearing browser session' >&2
+    browser cookies clear >/dev/null
+    browser open "$base_url/" >/dev/null
+    if ! browser wait --load networkidle >/dev/null; then
+        debug_dump
+        fail 'anonymous post-logout shell did not become idle'
+    fi
+fi
+
 browser pushstate "$base_url/about" >/dev/null
 browser wait --load networkidle >/dev/null
 current_url=$(browser get url)
@@ -144,4 +286,8 @@ if [ "$recording" = true ]; then
     recording=false
 fi
 
-printf 'browser web-client smoke passed: mount, app body, SPA deep link, and page errors\n'
+if [ "$auth" = true ]; then
+    printf 'browser web-client smoke passed: mount, server-authenticated shell/settings/logout, SPA deep link, and page errors\n'
+else
+    printf 'browser web-client smoke passed: mount, app body, SPA deep link, and page errors\n'
+fi

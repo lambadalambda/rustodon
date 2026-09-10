@@ -71,7 +71,7 @@ run = "tools/mastodon-fixture cutover-test"
 
 [tasks.browser-integration]
 description = "Run Chromium startup and SPA navigation against the cutover fixture"
-run = "RUSTODON_BROWSER_SMOKE=true tools/mastodon-fixture cutover-test"
+run = "RUSTODON_BROWSER_SMOKE=true RUSTODON_BROWSER_AUTH=true RUSTODON_BROWSER_EMAIL=alice@fixture.invalid RUSTODON_BROWSER_PASSWORD=fixture-password RUSTODON_BROWSER_OTP=fixture-recovery-code tools/mastodon-fixture cutover-test"
 
 [tasks.differential]
 description = "Run all or one Rails-versus-Rust differential compatibility case"

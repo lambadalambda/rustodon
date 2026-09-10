@@ -14747,6 +14747,161 @@ async fn executor_bounds_resources_and_duplicate_execution_keeps_one_effect()
 
 #[tokio::test]
 #[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+#[allow(clippy::too_many_lines)]
+async fn executor_processes_twenty_user_waves_without_duplicate_effects()
+-> Result<(), Box<dyn std::error::Error>> {
+    const USER_COUNT: usize = 20;
+    const WAVES: usize = 8;
+    const PERMITS: usize = 4;
+
+    let url = std::env::var("RUSTODON_WORKER_DATABASE_URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(12)
+        .connect(&url)
+        .await?;
+    let queue = Queue::new(pool.clone());
+    reset().await?;
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let registry = HandlerRegistry::new();
+    registry.register(
+        "fixture.sustained",
+        Lane::Pull,
+        ResourceClass::RemoteHttp,
+        {
+            let pool = pool.clone();
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            move |job| {
+                let pool = pool.clone();
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                Box::pin(async move {
+                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now_active, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    sqlx::query(
+                        "INSERT INTO rustodon.idempotency_keys
+                           (scope, key, fingerprint, result, expires_at)
+                         VALUES ('worker-sustained', $1, $2, '{}'::jsonb,
+                                 clock_timestamp() + interval '1 hour')
+                         ON CONFLICT (scope, key) DO NOTHING",
+                    )
+                    .bind(job.logical_key.as_deref().unwrap_or("missing"))
+                    .bind([0_u8; 32].as_slice())
+                    .execute(&pool)
+                    .await
+                    .map_err(|_| HandlerFailure::retry("sustained effect write failed"))?;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    if job.attempt == 1 {
+                        Err(HandlerFailure::retry("retry after sustained effect commit"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        },
+    )?;
+
+    let executor = WorkerExecutor::new(queue.clone(), registry, PERMITS, 1)?;
+    for wave in 0..WAVES {
+        for user in 0..USER_COUNT {
+            queue
+                .enqueue(
+                    &JobSpec::new(
+                        Lane::Pull,
+                        "fixture.sustained",
+                        json!({"user": user, "wave": wave}),
+                    )
+                    .logical_key(format!("user-{user}-wave-{wave}"))
+                    .max_attempts(2),
+                )
+                .await?;
+        }
+
+        let first_attempts = (0..USER_COUNT)
+            .map(|slot| {
+                let executor = executor.clone();
+                async move {
+                    executor
+                        .process_one(
+                            &format!("sustained-{wave}-first-{slot}"),
+                            &[Lane::Pull],
+                            Duration::seconds(1),
+                        )
+                        .await
+                }
+            })
+            .collect::<Vec<_>>();
+        for result in futures_util::future::join_all(first_attempts).await {
+            assert!(result?);
+        }
+
+        sqlx::query(
+            "UPDATE rustodon.durable_jobs
+                SET run_at = clock_timestamp()
+              WHERE kind = 'fixture.sustained' AND dead_at IS NULL",
+        )
+        .execute(&pool)
+        .await?;
+
+        let retry_attempts = (0..USER_COUNT)
+            .map(|slot| {
+                let executor = executor.clone();
+                async move {
+                    executor
+                        .process_one(
+                            &format!("sustained-{wave}-retry-{slot}"),
+                            &[Lane::Pull],
+                            Duration::seconds(1),
+                        )
+                        .await
+                }
+            })
+            .collect::<Vec<_>>();
+        for result in futures_util::future::join_all(retry_attempts).await {
+            assert!(result?);
+        }
+    }
+
+    assert_eq!(maximum.load(Ordering::SeqCst), PERMITS);
+    assert_eq!(queue.queued_count().await?, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM rustodon.durable_jobs
+              WHERE kind = 'fixture.sustained' AND dead_at IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await?,
+        0,
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM rustodon.idempotency_keys
+              WHERE scope = 'worker-sustained'",
+        )
+        .fetch_one(&pool)
+        .await?,
+        i64::try_from(USER_COUNT * WAVES)?,
+    );
+    let expected_keys = (0..WAVES)
+        .flat_map(|wave| (0..USER_COUNT).map(move |user| format!("user-{user}-wave-{wave}")))
+        .collect::<BTreeSet<_>>();
+    let actual_keys = sqlx::query_scalar::<_, String>(
+        "SELECT key FROM rustodon.idempotency_keys
+          WHERE scope = 'worker-sustained' ORDER BY key",
+    )
+    .fetch_all(&pool)
+    .await?
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert_eq!(actual_keys, expected_keys);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
 async fn executor_renews_a_lease_while_waiting_for_a_resource_permit()
 -> Result<(), Box<dyn std::error::Error>> {
     let url = std::env::var("RUSTODON_WORKER_DATABASE_URL")?;

@@ -31,6 +31,6 @@ trigger local relationship rejection.
   Reject before the existing purge/Undo assertions.
 - Accept outbox creation now locks and rechecks the follow row, preventing a
   concurrent Follow handler from recreating an Accept after suspension.
-- `mise exec -- mise run worker-integration` passes 44/44, including the
+- `mise exec -- mise run worker-integration` passes 45/45, including the
   remote-origin actor Update lifecycle, whose follow-preservation assertion is
   explicit.

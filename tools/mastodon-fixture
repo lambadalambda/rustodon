@@ -1758,6 +1758,9 @@ cutover_abort() {
   status=$?
   cutover_stop_processes
   cleanup_containers
+  if [ -n "${cutover_browser_user_restore:-}" ]; then
+    rm -f "$cutover_browser_user_restore"
+  fi
   if [ "${CUTOVER_KEEP_ARTIFACTS:-false}" = true ]; then
     printf 'cutover artifacts retained under %s and %s\n' \
       "${cutover_worker_log:-}" "${cutover_web_log:-}" >&2
@@ -1843,6 +1846,7 @@ cutover_preflight() {
 
 cutover_test() {
   fixture=$FIXTURE_DIR
+  umask 077
   verify_static "$fixture"
   verify_differential_images
   start_database publish
@@ -1854,6 +1858,10 @@ cutover_test() {
   cutover_after_prefix="$ROOT/target/cutover-after-$$"
   cutover_before_media="$ROOT/target/cutover-before-media-$$"
   cutover_after_media="$ROOT/target/cutover-after-media-$$"
+  cutover_browser_user_restore=''
+  cutover_browser_login_activity_max=''
+  cutover_browser_session_activation_max=''
+  cutover_browser_token_max=''
   cutover_media_root="$ROOT/target/cutover-media-$$"
   trap cutover_abort EXIT HUP INT TERM
 
@@ -1962,16 +1970,63 @@ EOF
   cutover_web_pid=$!
   wait_for_http "http://127.0.0.1:$cutover_web_port/health"
   wait_for_http "http://127.0.0.1:$cutover_web_port/ready"
+  case "${RUSTODON_BROWSER_AUTH:-false}" in
+    true)
+      cutover_browser_user_restore="$ROOT/target/cutover-browser-user-$$.sql"
+      cutover_browser_login_activity_max=$(run_podman exec "$PG_CONTAINER" psql \
+        --set ON_ERROR_STOP=1 --tuples-only --no-align \
+        --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+        --command 'SELECT COALESCE(max(id), 0) FROM public.login_activities WHERE user_id = 101' | tr -d '[:space:]')
+      cutover_browser_session_activation_max=$(run_podman exec "$PG_CONTAINER" psql \
+        --set ON_ERROR_STOP=1 --tuples-only --no-align \
+        --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+        --command 'SELECT COALESCE(max(id), 0) FROM public.session_activations WHERE user_id = 101' | tr -d '[:space:]')
+      cutover_browser_token_max=$(run_podman exec "$PG_CONTAINER" psql \
+        --set ON_ERROR_STOP=1 --tuples-only --no-align \
+        --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+        --command 'SELECT COALESCE(max(id), 0) FROM public.oauth_access_tokens WHERE resource_owner_id = 101' | tr -d '[:space:]')
+      case "$cutover_browser_login_activity_max:$cutover_browser_session_activation_max:$cutover_browser_token_max" in
+        ''|*[!0-9:]*) die 'invalid browser authentication fixture baselines' ;;
+      esac
+      run_podman exec "$PG_CONTAINER" psql \
+        --set ON_ERROR_STOP=1 --tuples-only --no-align \
+        --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+        --command "SELECT format('UPDATE public.users SET current_sign_in_at = %L, last_sign_in_at = %L, sign_in_count = %s, consumed_timestep = %L, updated_at = %L, otp_backup_codes = %L WHERE id = 101;', current_sign_in_at, last_sign_in_at, sign_in_count, consumed_timestep, updated_at, otp_backup_codes) FROM public.users WHERE id = 101" \
+        > "$cutover_browser_user_restore"
+      run_podman exec "$PG_CONTAINER" psql \
+        --set ON_ERROR_STOP=1 --tuples-only --no-align \
+        --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+        --command "SELECT format('SELECT setval(''public.login_activities_id_seq'', %s, %L);', last_value, is_called) FROM public.login_activities_id_seq UNION ALL SELECT format('SELECT setval(''public.oauth_access_tokens_id_seq'', %s, %L);', last_value, is_called) FROM public.oauth_access_tokens_id_seq UNION ALL SELECT format('SELECT setval(''public.session_activations_id_seq'', %s, %L);', last_value, is_called) FROM public.session_activations_id_seq" \
+        >> "$cutover_browser_user_restore"
+      ;;
+    false) ;;
+    *) die 'RUSTODON_BROWSER_AUTH must be true or false' ;;
+  esac
   case "${RUSTODON_BROWSER_SMOKE:-false}" in
     true)
       RUSTODON_BROWSER_RECORD="${RUSTODON_BROWSER_RECORD:-}" \
         RUSTODON_BROWSER_SCREENSHOT="${RUSTODON_BROWSER_SCREENSHOT:-}" \
+        RUSTODON_BROWSER_AUTH="${RUSTODON_BROWSER_AUTH:-false}" \
+        RUSTODON_BROWSER_EMAIL="${RUSTODON_BROWSER_EMAIL:-}" \
+        RUSTODON_BROWSER_PASSWORD="${RUSTODON_BROWSER_PASSWORD:-}" \
+        RUSTODON_BROWSER_OTP="${RUSTODON_BROWSER_OTP:-}" \
         "$ROOT/tools/rustodon-browser-smoke" \
         "http://$LOCAL_DOMAIN:$cutover_web_port" "$LOCAL_DOMAIN"
       ;;
     false) ;;
     *) die 'RUSTODON_BROWSER_SMOKE must be true or false' ;;
   esac
+  if [ -n "$cutover_browser_user_restore" ]; then
+    run_podman exec -i "$PG_CONTAINER" psql \
+      --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+      < "$cutover_browser_user_restore" >/dev/null
+    run_podman exec "$PG_CONTAINER" psql \
+      --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+      --command "DELETE FROM public.session_activations WHERE user_id = 101 AND id > $cutover_browser_session_activation_max; DELETE FROM public.oauth_access_tokens WHERE resource_owner_id = 101 AND id > $cutover_browser_token_max; DELETE FROM public.login_activities WHERE user_id = 101 AND id > $cutover_browser_login_activity_max;" \
+      >/dev/null
+    rm -f "$cutover_browser_user_restore"
+    cutover_browser_user_restore=''
+  fi
   RUSTODON_SMOKE_DOMAIN="$LOCAL_DOMAIN" \
     RUSTODON_SMOKE_HOST="$LOCAL_DOMAIN" \
     RUSTODON_SMOKE_TOKEN='fixture-bearer-token-v4-6-5' \
@@ -2069,8 +2124,10 @@ EOF
     die 'cutover changed the Mastodon public catalog'
   cmp -s "${cutover_before_prefix}-schema" "${cutover_after_prefix}-schema" ||
     die 'cutover changed the Mastodon public schema'
-  cmp -s "${cutover_before_prefix}-data" "${cutover_after_prefix}-data" ||
+  if ! cmp -s "${cutover_before_prefix}-data" "${cutover_after_prefix}-data"; then
+    diff -u "${cutover_before_prefix}-data" "${cutover_after_prefix}-data" >&2 || true
     die 'cutover changed Mastodon public data'
+  fi
   cmp -s "${cutover_before_prefix}-auth" "${cutover_after_prefix}-auth" ||
     die 'cutover changed stable Mastodon authentication data'
   diff -r "$cutover_before_media" "$cutover_after_media" >/dev/null ||
