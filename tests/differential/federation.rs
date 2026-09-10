@@ -1234,6 +1234,59 @@ pub(crate) async fn run_federation_discovery_case(
     guard.finish().await
 }
 
+pub(crate) async fn run_actor_media_case(
+    config: DifferentialConfig,
+    rust_url: &Url,
+    media_root_url: &str,
+) -> Result<(), Box<dyn Error>> {
+    let guard = ReadOnlyGuard::begin(config, rust_url).await?;
+    let request = RequestSpec::new(
+        Method::GET,
+        "/users/alice",
+        None,
+        {
+            let mut headers = stable_request_headers();
+            headers.insert(ACCEPT, HeaderValue::from_static(ACTIVITY_ACCEPT));
+            headers
+        },
+        Vec::new(),
+    )?;
+    let responses = guard.send(&request).await?;
+    compare_json_paths(
+        "actor profile media",
+        &responses.mastodon,
+        &responses.rust,
+        &[
+            "/icon/type",
+            "/icon/mediaType",
+            "/icon/url",
+            "/image/type",
+            "/image/mediaType",
+            "/image/url",
+        ],
+    )?;
+    for (side, response) in [("Mastodon", &responses.mastodon), ("Rust", &responses.rust)] {
+        let actor: Value = serde_json::from_slice(&response.body)?;
+        for field in ["icon", "image"] {
+            let url = actor[field]["url"]
+                .as_str()
+                .ok_or_else(|| format!("{side} actor omitted {field}.url"))?;
+            let expected_root = if media_root_url.starts_with("http") {
+                media_root_url.to_owned()
+            } else {
+                format!("https://fixture-v4-6-5.rustodon.invalid{media_root_url}")
+            };
+            if !url.starts_with(&format!("{}/", expected_root.trim_end_matches('/'))) {
+                return Err(format!(
+                    "{side} actor {field}.url {url:?} does not use {expected_root:?}"
+                )
+                .into());
+            }
+        }
+    }
+    guard.finish().await
+}
+
 fn compare_json_paths(
     label: &str,
     mastodon: &CapturedResponse,

@@ -37,6 +37,10 @@ run = "tools/mastodon-fixture generate"
 description = "Verify fixture metadata and checksums without Podman"
 run = "tools/mastodon-fixture verify"
 
+[tasks.pinned-source-contracts]
+description = "Verify independently derived pinned frontend and Rails source contracts"
+run = "tools/pinned-source-contracts"
+
 [tasks.fixture-restore-verify]
 description = "Restore and verify the fixture with PostgreSQL and Mastodon Rails"
 run = "tools/mastodon-fixture restore-verify"
@@ -76,6 +80,10 @@ run = "RUSTODON_BROWSER_SMOKE=true RUSTODON_BROWSER_AUTH=true RUSTODON_BROWSER_E
 [tasks.differential]
 description = "Run all or one Rails-versus-Rust differential compatibility case"
 run = "tools/mastodon-fixture differential-test"
+
+[tasks.differential-ci]
+description = "Run stable high-value Rails-versus-Rust CI cases on fresh fixture clones"
+run = "tools/ci-differential"
 
 [tasks.check]
 description = "Run all local and CI checks"

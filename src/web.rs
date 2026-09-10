@@ -1221,7 +1221,7 @@ pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
     ),
     route!(
         "/api/v1/announcements",
-        Implemented,
+        DisabledResponse,
         ApiAuthentication::Required(NO_SCOPE.as_slice()),
         None,
         Private
@@ -1967,7 +1967,7 @@ pub const V1_REQUIRED_API_ROUTES: &[(&str, ApiMethod, ApiRouteSupport)] = &[
     (
         "/api/v1/announcements",
         ApiMethod::Get,
-        ApiRouteSupport::Implemented,
+        ApiRouteSupport::DisabledResponse,
     ),
     (
         "/api/v2/search",
@@ -11177,7 +11177,11 @@ fn browser_authentication_error_response(
             secure,
             signing_key,
             headers,
-            StatusCode::UNPROCESSABLE_ENTITY,
+            if accepts_html(headers) {
+                StatusCode::OK
+            } else {
+                StatusCode::UNPROCESSABLE_ENTITY
+            },
             "invalid_credentials",
             "Invalid email or password.",
             Some(email),
@@ -18367,8 +18371,27 @@ mod tests {
         assert!(body.contains("alice@example.invalid"));
         assert!(body.contains("name=\"csrf_token\""));
 
+        let response = browser_authentication_error_response(
+            false,
+            &signing_key,
+            &html_headers,
+            "alice@example.invalid",
+            &BrowserAuthenticationError::InvalidCredentials,
+            None,
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+
         let mut json_headers = HeaderMap::new();
         json_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        let response = browser_authentication_error_response(
+            false,
+            &signing_key,
+            &json_headers,
+            "alice@example.invalid",
+            &BrowserAuthenticationError::InvalidCredentials,
+            None,
+        );
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let response = browser_sign_in_error_response(
             false,
             &signing_key,

@@ -1,0 +1,15 @@
+#!/bin/sh
+
+set -eu
+
+ROOT=$(CDPATH= cd -P -- "$(dirname -- "$0")/.." && pwd)
+
+cd "$ROOT"
+"$ROOT/tools/mastodon-fixture" differential-test oauth_bearer_authentication
+"$ROOT/tools/mastodon-fixture" differential-test core_rest_serializers
+"$ROOT/tools/mastodon-fixture" differential-test rest_protocol_contracts
+"$ROOT/tools/mastodon-fixture" differential-test federation_discovery
+"$ROOT/tools/mastodon-fixture" differential-test status_authorization_matrix
+RUSTODON_DIFFERENTIAL_ACTOR_MEDIA_ROOT=relative \
+  "$ROOT/tools/mastodon-fixture" differential-test actor_media_root_url
+"$ROOT/tools/mastodon-fixture" differential-test actor_media_root_url

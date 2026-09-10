@@ -1,0 +1,10 @@
+#!/bin/sh
+
+set -eu
+
+ROOT=$(CDPATH= cd -P -- "$(dirname -- "$0")/.." && pwd)
+SOURCE="$ROOT/target/mastodon-v4.6.5"
+
+cd "$ROOT"
+"$ROOT/tools/mastodon-fixture" verify-source "$SOURCE"
+cargo test --locked --test pinned_source_contracts -- --ignored --test-threads=1

@@ -303,7 +303,7 @@ obtain_source() {
   fi
 
   parent=$(dirname "$destination")
-  [ -d "$parent" ] || die "source parent directory does not exist: $parent"
+  mkdir -p "$parent"
   git clone --filter=blob:none --branch "$RELEASE" --single-branch --depth 1 \
     https://github.com/mastodon/mastodon.git "$destination"
   verify_source "$destination"
@@ -2151,7 +2151,7 @@ validate_differential_case() {
       ;;
   esac
   case "$case_name" in
-    account_settings|admin_create_user|authorized_fetch_read_routes_require_signatures|browser_authentication|browser_two_factor_management|core_rest_serializers|federation_discovery|instance_v2|local_paperclip_media|local_paperclip_deleted_media|local_web_client_shell|media_writes|notification_writes|oauth_authorization_code|oauth_bearer_authentication|password_recovery|report_writes|rest_protocol_contracts|status_authorization_matrix|write_transactions) ;;
+    account_settings|actor_media_root_url|admin_create_user|authorized_fetch_read_routes_require_signatures|browser_authentication|browser_two_factor_management|core_rest_serializers|federation_discovery|instance_v2|local_paperclip_media|local_paperclip_deleted_media|local_web_client_shell|media_writes|notification_writes|oauth_authorization_code|oauth_bearer_authentication|password_recovery|report_writes|rest_protocol_contracts|status_authorization_matrix|write_transactions) ;;
     *) die "unknown differential case: $case_name" ;;
   esac
 }
@@ -2411,6 +2411,7 @@ start_differential_web() {
   media_root=$2
   media_mode=${3:-ro}
   prepare_feeds=${4:-true}
+  paperclip_root_url=${5:-/system}
   WEB_CONTAINER="rustodon-differential-v4-6-5-web-$$"
 
   run_podman run -d \
@@ -2454,7 +2455,7 @@ start_differential_web() {
     --env 'AZURE_ENABLED=false' \
     --env 'ES_ENABLED=false' \
     --env 'PAPERCLIP_ROOT_PATH=/opt/mastodon/public/system' \
-    --env 'PAPERCLIP_ROOT_URL=/system' \
+    --env "PAPERCLIP_ROOT_URL=$paperclip_root_url" \
     --env 'RAILS_SERVE_STATIC_FILES=true' \
     --env 'SECRET_KEY_BASE=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
     --env 'OTP_SECRET=abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789' \
@@ -2489,6 +2490,7 @@ reset_differential_feeds() {
   mastodon_database=$1
   media_root=$2
   media_mode=$3
+  paperclip_root_url=${4:-/system}
 
   if [ -n "$WEB_CONTAINER" ]; then
     run_podman rm -f --volumes "$WEB_CONTAINER" >/dev/null 2>&1 || true
@@ -2499,7 +2501,7 @@ reset_differential_feeds() {
     REDIS_CONTAINER=''
   fi
   start_differential_redis
-  start_differential_web "$mastodon_database" "$media_root" "$media_mode"
+  start_differential_web "$mastodon_database" "$media_root" "$media_mode" true "$paperclip_root_url"
 }
 
 verify_podman_resource_absent() {
@@ -2638,7 +2640,15 @@ EOF
   printf 'run=%s\nside=rust\n' "$DIFFERENTIAL_RUN_ID" > "$rust_media/.rustodon-differential-media-root"
 
   start_differential_redis
-  start_differential_web "$mastodon_database" "$mastodon_media" "$media_mode"
+  differential_paperclip_root_url='/system'
+  if [ "$case_name" = 'actor_media_root_url' ]; then
+    case "${RUSTODON_DIFFERENTIAL_ACTOR_MEDIA_ROOT:-absolute}" in
+      relative) ;;
+      absolute) differential_paperclip_root_url='https://media.fixture.invalid/system' ;;
+      *) die 'RUSTODON_DIFFERENTIAL_ACTOR_MEDIA_ROOT must be relative or absolute' ;;
+    esac
+  fi
+  start_differential_web "$mastodon_database" "$mastodon_media" "$media_mode" true "$differential_paperclip_root_url"
 
   published_database=$(run_podman port "$PG_CONTAINER" 5432/tcp)
   database_port=${published_database##*:}
@@ -2657,6 +2667,7 @@ EOF
   rust_write_database_url="postgresql://$DIFFERENTIAL_WRITER:$DIFFERENTIAL_WRITER_PASSWORD@127.0.0.1:$database_port/$rust_database"
   if [ -n "$case_name" ]; then
     RUSTODON_DIFFERENTIAL_RUN_ID="$DIFFERENTIAL_RUN_ID" \
+      RUSTODON_DIFFERENTIAL_PAPERCLIP_ROOT_URL="$differential_paperclip_root_url" \
       RUSTODON_DIFFERENTIAL_MASTODON_HTTP_URL="http://127.0.0.1:$web_port" \
        RUSTODON_DIFFERENTIAL_MASTODON_DATABASE_URL="$mastodon_database_url" \
        RUSTODON_DIFFERENTIAL_MASTODON_OWNER_DATABASE_URL="$mastodon_owner_database_url" \
@@ -2666,6 +2677,7 @@ EOF
       cargo test --locked --test differential "$case_name" -- --ignored --exact --nocapture --test-threads=1
   else
     RUSTODON_DIFFERENTIAL_RUN_ID="$DIFFERENTIAL_RUN_ID" \
+      RUSTODON_DIFFERENTIAL_PAPERCLIP_ROOT_URL='/system' \
       RUSTODON_DIFFERENTIAL_MASTODON_HTTP_URL="http://127.0.0.1:$web_port" \
        RUSTODON_DIFFERENTIAL_MASTODON_DATABASE_URL="$mastodon_database_url" \
        RUSTODON_DIFFERENTIAL_MASTODON_OWNER_DATABASE_URL="$mastodon_owner_database_url" \
@@ -2699,6 +2711,21 @@ EOF
        RUSTODON_DIFFERENTIAL_RUST_OWNER_DATABASE_URL="$rust_owner_url" \
        RUSTODON_DIFFERENTIAL_RUST_WRITE_DATABASE_URL="$rust_write_database_url" \
       cargo test --locked --test differential status_authorization_matrix \
+        -- --ignored --exact --nocapture --test-threads=1
+
+    reset_differential_feeds "$mastodon_database" "$mastodon_media" "$media_mode" \
+      'https://media.fixture.invalid/system'
+    published_web=$(run_podman port "$WEB_CONTAINER" 3000/tcp)
+    web_port=${published_web##*:}
+    RUSTODON_DIFFERENTIAL_RUN_ID="$DIFFERENTIAL_RUN_ID" \
+      RUSTODON_DIFFERENTIAL_PAPERCLIP_ROOT_URL='https://media.fixture.invalid/system' \
+      RUSTODON_DIFFERENTIAL_MASTODON_HTTP_URL="http://127.0.0.1:$web_port" \
+      RUSTODON_DIFFERENTIAL_MASTODON_DATABASE_URL="$mastodon_database_url" \
+      RUSTODON_DIFFERENTIAL_MASTODON_OWNER_DATABASE_URL="$mastodon_owner_database_url" \
+      RUSTODON_DIFFERENTIAL_RUST_DATABASE_URL="$rust_database_url" \
+      RUSTODON_DIFFERENTIAL_RUST_OWNER_DATABASE_URL="$rust_owner_url" \
+      RUSTODON_DIFFERENTIAL_RUST_WRITE_DATABASE_URL="$rust_write_database_url" \
+      cargo test --locked --test differential actor_media_root_url \
         -- --ignored --exact --nocapture --test-threads=1
   fi
 

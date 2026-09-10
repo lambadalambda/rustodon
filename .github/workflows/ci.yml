@@ -10,6 +10,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -24,3 +25,110 @@ jobs:
 
       - name: Run project checks
         run: mise run check
+
+  pinned-source-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install project tools
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: 2026.8.4
+          cache: true
+
+      - name: Obtain pinned Mastodon source
+        run: |
+          mkdir -p target
+          mise run fixture-obtain
+
+      - name: Check pinned frontend and Rails contracts
+        run: mise run pinned-source-contracts
+
+  postgres-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        task:
+          - mastodon-schema-integration
+          - operational-schema-integration
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install project tools
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: 2026.8.4
+          cache: true
+
+      - name: Install Podman
+        run: |
+          if ! command -v podman >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes podman
+          fi
+          podman info
+
+      - name: Run ${{ matrix.task }}
+        run: mise run ${{ matrix.task }}
+
+  worker-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install project tools
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: 2026.8.4
+          cache: true
+
+      - name: Install Podman
+        run: |
+          if ! command -v podman >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes podman
+          fi
+          podman info
+
+      - name: Run worker integration
+        run: mise run worker-integration
+
+  differential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install project tools
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: 2026.8.4
+          cache: true
+
+      - name: Install Podman
+        run: |
+          if ! command -v podman >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes podman
+          fi
+          podman info
+
+      - name: Run Rails-versus-Rust differential integration
+        run: mise run differential-ci

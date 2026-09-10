@@ -25,7 +25,7 @@ use differential::database::{
     TableSelection, compare_database_snapshots, compare_database_snapshots_with_labels,
     snapshot_database,
 };
-use differential::federation::run_federation_discovery_case;
+use differential::federation::{run_actor_media_case, run_federation_discovery_case};
 use differential::harness::{RequestSpec, send_identically, send_single};
 use differential::read_only::ReadOnlyGuard;
 use differential::safety::{DifferentialConfig, HttpTargets};
@@ -609,6 +609,85 @@ async fn federation_discovery() -> Result<(), Box<dyn std::error::Error>> {
     let _ = shutdown_tx.send(());
     server.await??;
     result
+}
+
+#[tokio::test]
+#[ignore = "requires guarded Mastodon/PostgreSQL/media clones from tools/mastodon-fixture"]
+async fn actor_media_root_url() -> Result<(), Box<dyn std::error::Error>> {
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let config = DifferentialConfig::from_process_environment(&repository_root)?;
+    config.validate_database_comments().await?;
+    let media_root_url = std::env::var("RUSTODON_DIFFERENTIAL_PAPERCLIP_ROOT_URL")
+        .unwrap_or_else(|_| "/system".to_owned());
+    set_actor_header_fixture(&config, true).await?;
+    let repository = Repository::connect(config.rust_database.url()).await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let rust_url = Url::parse(&format!("http://{}", listener.local_addr()?))?;
+    let app = web_router(WebState::new(
+        repository,
+        Url::parse("https://fixture-v4-6-5.rustodon.invalid/")?,
+        "fixture-v4-6-5.rustodon.invalid",
+        &media_root_url,
+        config.rust_media.clone(),
+        fixture_instance_runtime(),
+        Vec::new(),
+        vec!["fixture-v4-6-5.rustodon.invalid".to_owned()],
+    )?);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    let result = run_actor_media_case(config.clone(), &rust_url, &media_root_url).await;
+    let _ = shutdown_tx.send(());
+    server.await??;
+    let restore = set_actor_header_fixture(&config, false).await;
+    result.and(restore)
+}
+
+async fn set_actor_header_fixture(
+    config: &DifferentialConfig,
+    present: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let values = present.then_some((
+        "rustodon-actor-header.png",
+        "image/png",
+        68_i64,
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 1)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap(),
+        1_i32,
+    ));
+    for owner in [
+        config
+            .mastodon_owner_database
+            .as_ref()
+            .expect("actor media differential requires the Mastodon owner target"),
+        config
+            .rust_owner_database
+            .as_ref()
+            .expect("actor media differential requires the Rust owner target"),
+    ] {
+        let pool = sqlx::PgPool::connect(owner.url()).await?;
+        sqlx::query(
+            "UPDATE accounts SET header_file_name = $1, header_content_type = $2, \
+             header_file_size = $3, header_updated_at = $4, \
+             header_storage_schema_version = $5 WHERE id = 116844606259201001",
+        )
+        .bind(values.map(|value| value.0))
+        .bind(values.map(|value| value.1))
+        .bind(values.map(|value| value.2))
+        .bind(values.map(|value| value.3))
+        .bind(values.map(|value| value.4))
+        .execute(&pool)
+        .await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -1917,6 +1996,70 @@ async fn run_core_rest_serializers_case(
             DEFAULT_MISMATCH_LIMIT,
         )
         .map_err(|error| format!("instance serializer {path}: {error}"))?;
+    }
+    let mut startup_headers = stable_request_headers();
+    startup_headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_static("Bearer fixture-bearer-token-v4-6-5"),
+    );
+    let announcements = RequestSpec::new(
+        Method::GET,
+        "/api/v1/announcements",
+        None,
+        startup_headers,
+        Vec::new(),
+    )?;
+    let responses = guard.send(&announcements).await?;
+    if responses.mastodon.status != responses.rust.status || responses.rust.status != 200 {
+        return Err(format!(
+            "frontend announcement probe status mismatch: Mastodon={}, Rust={}",
+            responses.mastodon.status, responses.rust.status
+        )
+        .into());
+    }
+    for (side, response) in [("Mastodon", &responses.mastodon), ("Rust", &responses.rust)] {
+        if !response
+            .headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json"))
+            || !serde_json::from_slice::<Value>(&response.body)?.is_array()
+        {
+            return Err(format!("{side} announcement probe did not return a JSON array").into());
+        }
+    }
+    if serde_json::from_slice::<Value>(&responses.rust.body)? != serde_json::json!([]) {
+        return Err("Rust disabled announcement probe must return an empty array".into());
+    }
+
+    let mut search_headers = stable_request_headers();
+    search_headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_static("Bearer fixture-bearer-token-v4-6-5"),
+    );
+    let hashtag_search = RequestSpec::new(
+        Method::GET,
+        "/api/v2/search",
+        Some("q=fixturetag&type=hashtags".to_owned()),
+        search_headers,
+        Vec::new(),
+    )?;
+    let responses = guard.send(&hashtag_search).await?;
+    compare_responses(
+        &responses.mastodon,
+        &responses.rust,
+        &[CONTENT_TYPE],
+        &[],
+        DEFAULT_MISMATCH_LIMIT,
+    )
+    .map_err(|error| format!("frontend hashtag search probe: {error}"))?;
+    for (side, response) in [("Mastodon", &responses.mastodon), ("Rust", &responses.rust)] {
+        let body: Value = serde_json::from_slice(&response.body)?;
+        for key in ["accounts", "statuses", "hashtags"] {
+            if !body[key].is_array() {
+                return Err(format!("{side} hashtag search omitted the {key} array").into());
+            }
+        }
     }
     for (label, account_id, token) in [
         ("local account anonymous", 116_844_606_259_201_001_i64, None),

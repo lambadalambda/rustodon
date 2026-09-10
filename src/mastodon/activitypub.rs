@@ -307,7 +307,6 @@ fn note_context() -> Value {
             "inReplyToAtomUri": "ostatus:inReplyToAtomUri",
             "conversation": "ostatus:conversation",
             "toot": "http://joinmastodon.org/ns#",
-            "Emoji": "toot:Emoji",
             "Hashtag": "as:Hashtag",
             "blurhash": "toot:blurhash",
             "focalPoint": {"@container": "@list", "@id": "toot:focalPoint"},

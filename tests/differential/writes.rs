@@ -72,6 +72,77 @@ const ACTIVE_RECORD_PRIMARY_KEY: &str = "33333333333333333333333333333333";
 const ACTIVE_RECORD_DETERMINISTIC_KEY: &str = "11111111111111111111111111111111";
 const ACTIVE_RECORD_DERIVATION_SALT: &str = "22222222222222222222222222222222";
 
+#[derive(Clone, Debug)]
+struct BrowserFormState {
+    session_cookie: Option<String>,
+    csrf_cookie: Option<String>,
+    csrf_token: Option<String>,
+}
+
+impl BrowserFormState {
+    fn new(session_id: Option<&str>) -> Self {
+        Self {
+            session_cookie: session_id.map(|id| format!("_mastodon_session={id}")),
+            csrf_cookie: None,
+            csrf_token: None,
+        }
+    }
+
+    fn cookie_header(&self) -> String {
+        [self.session_cookie.as_deref(), self.csrf_cookie.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn update_from_response(
+        &mut self,
+        response: &CapturedResponse,
+        csrf_field: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        for value in response.headers.get_all(SET_COOKIE) {
+            let Some(cookie) = value
+                .to_str()
+                .ok()
+                .and_then(|value| value.split(';').next())
+            else {
+                continue;
+            };
+            if cookie.starts_with("_mastodon_session=") {
+                self.session_cookie = Some(cookie.to_owned());
+            } else if cookie.starts_with("__Host-csrf_token=") || cookie.starts_with("csrf_token=")
+            {
+                self.csrf_cookie = Some(cookie.to_owned());
+            }
+        }
+        self.csrf_token = Some(
+            hidden_form_value(&response.body, csrf_field)
+                .ok_or_else(|| format!("rendered form did not contain {csrf_field}"))?,
+        );
+        Ok(())
+    }
+
+    fn csrf_token(&self) -> Result<&str, Box<dyn Error>> {
+        self.csrf_token
+            .as_deref()
+            .ok_or_else(|| "browser flow has no rendered CSRF token".into())
+    }
+}
+
+fn operation_and_cleanup(
+    operation: Result<(), Box<dyn Error>>,
+    cleanup: Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    match (operation, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(operation), Err(cleanup)) => {
+            Err(format!("{operation}; cleanup also failed: {cleanup}").into())
+        }
+    }
+}
+
 pub(crate) fn fixture_active_record_encryption() -> ActiveRecordEncryptionConfig {
     ActiveRecordEncryptionConfig::new(
         SecretString::new(ACTIVE_RECORD_PRIMARY_KEY.to_owned()),
@@ -3714,7 +3785,6 @@ pub(crate) async fn run_browser_authentication_case(
     config: DifferentialConfig,
     rust_url: &Url,
 ) -> Result<(), Box<dyn Error>> {
-    const CSRF_TOKEN: &str = "fixture-browser-csrf-token";
     config.validate_database_comments().await?;
     let targets = HttpTargets::new(config.mastodon_http.as_str(), rust_url.as_str())?;
     let mastodon_owner = config
@@ -3764,6 +3834,11 @@ pub(crate) async fn run_browser_authentication_case(
         }
     };
     let rust_browser_lifecycle = snapshot_browser_lifecycle(rust_writer.url()).await?;
+    let mastodon_login_activities =
+        browser_user_rows(mastodon_owner.url(), "login_activities").await?;
+    let rust_login_activities = browser_user_rows(rust_writer.url(), "login_activities").await?;
+    let mastodon_sessions = browser_user_rows(mastodon_owner.url(), "session_activations").await?;
+    let rust_sessions = browser_user_rows(rust_writer.url(), "session_activations").await?;
     let set_browser_lifecycle = |database: &str,
                                  disabled: bool,
                                  suspended: bool,
@@ -3813,6 +3888,7 @@ pub(crate) async fn run_browser_authentication_case(
                 Ok::<(), sqlx::Error>(())
             }
         };
+    let operation = async {
     let lifecycle_writer = WriteRepository::connect(rust_writer.url()).await?;
     let lifecycle_reader = Repository::connect(rust_writer.url()).await?;
     for (label, disabled, suspended, memorial, moved) in [
@@ -3914,37 +3990,52 @@ pub(crate) async fn run_browser_authentication_case(
             "user%5Bemail%5D=alice%40fixture.invalid&user%5Bpassword%5D=fixture-password&user%5Botp_attempt%5D=wrong-code",
         ),
     ] {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            HOST,
-            HeaderValue::from_static("fixture-v4-6-5.rustodon.invalid"),
-        );
-        headers.insert(ACCEPT, HeaderValue::from_static("text/html"));
-        headers.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/x-www-form-urlencoded"),
-        );
-        headers.insert(
-            COOKIE,
-            HeaderValue::from_static("csrf_token=fixture-browser-csrf-token"),
-        );
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        let request = RequestSpec::new(
+        let mut mastodon_form = BrowserFormState::new(None);
+        load_browser_form(
+            targets.mastodon(),
+            "/auth/sign_in",
+            &mut mastodon_form,
+            "authenticity_token",
+            "Mastodon sign-in",
+        )
+        .await?;
+        let mut rust_form = BrowserFormState::new(None);
+        load_browser_form(
+            targets.rust(),
+            "/auth/sign_in",
+            &mut rust_form,
+            "csrf_token",
+            "Rust sign-in",
+        )
+        .await?;
+        let mastodon_request = browser_form_request(
             Method::POST,
             "/auth/sign_in",
-            None,
-            headers,
-            format!("csrf_token={CSRF_TOKEN}&{body}").into_bytes(),
+            &mastodon_form,
+            Some("authenticity_token"),
+            body,
         )?;
-        let responses = send_identically(&targets, &request).await?;
-        if responses.mastodon.status != responses.rust.status {
+        let rust_request = browser_form_request(
+            Method::POST,
+            "/auth/sign_in",
+            &rust_form,
+            Some("csrf_token"),
+            body,
+        )?;
+        let (mastodon_response, rust_response) = tokio::join!(
+            send_single(targets.mastodon(), &mastodon_request, "Mastodon sign-in"),
+            send_single(targets.rust(), &rust_request, "Rust sign-in")
+        );
+        let mastodon_response = mastodon_response?;
+        let rust_response = rust_response?;
+        if mastodon_response.status != rust_response.status {
             return Err(format!(
                 "{label}: status differs: Mastodon={}, Rust={}",
-                responses.mastodon.status, responses.rust.status,
+                mastodon_response.status, rust_response.status,
             )
             .into());
         }
-        for (side, response) in [("Mastodon", &responses.mastodon), ("Rust", &responses.rust)] {
+        for (side, response) in [("Mastodon", &mastodon_response), ("Rust", &rust_response)] {
             let content_type = response
                 .headers
                 .get(CONTENT_TYPE)
@@ -3958,19 +4049,18 @@ pub(crate) async fn run_browser_authentication_case(
                 .into());
             }
         }
-        if !responses
-            .rust
+        if !rust_response
             .body
             .windows(b"<form".len())
             .any(|window| window == b"<form")
         {
             return Err(format!(
                 "{label}: Rust did not render the sign-in form after failure: body={:?}",
-                String::from_utf8_lossy(&responses.rust.body),
+                String::from_utf8_lossy(&rust_response.body),
             )
             .into());
         }
-        if !(100..600).contains(&responses.mastodon.status) {
+        if !(100..600).contains(&mastodon_response.status) {
             return Err(format!("{label}: invalid HTTP status").into());
         }
     }
@@ -4071,11 +4161,18 @@ pub(crate) async fn run_browser_authentication_case(
         HeaderValue::from_static("fixture-v4-6-5.rustodon.invalid"),
     );
     shell_headers.insert(ACCEPT, HeaderValue::from_static("text/html"));
+    let mut authenticated_form = BrowserFormState::new(Some(&session_id));
+    let profile_form = load_browser_form(
+        rust_url,
+        "/settings/profile",
+        &mut authenticated_form,
+        "csrf_token",
+        "Rust authenticated profile",
+    )
+    .await?;
     shell_headers.insert(
         COOKIE,
-        HeaderValue::from_str(&format!(
-            "_mastodon_session={session_id}; csrf_token={CSRF_TOKEN}"
-        ))?,
+        HeaderValue::from_str(&authenticated_form.cookie_header())?,
     );
     shell_headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
     let shell_request = RequestSpec::new(Method::GET, "/", None, shell_headers, Vec::new())?;
@@ -4196,13 +4293,15 @@ pub(crate) async fn run_browser_authentication_case(
         HeaderValue::from_static("fixture-v4-6-5.rustodon.invalid"),
     );
     logout_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    authenticated_form.update_from_response(&profile_form, "csrf_token")?;
     logout_headers.insert(
         COOKIE,
-        HeaderValue::from_str(&format!(
-            "_mastodon_session={session_id}; csrf_token={CSRF_TOKEN}"
-        ))?,
+        HeaderValue::from_str(&authenticated_form.cookie_header())?,
     );
-    logout_headers.insert("x-csrf-token", HeaderValue::from_static(CSRF_TOKEN));
+    logout_headers.insert(
+        "x-csrf-token",
+        HeaderValue::from_str(authenticated_form.csrf_token()?)?,
+    );
     logout_headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
     let logout = send_single(
         rust_url,
@@ -4247,30 +4346,66 @@ pub(crate) async fn run_browser_authentication_case(
     if reader.browser_session(&session_id).await?.is_some() {
         return Err("Rust browser session remained after deletion".into());
     }
-    for (database, user_state) in [
-        (mastodon_owner.url(), mastodon_user_state),
-        (rust_writer.url(), rust_user_state),
-    ] {
-        let mut connection = PgConnection::connect(database).await?;
-        sqlx::query(
-            "UPDATE users SET current_sign_in_at = $1, last_sign_in_at = $2, \
-                    sign_in_count = $3, updated_at = $4, otp_backup_codes = $5 WHERE id = 101",
-        )
-        .bind(user_state.0)
-        .bind(user_state.1)
-        .bind(user_state.2)
-        .bind(user_state.3)
-        .bind(user_state.4)
-        .execute(&mut connection)
-        .await?;
-        sqlx::query("DELETE FROM login_activities WHERE user_id = 101")
-            .execute(&mut connection)
-            .await?;
-        sqlx::query("DELETE FROM session_activations WHERE user_id = 101")
-            .execute(&mut connection)
-            .await?;
+        Ok::<(), Box<dyn Error>>(())
     }
-    Ok(())
+    .await;
+
+    let cleanup = async {
+        let current_rust_session_tokens =
+            browser_session_access_token_ids(rust_writer.url()).await?;
+        let baseline_rust_session_tokens = rust_sessions
+            .iter()
+            .filter_map(|row| row.get("access_token_id").and_then(Value::as_i64))
+            .collect::<Vec<_>>();
+        restore_browser_lifecycle(rust_writer.url(), rust_browser_lifecycle).await?;
+        for (database, user_state) in [
+            (mastodon_owner.url(), mastodon_user_state),
+            (rust_writer.url(), rust_user_state),
+        ] {
+            let mut connection = PgConnection::connect(database).await?;
+            sqlx::query(
+                "UPDATE users SET current_sign_in_at = $1, last_sign_in_at = $2, \
+                    sign_in_count = $3, updated_at = $4, otp_backup_codes = $5 WHERE id = 101",
+            )
+            .bind(user_state.0)
+            .bind(user_state.1)
+            .bind(user_state.2)
+            .bind(user_state.3)
+            .bind(user_state.4)
+            .execute(&mut connection)
+            .await?;
+        }
+        restore_browser_user_rows(
+            mastodon_owner.url(),
+            "login_activities",
+            &mastodon_login_activities,
+        )
+        .await?;
+        restore_browser_user_rows(
+            rust_writer.url(),
+            "login_activities",
+            &rust_login_activities,
+        )
+        .await?;
+        restore_browser_user_rows(
+            mastodon_owner.url(),
+            "session_activations",
+            &mastodon_sessions,
+        )
+        .await?;
+        restore_browser_user_rows(rust_writer.url(), "session_activations", &rust_sessions).await?;
+        remove_oauth_access_tokens(
+            rust_writer.url(),
+            &current_rust_session_tokens
+                .into_iter()
+                .filter(|id| !baseline_rust_session_tokens.contains(id))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        Ok::<(), Box<dyn Error>>(())
+    }
+    .await;
+    operation_and_cleanup(operation, cleanup)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4278,7 +4413,6 @@ pub(crate) async fn run_account_settings_case(
     config: DifferentialConfig,
     rust_url: &Url,
 ) -> Result<(), Box<dyn Error>> {
-    const CSRF_TOKEN: &str = "fixture-browser-settings-csrf";
     config.validate_database_comments().await?;
     let rust_writer = config
         .rust_write_database
@@ -4303,7 +4437,7 @@ pub(crate) async fn run_account_settings_case(
             "rustodon-account-settings-test",
         )
         .await?;
-    let session_cookie = format!("_mastodon_session={session_id}; csrf_token={CSRF_TOKEN}");
+    let mut browser = BrowserFormState::new(Some(&session_id));
     let browser_media_session_id = writer
         .create_browser_session(
             BROWSER_MEDIA_USER_ID,
@@ -4311,8 +4445,7 @@ pub(crate) async fn run_account_settings_case(
             "rustodon-account-media-test",
         )
         .await?;
-    let browser_media_session_cookie =
-        format!("_mastodon_session={browser_media_session_id}; csrf_token={CSRF_TOKEN}");
+    let mut browser_media = BrowserFormState::new(Some(&browser_media_session_id));
     let profile_image = std::fs::read(MEDIA_FIXTURE)?;
     let mut created_status_ids = Vec::new();
     let request = |method: Method,
@@ -4379,7 +4512,7 @@ pub(crate) async fn run_account_settings_case(
         ] {
             let response = send_single(
                 rust_url,
-                &request(Method::GET, path, Some(&session_cookie), &[])? ,
+                &browser_form_request(Method::GET, path, &browser, None, "")?,
                 "Rust",
             )
             .await?;
@@ -4388,6 +4521,7 @@ pub(crate) async fn run_account_settings_case(
             {
                 return Err(format!("account settings page failed: {path}").into());
             }
+            browser.update_from_response(&response, "csrf_token")?;
             if path == "/settings/profile"
                 && !String::from_utf8_lossy(&response.body)
                     .contains("method=\"post\" action=\"/auth/sign_out\"")
@@ -4400,7 +4534,7 @@ pub(crate) async fn run_account_settings_case(
             &request(
                 Method::GET,
                 "/settings/preferences",
-                Some(&session_cookie),
+                Some(&browser.cookie_header()),
                 &[],
             )? ,
             "Rust",
@@ -4416,11 +4550,20 @@ pub(crate) async fn run_account_settings_case(
             return Err("account preferences did not redirect to appearance".into());
         }
 
-        let profile = request(
+        load_browser_form(
+            rust_url,
+            "/settings/profile",
+            &mut browser,
+            "csrf_token",
+            "Rust profile settings",
+        )
+        .await?;
+        let profile = browser_form_request(
             Method::POST,
             "/settings/profile",
-            Some(&session_cookie),
-            b"csrf_token=fixture-browser-settings-csrf&display_name=Browser+settings+profile&note=Browser+settings+note&bot=0&locked=0&discoverable=1&fields_attributes%5B0%5D%5Bname%5D=Website&fields_attributes%5B0%5D%5Bvalue%5D=https%3A%2F%2Fexample.com",
+            &browser,
+            Some("csrf_token"),
+            "display_name=Browser+settings+profile&note=Browser+settings+note&bot=0&locked=0&discoverable=1&fields_attributes%5B0%5D%5Bname%5D=Website&fields_attributes%5B0%5D%5Bvalue%5D=https%3A%2F%2Fexample.com",
         )?;
         let profile_response = send_single(rust_url, &profile, "Rust").await?;
         if profile_response.status != StatusCode::FOUND.as_u16()
@@ -4440,9 +4583,17 @@ pub(crate) async fn run_account_settings_case(
             return Err("browser profile settings did not persist account fields".into());
         }
 
+        load_browser_form(
+            rust_url,
+            "/settings/profile",
+            &mut browser_media,
+            "csrf_token",
+            "Rust media profile settings",
+        )
+        .await?;
         let upload = browser_profile_upload_request(
-            &browser_media_session_cookie,
-            &browser_profile_multipart_body(CSRF_TOKEN, &profile_image),
+            &browser_media.cookie_header(),
+            &browser_profile_multipart_body(browser_media.csrf_token()?, &profile_image),
         )?;
         let upload_response = send_single(rust_url, &upload, "Rust").await?;
         if upload_response.status != StatusCode::FOUND.as_u16()
@@ -4469,11 +4620,20 @@ pub(crate) async fn run_account_settings_case(
             &uploaded_media_state,
         )?;
 
-        let posting_defaults = request(
+        load_browser_form(
+            rust_url,
+            "/settings/preferences/posting_defaults",
+            &mut browser,
+            "csrf_token",
+            "Rust posting defaults",
+        )
+        .await?;
+        let posting_defaults = browser_form_request(
             Method::POST,
             "/settings/preferences/posting_defaults",
-            Some(&session_cookie),
-            b"csrf_token=fixture-browser-settings-csrf&source%5Bprivacy%5D=unlisted&source%5Bsensitive%5D=1&source%5Blanguage%5D=fr&source%5Bquote_policy%5D=followers",
+            &browser,
+            Some("csrf_token"),
+            "source%5Bprivacy%5D=unlisted&source%5Bsensitive%5D=1&source%5Blanguage%5D=fr&source%5Bquote_policy%5D=followers",
         )?;
         let posting_response = send_single(rust_url, &posting_defaults, "Rust").await?;
         if posting_response.status != StatusCode::FOUND.as_u16()
@@ -4500,11 +4660,20 @@ pub(crate) async fn run_account_settings_case(
             return Err("browser posting defaults did not persist all values".into());
         }
 
-        let private_defaults = request(
+        load_browser_form(
+            rust_url,
+            "/settings/preferences/posting_defaults",
+            &mut browser,
+            "csrf_token",
+            "Rust private posting defaults",
+        )
+        .await?;
+        let private_defaults = browser_form_request(
             Method::POST,
             "/settings/preferences/posting_defaults",
-            Some(&session_cookie),
-            b"csrf_token=fixture-browser-settings-csrf&source%5Bprivacy%5D=private&source%5Bquote_policy%5D=public",
+            &browser,
+            Some("csrf_token"),
+            "source%5Bprivacy%5D=private&source%5Bquote_policy%5D=public",
         )?;
         let private_response = send_single(rust_url, &private_defaults, "Rust").await?;
         if private_response.status != StatusCode::FOUND.as_u16() {
@@ -4577,7 +4746,7 @@ pub(crate) async fn run_account_settings_case(
         let missing_csrf = request(
             Method::POST,
             "/settings/profile",
-            Some(&session_cookie),
+            Some(&browser.cookie_header()),
             b"display_name=Rejected+profile+write",
         )?;
         let missing_csrf_response = send_single(rust_url, &missing_csrf, "Rust").await?;
@@ -4587,11 +4756,20 @@ pub(crate) async fn run_account_settings_case(
             return Err("account settings accepted a missing CSRF token".into());
         }
 
-        let invalid_password = request(
+        load_browser_form(
+            rust_url,
+            "/settings/security",
+            &mut browser,
+            "csrf_token",
+            "Rust security settings",
+        )
+        .await?;
+        let invalid_password = browser_form_request(
             Method::POST,
             "/settings/security",
-            Some(&session_cookie),
-            b"csrf_token=fixture-browser-settings-csrf&current_password=wrong-password&password=fixture-new-password&password_confirmation=fixture-new-password",
+            &browser,
+            Some("csrf_token"),
+            "current_password=wrong-password&password=fixture-new-password&password_confirmation=fixture-new-password",
         )?;
         let invalid_password_response = send_single(rust_url, &invalid_password, "Rust").await?;
         if invalid_password_response.status != StatusCode::UNPROCESSABLE_ENTITY.as_u16()
@@ -4600,11 +4778,21 @@ pub(crate) async fn run_account_settings_case(
         {
             return Err("account security page did not reject an invalid password".into());
         }
-        let invalid_deletion = request(
+        browser.update_from_response(&invalid_password_response, "csrf_token")?;
+        load_browser_form(
+            rust_url,
+            "/settings/delete",
+            &mut browser,
+            "csrf_token",
+            "Rust delete settings",
+        )
+        .await?;
+        let invalid_deletion = browser_form_request(
             Method::POST,
             "/settings/delete",
-            Some(&session_cookie),
-            b"csrf_token=fixture-browser-settings-csrf&password=wrong-password",
+            &browser,
+            Some("csrf_token"),
+            "password=wrong-password",
         )?;
         let invalid_deletion_response = send_single(rust_url, &invalid_deletion, "Rust").await?;
         if invalid_deletion_response.status != StatusCode::UNPROCESSABLE_ENTITY.as_u16()
@@ -4614,11 +4802,13 @@ pub(crate) async fn run_account_settings_case(
             return Err("account deletion did not reject an invalid challenge".into());
         }
 
-        let logout = request(
+        browser.update_from_response(&invalid_deletion_response, "csrf_token")?;
+        let logout = browser_form_request(
             Method::POST,
             "/auth/sign_out",
-            Some(&session_cookie),
-            b"csrf_token=fixture-browser-settings-csrf",
+            &browser,
+            Some("csrf_token"),
+            "",
         )?;
         let logout_response = send_single(rust_url, &logout, "Rust browser HTML logout").await?;
         if logout_response.status != StatusCode::FOUND.as_u16()
@@ -4637,7 +4827,7 @@ pub(crate) async fn run_account_settings_case(
         }
         let after_logout = send_single(
             rust_url,
-            &request(Method::GET, "/settings/profile", Some(&session_cookie), &[] )?,
+            &browser_form_request(Method::GET, "/settings/profile", &browser, None, "")?,
             "Rust browser session after logout",
         )
         .await?;
@@ -4709,7 +4899,6 @@ pub(crate) async fn run_browser_two_factor_management_case(
     rust_url: &Url,
 ) -> Result<(), Box<dyn Error>> {
     const USER_ID: i64 = 101;
-    const CSRF_TOKEN: &str = "fixture-browser-2fa-csrf";
     let rust_writer = config
         .rust_write_database
         .as_ref()
@@ -4771,39 +4960,13 @@ pub(crate) async fn run_browser_two_factor_management_case(
             "rustodon-browser-2fa-test",
         )
         .await?;
-    let session_cookie = format!("_mastodon_session={session_id}; csrf_token={CSRF_TOKEN}");
-    let request =
-        |method: Method, path: &str, body: &[u8]| -> Result<RequestSpec, Box<dyn Error>> {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                HOST,
-                HeaderValue::from_static("fixture-v4-6-5.rustodon.invalid"),
-            );
-            headers.insert(ACCEPT, HeaderValue::from_static("text/html"));
-            headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-            headers.insert(COOKIE, HeaderValue::from_str(&session_cookie)?);
-            if !body.is_empty() {
-                headers.insert(
-                    CONTENT_TYPE,
-                    HeaderValue::from_static("application/x-www-form-urlencoded"),
-                );
-            }
-            Ok(RequestSpec::new(
-                method,
-                path,
-                None,
-                headers,
-                body.to_vec(),
-            )?)
-        };
+    let mut browser = BrowserFormState::new(Some(&session_id));
     let operation = async {
-        let methods = send_single(
+        let methods = load_browser_form(
             rust_url,
-            &request(
-                Method::GET,
-                "/settings/two_factor_authentication_methods",
-                &[],
-            )?,
+            "/settings/two_factor_authentication_methods",
+            &mut browser,
+            "csrf_token",
             "Rust 2FA methods",
         )
         .await?;
@@ -4817,10 +4980,12 @@ pub(crate) async fn run_browser_two_factor_management_case(
 
         let invalid_disable = send_single(
             rust_url,
-            &request(
+            &browser_form_request(
                 Method::POST,
                 "/settings/two_factor_authentication_methods/disable",
-                format!("csrf_token={CSRF_TOKEN}&current_password=wrong-password").as_bytes(),
+                &browser,
+                Some("csrf_token"),
+                "current_password=wrong-password",
             )?,
             "Rust invalid 2FA disable",
         )
@@ -4831,13 +4996,16 @@ pub(crate) async fn run_browser_two_factor_management_case(
         {
             return Err("2FA disable accepted an invalid password".into());
         }
+        browser.update_from_response(&invalid_disable, "csrf_token")?;
 
         let protected_disable = send_single(
             rust_url,
-            &request(
+            &browser_form_request(
                 Method::POST,
                 "/settings/two_factor_authentication_methods/disable",
-                format!("csrf_token={CSRF_TOKEN}&current_password=fixture-password").as_bytes(),
+                &browser,
+                Some("csrf_token"),
+                "current_password=fixture-password",
             )?,
             "Rust required-role 2FA disable",
         )
@@ -4848,6 +5016,7 @@ pub(crate) async fn run_browser_two_factor_management_case(
         {
             return Err("required-role 2FA disable bypassed server-side protection".into());
         }
+        browser.update_from_response(&protected_disable, "csrf_token")?;
         if !two_factor_state(rust_writer.url(), USER_ID).await?.0 {
             return Err("required-role 2FA disable changed persisted authentication state".into());
         }
@@ -4857,12 +5026,22 @@ pub(crate) async fn run_browser_two_factor_management_case(
             .execute(&mut owner_connection)
             .await?;
 
+        load_browser_form(
+            rust_url,
+            "/settings/two_factor_authentication_methods",
+            &mut browser,
+            "csrf_token",
+            "Rust 2FA methods after role change",
+        )
+        .await?;
         let disabled = send_single(
             rust_url,
-            &request(
+            &browser_form_request(
                 Method::POST,
                 "/settings/two_factor_authentication_methods/disable",
-                format!("csrf_token={CSRF_TOKEN}&current_password=fixture-password").as_bytes(),
+                &browser,
+                Some("csrf_token"),
+                "current_password=fixture-password",
             )?,
             "Rust disable 2FA",
         )
@@ -4893,10 +5072,12 @@ pub(crate) async fn run_browser_two_factor_management_case(
 
         let methods_after_disable = send_single(
             rust_url,
-            &request(
+            &browser_form_request(
                 Method::GET,
                 "/settings/two_factor_authentication_methods",
-                &[],
+                &browser,
+                None,
+                "",
             )?,
             "Rust disabled 2FA methods",
         )
@@ -4911,9 +5092,11 @@ pub(crate) async fn run_browser_two_factor_management_case(
             return Err("disabled 2FA methods page did not redirect to setup".into());
         }
 
-        let setup = send_single(
+        let setup = load_browser_form(
             rust_url,
-            &request(Method::GET, "/settings/otp_authentication", &[])?,
+            "/settings/otp_authentication",
+            &mut browser,
+            "csrf_token",
             "Rust 2FA setup",
         )
         .await?;
@@ -4924,10 +5107,12 @@ pub(crate) async fn run_browser_two_factor_management_case(
         }
         let setup_start = send_single(
             rust_url,
-            &request(
+            &browser_form_request(
                 Method::POST,
                 "/settings/otp_authentication",
-                format!("csrf_token={CSRF_TOKEN}&current_password=fixture-password").as_bytes(),
+                &browser,
+                Some("csrf_token"),
+                "current_password=fixture-password",
             )?,
             "Rust 2FA setup start",
         )
@@ -4935,6 +5120,7 @@ pub(crate) async fn run_browser_two_factor_management_case(
         if setup_start.status != StatusCode::OK.as_u16() {
             return Err("2FA setup start did not render confirmation".into());
         }
+        browser.update_from_response(&setup_start, "csrf_token")?;
         let secret = hidden_form_value(&setup_start.body, "otp_secret")
             .ok_or("2FA confirmation did not contain a secret")?;
         if secret.len() != 32
@@ -4947,13 +5133,14 @@ pub(crate) async fn run_browser_two_factor_management_case(
         let attempt = fixture_totp_code(&secret, Utc::now().timestamp())?;
         let confirmed = send_single(
             rust_url,
-            &request(
+            &browser_form_request(
                 Method::POST,
                 "/settings/two_factor_authentication/confirmation",
-                format!(
-                    "csrf_token={CSRF_TOKEN}&current_password=fixture-password&otp_secret={secret}&otp_attempt={attempt}"
-                )
-                    .as_bytes(),
+                &browser,
+                Some("csrf_token"),
+                &format!(
+                    "current_password=fixture-password&otp_secret={secret}&otp_attempt={attempt}"
+                ),
             )?,
             "Rust 2FA confirmation",
         )
@@ -4963,6 +5150,7 @@ pub(crate) async fn run_browser_two_factor_management_case(
         {
             return Err("2FA confirmation did not render recovery codes".into());
         }
+        browser.update_from_response(&confirmed, "csrf_token")?;
         let enabled_state = two_factor_state(rust_writer.url(), USER_ID).await?;
         let stored_secret = enabled_state
             .1
@@ -4986,12 +5174,22 @@ pub(crate) async fn run_browser_two_factor_management_case(
             return Err("2FA confirmation did not persist a hashed backup-code set".into());
         }
 
+        load_browser_form(
+            rust_url,
+            "/settings/two_factor_authentication_methods",
+            &mut browser,
+            "csrf_token",
+            "Rust recovery-code form",
+        )
+        .await?;
         let regenerated = send_single(
             rust_url,
-            &request(
+            &browser_form_request(
                 Method::POST,
                 "/settings/two_factor_authentication/recovery_codes",
-                format!("csrf_token={CSRF_TOKEN}&current_password=fixture-password").as_bytes(),
+                &browser,
+                Some("csrf_token"),
+                "current_password=fixture-password",
             )?,
             "Rust backup-code regeneration",
         )
@@ -5001,13 +5199,24 @@ pub(crate) async fn run_browser_two_factor_management_case(
         {
             return Err("backup-code regeneration did not render recovery codes".into());
         }
+        browser.update_from_response(&regenerated, "csrf_token")?;
 
+        load_browser_form(
+            rust_url,
+            "/settings/two_factor_authentication_methods",
+            &mut browser,
+            "csrf_token",
+            "Rust final 2FA disable form",
+        )
+        .await?;
         let disabled_again = send_single(
             rust_url,
-            &request(
+            &browser_form_request(
                 Method::POST,
                 "/settings/two_factor_authentication_methods/disable",
-                format!("csrf_token={CSRF_TOKEN}&current_password=fixture-password").as_bytes(),
+                &browser,
+                Some("csrf_token"),
+                "current_password=fixture-password",
             )?,
             "Rust final 2FA disable",
         )
@@ -5018,7 +5227,7 @@ pub(crate) async fn run_browser_two_factor_management_case(
         Ok::<(), Box<dyn Error>>(())
     }
     .await;
-    writer.delete_browser_session(&session_id).await?;
+    let cleanup = async {
     let mut connection = PgConnection::connect(rust_writer.url()).await?;
     sqlx::query(
         "UPDATE users SET otp_required_for_login = $1, otp_secret = $2, \
@@ -5067,9 +5276,13 @@ pub(crate) async fn run_browser_two_factor_management_case(
         .bind(updated_at)
         .bind(user_id)
         .execute(&mut owner_connection)
-        .await?;
+            .await?;
     }
-    operation
+        writer.delete_browser_session(&session_id).await?;
+        Ok::<(), Box<dyn Error>>(())
+    }
+    .await;
+    operation_and_cleanup(operation, cleanup)
 }
 
 async fn two_factor_state(
@@ -5160,6 +5373,63 @@ fn hidden_form_value(body: &[u8], name: &str) -> Option<String> {
     let input = html.get(html.find(&name_marker)?..)?;
     let value = input.split("value=\"").nth(1)?.split('"').next()?;
     Some(value.to_owned())
+}
+
+fn browser_form_request(
+    method: Method,
+    path: &str,
+    state: &BrowserFormState,
+    csrf_field: Option<&str>,
+    fields: &str,
+) -> Result<RequestSpec, Box<dyn Error>> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HOST,
+        HeaderValue::from_static("fixture-v4-6-5.rustodon.invalid"),
+    );
+    headers.insert(ACCEPT, HeaderValue::from_static("text/html"));
+    headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+    let cookies = state.cookie_header();
+    if !cookies.is_empty() {
+        headers.insert(COOKIE, HeaderValue::from_str(&cookies)?);
+    }
+    let body = if let Some(csrf_field) = csrf_field {
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        serializer.append_pair(csrf_field, state.csrf_token()?);
+        let mut body = serializer.finish();
+        if !fields.is_empty() {
+            body.push('&');
+            body.push_str(fields);
+        }
+        body.into_bytes()
+    } else {
+        Vec::new()
+    };
+    Ok(RequestSpec::new(method, path, None, headers, body)?)
+}
+
+async fn load_browser_form(
+    target: &Url,
+    path: &str,
+    state: &mut BrowserFormState,
+    csrf_field: &str,
+    side: &'static str,
+) -> Result<CapturedResponse, Box<dyn Error>> {
+    let response = send_single(
+        target,
+        &browser_form_request(Method::GET, path, state, None, "")?,
+        side,
+    )
+    .await?;
+    if response.status != StatusCode::OK.as_u16() {
+        return Err(format!("{side} form {path} returned HTTP {}", response.status).into());
+    }
+    state.update_from_response(&response, csrf_field)?;
+    Ok(response)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7592,6 +7862,67 @@ async fn oauth_application_max_id(url: &str) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM public.oauth_applications")
         .fetch_one(&mut connection)
         .await
+}
+
+async fn browser_session_access_token_ids(url: &str) -> Result<Vec<i64>, sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query_scalar(
+        "SELECT access_token_id FROM public.session_activations \
+         WHERE user_id = 101 AND access_token_id IS NOT NULL",
+    )
+    .fetch_all(&mut connection)
+    .await
+}
+
+async fn remove_oauth_access_tokens(url: &str, ids: &[i64]) -> Result<(), sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query("DELETE FROM public.oauth_access_tokens WHERE id = ANY($1)")
+        .bind(ids)
+        .execute(&mut connection)
+        .await?;
+    Ok(())
+}
+
+async fn browser_user_rows(url: &str, table: &str) -> Result<Vec<Value>, sqlx::Error> {
+    let query = match table {
+        "login_activities" => {
+            "SELECT to_jsonb(row) FROM (SELECT * FROM public.login_activities WHERE user_id = 101 ORDER BY id) row"
+        }
+        "session_activations" => {
+            "SELECT to_jsonb(row) FROM (SELECT * FROM public.session_activations WHERE user_id = 101 ORDER BY session_id) row"
+        }
+        _ => unreachable!("browser snapshots use fixed tables"),
+    };
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query_scalar(query).fetch_all(&mut connection).await
+}
+
+async fn restore_browser_user_rows(
+    url: &str,
+    table: &str,
+    rows: &[Value],
+) -> Result<(), sqlx::Error> {
+    let (delete, insert) = match table {
+        "login_activities" => (
+            "DELETE FROM public.login_activities WHERE user_id = 101",
+            "INSERT INTO public.login_activities SELECT * FROM jsonb_populate_record(NULL::public.login_activities, $1)",
+        ),
+        "session_activations" => (
+            "DELETE FROM public.session_activations WHERE user_id = 101",
+            "INSERT INTO public.session_activations SELECT * FROM jsonb_populate_record(NULL::public.session_activations, $1)",
+        ),
+        _ => unreachable!("browser snapshots use fixed tables"),
+    };
+    let mut connection = PgConnection::connect(url).await?;
+    let mut transaction = connection.begin().await?;
+    sqlx::query(delete).execute(&mut *transaction).await?;
+    for row in rows {
+        sqlx::query(insert)
+            .bind(row)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await
 }
 
 fn notification_permission_pairs(rows: &[Value]) -> Vec<(i64, i64)> {
