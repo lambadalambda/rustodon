@@ -2415,6 +2415,51 @@ impl Repository {
         .await
     }
 
+    pub(crate) async fn rest_tag_search(
+        &self,
+        query: &str,
+        limit: i64,
+        offset: i64,
+    ) -> sqlx::Result<Vec<Tag>> {
+        let query = normalize_hashtag(query.trim().trim_start_matches('#'));
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        sqlx::query_as::<_, Tag>(
+            "SELECT id, name, display_name, usable, trendable, listable, last_status_at \
+             FROM tags WHERE lower(name) LIKE $1 ESCAPE '\\' AND listable IS NOT FALSE \
+             ORDER BY length(name), name LIMIT $2 OFFSET $3",
+        )
+        .bind(format!("{escaped}%"))
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn rest_tag_relationships(
+        &self,
+        account_id: i64,
+        tag_ids: &[i64],
+    ) -> sqlx::Result<Vec<(i64, bool, bool)>> {
+        sqlx::query_as(
+            "SELECT tag.id, \
+                    EXISTS (SELECT 1 FROM tag_follows follow \
+                      WHERE follow.account_id = $1 AND follow.tag_id = tag.id), \
+                    EXISTS (SELECT 1 FROM featured_tags featured \
+                      WHERE featured.account_id = $1 AND featured.tag_id = tag.id) \
+             FROM tags tag WHERE tag.id = ANY($2)",
+        )
+        .bind(account_id)
+        .bind(tag_ids)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     pub async fn status_tags(&self, status_id: i64) -> sqlx::Result<Vec<StatusTag>> {
         sqlx::query_as::<_, StatusTag>(
             "SELECT st.status_id, st.tag_id FROM statuses_tags st \

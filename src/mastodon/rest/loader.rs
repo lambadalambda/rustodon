@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use serde_json::Value;
@@ -1822,6 +1822,50 @@ impl RestProjectionLoader {
                 history: recent_tag_history(),
                 following: Some(tag.following),
                 featuring: Some(false),
+            })
+            .collect())
+    }
+
+    /// Searches listable hashtags by normalized name prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when the tag search fails.
+    pub async fn tag_search(
+        &self,
+        query: &str,
+        limit: i64,
+        offset: i64,
+    ) -> sqlx::Result<Vec<TagProjection>> {
+        let tags = self
+            .repository
+            .rest_tag_search(query, limit, offset)
+            .await?;
+        let relationships = if let Some(account_id) = self.viewer_account_id {
+            self.repository
+                .rest_tag_relationships(
+                    account_id,
+                    &tags.iter().map(|tag| tag.id).collect::<Vec<_>>(),
+                )
+                .await?
+                .into_iter()
+                .map(|(id, following, featuring)| (id, (following, featuring)))
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
+        Ok(tags
+            .into_iter()
+            .map(|tag| {
+                let relationship = relationships.get(&tag.id).copied();
+                TagProjection {
+                    id: tag.id,
+                    name: tag.name,
+                    display_name: tag.display_name,
+                    history: recent_tag_history(),
+                    following: relationship.map(|value| value.0),
+                    featuring: relationship.map(|value| value.1),
+                }
             })
             .collect())
     }

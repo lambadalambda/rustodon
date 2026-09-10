@@ -62,9 +62,9 @@ use crate::mastodon::{
     OAuthAuthorizationCodeError, OAuthAuthorizationGrantError, OAuthClientCredentialsError,
     OAuthError, OAuthResourceOwner, OAuthScopes, OAuthTokenRevocationError, PROFILE, READ_ACCOUNTS,
     READ_BLOCKS, READ_BOOKMARKS, READ_COLLECTIONS, READ_FAVOURITES, READ_FILTERS, READ_FOLLOWS,
-    READ_LISTS, READ_MUTES, READ_NOTIFICATIONS, READ_STATUSES, REPORT_RATE_LIMIT, Repository,
-    RequiredScopes, StatusMediaAttributeUpdate, StatusUpdate, TwoFactorVerification, User,
-    VERIFY_CREDENTIALS, WRITE_ACCOUNTS, WRITE_BLOCKS, WRITE_BOOKMARKS, WRITE_CONVERSATIONS,
+    READ_LISTS, READ_MUTES, READ_NOTIFICATIONS, READ_SEARCH, READ_STATUSES, REPORT_RATE_LIMIT,
+    Repository, RequiredScopes, StatusMediaAttributeUpdate, StatusUpdate, TwoFactorVerification,
+    User, VERIFY_CREDENTIALS, WRITE_ACCOUNTS, WRITE_BLOCKS, WRITE_BOOKMARKS, WRITE_CONVERSATIONS,
     WRITE_FAVOURITES, WRITE_FOLLOWS, WRITE_MEDIA, WRITE_MUTES, WRITE_NOTIFICATIONS, WRITE_REPORTS,
     WRITE_STATUSES, WriteError, WriteRepository,
     activitypub::{self, ACTIVITY_JSON, JRD_JSON},
@@ -1219,6 +1219,20 @@ pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
         None,
         Private
     ),
+    route!(
+        "/api/v1/announcements",
+        Implemented,
+        ApiAuthentication::Required(NO_SCOPE.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v2/search",
+        Implemented,
+        ApiAuthentication::Optional(READ_SEARCH.as_slice()),
+        None,
+        Anonymous
+    ),
     post_route!(
         "/api/v1/apps",
         Implemented,
@@ -1947,6 +1961,16 @@ pub const V1_REQUIRED_API_ROUTES: &[(&str, ApiMethod, ApiRouteSupport)] = &[
     ),
     (
         "/api/v1/accounts/search",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/announcements",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v2/search",
         ApiMethod::Get,
         ApiRouteSupport::Implemented,
     ),
@@ -3296,6 +3320,8 @@ pub fn router(state: WebState) -> Router {
         .route("/api/v1/custom_emojis", get(custom_emojis))
         .route("/api/v1/accounts/lookup", get(account_lookup))
         .route("/api/v1/accounts/search", get(account_search))
+        .route("/api/v1/announcements", get(announcements))
+        .route("/api/v2/search", get(search_v2))
         .route("/api/v1/apps", post(app_create))
         .route(
             "/api/v1/apps/verify_credentials",
@@ -3481,6 +3507,8 @@ pub fn router(state: WebState) -> Router {
         .route("/api/v1/custom_emojis/", get(custom_emojis))
         .route("/api/v1/accounts/lookup/", get(account_lookup))
         .route("/api/v1/accounts/search/", get(account_search))
+        .route("/api/v1/announcements/", get(announcements))
+        .route("/api/v2/search/", get(search_v2))
         .route("/api/v1/apps/", post(app_create))
         .route(
             "/api/v1/apps/verify_credentials/",
@@ -8686,6 +8714,73 @@ async fn account_search(
         Some(body) => json_response(StatusCode::OK, body),
         None => internal_error(),
     }
+}
+
+async fn announcements(State(state): State<WebState>, headers: HeaderMap) -> Response<Body> {
+    if let Err(response) = required_viewer(&state, &headers, NO_SCOPE).await {
+        return response;
+    }
+    json_response(StatusCode::OK, b"[]".to_vec())
+}
+
+async fn search_v2(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let owner = match optional_viewer(&state, &headers, READ_SEARCH).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let Ok(Some(query)) = oauth_scalar(&rack, "q") else {
+        return error_response(StatusCode::BAD_REQUEST, "q is required");
+    };
+    if query.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "q is required");
+    }
+    let Ok(search_type) = oauth_scalar(&rack, "type") else {
+        return error_response(StatusCode::BAD_REQUEST, "type is invalid");
+    };
+    if owner.is_none() && rack.get("offset").is_some() {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "Search queries pagination is not supported without authentication",
+        );
+    }
+    let Ok(limit) = nonnegative_search_parameter(&rack, "limit", 20, Some(40)) else {
+        return error_response(StatusCode::BAD_REQUEST, "limit is invalid");
+    };
+    let offset = if search_type.is_some() {
+        match nonnegative_search_parameter(&rack, "offset", 0, None) {
+            Ok(offset) => offset,
+            Err(()) => return error_response(StatusCode::BAD_REQUEST, "offset is invalid"),
+        }
+    } else {
+        0
+    };
+    let tags = if search_type.is_none_or(|value| value == "hashtags") && limit > 0 {
+        match state.loader(owner).tag_search(query, limit, offset).await {
+            Ok(tags) => tags,
+            Err(_) => return internal_error(),
+        }
+    } else {
+        Vec::new()
+    };
+    let serializer = state.serializer();
+    let hashtags = tags
+        .iter()
+        .map(|tag| serializer.tag(tag))
+        .collect::<Vec<_>>();
+    json_response(
+        StatusCode::OK,
+        serde_json::to_vec(&serde_json::json!({
+            "accounts": [],
+            "statuses": [],
+            "hashtags": hashtags,
+            "collections": [],
+        }))
+        .expect("search response is serializable"),
+    )
 }
 
 async fn oauth_token(
@@ -17477,6 +17572,29 @@ fn limit_parameter(parameters: &RackParameters, default: i64, maximum: i64) -> R
     }
 }
 
+fn nonnegative_search_parameter(
+    parameters: &RackParameters,
+    name: &str,
+    default: i64,
+    maximum: Option<i64>,
+) -> Result<i64, ()> {
+    let value = match parameters.get(name) {
+        None | Some(RackValue::Null) => return Ok(default),
+        Some(RackValue::Scalar(value)) => ruby_integer(value),
+        Some(RackValue::Number(value)) => json_number_integer(value)?,
+        Some(
+            RackValue::Boolean(_)
+            | RackValue::Array(_)
+            | RackValue::Object(_)
+            | RackValue::Upload(_),
+        ) => return Err(()),
+    };
+    if value < 0 {
+        return Err(());
+    }
+    Ok(maximum.map_or(value, |maximum| value.min(maximum)))
+}
+
 fn ruby_integer(value: &str) -> i64 {
     let value = trim_ascii_start(value);
     let bytes = value.as_bytes();
@@ -18721,7 +18839,7 @@ mod tests {
 
     #[test]
     fn api_route_inventory_is_unique_and_declares_protocol_contracts() {
-        assert_eq!(API_ROUTE_INVENTORY.len(), 104);
+        assert_eq!(API_ROUTE_INVENTORY.len(), 106);
         assert_eq!(REST_BODY_LIMIT_BYTES, 103_809_024);
         assert_eq!(
             API_ROUTE_INVENTORY
@@ -19221,6 +19339,21 @@ mod tests {
             Some("alice@fixture.invalid")
         );
         assert_eq!(browser_scalar(&flat, "missing"), None);
+    }
+
+    #[test]
+    fn search_pagination_rejects_negative_and_structured_values() {
+        let negative = RackParameters::parse("limit=-1&offset=-2").unwrap();
+        assert!(nonnegative_search_parameter(&negative, "limit", 20, Some(40)).is_err());
+        assert!(nonnegative_search_parameter(&negative, "offset", 0, None).is_err());
+
+        let excessive = RackParameters::parse("limit=80").unwrap();
+        assert_eq!(
+            nonnegative_search_parameter(&excessive, "limit", 20, Some(40)),
+            Ok(40)
+        );
+        let structured = RackParameters::parse("offset%5B%5D=1").unwrap();
+        assert!(nonnegative_search_parameter(&structured, "offset", 0, None).is_err());
     }
 
     #[test]

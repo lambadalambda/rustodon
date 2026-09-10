@@ -41,6 +41,7 @@ pub const READ_FILTERS: RequiredScopes = RequiredScopes::new(&["read", "read:fil
 pub const READ_LISTS: RequiredScopes = RequiredScopes::new(&["read", "read:lists"]);
 pub const READ_MUTES: RequiredScopes = RequiredScopes::new(&["follow", "read", "read:mutes"]);
 pub const READ_NOTIFICATIONS: RequiredScopes = RequiredScopes::new(&["read", "read:notifications"]);
+pub const READ_SEARCH: RequiredScopes = RequiredScopes::new(&["read", "read:search"]);
 pub const READ_STATUSES: RequiredScopes = RequiredScopes::new(&["read", "read:statuses"]);
 pub const WRITE_NOTIFICATIONS: RequiredScopes =
     RequiredScopes::new(&["write", "write:notifications"]);

@@ -8336,3 +8336,24 @@ async fn notification_group_bucket_survives_last_row_deletion()
         .await?;
     result
 }
+
+#[tokio::test]
+#[ignore = "requires the restored Mastodon fixture database"]
+async fn hashtag_search_matches_normalized_prefixes_and_relationships() -> Result<(), Box<dyn Error>>
+{
+    let loader = RestProjectionLoader::new(
+        Repository::connect(&database_url()).await?,
+        Some(ALICE),
+        "fixture-v4-6-5.rustodon.invalid",
+    );
+
+    let tags = loader.tag_search("#Fixt", 20, 0).await?;
+    assert_eq!(tags.len(), 1);
+    assert_eq!(tags[0].id, 9201);
+    assert_eq!(tags[0].name, "fixturetag");
+    assert_eq!(tags[0].display_name.as_deref(), Some("FixtureTag"));
+    assert_eq!(tags[0].following, Some(true));
+    assert_eq!(tags[0].featuring, Some(true));
+    assert!(loader.tag_search("#missing", 20, 0).await?.is_empty());
+    Ok(())
+}
