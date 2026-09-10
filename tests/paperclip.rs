@@ -5,16 +5,29 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use image::AnimationDecoder;
-use image::codecs::gif::GifDecoder;
+use image::codecs::gif::{GifDecoder, GifEncoder};
+use image::{Frame, RgbaImage};
 use rustodon::paperclip::{
     PaperclipAttachment, PaperclipMetadata, PaperclipRoot, encode_url_path, open_paperclip_file,
-    parse_paperclip_path, partitioned_id, prepare_account_media, prepare_media_attachment,
-    write_prepared_media,
+    parse_paperclip_path, partitioned_id, prepare_account_media, prepare_custom_emoji,
+    prepare_media_attachment, write_prepared_media,
 };
 #[cfg(feature = "test-support")]
 use rustodon::paperclip::{PaperclipDirectorySyncFault, PaperclipRemoveFault, PaperclipWriteFault};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn gif_with_blank_frames(width: u32, height: u32, frame_count: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut encoder = GifEncoder::new(&mut bytes);
+    for _ in 0..frame_count {
+        encoder
+            .encode_frame(Frame::new(RgbaImage::new(width, height)))
+            .expect("blank GIF frame should encode");
+    }
+    drop(encoder);
+    bytes
+}
 
 fn metadata(
     attachment: PaperclipAttachment,
@@ -238,6 +251,20 @@ fn styles_and_derivative_extensions_follow_attachment_metadata() {
         "media_attachments/files/000/012/001/small/sound.mp3",
         &audio
     ));
+}
+
+#[test]
+fn custom_emoji_rejects_gifs_with_excessive_cumulative_pixels() {
+    let bytes = gif_with_blank_frames(960, 960, 17);
+    assert!(bytes.len() < 256 * 1024);
+    assert!(prepare_custom_emoji(12_001, "work.gif", "image/gif", &bytes).is_err());
+}
+
+#[test]
+fn custom_emoji_rejects_gifs_with_excessive_frame_counts() {
+    let bytes = gif_with_blank_frames(1, 1, 257);
+    assert!(bytes.len() < 256 * 1024);
+    assert!(prepare_custom_emoji(12_001, "frames.gif", "image/gif", &bytes).is_err());
 }
 
 #[test]
