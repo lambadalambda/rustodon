@@ -6061,6 +6061,26 @@ pub(crate) async fn run_oauth_authorization_code_case(
     {
         return Err("Rust OAuth consent page was not served".into());
     }
+    let consent_csrf_cookie = consent_response
+        .headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            value
+                .split(';')
+                .next()
+                .filter(|cookie| cookie.starts_with("__Host-csrf_token="))
+        })
+        .ok_or("Rust OAuth consent page did not rotate the CSRF cookie")?;
+    let consent_csrf_token = hidden_form_value(&consent_response.body, "csrf_token")
+        .ok_or("Rust OAuth consent page did not render the CSRF token")?;
+    consent_headers.insert(
+        COOKIE,
+        HeaderValue::from_str(&format!(
+            "_mastodon_session={session_id}; {consent_csrf_cookie}"
+        ))?,
+    );
     consent_headers.insert(
         CONTENT_TYPE,
         HeaderValue::from_static("application/x-www-form-urlencoded"),
@@ -6070,7 +6090,7 @@ pub(crate) async fn run_oauth_authorization_code_case(
         "/oauth/authorize",
         Some(consent_query),
         consent_headers,
-        b"csrf_token=consent-csrf&approve=true".to_vec(),
+        format!("csrf_token={consent_csrf_token}&approve=true").into_bytes(),
     )?;
     let approve_response =
         send_single(targets.rust(), &approve_request, "Rust OAuth approval").await?;

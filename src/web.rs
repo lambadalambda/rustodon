@@ -27,9 +27,13 @@ use axum::http::header::{
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::routing::{any, delete, get, patch, post};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use chrono::{Duration as ChronoDuration, NaiveDateTime, SecondsFormat, Utc};
 use futures_util::TryStreamExt;
+use hmac::{Hmac, Mac};
 use ipnetwork::IpNetwork;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use sha2::{Digest, Sha256};
@@ -77,6 +81,7 @@ use crate::remote::{
     canonical_remote_domain_from_url, valid_remote_username,
 };
 use crate::remote::{RemoteFetchLimits, RemoteFetcher};
+use crate::secret::SecretString;
 use crate::streaming::{
     ClientCommand, STATUS_UPDATE_NOTIFICATION_EVENT, STREAM_EVENT_BATCH_SIZE, SYSTEM_KILL_EVENT,
     StreamEvent, StreamName, TOKEN_KILL_EVENT, event_message,
@@ -126,7 +131,6 @@ enum ActivityPubStatusDocument {
     Note { pending_quote: bool },
     Activity,
 }
-const FRONTEND_CSRF_MAX_AGE: i64 = 30 * 24 * 60 * 60;
 const FRONTEND_THEME_SELECTION: &str = r"(function (element) {
   const {colorScheme, contrast} = element.dataset;
   const colorSchemeMediaWatcher = window.matchMedia('(prefers-color-scheme: dark)');
@@ -2299,6 +2303,7 @@ pub struct WebState {
     media_route_authority: Option<String>,
     instance_runtime: InstanceRuntimeConfig,
     frontend: FrontendAssets,
+    csrf_signing_key: [u8; 32],
     trusted_proxies: Vec<IpNetwork>,
     allowed_hosts: Vec<String>,
 }
@@ -2369,9 +2374,16 @@ impl WebState {
             media_route_authority,
             instance_runtime,
             frontend,
+            csrf_signing_key: derive_browser_csrf_signing_key(&random_auth_token(32)),
             trusted_proxies,
             allowed_hosts,
         })
+    }
+
+    #[must_use]
+    pub fn with_csrf_signing_secret(mut self, secret: &SecretString) -> Self {
+        self.csrf_signing_key = derive_browser_csrf_signing_key(secret.expose_secret());
+        self
     }
 
     #[must_use]
@@ -2694,8 +2706,8 @@ async fn frontend_html_response(
         .instance(state.instance_runtime.clone())
         .await
         .ok();
-    let csrf_token = request_cookie(headers, BROWSER_CSRF_COOKIE)
-        .map_or_else(|| random_auth_token(32), ToOwned::to_owned);
+    let secure = state.origin.scheme() == "https";
+    let (csrf_token, csrf_cookie) = browser_page_csrf(headers, secure, &state.csrf_signing_key);
     let csp_nonce = random_auth_token(32);
     let Some(document) = frontend_document(
         &state.frontend,
@@ -2714,17 +2726,8 @@ async fn frontend_html_response(
         HeaderValue::from_str(&frontend_content_security_policy(&csp_nonce))
             .expect("frontend CSP nonce is a valid header value"),
     );
-    if request_cookie(headers, BROWSER_CSRF_COOKIE).is_none() {
-        append_cookie(
-            &mut response,
-            &browser_cookie(
-                BROWSER_CSRF_COOKIE,
-                &csrf_token,
-                FRONTEND_CSRF_MAX_AGE,
-                false,
-                state.origin.scheme() == "https",
-            ),
-        );
+    if let Some(cookie) = csrf_cookie {
+        append_cookie(&mut response, &cookie);
     }
     response
 }
@@ -9032,7 +9035,12 @@ async fn oauth_authorize(
         return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_request");
     }
     if method == Method::GET {
-        return oauth_consent_response(
+        let (csrf_token, csrf_cookie) = browser_page_csrf(
+            &headers,
+            state.origin.scheme() == "https",
+            &state.csrf_signing_key,
+        );
+        let mut response = oauth_consent_response(
             &application.name,
             client_id,
             redirect_uri,
@@ -9045,15 +9053,21 @@ async fn oauth_authorize(
             oauth_scalar(&parameters, "code_challenge_method")
                 .ok()
                 .flatten(),
-            request_cookie(&headers, BROWSER_CSRF_COOKIE),
+            Some(&csrf_token),
         );
+        if let Some(cookie) = csrf_cookie {
+            append_cookie(&mut response, &cookie);
+        }
+        return response;
     }
-    let Some(csrf_cookie) = request_cookie(&headers, BROWSER_CSRF_COOKIE) else {
+    let Some(csrf_cookie) = request_browser_csrf_cookie(&headers, state.origin.scheme() == "https")
+    else {
         return browser_auth_error_response(StatusCode::FORBIDDEN, "invalid_csrf_token");
     };
     let csrf_attempt = oauth_scalar(&parameters, "csrf_token").ok().flatten();
-    if csrf_attempt
-        .is_none_or(|attempt| !constant_time_equal(csrf_cookie.as_bytes(), attempt.as_bytes()))
+    if !valid_browser_csrf_token(csrf_cookie, &state.csrf_signing_key)
+        || csrf_attempt
+            .is_none_or(|attempt| !constant_time_equal(csrf_cookie.as_bytes(), attempt.as_bytes()))
     {
         return browser_auth_error_response(StatusCode::FORBIDDEN, "invalid_csrf_token");
     }
@@ -9220,6 +9234,7 @@ fn html_response(status: StatusCode, body: String) -> Response<Body> {
 
 const BROWSER_SESSION_COOKIE: &str = "_mastodon_session";
 const BROWSER_CSRF_COOKIE: &str = "csrf_token";
+const SECURE_BROWSER_CSRF_COOKIE: &str = "__Host-csrf_token";
 const BROWSER_SESSION_MAX_AGE: i64 = 30 * 24 * 60 * 60;
 
 async fn browser_sign_in_page(
@@ -9228,7 +9243,7 @@ async fn browser_sign_in_page(
     headers: HeaderMap,
 ) -> Response<Body> {
     let secure = state.origin.scheme() == "https";
-    let (csrf_token, set_cookie) = browser_page_csrf(&headers, secure);
+    let (csrf_token, set_cookie) = browser_page_csrf(&headers, secure, &state.csrf_signing_key);
     let mut response = html_response(
         StatusCode::OK,
         browser_sign_in_document(
@@ -9244,23 +9259,29 @@ async fn browser_sign_in_page(
     response
 }
 
-fn browser_page_csrf(headers: &HeaderMap, secure: bool) -> (String, Option<String>) {
-    request_cookie(headers, BROWSER_CSRF_COOKIE).map_or_else(
-        || {
-            let token = random_auth_token(32);
-            (
-                token.clone(),
-                Some(browser_cookie(
-                    BROWSER_CSRF_COOKIE,
-                    &token,
-                    BROWSER_SESSION_MAX_AGE,
-                    false,
-                    secure,
-                )),
-            )
-        },
-        |token| (token.to_owned(), None),
-    )
+fn browser_page_csrf(
+    headers: &HeaderMap,
+    secure: bool,
+    signing_key: &[u8],
+) -> (String, Option<String>) {
+    request_browser_csrf_cookie(headers, secure)
+        .filter(|token| valid_browser_csrf_token(token, signing_key))
+        .map_or_else(
+            || {
+                let token = new_browser_csrf_token(signing_key);
+                (
+                    token.clone(),
+                    Some(browser_cookie(
+                        browser_csrf_cookie_name(secure),
+                        &token,
+                        BROWSER_SESSION_MAX_AGE,
+                        false,
+                        secure,
+                    )),
+                )
+            },
+            |token| (token.to_owned(), None),
+        )
 }
 
 fn browser_sign_in_document(
@@ -9351,7 +9372,11 @@ fn browser_settings_error_response(
     status: StatusCode,
     message: &str,
 ) -> Response<Body> {
-    let (csrf_token, csrf_cookie) = browser_page_csrf(headers, state.origin.scheme() == "https");
+    let (csrf_token, csrf_cookie) = browser_page_csrf(
+        headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    );
     let content = format!(
         "<p role=\"alert\">{}</p><p><a href=\"/settings/profile\">Return to settings</a></p>",
         html_escape::encode_text(message)
@@ -9381,7 +9406,11 @@ async fn browser_profile_page(State(state): State<WebState>, headers: HeaderMap)
         Ok(None) => return record_not_found(),
         Err(_) => return internal_error(),
     };
-    let (csrf_token, csrf_cookie) = browser_page_csrf(&headers, state.origin.scheme() == "https");
+    let (csrf_token, csrf_cookie) = browser_page_csrf(
+        &headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    );
     browser_settings_page(
         "Profile",
         &browser_profile_form(&account, &csrf_token),
@@ -9467,7 +9496,11 @@ async fn browser_settings_appearance(
     if let Err(response) = required_browser_session(&state, &headers).await {
         return response;
     }
-    let (csrf_token, csrf_cookie) = browser_page_csrf(&headers, state.origin.scheme() == "https");
+    let (csrf_token, csrf_cookie) = browser_page_csrf(
+        &headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    );
     let content = format!(
         "<p>The pinned Mastodon web client controls appearance settings locally. Rustodon v1 keeps the server-side appearance surface English-only.</p><p>Posting defaults are persisted server-side on the <a href=\"/settings/preferences/posting_defaults\">posting defaults page</a>.</p>{}",
         hidden_csrf(&csrf_token),
@@ -9490,7 +9523,11 @@ async fn browser_posting_defaults_page(
     else {
         return internal_error();
     };
-    let (csrf_token, csrf_cookie) = browser_page_csrf(&headers, state.origin.scheme() == "https");
+    let (csrf_token, csrf_cookie) = browser_page_csrf(
+        &headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    );
     browser_settings_page(
         "Posting defaults",
         &browser_posting_defaults_form(&state, &preferences, &csrf_token),
@@ -9600,7 +9637,11 @@ async fn browser_two_factor_methods_page(
     if !user.otp_required_for_login {
         return browser_redirect_response("/settings/otp_authentication");
     }
-    let (csrf_token, csrf_cookie) = browser_page_csrf(&headers, state.origin.scheme() == "https");
+    let (csrf_token, csrf_cookie) = browser_page_csrf(
+        &headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    );
     browser_settings_page(
         "Two-factor authentication",
         &browser_two_factor_methods_form(&user, &csrf_token),
@@ -9636,7 +9677,12 @@ async fn browser_two_factor_disable(
         Ok(session) => session,
         Err(response) => return response,
     };
-    if !browser_csrf_is_valid(&parameters, &headers) {
+    if !browser_csrf_is_valid(
+        &parameters,
+        &headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    ) {
         return browser_settings_error_response(
             &state,
             &headers,
@@ -9707,7 +9753,12 @@ async fn browser_otp_authentication_start(
         Ok(session) => session,
         Err(response) => return response,
     };
-    if !browser_csrf_is_valid(&parameters, &headers) {
+    if !browser_csrf_is_valid(
+        &parameters,
+        &headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    ) {
         return browser_otp_setup_page_response(
             &state,
             &headers,
@@ -9777,7 +9828,12 @@ async fn browser_otp_confirmation(
     let Some(secret) = browser_scalar(&parameters, "otp_secret") else {
         return browser_redirect_response("/settings/otp_authentication");
     };
-    if !browser_csrf_is_valid(&parameters, &headers) {
+    if !browser_csrf_is_valid(
+        &parameters,
+        &headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    ) {
         return browser_otp_confirmation_page_response(
             &state,
             &headers,
@@ -9862,7 +9918,12 @@ async fn browser_two_factor_recovery_codes(
         Ok(session) => session,
         Err(response) => return response,
     };
-    if !browser_csrf_is_valid(&parameters, &headers) {
+    if !browser_csrf_is_valid(
+        &parameters,
+        &headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    ) {
         return browser_settings_error_response(
             &state,
             &headers,
@@ -9911,7 +9972,11 @@ fn browser_otp_setup_page_response(
     status: StatusCode,
     error: Option<&str>,
 ) -> Response<Body> {
-    let (csrf_token, csrf_cookie) = browser_page_csrf(headers, state.origin.scheme() == "https");
+    let (csrf_token, csrf_cookie) = browser_page_csrf(
+        headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    );
     let error = error.map_or_else(String::new, |message| {
         format!(
             "<p role=\"alert\">{}</p>",
@@ -9940,7 +10005,11 @@ fn browser_otp_confirmation_page_response(
     secret: &str,
     error: Option<&str>,
 ) -> Response<Body> {
-    let (csrf_token, csrf_cookie) = browser_page_csrf(headers, state.origin.scheme() == "https");
+    let (csrf_token, csrf_cookie) = browser_page_csrf(
+        headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    );
     let error = error.map_or_else(String::new, |message| {
         format!(
             "<p role=\"alert\">{}</p>",
@@ -9970,7 +10039,11 @@ fn browser_two_factor_recovery_codes_page(
     headers: &HeaderMap,
     backup_codes: &[String],
 ) -> Response<Body> {
-    let (csrf_token, csrf_cookie) = browser_page_csrf(headers, state.origin.scheme() == "https");
+    let (csrf_token, csrf_cookie) = browser_page_csrf(
+        headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    );
     let codes = backup_codes.iter().fold(String::new(), |mut codes, code| {
         let _ = write!(
             codes,
@@ -10020,7 +10093,11 @@ async fn browser_security_page(
         Ok(None) => return record_not_found(),
         Err(_) => return internal_error(),
     };
-    let (csrf_token, csrf_cookie) = browser_page_csrf(&headers, state.origin.scheme() == "https");
+    let (csrf_token, csrf_cookie) = browser_page_csrf(
+        &headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    );
     let two_factor = if user.otp_required_for_login {
         "enabled"
     } else {
@@ -10053,7 +10130,12 @@ async fn browser_security_update(
         Ok(session) => session,
         Err(response) => return response,
     };
-    if !browser_csrf_is_valid(&parameters, &headers) {
+    if !browser_csrf_is_valid(
+        &parameters,
+        &headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    ) {
         return browser_settings_error_response(
             &state,
             &headers,
@@ -10129,6 +10211,7 @@ async fn browser_delete_page(State(state): State<WebState>, headers: HeaderMap) 
         Err(_) => return internal_error(),
     };
     browser_delete_page_response(
+        &state,
         state.origin.scheme() == "https",
         &headers,
         StatusCode::OK,
@@ -10156,8 +10239,14 @@ async fn browser_delete(
         Ok(None) => return record_not_found(),
         Err(_) => return internal_error(),
     };
-    if !browser_csrf_is_valid(&parameters, &headers) {
+    if !browser_csrf_is_valid(
+        &parameters,
+        &headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    ) {
         return browser_delete_page_response(
+            &state,
             state.origin.scheme() == "https",
             &headers,
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -10173,6 +10262,7 @@ async fn browser_delete(
     };
     if !challenge_passed {
         return browser_delete_page_response(
+            &state,
             state.origin.scheme() == "https",
             &headers,
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -10191,6 +10281,7 @@ async fn browser_delete(
         Ok(()) => {}
         Err(WriteError::InvalidInput(_) | WriteError::Validation(_)) => {
             return browser_delete_page_response(
+                &state,
                 state.origin.scheme() == "https",
                 &headers,
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -10211,13 +10302,14 @@ async fn browser_delete(
 }
 
 fn browser_delete_page_response(
+    state: &WebState,
     secure: bool,
     headers: &HeaderMap,
     status: StatusCode,
     user: &User,
     error: Option<&str>,
 ) -> Response<Body> {
-    let (csrf_token, csrf_cookie) = browser_page_csrf(headers, secure);
+    let (csrf_token, csrf_cookie) = browser_page_csrf(headers, secure, &state.csrf_signing_key);
     let error = error.map_or_else(String::new, |message| {
         format!(
             "<p role=\"alert\">{}</p>",
@@ -10257,7 +10349,12 @@ async fn browser_settings_account_update(
         Ok(session) => session,
         Err(response) => return response,
     };
-    if !browser_csrf_is_valid(&parameters, &headers) {
+    if !browser_csrf_is_valid(
+        &parameters,
+        &headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    ) {
         return browser_settings_error_response(
             &state,
             &headers,
@@ -10292,6 +10389,7 @@ async fn browser_password_reset_page(
 ) -> Response<Body> {
     browser_password_reset_page_response(
         state.origin.scheme() == "https",
+        &state.csrf_signing_key,
         &headers,
         StatusCode::OK,
         None,
@@ -10311,6 +10409,7 @@ async fn browser_password_reset_edit(
     };
     browser_password_reset_page_response(
         state.origin.scheme() == "https",
+        &state.csrf_signing_key,
         &headers,
         StatusCode::OK,
         Some(token),
@@ -10320,12 +10419,13 @@ async fn browser_password_reset_edit(
 
 fn browser_password_reset_page_response(
     secure: bool,
+    signing_key: &[u8],
     headers: &HeaderMap,
     status: StatusCode,
     reset_token: Option<&str>,
     error: Option<&str>,
 ) -> Response<Body> {
-    let (csrf_token, set_cookie) = browser_page_csrf(headers, secure);
+    let (csrf_token, set_cookie) = browser_page_csrf(headers, secure, signing_key);
     let mut response = html_response(
         status,
         browser_password_reset_document(&csrf_token, reset_token, error),
@@ -10359,8 +10459,10 @@ fn browser_password_reset_document(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn browser_sign_in_error_response(
     secure: bool,
+    signing_key: &[u8],
     headers: &HeaderMap,
     status: StatusCode,
     code: &str,
@@ -10371,7 +10473,7 @@ fn browser_sign_in_error_response(
     if !accepts_html(headers) {
         return browser_auth_error_response(status, code);
     }
-    let (csrf_token, set_cookie) = browser_page_csrf(headers, secure);
+    let (csrf_token, set_cookie) = browser_page_csrf(headers, secure, signing_key);
     let mut response = html_response(
         status,
         browser_sign_in_document(&csrf_token, email, Some(message), return_to),
@@ -10384,6 +10486,7 @@ fn browser_sign_in_error_response(
 
 fn browser_password_reset_error_response(
     secure: bool,
+    signing_key: &[u8],
     headers: &HeaderMap,
     status: StatusCode,
     code: &str,
@@ -10393,7 +10496,14 @@ fn browser_password_reset_error_response(
     if !accepts_html(headers) {
         return browser_auth_error_response(status, code);
     }
-    browser_password_reset_page_response(secure, headers, status, reset_token, Some(message))
+    browser_password_reset_page_response(
+        secure,
+        signing_key,
+        headers,
+        status,
+        reset_token,
+        Some(message),
+    )
 }
 
 fn browser_confirmation_error_response(
@@ -10416,12 +10526,14 @@ fn browser_confirmation_error_response(
 
 fn browser_sign_in_rate_limited_response(
     secure: bool,
+    signing_key: &[u8],
     headers: &HeaderMap,
     limited: RateLimitExceeded,
     return_to: Option<&str>,
 ) -> Response<Body> {
     let mut response = browser_sign_in_error_response(
         secure,
+        signing_key,
         headers,
         StatusCode::TOO_MANY_REQUESTS,
         "rate_limited",
@@ -10435,11 +10547,13 @@ fn browser_sign_in_rate_limited_response(
 
 fn browser_password_reset_rate_limited_response(
     secure: bool,
+    signing_key: &[u8],
     headers: &HeaderMap,
     limited: RateLimitExceeded,
 ) -> Response<Body> {
     let mut response = browser_password_reset_error_response(
         secure,
+        signing_key,
         headers,
         StatusCode::TOO_MANY_REQUESTS,
         "rate_limited",
@@ -10456,9 +10570,15 @@ async fn browser_password_reset_request(
     Extension(metadata): Extension<RequestMetadata>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    if !browser_csrf_is_valid(&parameters, &headers) {
+    if !browser_csrf_is_valid(
+        &parameters,
+        &headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    ) {
         return browser_password_reset_error_response(
             state.origin.scheme() == "https",
+            &state.csrf_signing_key,
             &headers,
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_csrf_token",
@@ -10470,6 +10590,7 @@ async fn browser_password_reset_request(
     else {
         return browser_password_reset_error_response(
             state.origin.scheme() == "https",
+            &state.csrf_signing_key,
             &headers,
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_request",
@@ -10480,6 +10601,7 @@ async fn browser_password_reset_request(
     if matches!(state.mail_config.as_ref(), Some(config) if !config.is_enabled()) {
         return browser_password_reset_error_response(
             state.origin.scheme() == "https",
+            &state.csrf_signing_key,
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             "mail_unavailable",
@@ -10498,6 +10620,7 @@ async fn browser_password_reset_request(
     {
         return browser_password_reset_rate_limited_response(
             state.origin.scheme() == "https",
+            &state.csrf_signing_key,
             &headers,
             limited,
         );
@@ -10573,9 +10696,15 @@ async fn browser_password_reset_update(
     Extension(parameters): Extension<RackParameters>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    if !browser_csrf_is_valid(&parameters, &headers) {
+    if !browser_csrf_is_valid(
+        &parameters,
+        &headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    ) {
         return browser_password_reset_error_response(
             state.origin.scheme() == "https",
+            &state.csrf_signing_key,
             &headers,
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_csrf_token",
@@ -10588,6 +10717,7 @@ async fn browser_password_reset_update(
     else {
         return browser_password_reset_error_response(
             state.origin.scheme() == "https",
+            &state.csrf_signing_key,
             &headers,
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_reset_token",
@@ -10598,6 +10728,7 @@ async fn browser_password_reset_update(
     let Some(password) = browser_scalar(&parameters, "password") else {
         return browser_password_reset_error_response(
             state.origin.scheme() == "https",
+            &state.csrf_signing_key,
             &headers,
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_password",
@@ -10608,6 +10739,7 @@ async fn browser_password_reset_update(
     if browser_scalar(&parameters, "password_confirmation") != Some(password) {
         return browser_password_reset_error_response(
             state.origin.scheme() == "https",
+            &state.csrf_signing_key,
             &headers,
             StatusCode::UNPROCESSABLE_ENTITY,
             "password_confirmation_mismatch",
@@ -10635,6 +10767,7 @@ async fn browser_password_reset_update(
         Ok(false) | Err(WriteError::InvalidInput(_) | WriteError::Validation(_)) => {
             browser_password_reset_error_response(
                 state.origin.scheme() == "https",
+                &state.csrf_signing_key,
                 &headers,
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "invalid_reset_token",
@@ -10654,9 +10787,15 @@ async fn browser_sign_in(
     headers: HeaderMap,
 ) -> Response<Body> {
     let return_to = valid_browser_return_to(browser_scalar(&parameters, "return_to"));
-    if !browser_csrf_is_valid(&parameters, &headers) {
+    if !browser_csrf_is_valid(
+        &parameters,
+        &headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    ) {
         return browser_sign_in_error_response(
             state.origin.scheme() == "https",
+            &state.csrf_signing_key,
             &headers,
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_csrf_token",
@@ -10669,6 +10808,7 @@ async fn browser_sign_in(
     else {
         return browser_sign_in_error_response(
             state.origin.scheme() == "https",
+            &state.csrf_signing_key,
             &headers,
             StatusCode::BAD_REQUEST,
             "invalid_request",
@@ -10680,6 +10820,7 @@ async fn browser_sign_in(
     let Some(password) = browser_scalar(&parameters, "password") else {
         return browser_sign_in_error_response(
             state.origin.scheme() == "https",
+            &state.csrf_signing_key,
             &headers,
             StatusCode::BAD_REQUEST,
             "invalid_request",
@@ -10699,6 +10840,7 @@ async fn browser_sign_in(
     {
         return browser_sign_in_rate_limited_response(
             state.origin.scheme() == "https",
+            &state.csrf_signing_key,
             &headers,
             limited,
             return_to,
@@ -10728,6 +10870,7 @@ async fn browser_sign_in(
         Err(error) => {
             return browser_authentication_error_response(
                 state.origin.scheme() == "https",
+                &state.csrf_signing_key,
                 &headers,
                 email,
                 &error,
@@ -10741,7 +10884,7 @@ async fn browser_sign_in(
     else {
         return internal_error();
     };
-    let csrf_token = random_auth_token(32);
+    let csrf_token = new_browser_csrf_token(&state.csrf_signing_key);
     let mut response = browser_redirect_response(return_to.unwrap_or("/"));
     let secure = state.origin.scheme() == "https";
     append_cookie(
@@ -10757,7 +10900,7 @@ async fn browser_sign_in(
     append_cookie(
         &mut response,
         &browser_cookie(
-            BROWSER_CSRF_COOKIE,
+            browser_csrf_cookie_name(secure),
             &csrf_token,
             BROWSER_SESSION_MAX_AGE,
             false,
@@ -10807,7 +10950,12 @@ async fn browser_sign_out(
             browser_signed_out_response(state.origin.scheme() == "https")
         };
     };
-    if !browser_sign_out_csrf_is_valid(&parameters, &headers) {
+    if !browser_sign_out_csrf_is_valid(
+        &parameters,
+        &headers,
+        state.origin.scheme() == "https",
+        &state.csrf_signing_key,
+    ) {
         return browser_sign_out_error_response(&state, &headers);
     }
     let Some(writer) = state.write_repository.as_ref() else {
@@ -10823,15 +10971,21 @@ async fn browser_sign_out(
     }
 }
 
-fn browser_sign_out_csrf_is_valid(parameters: &RackParameters, headers: &HeaderMap) -> bool {
-    browser_csrf_is_valid(parameters, headers)
-        || request_cookie(headers, BROWSER_CSRF_COOKIE).is_some_and(|csrf_cookie| {
-            headers
-                .get("x-csrf-token")
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|csrf_header| {
-                    constant_time_equal(csrf_cookie.as_bytes(), csrf_header.as_bytes())
-                })
+fn browser_sign_out_csrf_is_valid(
+    parameters: &RackParameters,
+    headers: &HeaderMap,
+    secure: bool,
+    signing_key: &[u8],
+) -> bool {
+    browser_csrf_is_valid(parameters, headers, secure, signing_key)
+        || request_browser_csrf_cookie(headers, secure).is_some_and(|csrf_cookie| {
+            valid_browser_csrf_token(csrf_cookie, signing_key)
+                && headers
+                    .get("x-csrf-token")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|csrf_header| {
+                        constant_time_equal(csrf_cookie.as_bytes(), csrf_header.as_bytes())
+                    })
         })
 }
 
@@ -10861,18 +11015,25 @@ fn browser_scalar<'a>(parameters: &'a RackParameters, name: &str) -> Option<&'a 
     }
 }
 
-fn browser_csrf_is_valid(parameters: &RackParameters, headers: &HeaderMap) -> bool {
-    let Some(cookie) = request_cookie(headers, BROWSER_CSRF_COOKIE) else {
+fn browser_csrf_is_valid(
+    parameters: &RackParameters,
+    headers: &HeaderMap,
+    secure: bool,
+    signing_key: &[u8],
+) -> bool {
+    let Some(cookie) = request_browser_csrf_cookie(headers, secure) else {
         return false;
     };
     let Some(attempt) = browser_scalar(parameters, BROWSER_CSRF_COOKIE) else {
         return false;
     };
-    constant_time_equal(cookie.as_bytes(), attempt.as_bytes())
+    valid_browser_csrf_token(cookie, signing_key)
+        && constant_time_equal(cookie.as_bytes(), attempt.as_bytes())
 }
 
 fn browser_authentication_error_response(
     secure: bool,
+    signing_key: &[u8],
     headers: &HeaderMap,
     email: &str,
     error: &BrowserAuthenticationError,
@@ -10881,6 +11042,7 @@ fn browser_authentication_error_response(
     match error {
         BrowserAuthenticationError::InvalidCredentials => browser_sign_in_error_response(
             secure,
+            signing_key,
             headers,
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_credentials",
@@ -10893,6 +11055,7 @@ fn browser_authentication_error_response(
         | BrowserAuthenticationError::Memorialized => browser_sign_in_redirect(return_to),
         BrowserAuthenticationError::TwoFactorRequired => browser_sign_in_error_response(
             secure,
+            signing_key,
             headers,
             StatusCode::OK,
             "two_factor_required",
@@ -10902,6 +11065,7 @@ fn browser_authentication_error_response(
         ),
         BrowserAuthenticationError::InvalidTwoFactor => browser_sign_in_error_response(
             secure,
+            signing_key,
             headers,
             StatusCode::OK,
             "invalid_two_factor",
@@ -10911,6 +11075,7 @@ fn browser_authentication_error_response(
         ),
         BrowserAuthenticationError::RateLimited => browser_sign_in_error_response(
             secure,
+            signing_key,
             headers,
             StatusCode::OK,
             "rate_limited",
@@ -11004,7 +11169,7 @@ fn browser_signed_out_response(secure: bool) -> Response<Body> {
     );
     append_cookie(
         &mut response,
-        &browser_cookie(BROWSER_CSRF_COOKIE, "", 0, false, secure),
+        &browser_cookie(browser_csrf_cookie_name(secure), "", 0, false, secure),
     );
     response
 }
@@ -11017,21 +11182,76 @@ fn browser_signed_out_redirect_response(secure: bool) -> Response<Body> {
     );
     append_cookie(
         &mut response,
-        &browser_cookie(BROWSER_CSRF_COOKIE, "", 0, false, secure),
+        &browser_cookie(browser_csrf_cookie_name(secure), "", 0, false, secure),
     );
     response
 }
 
 fn request_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers
-        .get(COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| {
-            value.split(';').find_map(|cookie| {
-                let (cookie_name, cookie_value) = cookie.trim().split_once('=')?;
-                (cookie_name == name).then_some(cookie_value)
-            })
-        })
+    let mut result = None;
+    for value in headers.get_all(COOKIE) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for cookie in value.split(';') {
+            let Some((cookie_name, cookie_value)) = cookie.trim().split_once('=') else {
+                continue;
+            };
+            if cookie_name == name {
+                if result.is_some() {
+                    return None;
+                }
+                result = Some(cookie_value);
+            }
+        }
+    }
+    result
+}
+
+fn browser_csrf_cookie_name(secure: bool) -> &'static str {
+    if secure {
+        SECURE_BROWSER_CSRF_COOKIE
+    } else {
+        BROWSER_CSRF_COOKIE
+    }
+}
+
+fn request_browser_csrf_cookie(headers: &HeaderMap, secure: bool) -> Option<&str> {
+    request_cookie(headers, browser_csrf_cookie_name(secure))
+}
+
+fn derive_browser_csrf_signing_key(secret: &str) -> [u8; 32] {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any size");
+    mac.update(b"rustodon/browser-csrf/signing-key/v1");
+    mac.finalize().into_bytes().into()
+}
+
+fn new_browser_csrf_token(signing_key: &[u8]) -> String {
+    let nonce = random_auth_token(32);
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(signing_key).expect("HMAC accepts keys of any size");
+    mac.update(nonce.as_bytes());
+    format!(
+        "{nonce}.{}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    )
+}
+
+fn valid_browser_csrf_token(token: &str, signing_key: &[u8]) -> bool {
+    let Some((nonce, signature)) = token.split_once('.') else {
+        return false;
+    };
+    if nonce.is_empty() || signature.contains('.') {
+        return false;
+    }
+    let Ok(signature) = URL_SAFE_NO_PAD.decode(signature) else {
+        return false;
+    };
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(signing_key).expect("HMAC accepts keys of any size");
+    mac.update(nonce.as_bytes());
+    mac.verify_slice(&signature).is_ok()
 }
 
 fn browser_cookie(name: &str, value: &str, max_age: i64, http_only: bool, secure: bool) -> String {
@@ -17926,10 +18146,12 @@ mod tests {
 
     #[tokio::test]
     async fn browser_form_errors_render_html_and_keep_json_for_api_requests() {
+        let signing_key = [7; 32];
         let mut html_headers = HeaderMap::new();
         html_headers.insert(ACCEPT, HeaderValue::from_static("text/html"));
         let response = browser_sign_in_error_response(
             false,
+            &signing_key,
             &html_headers,
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_credentials",
@@ -17952,6 +18174,7 @@ mod tests {
         json_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         let response = browser_sign_in_error_response(
             false,
+            &signing_key,
             &json_headers,
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_credentials",
@@ -17970,6 +18193,7 @@ mod tests {
 
         let response = browser_password_reset_error_response(
             false,
+            &signing_key,
             &html_headers,
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_reset_token",
@@ -19001,40 +19225,206 @@ mod tests {
 
     #[test]
     fn browser_sign_in_requires_a_matching_double_submit_csrf_token() {
-        let parameters =
-            RackParameters::parse("csrf_token=csrf-value").expect("CSRF parameters are valid");
+        let signing_key = [7; 32];
+        let csrf_token = new_browser_csrf_token(&signing_key);
+        let parameters = RackParameters::parse(&format!("csrf_token={csrf_token}"))
+            .expect("CSRF parameters are valid");
         let mut headers = HeaderMap::new();
-        headers.insert(COOKIE, HeaderValue::from_static("csrf_token=csrf-value"));
-        assert!(browser_csrf_is_valid(&parameters, &headers));
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!("csrf_token={csrf_token}")).unwrap(),
+        );
+        assert!(browser_csrf_is_valid(
+            &parameters,
+            &headers,
+            false,
+            &signing_key
+        ));
 
         headers.insert(COOKIE, HeaderValue::from_static("csrf_token=other-value"));
-        assert!(!browser_csrf_is_valid(&parameters, &headers));
+        assert!(!browser_csrf_is_valid(
+            &parameters,
+            &headers,
+            false,
+            &signing_key
+        ));
         assert!(!browser_csrf_is_valid(
             &RackParameters::parse("").expect("empty parameters are valid"),
-            &headers
+            &headers,
+            false,
+            &signing_key
         ));
     }
 
     #[test]
     fn browser_sign_out_accepts_form_or_header_csrf_tokens() {
+        let signing_key = [7; 32];
+        let csrf_token = new_browser_csrf_token(&signing_key);
         let mut headers = HeaderMap::new();
-        headers.insert(COOKIE, HeaderValue::from_static("csrf_token=csrf-value"));
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!("csrf_token={csrf_token}")).unwrap(),
+        );
         assert!(browser_sign_out_csrf_is_valid(
-            &RackParameters::parse("csrf_token=csrf-value").expect("form parameters are valid"),
-            &headers
+            &RackParameters::parse(&format!("csrf_token={csrf_token}"))
+                .expect("form parameters are valid"),
+            &headers,
+            false,
+            &signing_key
         ));
 
-        headers.insert("x-csrf-token", HeaderValue::from_static("csrf-value"));
+        headers.insert("x-csrf-token", HeaderValue::from_str(&csrf_token).unwrap());
         assert!(browser_sign_out_csrf_is_valid(
             &RackParameters::parse("").expect("empty parameters are valid"),
-            &headers
+            &headers,
+            false,
+            &signing_key
         ));
 
         headers.insert("x-csrf-token", HeaderValue::from_static("wrong-value"));
         assert!(!browser_sign_out_csrf_is_valid(
             &RackParameters::parse("").expect("empty parameters are valid"),
-            &headers
+            &headers,
+            false,
+            &signing_key
         ));
+    }
+
+    #[test]
+    fn browser_csrf_rejects_unsigned_and_duplicate_cookies() {
+        let signing_key = [7; 32];
+        let parameters =
+            RackParameters::parse("csrf_token=attacker").expect("CSRF parameters are valid");
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, HeaderValue::from_static("csrf_token=attacker"));
+        assert!(!browser_csrf_is_valid(
+            &parameters,
+            &headers,
+            false,
+            &signing_key
+        ));
+
+        let csrf_token = new_browser_csrf_token(&signing_key);
+        let parameters = RackParameters::parse(&format!("csrf_token={csrf_token}"))
+            .expect("CSRF parameters are valid");
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!("csrf_token=attacker; csrf_token={csrf_token}"))
+                .unwrap(),
+        );
+        assert!(!browser_csrf_is_valid(
+            &parameters,
+            &headers,
+            false,
+            &signing_key
+        ));
+        assert!(request_cookie(&headers, BROWSER_CSRF_COOKIE).is_none());
+
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!("csrf_token={csrf_token}")).unwrap(),
+        );
+        assert!(!browser_csrf_is_valid(
+            &parameters,
+            &headers,
+            true,
+            &signing_key
+        ));
+    }
+
+    #[test]
+    fn browser_csrf_rejects_duplicates_across_cookie_headers() {
+        let signing_key = [7; 32];
+        let csrf_token = new_browser_csrf_token(&signing_key);
+        let parameters = RackParameters::parse(&format!("csrf_token={csrf_token}"))
+            .expect("CSRF parameters are valid");
+        let mut headers = HeaderMap::new();
+        headers.append(COOKIE, HeaderValue::from_static("csrf_token=attacker"));
+        headers.append(
+            COOKIE,
+            HeaderValue::from_str(&format!("theme=dark; csrf_token={csrf_token}")).unwrap(),
+        );
+
+        assert!(!browser_csrf_is_valid(
+            &parameters,
+            &headers,
+            false,
+            &signing_key
+        ));
+    }
+
+    #[test]
+    fn browser_csrf_ignores_malformed_unrelated_cookie_segments() {
+        let signing_key = [7; 32];
+        let csrf_token = new_browser_csrf_token(&signing_key);
+        let parameters = RackParameters::parse(&format!("csrf_token={csrf_token}"))
+            .expect("CSRF parameters are valid");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!(
+                "malformed; =missing-name; theme; csrf_token={csrf_token}; other=value"
+            ))
+            .unwrap(),
+        );
+
+        assert!(browser_csrf_is_valid(
+            &parameters,
+            &headers,
+            false,
+            &signing_key
+        ));
+    }
+
+    #[test]
+    fn browser_csrf_key_derivation_is_stable_and_secret_specific() {
+        let first = derive_browser_csrf_signing_key("fixture-secret-key-base");
+        let restarted = derive_browser_csrf_signing_key("fixture-secret-key-base");
+        let other = derive_browser_csrf_signing_key("different-secret-key-base");
+        let token = new_browser_csrf_token(&first);
+
+        assert_eq!(first, restarted);
+        assert_ne!(first, other);
+        assert!(valid_browser_csrf_token(&token, &restarted));
+        assert!(!valid_browser_csrf_token(&token, &other));
+        assert_ne!(first, Sha256::digest(b"fixture-secret-key-base").as_slice());
+    }
+
+    #[test]
+    fn secure_browser_csrf_rotates_legacy_and_invalid_cookies() {
+        let signing_key = [7; 32];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_static("csrf_token=transplanted; __Host-csrf_token=unsigned"),
+        );
+
+        let (token, cookie) = browser_page_csrf(&headers, true, &signing_key);
+        assert!(valid_browser_csrf_token(&token, &signing_key));
+        let cookie = cookie.expect("invalid secure cookie is rotated");
+        assert!(cookie.starts_with("__Host-csrf_token="));
+        assert!(cookie.contains("; Path=/;"));
+        assert!(cookie.contains("; Secure"));
+        assert!(!cookie.contains("Domain="));
+
+        let legacy_only = HeaderMap::from_iter([(
+            COOKIE,
+            HeaderValue::from_str(&format!(
+                "csrf_token={}",
+                new_browser_csrf_token(&signing_key)
+            ))
+            .unwrap(),
+        )]);
+        assert!(
+            browser_page_csrf(&legacy_only, true, &signing_key)
+                .1
+                .is_some()
+        );
+
+        let (_, cookie) = browser_page_csrf(&HeaderMap::new(), false, &signing_key);
+        let cookie = cookie.expect("HTTP requests receive a CSRF cookie");
+        assert!(cookie.starts_with("csrf_token="));
+        assert!(!cookie.contains("; Secure"));
     }
 
     #[test]

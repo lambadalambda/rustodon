@@ -988,6 +988,7 @@ async fn run_web() -> ExitCode {
         eprintln!("web media root could not be opened safely");
         return ExitCode::FAILURE;
     };
+    state = state.with_csrf_signing_secret(&config.secrets.secret_key_base);
     state = state.with_queue(Queue::new(queue_pool));
     let mail_config = MailConfig::new(
         config.smtp.clone(),

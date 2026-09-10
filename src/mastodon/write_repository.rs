@@ -8181,9 +8181,10 @@ impl WriteRepository {
         code_challenge_method: Option<&str>,
     ) -> Result<OAuthAuthorizationGrant, OAuthAuthorizationGrantError> {
         let mut transaction = self.pool.begin().await?;
-        let Some((application_id, application_redirect_uri, application_scopes)) =
-            sqlx::query_as::<_, (i64, String, String)>(
-                "SELECT id, redirect_uri, scopes FROM oauth_applications WHERE uid = $1",
+        let Some((application_id, application_redirect_uri, application_scopes, confidential)) =
+            sqlx::query_as::<_, (i64, String, String, bool)>(
+                "SELECT id, redirect_uri, scopes, confidential \
+                 FROM oauth_applications WHERE uid = $1",
             )
             .bind(client_id)
             .fetch_optional(&mut *transaction)
@@ -8197,9 +8198,7 @@ impl WriteRepository {
         {
             return Err(OAuthAuthorizationGrantError::InvalidRedirectUri);
         }
-        if code_challenge.is_some() != code_challenge_method.is_some()
-            || code_challenge_method.is_some_and(|method| method != "S256")
-        {
+        if !oauth_grant_pkce_is_valid(confidential, code_challenge, code_challenge_method) {
             return Err(OAuthAuthorizationGrantError::InvalidCodeChallenge);
         }
         let scopes = requested_scopes
@@ -8379,17 +8378,13 @@ impl WriteRepository {
         {
             return Err(OAuthAuthorizationCodeError::InvalidGrant);
         }
-        if let Some(challenge) = grant_challenge {
-            if grant_challenge_method.as_deref() != Some("S256") {
-                return Err(OAuthAuthorizationCodeError::InvalidGrant);
-            }
-            let Some(code_verifier) = code_verifier else {
-                return Err(OAuthAuthorizationCodeError::InvalidGrant);
-            };
-            let computed = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
-            if !constant_time_string_equal(&challenge, &computed) {
-                return Err(OAuthAuthorizationCodeError::InvalidGrant);
-            }
+        if !oauth_pkce_matches(
+            confidential,
+            grant_challenge.as_deref(),
+            grant_challenge_method.as_deref(),
+            code_verifier,
+        ) {
+            return Err(OAuthAuthorizationCodeError::InvalidGrant);
         }
         sqlx::query("UPDATE oauth_access_grants SET revoked_at = clock_timestamp() WHERE id = $1")
             .bind(grant_id)
@@ -12288,6 +12283,52 @@ fn constant_time_string_equal(left: &str, right: &str) -> bool {
             ^ usize::from(right.get(index).copied().unwrap_or_default());
     }
     difference == 0
+}
+
+fn oauth_grant_pkce_is_valid(
+    confidential: bool,
+    code_challenge: Option<&str>,
+    code_challenge_method: Option<&str>,
+) -> bool {
+    match (code_challenge, code_challenge_method) {
+        (None, None) => confidential,
+        (Some(challenge), Some("S256")) => valid_s256_code_challenge(challenge),
+        _ => false,
+    }
+}
+
+fn oauth_pkce_matches(
+    confidential: bool,
+    code_challenge: Option<&str>,
+    code_challenge_method: Option<&str>,
+    code_verifier: Option<&str>,
+) -> bool {
+    match (code_challenge, code_challenge_method) {
+        (None, None) => confidential,
+        (Some(challenge), Some("S256")) if valid_s256_code_challenge(challenge) => {
+            let Some(verifier) = code_verifier.filter(|verifier| valid_pkce_verifier(verifier))
+            else {
+                return false;
+            };
+            let computed = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+            constant_time_string_equal(challenge, &computed)
+        }
+        _ => false,
+    }
+}
+
+fn valid_s256_code_challenge(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn valid_pkce_verifier(value: &str) -> bool {
+    (43..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
 }
 
 fn random_urlsafe_base64(byte_count: usize) -> String {
@@ -17055,15 +17096,18 @@ mod tests {
         RemoteNoteAudience, RemoteNoteData, WriteError, canonical_email_hash,
         canonical_oauth_scopes, devise_token_digest, domain_block_is_stricter, local_object_tag_id,
         normalize_domain_block_domain, normalize_status_language, notification_policy_decision,
-        notification_policy_decision_for_type, parse_user_active_days, password_reset_digest,
-        quote_approval_policy_for_status, random_urlsafe_base64, remote_actor_account_id,
-        remote_domain_lock_scopes, remote_note_attachments, remote_note_object_is_too_old,
-        remote_note_visibility, report_category_value, report_email_enabled,
-        report_uri_matches_domain, status_mention_candidates, two_factor_attempt_is_rate_limited,
-        validate_local_password, validate_oauth_application_registration,
+        notification_policy_decision_for_type, oauth_grant_pkce_is_valid, oauth_pkce_matches,
+        parse_user_active_days, password_reset_digest, quote_approval_policy_for_status,
+        random_urlsafe_base64, remote_actor_account_id, remote_domain_lock_scopes,
+        remote_note_attachments, remote_note_object_is_too_old, remote_note_visibility,
+        report_category_value, report_email_enabled, report_uri_matches_domain,
+        status_mention_candidates, two_factor_attempt_is_rate_limited, validate_local_password,
+        validate_oauth_application_registration,
     };
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use chrono::NaiveDateTime;
     use serde_json::json;
+    use sha2::{Digest, Sha256};
 
     fn facts() -> NotificationPolicyFacts {
         NotificationPolicyFacts {
@@ -17431,6 +17475,89 @@ mod tests {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
         );
+    }
+
+    #[test]
+    fn public_oauth_grants_require_a_well_formed_s256_challenge() {
+        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        assert!(oauth_grant_pkce_is_valid(
+            false,
+            Some(challenge),
+            Some("S256")
+        ));
+        assert!(!oauth_grant_pkce_is_valid(false, None, None));
+        assert!(!oauth_grant_pkce_is_valid(
+            false,
+            Some(challenge),
+            Some("plain")
+        ));
+        assert!(!oauth_grant_pkce_is_valid(
+            false,
+            Some(&"a".repeat(42)),
+            Some("S256")
+        ));
+        assert!(!oauth_grant_pkce_is_valid(
+            false,
+            Some("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw.cM"),
+            Some("S256")
+        ));
+    }
+
+    #[test]
+    fn confidential_oauth_grants_may_omit_pkce_but_not_supply_invalid_pkce() {
+        assert!(oauth_grant_pkce_is_valid(true, None, None));
+        assert!(!oauth_grant_pkce_is_valid(
+            true,
+            Some("short"),
+            Some("S256")
+        ));
+        assert!(!oauth_grant_pkce_is_valid(true, Some("challenge"), None));
+    }
+
+    #[test]
+    fn oauth_pkce_redemption_validates_the_rfc_7636_verifier() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        assert!(oauth_pkce_matches(
+            false,
+            Some(challenge),
+            Some("S256"),
+            Some(verifier)
+        ));
+        assert!(!oauth_pkce_matches(
+            false,
+            Some(challenge),
+            Some("S256"),
+            Some(&"a".repeat(42))
+        ));
+        assert!(!oauth_pkce_matches(
+            false,
+            Some(challenge),
+            Some("S256"),
+            Some(&"a".repeat(129))
+        ));
+        assert!(!oauth_pkce_matches(
+            false,
+            Some(challenge),
+            Some("S256"),
+            Some("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk=")
+        ));
+
+        for verifier in ["~".repeat(43), ".".repeat(128)] {
+            let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+            assert!(oauth_pkce_matches(
+                false,
+                Some(&challenge),
+                Some("S256"),
+                Some(&verifier)
+            ));
+        }
+    }
+
+    #[test]
+    fn oauth_pkce_redemption_rejects_legacy_public_grants() {
+        assert!(!oauth_pkce_matches(false, None, None, None));
+        assert!(oauth_pkce_matches(true, None, None, None));
     }
 
     #[test]
