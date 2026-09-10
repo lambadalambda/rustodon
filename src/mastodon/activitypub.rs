@@ -1467,11 +1467,12 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        PUBLIC_ADDRESS, accept, actor, actor_url, announce_with_uris, block_with_uris, create,
-        delete_actor_with_uris, delete_with_uris, follow_with_uris, host_meta, like_with_uris,
-        note, quote_authorization, quote_authorization_url, reject_with_uris, status_activity,
-        status_url, undo_announce_with_uris, undo_block_with_uris, undo_follow_with_uris,
-        undo_like_with_uris, update_actor, update_with_uris,
+        PUBLIC_ADDRESS, accept, actor, actor_url, actor_with_media, announce_with_uris,
+        block_with_uris, create, delete_actor_with_uris, delete_with_uris, follow_with_uris,
+        host_meta, like_with_uris, note, quote_authorization, quote_authorization_url,
+        reject_with_uris, status_activity, status_url, undo_announce_with_uris,
+        undo_block_with_uris, undo_follow_with_uris, undo_like_with_uris, update_actor,
+        update_with_uris,
     };
     use crate::mastodon::records::{Account, MediaAttachment, Status};
     use crate::mastodon::types::{AccountIdScheme, RawI32, RawString, StatusVisibility};
@@ -1636,6 +1637,43 @@ mod tests {
         assert_eq!(
             actor_url(&origin, &account(Some(AccountIdScheme::Numeric))),
             "https://example.test/ap/users/42"
+        );
+    }
+
+    #[test]
+    fn actor_media_urls_use_the_configured_paperclip_root() {
+        let origin = url::Url::parse("https://example.test/").expect("valid origin");
+        let mut account = account(Some(AccountIdScheme::Username));
+        account.avatar_file_name = Some("avatar.png".to_owned());
+        account.avatar_content_type = Some("image/png".to_owned());
+        account.avatar_storage_schema_version = Some(1);
+        account.header_file_name = Some("header.jpg".to_owned());
+        account.header_content_type = Some("image/jpeg".to_owned());
+        account.header_storage_schema_version = Some(1);
+
+        let relative = actor_with_media(&origin, "example.test", "/system", &account);
+        assert_eq!(
+            relative["icon"]["url"],
+            "https://example.test/system/accounts/avatars/000/000/042/original/avatar.png"
+        );
+        assert_eq!(
+            relative["image"]["url"],
+            "https://example.test/system/accounts/headers/000/000/042/original/header.jpg"
+        );
+
+        let absolute = actor_with_media(
+            &origin,
+            "example.test",
+            "https://media.example/assets",
+            &account,
+        );
+        assert_eq!(
+            absolute["icon"]["url"],
+            "https://media.example/assets/accounts/avatars/000/000/042/original/avatar.png"
+        );
+        assert_eq!(
+            absolute["image"]["url"],
+            "https://media.example/assets/accounts/headers/000/000/042/original/header.jpg"
         );
     }
 

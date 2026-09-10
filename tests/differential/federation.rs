@@ -380,6 +380,8 @@ pub(crate) async fn run_federation_discovery_case(
                 "/publicKey/id",
                 "/publicKey/owner",
                 "/endpoints/sharedInbox",
+                "/icon",
+                "/image",
             ][..],
         ),
         (

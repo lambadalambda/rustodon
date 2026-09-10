@@ -4702,7 +4702,12 @@ async fn federation_actor_response(
     activity_response(
         StatusCode::OK,
         ACTIVITY_JSON,
-        activitypub::actor(&state.origin, &state.local_domain, &account),
+        activitypub::actor_with_media(
+            &state.origin,
+            &state.local_domain,
+            &state.media_root_url,
+            &account,
+        ),
     )
 }
 
