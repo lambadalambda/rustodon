@@ -1,9 +1,11 @@
 use chrono::NaiveDateTime;
 use rustodon::mastodon::rest::{
-    AccountFieldProjection, AccountProjection, CustomEmojiProjection, MediaAttachmentProjection,
-    NotificationProjection, PollOptionProjection, PollProjection, QuoteProjection,
-    QuoteTargetAccess, QuoteTargetLinkProjection, RestSerializer, StatusApplicationProjection,
-    StatusProjection, StatusShape, StatusViewerProjection, TagHistoryProjection, TagProjection,
+    AccountFieldProjection, AccountProjection, AnnouncementProjection,
+    AnnouncementReactionProjection, CustomEmojiProjection, MediaAttachmentProjection,
+    MentionProjection, NotificationProjection, PollOptionProjection, PollProjection,
+    QuoteProjection, QuoteTargetAccess, QuoteTargetLinkProjection, RestSerializer,
+    StatusApplicationProjection, StatusProjection, StatusShape, StatusViewerProjection,
+    TagHistoryProjection, TagProjection,
 };
 use rustodon::mastodon::{AccountIdScheme, NotificationType};
 use serde_json::{Value, json};
@@ -126,6 +128,57 @@ fn public_status() -> StatusProjection {
         quote_manual: Vec::new(),
         quote_current_user: "denied".to_owned(),
     }
+}
+
+#[test]
+fn announcement_serialization_matches_authenticated_client_contract() {
+    let emoji = CustomEmojiProjection {
+        id: 12_001,
+        shortcode: "fixtureparty".to_owned(),
+        domain: None,
+        file_name: "fixtureparty.png".to_owned(),
+        storage_schema_version: Some(1),
+        visible_in_picker: true,
+        category: None,
+        featured: None,
+    };
+    let announcement = AnnouncementProjection {
+        id: 8_701,
+        text: "Hello @alice #FixtureTag :fixtureparty:".to_owned(),
+        starts_at: Some(timestamp("2026-07-01 17:36:00")),
+        ends_at: None,
+        all_day: false,
+        published_at: Some(timestamp("2026-07-01 17:36:00")),
+        updated_at: timestamp("2026-07-01 17:37:00"),
+        read: true,
+        mentions: vec![MentionProjection { account: alice() }],
+        statuses: vec![public_status()],
+        tags: vec!["fixturetag".to_owned()],
+        emojis: vec![emoji.clone()],
+        reactions: vec![AnnouncementReactionProjection {
+            name: "fixtureparty".to_owned(),
+            count: 2,
+            me: true,
+            custom_emoji: Some(emoji),
+        }],
+    };
+
+    let value = serde_json::to_value(serializer().announcement(&announcement).unwrap()).unwrap();
+    assert_eq!(value["id"], "8701");
+    assert_eq!(value["read"], true);
+    assert_eq!(value["mentions"][0]["acct"], "alice");
+    assert_eq!(value["statuses"][0]["id"], PUBLIC_STATUS.to_string());
+    assert_eq!(
+        value["tags"],
+        json!([{
+            "name": "fixturetag",
+            "url": "https://fixture-v4-6-5.rustodon.invalid/tags/fixturetag"
+        }])
+    );
+    assert_eq!(value["emojis"][0]["shortcode"], "fixtureparty");
+    assert_eq!(value["reactions"][0]["count"], 2);
+    assert_eq!(value["reactions"][0]["me"], true);
+    assert!(value["reactions"][0]["url"].is_string());
 }
 
 #[test]

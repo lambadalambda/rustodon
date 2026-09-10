@@ -5,7 +5,8 @@ use serde_json::Value;
 
 use super::{
     AccountFieldProjection, AccountProjection, AccountRelationshipProjection,
-    AccountRoleProjection, AccountWarningProjection, AppealProjection, CollectionItemProjection,
+    AccountRoleProjection, AccountWarningProjection, AnnouncementProjection,
+    AnnouncementReactionProjection, AppealProjection, CollectionItemProjection,
     CollectionProjection, ConversationProjection, CredentialAccountProjection,
     CredentialRoleProjection, CustomEmojiProjection, FilterKeywordProjection, FilterProjection,
     FilterResultProjection, FilterStatusProjection, FollowedTagsPage,
@@ -23,6 +24,7 @@ use crate::mastodon::policy::{
     AuthenticatedViewerFacts, AuthorRestriction, StatusAccessFacts, StatusAvailability,
     ViewerFacts, status_access,
 };
+use crate::mastodon::repository::normalize_hashtag;
 use crate::mastodon::{
     AccountConversation, Notification, NotificationType, PermissionBits, Repository, UserPermission,
 };
@@ -230,6 +232,118 @@ impl RestProjectionLoader {
     /// Returns a database error when the read-only account query fails.
     pub async fn account(&self, id: i64) -> sqlx::Result<Option<AccountProjection>> {
         Ok(self.accounts(&[id]).await?.into_iter().next())
+    }
+
+    /// Loads published announcements with their authenticated viewer state and serializer graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when announcement or related projection loading fails.
+    pub async fn announcements(
+        &self,
+        viewer_account_id: i64,
+    ) -> sqlx::Result<Vec<AnnouncementProjection>> {
+        let rows = self
+            .repository
+            .rest_announcements(viewer_account_id)
+            .await?;
+        let announcement_ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let status_ids = rows
+            .iter()
+            .flat_map(|row| row.status_ids.iter().flatten().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let statuses = self
+            .preauthorized_statuses(&status_ids)
+            .await?
+            .into_iter()
+            .filter(|status| matches!(status.visibility, 0 | 1))
+            .map(|status| (status.id, status))
+            .collect::<BTreeMap<_, _>>();
+        let handles = mention_handles(rows.iter().map(|row| row.text.as_str()), &self.local_domain);
+        let handle_rows = self.repository.rest_account_handles(&handles).await?;
+        let accounts = self
+            .accounts(&handle_rows.iter().map(|row| row.id).collect::<Vec<_>>())
+            .await?
+            .into_iter()
+            .map(|account| (account.id, account))
+            .collect::<BTreeMap<_, _>>();
+        let account_ids_by_handle = handle_rows
+            .into_iter()
+            .map(|row| (row.handle, row.id))
+            .collect::<BTreeMap<_, _>>();
+        let emoji_demands = rows
+            .iter()
+            .map(|row| (None, emoji_shortcodes(std::iter::once(row.text.as_str()))))
+            .collect::<Vec<_>>();
+        let emojis = self.load_custom_emojis(&emoji_demands).await?;
+        let reactions = self
+            .repository
+            .rest_announcement_reactions(&announcement_ids, viewer_account_id)
+            .await?
+            .into_iter()
+            .fold(BTreeMap::<i64, Vec<_>>::new(), |mut grouped, row| {
+                let custom_emoji = row.custom_emoji_id.and_then(|id| {
+                    Some(CustomEmojiProjection {
+                        id,
+                        shortcode: row.shortcode?,
+                        domain: row.domain,
+                        file_name: row.image_file_name?,
+                        storage_schema_version: row.image_storage_schema_version,
+                        visible_in_picker: row.visible_in_picker?,
+                        category: None,
+                        featured: None,
+                    })
+                });
+                grouped.entry(row.announcement_id).or_default().push(
+                    AnnouncementReactionProjection {
+                        name: row.name,
+                        count: row.count,
+                        me: row.me,
+                        custom_emoji,
+                    },
+                );
+                grouped
+            });
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let handles =
+                    mention_handles(std::iter::once(row.text.as_str()), &self.local_domain);
+                let mentions = handles
+                    .iter()
+                    .filter_map(|handle| account_ids_by_handle.get(handle))
+                    .filter_map(|id| accounts.get(id).cloned())
+                    .map(|account| MentionProjection { account })
+                    .collect();
+                let shortcodes = emoji_shortcodes(std::iter::once(row.text.as_str()));
+                let announcement_emojis = project_emojis(None, &shortcodes, &emojis);
+                let announcement_statuses = row
+                    .status_ids
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|id| statuses.get(id).cloned())
+                    .collect();
+                AnnouncementProjection {
+                    id: row.id,
+                    text: row.text.clone(),
+                    starts_at: row.starts_at,
+                    ends_at: row.ends_at,
+                    all_day: row.all_day,
+                    published_at: row.published_at,
+                    updated_at: row.updated_at,
+                    read: row.read,
+                    mentions,
+                    statuses: announcement_statuses,
+                    tags: hashtag_names(&row.text),
+                    emojis: announcement_emojis,
+                    reactions: reactions.get(&row.id).cloned().unwrap_or_default(),
+                }
+            })
+            .collect())
     }
 
     /// Loads one report with the target account required by the REST serializer.
@@ -1836,10 +1950,11 @@ impl RestProjectionLoader {
         query: &str,
         limit: i64,
         offset: i64,
+        exclude_unreviewed: bool,
     ) -> sqlx::Result<Vec<TagProjection>> {
         let tags = self
             .repository
-            .rest_tag_search(query, limit, offset)
+            .rest_tag_search(query, limit, offset, exclude_unreviewed)
             .await?;
         let relationships = if let Some(account_id) = self.viewer_account_id {
             self.repository
@@ -2813,6 +2928,45 @@ fn emoji_shortcodes<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<String>
     shortcodes
 }
 
+fn hashtag_names(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut characters = text.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        if !matches!(character, '#' | '＃')
+            || (index > 0
+                && text[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|previous| !previous.is_whitespace()))
+        {
+            continue;
+        }
+        let mut name = String::new();
+        while let Some((_, candidate)) = characters.peek() {
+            if candidate.is_alphanumeric()
+                || matches!(
+                    candidate,
+                    '_' | '·' | '・' | '\u{200c}' | '\u{0e47}'..='\u{0e4e}'
+                )
+            {
+                name.push(*candidate);
+                characters.next();
+            } else {
+                break;
+            }
+        }
+        let normalized = normalize_hashtag(&name);
+        if !normalized.is_empty()
+            && normalized.chars().any(char::is_alphabetic)
+            && seen.insert(normalized.clone())
+        {
+            names.push(normalized);
+        }
+    }
+    names
+}
+
 fn project_emojis(
     domain: Option<&String>,
     shortcodes: &[String],
@@ -3399,7 +3553,15 @@ fn policy_allows(bitmap: i32, viewer_follows: bool, follows_viewer: bool) -> boo
 
 #[cfg(test)]
 mod tests {
-    use super::{QuoteViewerRestriction, quote_filter_state_from};
+    use super::{QuoteViewerRestriction, hashtag_names, quote_filter_state_from};
+
+    #[test]
+    fn announcement_hashtags_follow_mastodon_boundaries_and_separators() {
+        assert_eq!(
+            hashtag_names("word#ignored #FixtureTag #foo\u{00b7}bar #123"),
+            ["fixturetag", "foo\u{00b7}bar"]
+        );
+    }
 
     #[test]
     fn quote_filter_never_bypasses_failed_status_authorization() {

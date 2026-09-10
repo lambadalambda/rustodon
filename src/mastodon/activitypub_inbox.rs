@@ -507,10 +507,7 @@ pub(crate) fn validate_note_object(
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_note_emojis(object: &Value, actor_uri: &str) -> Vec<RemoteEmojiTag> {
-    let Some(actor_host) = Url::parse(actor_uri)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-    else {
+    let Ok(actor_origin) = Url::parse(actor_uri) else {
         return Vec::new();
     };
     let Some(tags) = object.get("tag") else {
@@ -544,9 +541,12 @@ pub(crate) fn parse_note_emojis(object: &Value, actor_uri: &str) -> Vec<RemoteEm
             Some(Value::String(uri)) if uri.len() <= MAX_REMOTE_EMOJI_URL => {
                 let Some(url) = Url::parse(uri).ok().filter(|url| {
                     matches!(url.scheme(), "http" | "https")
+                        && url.scheme() == actor_origin.scheme()
                         && url
                             .host_str()
-                            .is_some_and(|host| host.eq_ignore_ascii_case(&actor_host))
+                            .zip(actor_origin.host_str())
+                            .is_some_and(|(host, actor_host)| host.eq_ignore_ascii_case(actor_host))
+                        && url.port_or_known_default() == actor_origin.port_or_known_default()
                         && url.username().is_empty()
                         && url.password().is_none()
                         && url.fragment().is_none()
@@ -1051,22 +1051,81 @@ mod tests {
     }
 
     #[test]
+    fn actor_update_exposes_valid_profile_emojis_without_losing_other_tags() {
+        let update = parse_activity(
+            &json!({
+                "type": "Update",
+                "actor": "https://remote.example/users/alice",
+                "object": {
+                    "id": "https://remote.example/users/alice",
+                    "type": "Person",
+                    "preferredUsername": "alice",
+                    "name": "Alice :party_blob:",
+                    "summary": "Hello #rust",
+                    "tag": [
+                        {"type": "Hashtag", "name": "#rust", "href": "https://remote.example/tags/rust"},
+                        {
+                            "id": "https://remote.example/emojis/party_blob",
+                            "type": "Emoji",
+                            "name": ":party_blob:",
+                            "updated": "2026-08-25T12:00:00Z",
+                            "icon": {"type": "Image", "mediaType": "image/png", "url": "https://media.remote.example/party.png"}
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .expect("actor Update should parse");
+        let InboxActivity::UpdateActor { actor_uri, object } = update else {
+            panic!("expected actor Update");
+        };
+        let emojis = parse_note_emojis(&object, &actor_uri);
+        assert_eq!(emojis.len(), 1);
+        assert_eq!(emojis[0].shortcode, "party_blob");
+        assert_eq!(object["tag"][0]["type"], "Hashtag");
+    }
+
+    #[test]
+    fn remote_emoji_ids_are_bound_to_the_actor_origin_authority() {
+        let tag = |id: &str| {
+            json!({
+                "tag": [{
+                    "id": id,
+                    "type": "Emoji",
+                    "name": ":party_blob:",
+                    "icon": {"mediaType": "image/png", "url": "https://cdn.example/party.png"}
+                }]
+            })
+        };
+        let actor = "https://remote.example:8443/users/alice";
+        assert_eq!(
+            parse_note_emojis(&tag("https://remote.example:8443/emojis/party"), actor).len(),
+            1
+        );
+        assert!(parse_note_emojis(&tag("https://remote.example/emojis/party"), actor).is_empty());
+        assert!(
+            parse_note_emojis(&tag("http://remote.example:8443/emojis/party"), actor).is_empty()
+        );
+    }
+
+    #[test]
     fn parses_uri_only_note_create_as_a_durable_resolution_contract() {
         let create = parse_activity(
-            r#"{"id":"https://remote.example/activities/create-reference","type":"Create","actor":"https://remote.example/users/alice","object":"https://remote.example/statuses/1","to":["https://local.example/users/bob"],"cc":"https://www.w3.org/ns/activitystreams#Public"}"#,
+            r#"{"id":"https://relay.example/activities/create-reference","type":"Create","actor":"https://remote.example/users/alice","object":"https://remote.example/statuses/1","to":["https://local.example/users/bob"],"cc":"https://www.w3.org/ns/activitystreams#Public"}"#,
         )
-        .expect("URI-only Create should parse");
+        .expect("URI-only Create with a cross-host activity ID should parse");
 
         assert_eq!(
             create,
             InboxActivity::CreateNoteReference {
-                activity_uri: "https://remote.example/activities/create-reference".to_owned(),
+                activity_uri: "https://relay.example/activities/create-reference".to_owned(),
                 actor_uri: "https://remote.example/users/alice".to_owned(),
                 object_uri: "https://remote.example/statuses/1".to_owned(),
                 to: vec!["https://local.example/users/bob".to_owned()],
                 cc: vec!["https://www.w3.org/ns/activitystreams#Public".to_owned()],
                 activity: json!({
-                    "id": "https://remote.example/activities/create-reference",
+                    "id": "https://relay.example/activities/create-reference",
                     "type": "Create",
                     "actor": "https://remote.example/users/alice",
                     "object": "https://remote.example/statuses/1",

@@ -620,6 +620,7 @@ async fn actor_media_root_url() -> Result<(), Box<dyn std::error::Error>> {
     let media_root_url = std::env::var("RUSTODON_DIFFERENTIAL_PAPERCLIP_ROOT_URL")
         .unwrap_or_else(|_| "/system".to_owned());
     set_actor_header_fixture(&config, true).await?;
+    set_actor_profile_emoji_fixture(&config, true).await?;
     let repository = Repository::connect(config.rust_database.url()).await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let rust_url = Url::parse(&format!("http://{}", listener.local_addr()?))?;
@@ -645,8 +646,53 @@ async fn actor_media_root_url() -> Result<(), Box<dyn std::error::Error>> {
     let result = run_actor_media_case(config.clone(), &rust_url, &media_root_url).await;
     let _ = shutdown_tx.send(());
     server.await??;
+    let profile_restore = set_actor_profile_emoji_fixture(&config, false).await;
     let restore = set_actor_header_fixture(&config, false).await;
-    result.and(restore)
+    result.and(profile_restore).and(restore)
+}
+
+async fn set_actor_profile_emoji_fixture(
+    config: &DifferentialConfig,
+    present: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for owner in [
+        config
+            .mastodon_owner_database
+            .as_ref()
+            .expect("actor emoji differential requires the Mastodon owner target"),
+        config
+            .rust_owner_database
+            .as_ref()
+            .expect("actor emoji differential requires the Rust owner target"),
+    ] {
+        let pool = sqlx::PgPool::connect(owner.url()).await?;
+        let display_name = if present {
+            "display_name || ' :actorprofileblob:'"
+        } else {
+            "replace(display_name, ' :actorprofileblob:', '')"
+        };
+        sqlx::query(&format!(
+            "UPDATE accounts SET display_name = {display_name} WHERE id = 116844606259201001"
+        ))
+        .execute(&pool)
+        .await?;
+        sqlx::query("DELETE FROM custom_emojis WHERE id = 12991")
+            .execute(&pool)
+            .await?;
+        if present {
+            sqlx::query(
+                "INSERT INTO custom_emojis
+                     (id, shortcode, domain, image_content_type, image_file_name, image_file_size,
+                      image_storage_schema_version, disabled, visible_in_picker, created_at, updated_at)
+                 VALUES (12991, 'actorprofileblob', NULL, 'image/png', 'actor-profile.png', 68,
+                         1, false, false, TIMESTAMP '2026-07-01 14:08:00',
+                         TIMESTAMP '2026-07-01 14:08:00')",
+            )
+            .execute(&pool)
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn set_actor_header_fixture(
@@ -1973,6 +2019,123 @@ async fn run_core_rest_serializers_case(
     config: DifferentialConfig,
     rust_url: &Url,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    set_announcement_fixture(&config, true).await?;
+    if let Err(error) = set_tag_search_fixture(&config, true).await {
+        let _ = set_tag_search_fixture(&config, false).await;
+        set_announcement_fixture(&config, false).await?;
+        return Err(error);
+    }
+    let result = run_core_rest_serializers_read_only_case(config.clone(), rust_url).await;
+    let tag_cleanup = set_tag_search_fixture(&config, false).await;
+    let announcement_cleanup = set_announcement_fixture(&config, false).await;
+    result.and(tag_cleanup).and(announcement_cleanup)
+}
+
+async fn set_tag_search_fixture(
+    config: &DifferentialConfig,
+    present: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for owner in [
+        config
+            .mastodon_owner_database
+            .as_ref()
+            .expect("tag search differential requires the Mastodon owner target"),
+        config
+            .rust_owner_database
+            .as_ref()
+            .expect("tag search differential requires the Rust owner target"),
+    ] {
+        let pool = sqlx::PgPool::connect(owner.url()).await?;
+        let mut transaction = pool.begin().await?;
+        sqlx::query("DELETE FROM tags WHERE id BETWEEN -9214 AND -9211")
+            .execute(&mut *transaction)
+            .await?;
+        if present {
+            sqlx::query(
+                "INSERT INTO tags \
+                 (id, name, display_name, usable, trendable, listable, reviewed_at, created_at, updated_at) \
+                 VALUES \
+                 (-9211, 'reviewprobe', 'ReviewProbe', true, false, true, NULL, \
+                  TIMESTAMP '2026-07-01 17:41:00', TIMESTAMP '2026-07-01 17:41:00'), \
+                 (-9212, 'reviewprobehidden', 'ReviewProbeHidden', true, false, true, NULL, \
+                  TIMESTAMP '2026-07-01 17:41:00', TIMESTAMP '2026-07-01 17:41:00'), \
+                 (-9213, 'reviewprobereviewed', 'ReviewProbeReviewed', true, false, true, \
+                  TIMESTAMP '2026-07-01 17:41:00', TIMESTAMP '2026-07-01 17:41:00', \
+                  TIMESTAMP '2026-07-01 17:41:00'), \
+                 (-9214, 'reviewprobeunlisted', 'ReviewProbeUnlisted', true, false, false, \
+                  TIMESTAMP '2026-07-01 17:41:00', TIMESTAMP '2026-07-01 17:41:00', \
+                  TIMESTAMP '2026-07-01 17:41:00')",
+            )
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+    }
+    Ok(())
+}
+
+async fn set_announcement_fixture(
+    config: &DifferentialConfig,
+    present: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for owner in [
+        config
+            .mastodon_owner_database
+            .as_ref()
+            .expect("announcement differential requires the Mastodon owner target"),
+        config
+            .rust_owner_database
+            .as_ref()
+            .expect("announcement differential requires the Rust owner target"),
+    ] {
+        let pool = sqlx::PgPool::connect(owner.url()).await?;
+        let mut transaction = pool.begin().await?;
+        sqlx::query("DELETE FROM announcements WHERE id = -8701")
+            .execute(&mut *transaction)
+            .await?;
+        if present {
+            sqlx::query(
+                "INSERT INTO announcements \
+                 (id, all_day, created_at, ends_at, notification_sent_at, published, \
+                  published_at, scheduled_at, starts_at, status_ids, text, updated_at) \
+                 VALUES (-8701, false, TIMESTAMP '2026-07-01 17:36:00', NULL, NULL, true, \
+                  TIMESTAMP '2026-07-01 17:36:00', NULL, TIMESTAMP '2026-07-01 17:36:00', \
+                  ARRAY[116844842188805001]::bigint[], \
+                  'Differential announcement word#ignored for @moderator #fixturetag', \
+                  TIMESTAMP '2026-07-01 17:37:00')",
+            )
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "INSERT INTO announcement_mutes \
+                 (id, account_id, announcement_id, created_at, updated_at) \
+                 VALUES (-8701, 116844606259201001, -8701, \
+                  TIMESTAMP '2026-07-01 17:38:00', TIMESTAMP '2026-07-01 17:38:00')",
+            )
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "INSERT INTO announcement_reactions \
+                 (id, account_id, announcement_id, created_at, custom_emoji_id, name, updated_at) \
+                 VALUES \
+                  (-8701, 116844606259201001, -8701, TIMESTAMP '2026-07-01 17:39:00', \
+                   NULL, 'wave', TIMESTAMP '2026-07-01 17:39:00'), \
+                  (-8702, 116844606259201002, -8701, TIMESTAMP '2026-07-01 17:40:00', \
+                   NULL, 'wave', TIMESTAMP '2026-07-01 17:40:00')",
+            )
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_core_rest_serializers_read_only_case(
+    config: DifferentialConfig,
+    rust_url: &Url,
+) -> Result<(), Box<dyn std::error::Error>> {
     let guard = ReadOnlyGuard::begin(config, rust_url).await?;
     for path in [
         "/api/v1/instance",
@@ -2010,26 +2173,26 @@ async fn run_core_rest_serializers_case(
         Vec::new(),
     )?;
     let responses = guard.send(&announcements).await?;
-    if responses.mastodon.status != responses.rust.status || responses.rust.status != 200 {
-        return Err(format!(
-            "frontend announcement probe status mismatch: Mastodon={}, Rust={}",
-            responses.mastodon.status, responses.rust.status
-        )
-        .into());
-    }
-    for (side, response) in [("Mastodon", &responses.mastodon), ("Rust", &responses.rust)] {
-        if !response
-            .headers
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("application/json"))
-            || !serde_json::from_slice::<Value>(&response.body)?.is_array()
-        {
-            return Err(format!("{side} announcement probe did not return a JSON array").into());
+    compare_responses(
+        &responses.mastodon,
+        &responses.rust,
+        &[CONTENT_TYPE],
+        &[],
+        DEFAULT_MISMATCH_LIMIT,
+    )
+    .map_err(|error| format!("announcement serializer: {error}"))?;
+    let announcements = serde_json::from_slice::<Value>(&responses.rust.body)?;
+    let active = announcements
+        .as_array()
+        .and_then(|announcements| announcements.iter().find(|item| item["id"] == "-8701"))
+        .ok_or("announcement serializer omitted the active persisted announcement")?;
+    for key in ["mentions", "statuses", "tags", "emojis", "reactions"] {
+        if !active[key].is_array() {
+            return Err(format!("announcement serializer omitted the {key} array").into());
         }
     }
-    if serde_json::from_slice::<Value>(&responses.rust.body)? != serde_json::json!([]) {
-        return Err("Rust disabled announcement probe must return an empty array".into());
+    if active["read"] != true || active["reactions"][0]["me"] != true {
+        return Err("announcement serializer omitted authenticated mute/reaction state".into());
     }
 
     let mut search_headers = stable_request_headers();
@@ -2041,7 +2204,7 @@ async fn run_core_rest_serializers_case(
         Method::GET,
         "/api/v2/search",
         Some("q=fixturetag&type=hashtags".to_owned()),
-        search_headers,
+        search_headers.clone(),
         Vec::new(),
     )?;
     let responses = guard.send(&hashtag_search).await?;
@@ -2059,6 +2222,36 @@ async fn run_core_rest_serializers_case(
             if !body[key].is_array() {
                 return Err(format!("{side} hashtag search omitted the {key} array").into());
             }
+        }
+    }
+    let reviewed_hashtag_search = RequestSpec::new(
+        Method::GET,
+        "/api/v2/search",
+        Some("q=%23ReviewProbe&type=hashtags&exclude_unreviewed=true&limit=20&offset=0".to_owned()),
+        search_headers,
+        Vec::new(),
+    )?;
+    let responses = guard.send(&reviewed_hashtag_search).await?;
+    compare_responses(
+        &responses.mastodon,
+        &responses.rust,
+        &[CONTENT_TYPE],
+        &[],
+        DEFAULT_MISMATCH_LIMIT,
+    )
+    .map_err(|error| format!("exclude-unreviewed hashtag search probe: {error}"))?;
+    for (side, response) in [("Mastodon", &responses.mastodon), ("Rust", &responses.rust)] {
+        let body: Value = serde_json::from_slice(&response.body)?;
+        let names = body["hashtags"]
+            .as_array()
+            .ok_or_else(|| format!("{side} hashtag search omitted the hashtags array"))?
+            .iter()
+            .filter_map(|tag| tag["name"].as_str())
+            .collect::<Vec<_>>();
+        if names != ["ReviewProbe", "ReviewProbeReviewed"] {
+            return Err(
+                format!("{side} returned unexpected reviewed hashtag search: {names:?}").into(),
+            );
         }
     }
     for (label, account_id, token) in [

@@ -176,14 +176,15 @@ impl StatusPolicyRow {
 use super::rest::{
     AccountListKind, AccountListOptions, AccountStatusesOptions, FollowCollectionKind,
     FollowCollectionOptions, FollowedTagsOptions, NotificationOptions, RestAccountHandleRow,
-    RestAccountListRow, RestAccountRow, RestAccountWarningRow, RestCredentialRow,
-    RestCustomEmojiRow, RestFeaturedTagRow, RestFollowCollectionRow, RestFollowedTagRow,
-    RestInstanceCountsRow, RestListedCustomEmojiRow, RestMentionRow, RestNotificationGroupRow,
-    RestNotificationTargetRow, RestPollVoteRow, RestPreferencesRow, RestPreviewCardRow,
-    RestRelationshipRow, RestRuleRow, RestSavedStatusRow, RestSeveranceEventRow,
-    RestStatusQuoteRow, RestStatusRow, RestStatusTagRow, RestTagSuggestionRow,
-    RestTaggedCollectionRow, SavedStatusKind, SavedStatusesOptions, TagTimelineOptions,
-    TimelineOptions, grouped_notification_types, notification_type_filter_with_exclusions,
+    RestAccountListRow, RestAccountRow, RestAccountWarningRow, RestAnnouncementReactionRow,
+    RestAnnouncementRow, RestCredentialRow, RestCustomEmojiRow, RestFeaturedTagRow,
+    RestFollowCollectionRow, RestFollowedTagRow, RestInstanceCountsRow, RestListedCustomEmojiRow,
+    RestMentionRow, RestNotificationGroupRow, RestNotificationTargetRow, RestPollVoteRow,
+    RestPreferencesRow, RestPreviewCardRow, RestRelationshipRow, RestRuleRow, RestSavedStatusRow,
+    RestSeveranceEventRow, RestStatusQuoteRow, RestStatusRow, RestStatusTagRow,
+    RestTagSuggestionRow, RestTaggedCollectionRow, SavedStatusKind, SavedStatusesOptions,
+    TagTimelineOptions, TimelineOptions, grouped_notification_types,
+    notification_type_filter_with_exclusions,
 };
 
 const REST_LIST_TIMELINE_SQL: &str = "WITH authorized AS ( \
@@ -918,6 +919,52 @@ impl Repository {
              WHERE status.id = ANY($1) AND status.deleted_at IS NULL ORDER BY status.id",
         )
         .bind(ids)
+        .bind(viewer_account_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn rest_announcements(
+        &self,
+        viewer_account_id: i64,
+    ) -> sqlx::Result<Vec<RestAnnouncementRow>> {
+        sqlx::query_as::<_, RestAnnouncementRow>(
+            "SELECT announcement.id, announcement.text, announcement.starts_at, \
+             announcement.ends_at, announcement.all_day, announcement.published_at, \
+             announcement.updated_at, announcement.status_ids, \
+             EXISTS (SELECT 1 FROM announcement_mutes mute \
+               WHERE mute.announcement_id = announcement.id AND mute.account_id = $1) AS read \
+             FROM announcements announcement WHERE announcement.published = true \
+             ORDER BY COALESCE(announcement.starts_at, announcement.scheduled_at, \
+               announcement.published_at, announcement.created_at)",
+        )
+        .bind(viewer_account_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn rest_announcement_reactions(
+        &self,
+        announcement_ids: &[i64],
+        viewer_account_id: i64,
+    ) -> sqlx::Result<Vec<RestAnnouncementReactionRow>> {
+        sqlx::query_as::<_, RestAnnouncementReactionRow>(
+            "SELECT reaction.announcement_id, reaction.name, COUNT(*) AS count, \
+             EXISTS (SELECT 1 FROM announcement_reactions mine \
+               WHERE mine.announcement_id = reaction.announcement_id \
+                 AND mine.account_id = $2 AND mine.name = reaction.name) AS me, \
+             reaction.custom_emoji_id, emoji.shortcode, emoji.domain, \
+             emoji.image_file_name, emoji.image_storage_schema_version, \
+             emoji.visible_in_picker \
+             FROM announcement_reactions reaction \
+             LEFT JOIN custom_emojis emoji ON emoji.id = reaction.custom_emoji_id \
+             WHERE reaction.announcement_id = ANY($1) \
+             GROUP BY reaction.announcement_id, reaction.name, reaction.custom_emoji_id, \
+               emoji.id, emoji.shortcode, emoji.domain, emoji.image_file_name, \
+               emoji.image_storage_schema_version, emoji.visible_in_picker \
+             ORDER BY reaction.announcement_id, MIN(reaction.created_at)",
+        )
+        .bind(announcement_ids)
         .bind(viewer_account_id)
         .fetch_all(&self.pool)
         .await
@@ -2525,6 +2572,100 @@ impl Repository {
         })
     }
 
+    pub(crate) async fn activitypub_account_emojis(
+        &self,
+        account_id: i64,
+    ) -> sqlx::Result<Vec<activitypub::CustomEmoji>> {
+        let profile = sqlx::query_as::<_, (String, String, Option<serde_json::Value>)>(
+            "SELECT display_name, note, fields FROM accounts
+             WHERE id = $1 AND domain IS NULL",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((display_name, note, fields)) = profile else {
+            return Ok(Vec::new());
+        };
+        let mut sources = vec![display_name.as_str(), note.as_str()];
+        if let Some(fields) = fields.as_ref().and_then(serde_json::Value::as_array) {
+            for field in fields {
+                sources.extend([
+                    field
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                    field
+                        .get("value")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                ]);
+            }
+        }
+        let shortcodes = activitypub_emoji_shortcodes(sources);
+        if shortcodes.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                String,
+                Option<String>,
+                Option<i32>,
+                NaiveDateTime,
+            ),
+        >(
+            "SELECT id, shortcode, image_file_name, image_content_type,
+                    image_storage_schema_version, updated_at
+             FROM custom_emojis
+             WHERE domain IS NULL AND disabled = false AND shortcode = ANY($1)
+               AND image_file_name IS NOT NULL
+             ORDER BY id",
+        )
+        .bind(shortcodes)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(
+                    |(
+                        id,
+                        shortcode,
+                        file_name,
+                        content_type,
+                        storage_schema_version,
+                        updated_at,
+                    )| {
+                        activitypub::CustomEmoji {
+                            id,
+                            shortcode,
+                            file_name,
+                            content_type,
+                            storage_schema_version,
+                            updated_at,
+                        }
+                    },
+                )
+                .collect()
+        })
+    }
+
+    pub(crate) async fn activitypub_account_hashtags(
+        &self,
+        account_id: i64,
+    ) -> sqlx::Result<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT tag.name FROM accounts_tags account_tag
+             JOIN tags tag ON tag.id = account_tag.tag_id
+             JOIN accounts account ON account.id = account_tag.account_id AND account.domain IS NULL
+             WHERE account_tag.account_id = $1 ORDER BY tag.id",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     pub(crate) async fn activitypub_emoji(
         &self,
         id: i64,
@@ -2569,6 +2710,7 @@ impl Repository {
         query: &str,
         limit: i64,
         offset: i64,
+        exclude_unreviewed: bool,
     ) -> sqlx::Result<Vec<Tag>> {
         let query = normalize_hashtag(query.trim().trim_start_matches('#'));
         if query.is_empty() {
@@ -2581,11 +2723,14 @@ impl Repository {
         sqlx::query_as::<_, Tag>(
             "SELECT id, name, display_name, usable, trendable, listable, last_status_at \
              FROM tags WHERE lower(name) LIKE $1 ESCAPE '\\' AND listable IS NOT FALSE \
+             AND (NOT $4 OR lower(name) = $5 OR reviewed_at IS NOT NULL) \
              ORDER BY length(name), name LIMIT $2 OFFSET $3",
         )
         .bind(format!("{escaped}%"))
         .bind(limit)
         .bind(offset)
+        .bind(exclude_unreviewed)
+        .bind(query)
         .fetch_all(&self.pool)
         .await
     }
@@ -4109,7 +4254,7 @@ fn domain_policy_hostname(domain: &str) -> String {
     canonical_remote_host(domain).unwrap_or_else(|_| domain.trim_end_matches('.').to_owned())
 }
 
-fn normalize_hashtag(value: &str) -> String {
+pub(crate) fn normalize_hashtag(value: &str) -> String {
     const NON_ASCII: &str = "ÀÁÂÃÄÅàáâãäåĀāĂăĄąÇçĆćĈĉĊċČčÐðĎďĐđÈÉÊËèéêëĒēĔĕĖėĘęĚěĜĝĞğĠġĢģĤĥĦħÌÍÎÏìíîïĨĩĪīĬĭĮįİıĴĵĶķĸĹĺĻļĽľĿŀŁłÑñŃńŅņŇňŉŊŋÒÓÔÕÖØòóôõöøŌōŎŏŐőŔŕŖŗŘřŚśŜŝŞşŠšſŢţŤťŦŧÙÚÛÜùúûüŨũŪūŬŭŮůŰűŲųŴŵÝýÿŶŷŸŹźŻżŽž";
     const ASCII: &str = "AAAAAAaaaaaaAaAaAaCcCcCcCcCcDdDdDdEEEEeeeeEeEeEeEeEeGgGgGgGgHhHhIIIIiiiiIiIiIiIiIiJjKkkLlLlLlLlLlNnNnNnNnnNnOOOOOOooooooOoOoOoRrRrRrSsSsSsSssTtTtTtUUUUuuuuUuUuUuUuUuUuWwYyyYyYZzZzZz";
     value

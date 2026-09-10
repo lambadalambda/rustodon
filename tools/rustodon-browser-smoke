@@ -33,6 +33,7 @@ host=$2
 auth=${RUSTODON_BROWSER_AUTH:-false}
 cookie_jar=''
 header_file=''
+csrf_body=''
 case "$base_url" in
     http://*|https://*) ;;
     *) fail 'BASE_URL must use http or https' ;;
@@ -86,6 +87,9 @@ cleanup() {
     if [ -n "$header_file" ]; then
         rm -f "$header_file"
     fi
+    if [ -n "$csrf_body" ]; then
+        rm -f "$csrf_body"
+    fi
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
@@ -134,6 +138,24 @@ assert_mount() {
     esac
 }
 
+bootstrap_csrf() {
+    csrf_path=$1
+    bootstrap_cookie=$2
+    csrf_label=$3
+    curl --silent --show-error --fail --max-time 30 \
+        --resolve "$base_host:$base_port:127.0.0.1" \
+        --header "Host: $host" \
+        --header 'X-Forwarded-Proto: https' \
+        --cookie "$bootstrap_cookie" \
+        --dump-header "$header_file" \
+        --output "$csrf_body" \
+        "$base_url$csrf_path" || fail "$csrf_label CSRF bootstrap failed"
+    csrf_token=$(awk 'match($0, /name="csrf_token"[[:space:]]+value="[^"]+"/) { value = substr($0, RSTART, RLENGTH); sub(/^.*value="/, "", value); sub(/"$/, "", value); print value; exit }' "$csrf_body")
+    csrf_cookie=$(awk 'tolower($0) ~ /^set-cookie:[[:space:]]*__host-csrf_token=/ { line = $0; sub(/^[^:]+:[[:space:]]*/, "", line); sub(/^[^=]+=/, "", line); sub(/;.*/, "", line); print line; exit }' "$header_file")
+    [ -n "$csrf_token" ] || fail "$csrf_label page did not expose a CSRF token"
+    [ -n "$csrf_cookie" ] || fail "$csrf_label did not return an __Host-csrf_token cookie"
+}
+
 assert_mount
 body_class=$(browser eval 'document.body.className')
 case "$body_class" in
@@ -157,9 +179,6 @@ if [ "$auth" = true ]; then
     browser fill '#email' "$browser_email"
     browser fill '#password' "$browser_password"
     browser fill '#otp_attempt' "$browser_otp"
-    csrf_token=$(browser eval 'document.querySelector("input[name=csrf_token]").value')
-    [ -n "$csrf_token" ] || fail 'browser sign-in form did not expose a CSRF token'
-    csrf_cookie=$csrf_token
     case "$base_authority" in
         *:*)
             base_host=${base_authority%:*}
@@ -173,14 +192,17 @@ if [ "$auth" = true ]; then
     command -v curl >/dev/null 2>&1 || fail 'curl is required when browser auth is enabled'
     cookie_jar=$(mktemp "${TMPDIR:-/tmp}/rustodon-browser-cookies.XXXXXX")
     header_file=$(mktemp "${TMPDIR:-/tmp}/rustodon-browser-headers.XXXXXX")
+    csrf_body=$(mktemp "${TMPDIR:-/tmp}/rustodon-browser-csrf.XXXXXX")
+    # Chromium cannot retain the canonical origin's Secure __Host- cookie over
+    # the fixture's loopback HTTP transport, so curl must bootstrap each form.
+    bootstrap_csrf '/auth/sign_in' '' 'browser sign-in'
     printf '%s\n' 'browser auth: submitting fixture credentials through the local form endpoint' >&2
-    # The fixture has a canonical HTTPS origin, while this browser endpoint is loopback HTTP.
     login_result=$(curl --silent --show-error --max-time 30 \
         --resolve "$base_host:$base_port:127.0.0.1" \
         --header "Host: $host" \
         --header 'X-Forwarded-Proto: https' \
         --header 'Content-Type: application/x-www-form-urlencoded' \
-        --cookie "csrf_token=$csrf_cookie" \
+        --cookie "__Host-csrf_token=$csrf_cookie" \
         --cookie-jar "$cookie_jar" \
         --data-urlencode "csrf_token=$csrf_token" \
         --data-urlencode "user[email]=$browser_email" \
@@ -228,14 +250,14 @@ if [ "$auth" = true ]; then
         *) fail 'authenticated profile settings page did not render expected controls' ;;
     esac
     printf '%s\n' 'browser auth: submitting logout' >&2
-    logout_csrf=$(browser eval 'document.querySelector("nav form input[name=csrf_token]").value')
+    bootstrap_csrf '/settings/profile' "_mastodon_session=$browser_session" 'browser logout'
     logout_status=$(curl --silent --show-error --fail --max-time 30 \
         --resolve "$base_host:$base_port:127.0.0.1" \
         --header "Host: $host" \
         --header 'X-Forwarded-Proto: https' \
         --header 'Content-Type: application/x-www-form-urlencoded' \
-        --cookie "csrf_token=$logout_csrf; _mastodon_session=$browser_session" \
-        --data-urlencode "csrf_token=$logout_csrf" \
+        --cookie "__Host-csrf_token=$csrf_cookie; _mastodon_session=$browser_session" \
+        --data-urlencode "csrf_token=$csrf_token" \
         --write-out '%{http_code}' \
         --output /dev/null \
         "$base_url/auth/sign_out")

@@ -38,6 +38,18 @@ pub fn is_public_address(uri: &str) -> bool {
 
 #[must_use]
 pub fn emoji(origin: &Url, media_root_url: &str, emoji: &CustomEmoji) -> Value {
+    let mut value = emoji_tag(origin, media_root_url, emoji);
+    value.as_object_mut().expect("emoji is an object").insert(
+        "@context".to_owned(),
+        json!([ACTIVITY_STREAMS_CONTEXT, {
+            "toot": "http://joinmastodon.org/ns#",
+            "Emoji": "toot:Emoji"
+        }]),
+    );
+    value
+}
+
+fn emoji_tag(origin: &Url, media_root_url: &str, emoji: &CustomEmoji) -> Value {
     let metadata = PaperclipMetadata {
         attachment: PaperclipAttachment::CustomEmojiImage,
         id: emoji.id,
@@ -48,10 +60,6 @@ pub fn emoji(origin: &Url, media_root_url: &str, emoji: &CustomEmoji) -> Value {
         variant: None,
     };
     json!({
-        "@context": [ACTIVITY_STREAMS_CONTEXT, {
-            "toot": "http://joinmastodon.org/ns#",
-            "Emoji": "toot:Emoji"
-        }],
         "id": origin.join(&format!("emojis/{}", emoji.id)).expect("origin is absolute").to_string(),
         "type": "Emoji",
         "name": format!(":{}:", emoji.shortcode),
@@ -532,15 +540,18 @@ pub fn nodeinfo(
 
 #[must_use]
 pub fn actor(origin: &Url, local_domain: &str, account: &Account) -> Value {
-    actor_with_media(origin, local_domain, "", account)
+    actor_with_media(origin, local_domain, "", account, &[], &[])
 }
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn actor_with_media(
     origin: &Url,
     local_domain: &str,
     media_root_url: &str,
     account: &Account,
+    hashtags: &[String],
+    emojis: &[CustomEmoji],
 ) -> Value {
     let actor = actor_url(origin, account);
     let is_instance = account.id == -99;
@@ -620,6 +631,10 @@ pub fn actor_with_media(
             "attachment".to_owned(),
             Value::Array(profile_attachments(origin, local_domain, account)),
         );
+        object.insert(
+            "tag".to_owned(),
+            Value::Array(profile_tags(origin, media_root_url, hashtags, emojis)),
+        );
     }
     if is_instance {
         let object = value.as_object_mut().expect("actor is an object");
@@ -650,6 +665,8 @@ pub fn update_actor(
     local_domain: &str,
     media_root_url: &str,
     account: &Account,
+    hashtags: &[String],
+    emojis: &[CustomEmoji],
 ) -> Value {
     let actor_uri = actor_url(origin, account);
     json!({
@@ -658,7 +675,7 @@ pub fn update_actor(
         "type": "Update",
         "actor": actor_uri,
         "to": [PUBLIC_ADDRESS],
-        "object": actor_with_media(origin, local_domain, media_root_url, account)
+        "object": actor_with_media(origin, local_domain, media_root_url, account, hashtags, emojis)
     })
 }
 
@@ -692,6 +709,25 @@ fn profile_attachments(origin: &Url, local_domain: &str, account: &Account) -> V
             }))
         })
         .collect()
+}
+
+fn profile_tags(
+    origin: &Url,
+    media_root_url: &str,
+    hashtags: &[String],
+    emojis: &[CustomEmoji],
+) -> Vec<Value> {
+    let emoji_tags = emojis
+        .iter()
+        .map(|emoji| emoji_tag(origin, media_root_url, emoji));
+    let hashtag_tags = hashtags.iter().filter_map(|name| {
+        Some(json!({
+            "type": "Hashtag",
+            "href": origin.join(&format!("tags/{name}")).ok()?.to_string(),
+            "name": format!("#{name}")
+        }))
+    });
+    emoji_tags.chain(hashtag_tags).collect()
 }
 
 #[must_use]
@@ -1719,7 +1755,7 @@ mod tests {
         account.header_content_type = Some("image/jpeg".to_owned());
         account.header_storage_schema_version = Some(1);
 
-        let relative = actor_with_media(&origin, "example.test", "/system", &account);
+        let relative = actor_with_media(&origin, "example.test", "/system", &account, &[], &[]);
         assert_eq!(
             relative["icon"]["url"],
             "https://example.test/system/accounts/avatars/000/000/042/original/avatar.png"
@@ -1734,6 +1770,8 @@ mod tests {
             "example.test",
             "https://media.example/assets",
             &account,
+            &[],
+            &[],
         );
         assert_eq!(
             absolute["icon"]["url"],
@@ -1826,7 +1864,22 @@ mod tests {
         account.header_file_name = Some("header.jpg".to_owned());
         account.header_storage_schema_version = Some(1);
 
-        let value = update_actor(&origin, "example.test", "/system", &account);
+        let emoji = CustomEmoji {
+            id: 12_001,
+            shortcode: "party_blob".to_owned(),
+            file_name: "party.png".to_owned(),
+            content_type: Some("image/png".to_owned()),
+            storage_schema_version: None,
+            updated_at: DateTime::<Utc>::UNIX_EPOCH.naive_utc(),
+        };
+        let value = update_actor(
+            &origin,
+            "example.test",
+            "/system",
+            &account,
+            &["profiletag".to_owned()],
+            &[emoji],
+        );
 
         assert_eq!(value["type"], "Update");
         assert_eq!(value["id"], "https://example.test/users/alice#updates/42");
@@ -1838,6 +1891,10 @@ mod tests {
         assert_eq!(value["object"]["image"]["mediaType"], "image/jpeg");
         assert_eq!(value["object"]["attachment"][0]["type"], "PropertyValue");
         assert_eq!(value["object"]["attachment"][0]["name"], "Website");
+        assert_eq!(value["object"]["tag"][0]["type"], "Emoji");
+        assert_eq!(value["object"]["tag"][0]["name"], ":party_blob:");
+        assert_eq!(value["object"]["tag"][1]["type"], "Hashtag");
+        assert_eq!(value["object"]["tag"][1]["name"], "#profiletag");
     }
 
     #[test]

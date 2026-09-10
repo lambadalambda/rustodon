@@ -1221,7 +1221,7 @@ pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
     ),
     route!(
         "/api/v1/announcements",
-        DisabledResponse,
+        Implemented,
         ApiAuthentication::Required(NO_SCOPE.as_slice()),
         None,
         Private
@@ -1967,7 +1967,7 @@ pub const V1_REQUIRED_API_ROUTES: &[(&str, ApiMethod, ApiRouteSupport)] = &[
     (
         "/api/v1/announcements",
         ApiMethod::Get,
-        ApiRouteSupport::DisabledResponse,
+        ApiRouteSupport::Implemented,
     ),
     (
         "/api/v2/search",
@@ -4757,6 +4757,20 @@ async fn federation_actor_response(
             return error_response(StatusCode::GONE, "Unavailable account");
         }
     }
+    let Ok(hashtags) = state
+        .repository
+        .activitypub_account_hashtags(account.id)
+        .await
+    else {
+        return internal_error();
+    };
+    let Ok(emojis) = state
+        .repository
+        .activitypub_account_emojis(account.id)
+        .await
+    else {
+        return internal_error();
+    };
     activity_response(
         StatusCode::OK,
         ACTIVITY_JSON,
@@ -4765,6 +4779,8 @@ async fn federation_actor_response(
             &state.local_domain,
             &state.media_root_url,
             &account,
+            &hashtags,
+            &emojis,
         ),
     )
 }
@@ -8755,10 +8771,24 @@ async fn account_search(
 }
 
 async fn announcements(State(state): State<WebState>, headers: HeaderMap) -> Response<Body> {
-    if let Err(response) = required_viewer(&state, &headers, NO_SCOPE).await {
-        return response;
+    let owner = match required_viewer(&state, &headers, NO_SCOPE).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let Ok(announcements) = state.loader(Some(owner)).announcements(owner).await else {
+        return internal_error();
+    };
+    let serializer = state.serializer();
+    match announcements
+        .iter()
+        .map(|announcement| serializer.announcement(announcement))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
+        .and_then(|announcements| serde_json::to_vec(&announcements).ok())
+    {
+        Some(body) => json_response(StatusCode::OK, body),
+        None => internal_error(),
     }
-    json_response(StatusCode::OK, b"[]".to_vec())
 }
 
 async fn search_v2(
@@ -8796,8 +8826,13 @@ async fn search_v2(
     } else {
         0
     };
+    let exclude_unreviewed = boolean_parameter(&rack, "exclude_unreviewed");
     let tags = if search_type.is_none_or(|value| value == "hashtags") && limit > 0 {
-        match state.loader(owner).tag_search(query, limit, offset).await {
+        match state
+            .loader(owner)
+            .tag_search(query, limit, offset, exclude_unreviewed)
+            .await
+        {
             Ok(tags) => tags,
             Err(_) => return internal_error(),
         }
@@ -16469,7 +16504,7 @@ async fn status_delete(
     let Some(writer) = state.write_repository.as_ref() else {
         return internal_error();
     };
-    let deleted_media = match writer
+    match writer
         .delete_status(
             &authenticated,
             status_id,
@@ -16477,11 +16512,8 @@ async fn status_delete(
         )
         .await
     {
-        Ok(media) => media,
+        Ok(_) => {}
         Err(error) => return status_saved_write_error(&error),
-    };
-    for media in &deleted_media {
-        remove_media_files(&state.media_root, media);
     }
     match body {
         Some(body) => json_response(StatusCode::OK, body),

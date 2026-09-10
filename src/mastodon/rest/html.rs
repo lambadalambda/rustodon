@@ -62,6 +62,13 @@ impl<'a> HtmlFormatter<'a> {
     }
 
     #[must_use]
+    pub fn announcement_text(&self, text: &str, mentions: &[MentionTarget<'_>]) -> RenderedHtml {
+        RenderedHtml(simple_format(
+            &self.linkify_local(text, mentions, false, false),
+        ))
+    }
+
+    #[must_use]
     pub fn local_inline(&self, text: &str, mentions: &[MentionTarget<'_>]) -> RenderedHtml {
         RenderedHtml(self.linkify_local(text, mentions, true, false))
     }
@@ -284,7 +291,12 @@ fn hashtag_end(text: &str, start: usize) -> Option<usize> {
     }
     let mut end = start + hash.len_utf8();
     while let Some(character) = text[end..].chars().next() {
-        if character.is_alphanumeric() || matches!(character, '_' | '·' | '・' | '\u{200c}') {
+        if character.is_alphanumeric()
+            || matches!(
+                character,
+                '_' | '·' | '・' | '\u{200c}' | '\u{0e47}'..='\u{0e4e}'
+            )
+        {
             end += character.len_utf8();
         } else {
             break;

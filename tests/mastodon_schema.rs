@@ -609,6 +609,68 @@ async fn reads_every_mapped_mastodon_4_6_5_record_losslessly() -> sqlx::Result<(
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "starts a restored Mastodon PostgreSQL fixture through the Mise task"]
+async fn remote_profile_emoji_is_visible_from_mastodon_schema_rows() -> sqlx::Result<()> {
+    const EMOJI_ID: i64 = -93_011;
+    let url = database_url();
+    let owner_url = std::env::var("RUSTODON_MASTODON_OWNER_DATABASE_URL")
+        .expect("the Podman fixture task must provide RUSTODON_MASTODON_OWNER_DATABASE_URL");
+    let mut connection = PgConnection::connect(&owner_url).await?;
+    let display_name =
+        sqlx::query_scalar::<_, String>("SELECT display_name FROM accounts WHERE id = $1")
+            .bind(BOB)
+            .fetch_one(&mut connection)
+            .await?;
+    sqlx::query("DELETE FROM custom_emojis WHERE id = $1")
+        .bind(EMOJI_ID)
+        .execute(&mut connection)
+        .await?;
+    sqlx::query(
+        "INSERT INTO custom_emojis
+             (id, shortcode, domain, uri, image_content_type, image_file_name,
+              image_file_size, image_remote_url, image_storage_schema_version,
+              disabled, visible_in_picker, created_at, updated_at)
+         VALUES ($1, 'profile_blob', 'remote.fixture.invalid',
+                 'https://remote.fixture.invalid/emojis/profile_blob', 'image/png',
+                 'profile.png', 68, 'https://media.fixture.invalid/profile.png', 1,
+                 false, false, clock_timestamp(), clock_timestamp())",
+    )
+    .bind(EMOJI_ID)
+    .execute(&mut connection)
+    .await?;
+    sqlx::query("UPDATE accounts SET display_name = $2 WHERE id = $1")
+        .bind(BOB)
+        .bind(format!("{display_name} :profile_blob:"))
+        .execute(&mut connection)
+        .await?;
+
+    let result = async {
+        let loader = RestProjectionLoader::new(
+            Repository::connect(&url).await?,
+            None,
+            "fixture-v4-6-5.rustodon.invalid",
+        );
+        let account = loader.account(BOB).await?.expect("remote account exists");
+        assert_eq!(account.emojis.len(), 1);
+        assert_eq!(account.emojis[0].shortcode, "profile_blob");
+        assert!(!account.emojis[0].visible_in_picker);
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+
+    sqlx::query("UPDATE accounts SET display_name = $2 WHERE id = $1")
+        .bind(BOB)
+        .bind(display_name)
+        .execute(&mut connection)
+        .await?;
+    sqlx::query("DELETE FROM custom_emojis WHERE id = $1")
+        .bind(EMOJI_ID)
+        .execute(&mut connection)
+        .await?;
+    result
+}
+
 fn bearer_headers(token: &'static str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(AUTHORIZATION, HeaderValue::from_static(token));
@@ -8460,13 +8522,23 @@ async fn hashtag_search_matches_normalized_prefixes_and_relationships() -> Resul
         "fixture-v4-6-5.rustodon.invalid",
     );
 
-    let tags = loader.tag_search("#Fixt", 20, 0).await?;
+    let tags = loader.tag_search("#Fixt", 20, 0, false).await?;
     assert_eq!(tags.len(), 1);
     assert_eq!(tags[0].id, 9201);
     assert_eq!(tags[0].name, "fixturetag");
     assert_eq!(tags[0].display_name.as_deref(), Some("FixtureTag"));
     assert_eq!(tags[0].following, Some(true));
     assert_eq!(tags[0].featuring, Some(true));
-    assert!(loader.tag_search("#missing", 20, 0).await?.is_empty());
+    assert!(loader.tag_search("#Fixt", 20, 0, true).await?.is_empty());
+    assert_eq!(
+        loader.tag_search("#FixtureTag", 20, 0, true).await?[0].id,
+        9201
+    );
+    assert!(
+        loader
+            .tag_search("#missing", 20, 0, false)
+            .await?
+            .is_empty()
+    );
     Ok(())
 }

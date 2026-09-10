@@ -3286,6 +3286,16 @@ impl WriteRepository {
         {
             return Ok(());
         }
+        upsert_remote_emojis(
+            &mut transaction,
+            domain.as_deref().expect("remote account has a domain"),
+            actor_uri,
+            object,
+        )
+        .await?;
+        if let Some(note) = note.as_deref() {
+            update_account_tags(&mut transaction, account_id, note).await?;
+        }
         sqlx::query(
             "UPDATE accounts SET
                 username = COALESCE($2, username),
@@ -3724,7 +3734,7 @@ impl WriteRepository {
             transaction.commit().await?;
             return Ok(None);
         }
-        upsert_remote_note_emojis(
+        upsert_remote_emojis(
             &mut transaction,
             domain.as_deref().expect("remote accounts have a domain"),
             actor_uri,
@@ -4179,7 +4189,7 @@ impl WriteRepository {
             transaction.commit().await?;
             return Ok(None);
         }
-        upsert_remote_note_emojis(
+        upsert_remote_emojis(
             &mut transaction,
             domain.as_deref().expect("remote accounts have a domain"),
             actor_uri,
@@ -5062,7 +5072,10 @@ impl WriteRepository {
                 "Media attachment is currently used by a status",
             ));
         }
-        let paths = local_media_deletion_paths(&media)?;
+        let paths = local_media_deletion_paths(&media);
+        if paths.is_empty() {
+            return Err(WriteError::NotFound);
+        }
         #[cfg(feature = "test-support")]
         if self
             .local_media_cleanup_intent_fault
@@ -6425,6 +6438,28 @@ impl WriteRepository {
         .execute(&mut *transaction)
         .await?;
         if delete_media && !reported {
+            let cleanup_jobs = removed_attachments
+                .iter()
+                .filter_map(|media| {
+                    let paths = local_media_deletion_paths(media);
+                    (!paths.is_empty())
+                        .then(|| local_media_cleanup_job(account_id, media.id, "delete", &paths))
+                })
+                .collect::<Vec<_>>();
+            #[cfg(feature = "test-support")]
+            if !cleanup_jobs.is_empty()
+                && self
+                    .local_media_cleanup_intent_fault
+                    .as_ref()
+                    .is_some_and(|fault| fault.swap(false, Ordering::AcqRel))
+            {
+                return Err(WriteError::InvalidInput(
+                    "injected local media cleanup intent failure",
+                ));
+            }
+            for cleanup_job in &cleanup_jobs {
+                record_outbox_in(&mut transaction, cleanup_job).await?;
+            }
             sqlx::query("DELETE FROM media_attachments WHERE status_id = $1")
                 .bind(status_id)
                 .execute(&mut *transaction)
@@ -11375,7 +11410,7 @@ impl RemoteNoteData {
     }
 }
 
-async fn upsert_remote_note_emojis(
+async fn upsert_remote_emojis(
     transaction: &mut Transaction<'_, Postgres>,
     domain: &str,
     actor_uri: &str,
@@ -12963,13 +12998,13 @@ fn local_media_create_cleanup_job(
     ))
 }
 
-fn local_media_deletion_paths(media: &MediaAttachment) -> Result<Vec<String>, WriteError> {
+fn local_media_deletion_paths(media: &MediaAttachment) -> Vec<String> {
     let mut paths = Vec::new();
     if let Some(file_name) = media.file_file_name.as_ref() {
         let metadata = PaperclipMetadata {
             attachment: PaperclipAttachment::MediaFile,
             id: media.id,
-            remote: false,
+            remote: !rails_blank(&media.remote_url),
             storage_schema_version: media.file_storage_schema_version,
             file_name: file_name.clone(),
             content_type: media.file_content_type.clone(),
@@ -12985,7 +13020,10 @@ fn local_media_deletion_paths(media: &MediaAttachment) -> Result<Vec<String>, Wr
         let metadata = PaperclipMetadata {
             attachment: PaperclipAttachment::MediaThumbnail,
             id: media.id,
-            remote: false,
+            remote: !media
+                .thumbnail_remote_url
+                .as_deref()
+                .is_none_or(rails_blank),
             storage_schema_version: media.thumbnail_storage_schema_version,
             file_name: file_name.clone(),
             content_type: media.thumbnail_content_type.clone(),
@@ -12993,12 +13031,9 @@ fn local_media_deletion_paths(media: &MediaAttachment) -> Result<Vec<String>, Wr
         };
         paths.extend(metadata.relative_path("original"));
     }
-    if paths.is_empty() {
-        return Err(WriteError::NotFound);
-    }
     paths.sort_unstable();
     paths.dedup();
-    Ok(paths)
+    paths
 }
 
 fn local_media_cleanup_job(

@@ -1283,6 +1283,28 @@ pub(crate) async fn run_actor_media_case(
                 .into());
             }
         }
+        let emoji = actor["tag"]
+            .as_array()
+            .and_then(|tags| tags.iter().find(|tag| tag["type"] == "Emoji"))
+            .ok_or_else(|| format!("{side} actor omitted its profile emoji tag"))?;
+        if emoji["name"] != ":actorprofileblob:"
+            || emoji["id"] != "https://fixture-v4-6-5.rustodon.invalid/emojis/12991"
+        {
+            return Err(
+                format!("{side} actor returned an unexpected profile emoji: {emoji}").into(),
+            );
+        }
+    }
+    let mastodon_actor: Value = serde_json::from_slice(&responses.mastodon.body)?;
+    let rust_actor: Value = serde_json::from_slice(&responses.rust.body)?;
+    let profile_emoji = |actor: &Value| {
+        actor["tag"]
+            .as_array()
+            .and_then(|tags| tags.iter().find(|tag| tag["type"] == "Emoji"))
+            .cloned()
+    };
+    if profile_emoji(&mastodon_actor) != profile_emoji(&rust_actor) {
+        return Err("actor profile emoji differs from pinned Mastodon".into());
     }
     guard.finish().await
 }

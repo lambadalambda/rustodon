@@ -43,6 +43,15 @@ const FRONTEND_ROUTES: &[FrontendRouteContract] = &[
         router_handler: "get(grouped_notifications)",
     },
     FrontendRouteContract {
+        label: "delayed authenticated instance refresh",
+        source: "app/javascript/mastodon/api/instance.ts",
+        evidence: "apiRequestGet<ApiInstanceJSON>('v2/instance')",
+        path: "/api/v2/instance",
+        method: ApiMethod::Get,
+        support: ApiRouteSupport::Implemented,
+        router_handler: "get(instance_v2)",
+    },
+    FrontendRouteContract {
         label: "disabled startup translation probe",
         source: "app/javascript/mastodon/api/instance.ts",
         evidence: "'v1/instance/translation_languages'",
@@ -57,7 +66,7 @@ const FRONTEND_ROUTES: &[FrontendRouteContract] = &[
         evidence: "api().get('/api/v1/announcements')",
         path: "/api/v1/announcements",
         method: ApiMethod::Get,
-        support: ApiRouteSupport::DisabledResponse,
+        support: ApiRouteSupport::Implemented,
         router_handler: "get(announcements)",
     },
     FrontendRouteContract {
@@ -104,6 +113,7 @@ fn pinned_frontend_routes_are_explicitly_supported_and_routed() {
         "fetchMarkers()",
         "expandHomeTimeline()",
         "fetchNotifications()",
+        "fetchServer()",
         "fetchServerTranslationLanguages()",
         "checkAnnualReport()",
     ] {

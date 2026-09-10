@@ -931,11 +931,21 @@ async fn distribute_account_update(
     if account.domain.is_some() || account.updated_at != requested_updated_at {
         return Ok(());
     }
+    let hashtags = repository
+        .activitypub_account_hashtags(account_id)
+        .await
+        .map_err(|_| HandlerFailure::retry("account update hashtag lookup failed"))?;
+    let emojis = repository
+        .activitypub_account_emojis(account_id)
+        .await
+        .map_err(|_| HandlerFailure::retry("account update emoji lookup failed"))?;
     let activity = activitypub::update_actor(
         &config.origin,
         &config.local_domain,
         &config.media_root_url,
         &account,
+        &hashtags,
+        &emojis,
     );
     let recipient_ids = repository
         .activitypub_account_reach_account_ids(account_id)
@@ -2313,14 +2323,13 @@ fn announce_resolution_logical_key(activity_uri: &str) -> String {
 
 fn note_resolution_logical_key(
     source_account_id: i64,
-    activity_uri: &str,
     actor_uri: &str,
     object_uri: &str,
     delivery_target_account_id: Option<i64>,
 ) -> String {
     let digest = Sha256::digest(
         format!(
-            "{source_account_id}\n{activity_uri}\n{actor_uri}\n{object_uri}\n{}",
+            "{source_account_id}\n{actor_uri}\n{object_uri}\n{}",
             delivery_target_account_id.map_or_else(|| "shared".to_owned(), |id| id.to_string())
         )
         .as_bytes(),
@@ -2337,7 +2346,7 @@ fn validate_create_binding(
     actor_uri: &str,
     object_uri: &str,
 ) -> Result<(), HandlerFailure> {
-    let activity_location = Url::parse(activity_uri)
+    Url::parse(activity_uri)
         .map_err(|_| HandlerFailure::permanent("remote Create activity URI is invalid"))?;
     let actor_location = Url::parse(actor_uri)
         .map_err(|_| HandlerFailure::permanent("remote Create actor URI is invalid"))?;
@@ -2345,19 +2354,13 @@ fn validate_create_binding(
         .map_err(|_| HandlerFailure::permanent("remote Create object URI is invalid"))?;
     let actor_host = actor_location.host_str();
     if actor_host.is_none()
-        || activity_location
-            .host_str()
-            .zip(actor_host)
-            .is_none_or(|(activity_host, actor_host)| {
-                !activity_host.eq_ignore_ascii_case(actor_host)
-            })
         || object_location
             .host_str()
             .zip(actor_host)
             .is_none_or(|(object_host, actor_host)| !object_host.eq_ignore_ascii_case(actor_host))
     {
         return Err(HandlerFailure::permanent(
-            "remote Create activity, actor, and object hosts do not match",
+            "remote Create actor and object hosts do not match",
         ));
     }
     Ok(())
@@ -2416,7 +2419,6 @@ async fn schedule_remote_note_resolution(
     )
     .logical_key(note_resolution_logical_key(
         source_account_id,
-        activity_uri,
         actor_uri,
         object_uri,
         delivery_target_account_id,
@@ -5917,7 +5919,7 @@ mod tests {
         inbox_actor_domain, note_fetch_audience, note_resolution_logical_key,
         preferred_note_fetch_signer_id, remote_announce_document, remote_media_fetch_failure,
         remote_note_document, remote_note_fetch_failure, resolved_create_note, retry_delay,
-        safe_cleanup_path, update_delivery_logical_key,
+        safe_cleanup_path, update_delivery_logical_key, validate_create_binding,
     };
     use crate::jobs::Lane;
     use crate::remote::RemoteFetchError;
@@ -6140,7 +6142,6 @@ mod tests {
     fn note_resolution_keys_preserve_actor_object_and_personal_recipient() {
         let first = note_resolution_logical_key(
             1,
-            "https://remote.example/activities/1",
             "https://remote.example/users/alice",
             "https://remote.example/statuses/1",
             Some(7),
@@ -6149,7 +6150,6 @@ mod tests {
             first,
             note_resolution_logical_key(
                 1,
-                "https://remote.example/activities/1",
                 "https://remote.example/users/alice",
                 "https://remote.example/statuses/1",
                 Some(7),
@@ -6159,7 +6159,6 @@ mod tests {
             first,
             note_resolution_logical_key(
                 1,
-                "https://remote.example/activities/1",
                 "https://remote.example/users/alice",
                 "https://remote.example/statuses/1",
                 Some(8),
@@ -6169,7 +6168,6 @@ mod tests {
             first,
             note_resolution_logical_key(
                 2,
-                "https://remote.example/activities/1",
                 "https://remote.example/users/mallory",
                 "https://remote.example/statuses/2",
                 Some(7),
@@ -6203,8 +6201,8 @@ mod tests {
     }
 
     #[test]
-    fn resolved_create_note_rejects_spoofed_identity_actor_and_type() {
-        let activity_uri = "https://remote.example/activities/1";
+    fn resolved_create_note_accepts_cross_host_activity_with_origin_bound_object() {
+        let activity_uri = "https://relay.example/activities/1";
         let actor_uri = "https://remote.example/users/alice";
         let object_uri = "https://remote.example/statuses/1";
         let valid = json!({
@@ -6214,6 +6212,33 @@ mod tests {
             "content": "hello"
         });
         assert!(resolved_create_note(&valid, activity_uri, actor_uri, object_uri).is_ok());
+    }
+
+    #[test]
+    fn create_binding_rejects_cross_host_object_spoofing() {
+        assert_eq!(
+            validate_create_binding(
+                "https://relay.example/activities/1",
+                "https://remote.example/users/alice",
+                "https://attacker.example/statuses/1",
+            )
+            .expect_err("the dereferenced object must remain on the actor origin")
+            .disposition,
+            FailureDisposition::Permanent
+        );
+    }
+
+    #[test]
+    fn resolved_create_note_rejects_spoofed_logical_identity_actor_and_type() {
+        let activity_uri = "https://relay.example/activities/1";
+        let actor_uri = "https://remote.example/users/alice";
+        let object_uri = "https://remote.example/statuses/1";
+        let valid = json!({
+            "id": object_uri,
+            "type": "Note",
+            "attributedTo": actor_uri,
+            "content": "hello"
+        });
 
         for spoofed in [
             json!({"id":"https://remote.example/statuses/2","type":"Note","attributedTo":actor_uri,"content":"hello"}),

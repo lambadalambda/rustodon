@@ -7,9 +7,9 @@ use rustodon::crypto::ActiveRecordEncryptionConfig;
 use rustodon::jobs::{Queue, connect_pool};
 use rustodon::mail::MailConfig;
 use rustodon::mastodon::rest::InstanceRuntimeConfig;
-use rustodon::mastodon::{MediaAttachment, Repository, WriteRepository, random_auth_token};
+use rustodon::mastodon::{Repository, WriteRepository, random_auth_token};
 use rustodon::operational_schema;
-use rustodon::paperclip::{PaperclipAttachment, PaperclipMetadata, PaperclipRoot, rails_blank};
+use rustodon::paperclip::PaperclipRoot;
 use rustodon::preflight;
 use rustodon::startup;
 use rustodon::web::{self, WebState};
@@ -388,16 +388,6 @@ async fn run_admin_delete_status(
         eprintln!("status deletion database configuration failed");
         return ExitCode::FAILURE;
     };
-    let media_root = if delete_media {
-        if let Ok(root) = PaperclipRoot::open(&config.paperclip.root_path) {
-            Some(root)
-        } else {
-            eprintln!("status deletion media root could not be opened safely");
-            return ExitCode::FAILURE;
-        }
-    } else {
-        None
-    };
     let Ok(writer) = WriteRepository::connect_with_pool_size(options, database.pool_size).await
     else {
         eprintln!("status deletion database connection failed");
@@ -413,52 +403,11 @@ async fn run_admin_delete_status(
             return ExitCode::FAILURE;
         }
     };
-    if let Some(media_root) = media_root.as_ref() {
-        remove_admin_media_files(media_root, &removed_media);
-    }
     eprintln!(
         "status {status_id} deleted by account {actor_account_id}; removed_media={}",
         removed_media.len()
     );
     ExitCode::SUCCESS
-}
-
-fn remove_admin_media_files(root: &PaperclipRoot, media: &[MediaAttachment]) {
-    for media in media {
-        if let Some(file_name) = media.file_file_name.as_deref() {
-            let metadata = PaperclipMetadata {
-                attachment: PaperclipAttachment::MediaFile,
-                id: media.id,
-                remote: !rails_blank(&media.remote_url),
-                storage_schema_version: media.file_storage_schema_version,
-                file_name: file_name.to_owned(),
-                content_type: media.file_content_type.clone(),
-                variant: None,
-            };
-            for style in ["original", "small"] {
-                if let Some(path) = metadata.relative_path(style) {
-                    let _ = root.remove_file(std::path::Path::new(&path));
-                }
-            }
-        }
-        if let Some(file_name) = media.thumbnail_file_name.as_deref() {
-            let metadata = PaperclipMetadata {
-                attachment: PaperclipAttachment::MediaThumbnail,
-                id: media.id,
-                remote: media
-                    .thumbnail_remote_url
-                    .as_deref()
-                    .is_some_and(|url| !rails_blank(url)),
-                storage_schema_version: media.thumbnail_storage_schema_version,
-                file_name: file_name.to_owned(),
-                content_type: media.thumbnail_content_type.clone(),
-                variant: None,
-            };
-            if let Some(path) = metadata.relative_path("original") {
-                let _ = root.remove_file(std::path::Path::new(&path));
-            }
-        }
-    }
 }
 
 async fn run_admin_reconcile_account_stats(

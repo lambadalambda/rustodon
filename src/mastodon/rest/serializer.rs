@@ -6,18 +6,19 @@ use url::Url;
 use crate::paperclip::{PaperclipAttachment, PaperclipMetadata, encode_url_path, rails_blank};
 
 use super::{
-    AccountProjection, AccountRelationshipProjection, AccountWarningProjection, ApiDate,
-    ApiDateTime, ApiSecondDateTime, CollectionProjection, CredentialAccountProjection,
-    CustomEmojiProjection, DecimalId, FeaturedTagProjection, FilterProjection,
-    FilterResultProjection, GroupedNotificationsProjection, HtmlFormatter, InstanceProjection,
-    ListProjection, MarkerProjection, MediaAttachmentProjection, MentionProjection,
-    NotificationGroupProjection, NotificationProjection, NotificationRequestProjection,
-    PollProjection, PreferencesProjection, PreviewCardProjection, QuoteProjection,
-    QuoteTargetAccess, QuoteTargetLinkProjection, ReportProjection, RestAccount, RestAccountField,
-    RestAccountRole, RestAccountWarning, RestAnnualReport, RestAppeal, RestApplication,
-    RestCollection, RestCollectionItem, RestCollectionWithAccounts, RestCredentialAccount,
-    RestCredentialSource, RestCustomEmoji, RestFallback, RestFeatureApproval, RestFeaturedTag,
-    RestFilter, RestFilterKeyword, RestFilterResult, RestFilterStatus, RestGroupedNotifications,
+    AccountProjection, AccountRelationshipProjection, AccountWarningProjection,
+    AnnouncementProjection, ApiDate, ApiDateTime, ApiSecondDateTime, CollectionProjection,
+    CredentialAccountProjection, CustomEmojiProjection, DecimalId, FeaturedTagProjection,
+    FilterProjection, FilterResultProjection, GroupedNotificationsProjection, HtmlFormatter,
+    InstanceProjection, ListProjection, MarkerProjection, MediaAttachmentProjection,
+    MentionProjection, NotificationGroupProjection, NotificationProjection,
+    NotificationRequestProjection, PollProjection, PreferencesProjection, PreviewCardProjection,
+    QuoteProjection, QuoteTargetAccess, QuoteTargetLinkProjection, ReportProjection, RestAccount,
+    RestAccountField, RestAccountRole, RestAccountWarning, RestAnnouncement,
+    RestAnnouncementReaction, RestAnnualReport, RestAppeal, RestApplication, RestCollection,
+    RestCollectionItem, RestCollectionWithAccounts, RestCredentialAccount, RestCredentialSource,
+    RestCustomEmoji, RestFallback, RestFeatureApproval, RestFeaturedTag, RestFilter,
+    RestFilterKeyword, RestFilterResult, RestFilterStatus, RestGroupedNotifications,
     RestInstanceV1, RestInstanceV2, RestList, RestMarker, RestMediaAttachment, RestMention,
     RestMutedAccount, RestNotification, RestNotificationGroup, RestNotificationRequest,
     RestPartialAccount, RestPoll, RestPollOption, RestPreferences, RestPreviewCard,
@@ -96,6 +97,77 @@ impl<'a> RestSerializer<'a> {
 
     pub fn account(&self, account: &AccountProjection) -> Result<RestAccount, RestError> {
         self.account_with_depth(account, true)
+    }
+
+    pub fn announcement(
+        &self,
+        announcement: &AnnouncementProjection,
+    ) -> Result<RestAnnouncement, RestError> {
+        let mention_urls = announcement
+            .mentions
+            .iter()
+            .map(|mention| self.account_url(&mention.account))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mention_targets = announcement
+            .mentions
+            .iter()
+            .zip(&mention_urls)
+            .map(|(mention, url)| mention.account.mention_target(url))
+            .collect::<Vec<_>>();
+        let content = HtmlFormatter::new(self.origin, self.local_domain)
+            .announcement_text(&announcement.text, &mention_targets)
+            .into_string();
+        let reactions = announcement
+            .reactions
+            .iter()
+            .map(|reaction| {
+                let emoji = reaction
+                    .custom_emoji
+                    .as_ref()
+                    .map(|emoji| self.custom_emoji(emoji));
+                RestAnnouncementReaction {
+                    name: reaction.name.clone(),
+                    count: reaction.count,
+                    me: reaction.me,
+                    url: emoji.as_ref().map(|emoji| emoji.url.clone()),
+                    static_url: emoji.map(|emoji| emoji.static_url),
+                }
+            })
+            .collect();
+        Ok(RestAnnouncement {
+            id: DecimalId::new(announcement.id),
+            content,
+            starts_at: announcement.starts_at.map(ApiDateTime::new),
+            ends_at: announcement.ends_at.map(ApiDateTime::new),
+            all_day: announcement.all_day,
+            published_at: announcement.published_at.map(ApiDateTime::new),
+            updated_at: ApiDateTime::new(announcement.updated_at),
+            read: announcement.read,
+            mentions: announcement
+                .mentions
+                .iter()
+                .map(|mention| self.mention(mention))
+                .collect::<Result<_, _>>()?,
+            statuses: announcement
+                .statuses
+                .iter()
+                .map(|status| self.status(status, StatusShape::Full))
+                .collect::<Result<_, _>>()?,
+            tags: announcement
+                .tags
+                .iter()
+                .map(|name| RestShallowTag {
+                    name: name.clone(),
+                    url: self.tag_url(name),
+                })
+                .collect(),
+            emojis: announcement
+                .emojis
+                .iter()
+                .map(|emoji| self.custom_emoji(emoji))
+                .collect(),
+            reactions,
+        })
     }
 
     #[must_use]

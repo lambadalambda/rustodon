@@ -4421,14 +4421,24 @@ async fn activitypub_actor_update_and_delete_are_processed_idempotently()
             "id": actor_uri,
             "type": actor_type.as_deref().unwrap_or("Person"),
             "preferredUsername": username,
-            "name": "Fixture Updated Actor",
-            "summary": "Fixture updated summary",
+            "name": "Fixture Updated Actor :actor_profile_blob:",
+            "summary": "Fixture updated summary #actorprofile",
             "url": url.as_deref().unwrap_or(&actor_uri),
             "inbox": inbox_url,
             "outbox": outbox_url,
             "followers": followers_url,
             "following": following_url,
-            "endpoints": endpoints
+            "endpoints": endpoints,
+            "tag": [
+                {"type": "Hashtag", "name": "#actorprofile", "href": "https://remote.fixture.invalid/tags/actorprofile"},
+                {
+                    "id": "https://remote.fixture.invalid/emojis/actor_profile_blob",
+                    "type": "Emoji",
+                    "name": ":actor_profile_blob:",
+                    "updated": "2026-08-25T12:00:00Z",
+                    "icon": {"type": "Image", "mediaType": "image/png", "url": "https://media.fixture.invalid/actor-profile.png"}
+                }
+            ]
         }
     })
     .to_string();
@@ -4522,6 +4532,57 @@ async fn activitypub_actor_update_and_delete_are_processed_idempotently()
                     .await?,
                     1,
                     "remote actor unsuspension must preserve the existing follow"
+                );
+            }
+            if logical_key == "activitypub:test-actor-update" {
+                let profile_emoji = sqlx::query_as::<_, (i64, String, bool, bool)>(
+                    "SELECT id, image_remote_url, disabled, visible_in_picker
+                       FROM custom_emojis
+                      WHERE shortcode = 'actor_profile_blob' AND domain = $1",
+                )
+                .bind(&remote_domain)
+                .fetch_one(&writer_pool)
+                .await?;
+                assert_eq!(
+                    profile_emoji.1,
+                    "https://media.fixture.invalid/actor-profile.png"
+                );
+                assert!(!profile_emoji.2);
+                assert!(profile_emoji.3);
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM rustodon.outbox_events
+                          WHERE kind = $1 AND payload -> 'arguments' ->> 'emoji_id' = $2",
+                    )
+                    .bind(ACTIVITYPUB_EMOJI_FETCH_JOB_KIND)
+                    .bind(profile_emoji.0.to_string())
+                    .fetch_one(&writer_pool)
+                    .await?,
+                    1,
+                    "actor emoji fetches must use the deduplicated Note emoji pipeline",
+                );
+                assert_eq!(
+                    sqlx::query_scalar::<_, Vec<String>>(
+                        "SELECT array_agg(tag.name ORDER BY tag.name)
+                           FROM accounts_tags account_tag
+                           JOIN tags tag ON tag.id = account_tag.tag_id
+                          WHERE account_tag.account_id = $1",
+                    )
+                    .bind(actor_id)
+                    .fetch_one(&writer_pool)
+                    .await?,
+                    vec!["actorprofile".to_owned()],
+                    "actor emoji processing must preserve profile hashtag associations",
+                );
+                assert_eq!(
+                    sqlx::query_scalar::<_, Option<Value>>(
+                        "SELECT fields FROM accounts WHERE id = $1",
+                    )
+                    .bind(actor_id)
+                    .fetch_one(&writer_pool)
+                    .await?,
+                    fields.clone(),
+                    "an actor Update without attachment must preserve profile fields",
                 );
             }
         }
@@ -4917,6 +4978,18 @@ async fn activitypub_actor_update_and_delete_are_processed_idempotently()
         .bind(ACTOR_ACCOUNT_ID)
         .execute(&writer_pool)
         .await?;
+    sqlx::query(
+        "DELETE FROM custom_emojis
+          WHERE shortcode = 'actor_profile_blob' AND domain = 'remote.fixture.invalid'",
+    )
+    .execute(&writer_pool)
+    .await?;
+    sqlx::query(
+        "DELETE FROM tags WHERE lower(name) = 'actorprofile'
+          AND NOT EXISTS (SELECT 1 FROM accounts_tags WHERE tag_id = tags.id)",
+    )
+    .execute(&writer_pool)
+    .await?;
     drop(media_root);
     fs::remove_dir_all(&media_root_path)?;
     result
@@ -5910,7 +5983,9 @@ async fn uri_only_create_is_deduplicated_retried_materialized_and_replayed()
     const ORIGIN: &str = "https://fixture-v4-6-5.rustodon.invalid/";
     const ACTOR: &str = "https://remote.fixture.invalid/users/bob";
     const KEY_ID: &str = "https://remote.fixture.invalid/users/bob#secondary-key";
-    const ACTIVITY_URI: &str = "http://remote.fixture.invalid/activities/rustodon-uri-create";
+    const ACTIVITY_URI: &str = "http://relay.fixture.invalid/activities/rustodon-uri-create";
+    const ALTERNATE_ACTIVITY_URI: &str =
+        "http://another-relay.fixture.invalid/activities/rustodon-uri-create-copy";
     const NOTE_URI: &str = "http://remote.fixture.invalid/users/bob/statuses/rustodon-uri-create";
     const DELETED_ACTIVITY_URI: &str =
         "http://remote.fixture.invalid/activities/rustodon-uri-create-deleted";
@@ -6046,11 +6121,20 @@ async fn uri_only_create_is_deduplicated_retried_materialized_and_replayed()
         }
     })
     .to_string();
+    let duplicate_body = body.replace(ACTIVITY_URI, ALTERNATE_ACTIVITY_URI);
     let result = async {
-        for (logical_key, delivery_target_account_id) in [
-            ("activitypub:test-uri-create", MODERATOR),
-            ("activitypub:test-uri-create-duplicate", MODERATOR),
-            ("activitypub:test-uri-create-second-recipient", API_MODERATOR),
+        for (logical_key, delivery_target_account_id, delivered_body) in [
+            ("activitypub:test-uri-create", MODERATOR, body.as_str()),
+            (
+                "activitypub:test-uri-create-duplicate",
+                MODERATOR,
+                duplicate_body.as_str(),
+            ),
+            (
+                "activitypub:test-uri-create-second-recipient",
+                API_MODERATOR,
+                body.as_str(),
+            ),
         ] {
             queue
                 .enqueue(
@@ -6058,7 +6142,7 @@ async fn uri_only_create_is_deduplicated_retried_materialized_and_replayed()
                         Lane::Ingress,
                         ACTIVITYPUB_INBOX_JOB_KIND,
                         json!({
-                            "body": body,
+                            "body": delivered_body,
                             "signature_key_id": KEY_ID,
                             "remote_domain": "remote.fixture.invalid",
                             "delivery_target_account_id": delivery_target_account_id
@@ -6081,7 +6165,7 @@ async fn uri_only_create_is_deduplicated_retried_materialized_and_replayed()
             .fetch_one(&writer_pool)
             .await?,
             2,
-            "exact retries must deduplicate without suppressing another personal inbox"
+            "alternate activity IDs must deduplicate without suppressing another personal inbox"
         );
         assert_eq!(queue.dispatch_outbox(10).await?, 2);
         let resolution_arguments: Value = sqlx::query_scalar(
@@ -7026,7 +7110,7 @@ async fn local_media_jobs_reconcile_create_and_delete_crash_boundaries()
         PaperclipRoot::open(&root_path)?.with_remove_fault(PaperclipRemoveFault::fail_once());
     let faulted_config = ActivityPubDeliveryConfig {
         media_root: Some(worker_root.clone()),
-        ..config
+        ..config.clone()
     };
     let handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
         &queue,
@@ -7076,7 +7160,173 @@ async fn local_media_jobs_reconcile_create_and_delete_crash_boundaries()
         0
     );
 
+    let status_media_id = writer
+        .stage_media_attachment(&authenticated, &create)
+        .await?;
+    let status_metadata = PaperclipMetadata {
+        id: status_media_id,
+        ..published_metadata
+    };
+    let mut status_paths = write_prepared_media(&media_root, &status_metadata, &prepared)?;
+    writer
+        .publish_media_attachment(&authenticated, status_media_id, &create)
+        .await?;
+    let thumbnail_metadata = PaperclipMetadata {
+        attachment: PaperclipAttachment::MediaThumbnail,
+        file_name: "status-thumbnail.jpg".to_owned(),
+        content_type: Some("image/jpeg".to_owned()),
+        ..status_metadata
+    };
+    let thumbnail_path = thumbnail_metadata
+        .relative_path("original")
+        .expect("status thumbnail path");
+    media_root.write_file(Path::new(&thumbnail_path), b"status thumbnail")?;
+    status_paths.push(thumbnail_path);
+    sqlx::query(
+        "UPDATE media_attachments SET thumbnail_content_type = 'image/jpeg', \
+             thumbnail_file_name = 'status-thumbnail.jpg', thumbnail_file_size = 16, \
+             thumbnail_storage_schema_version = 1, thumbnail_updated_at = clock_timestamp() \
+           WHERE id = $1",
+    )
+    .bind(status_media_id)
+    .execute(&writer_pool)
+    .await?;
+    assert_eq!(queue.dispatch_outbox(100).await?, 1);
+    assert!(
+        executor
+            .process_one(
+                "status-media-create-published",
+                &[Lane::Maintenance],
+                Duration::seconds(30)
+            )
+            .await?
+    );
+    let status = writer
+        .create_status(
+            &authenticated,
+            "durable status media cleanup",
+            &[status_media_id],
+            None,
+            Some(false),
+            Some("public"),
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+    let faulted_writer = writer.clone().with_local_media_cleanup_intent_fault();
+    assert!(
+        faulted_writer
+            .delete_status(&authenticated, status.status_id, true)
+            .await
+            .is_err(),
+        "status deletion rejects a failed cleanup-intent write"
+    );
+    assert!(
+        sqlx::query_scalar::<_, Option<NaiveDateTime>>(
+            "SELECT deleted_at FROM statuses WHERE id = $1"
+        )
+        .bind(status.status_id)
+        .fetch_one(&writer_pool)
+        .await?
+        .is_none(),
+        "status deletion rolls back with its cleanup intents"
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM media_attachments WHERE id = $1 AND status_id = $2)"
+        )
+        .bind(status_media_id)
+        .bind(status.status_id)
+        .fetch_one(&writer_pool)
+        .await?
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM rustodon.outbox_events
+              WHERE kind = $1 AND payload -> 'arguments' ->> 'media_id' = $2
+                AND payload -> 'arguments' ->> 'action' = 'delete'"
+        )
+        .bind(LOCAL_MEDIA_CLEANUP_JOB_KIND)
+        .bind(status_media_id.to_string())
+        .fetch_one(&writer_pool)
+        .await?,
+        0,
+        "a rolled-back status deletion leaves no cleanup intent"
+    );
+
+    writer
+        .delete_status(&authenticated, status.status_id, true)
+        .await?;
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM media_attachments WHERE id = $1)"
+        )
+        .bind(status_media_id)
+        .fetch_one(&writer_pool)
+        .await?,
+        "status metadata deletion and cleanup intent commit atomically"
+    );
+    for path in &status_paths {
+        assert!(
+            media_root.open_file(Path::new(path)).is_ok(),
+            "a crash after status deletion leaves files for the durable worker"
+        );
+    }
+    assert!(
+        queue.dispatch_outbox(100).await? >= 1,
+        "status deletion dispatches its local-media cleanup intent"
+    );
     drop(executor);
+    let status_worker_root =
+        PaperclipRoot::open(&root_path)?.with_remove_fault(PaperclipRemoveFault::fail_once());
+    let handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
+        &queue,
+        Some(writer_pool.clone()),
+        None,
+        Some(ActivityPubDeliveryConfig {
+            media_root: Some(status_worker_root.clone()),
+            ..config
+        }),
+    )?;
+    let executor = WorkerExecutor::new(queue.clone(), handlers, 1, 1)?;
+    assert!(
+        executor
+            .process_one(
+                "status-media-delete-retry",
+                &[Lane::Maintenance],
+                Duration::seconds(30)
+            )
+            .await?
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("SELECT attempts FROM rustodon.durable_jobs WHERE kind = $1")
+            .bind(LOCAL_MEDIA_CLEANUP_JOB_KIND)
+            .fetch_one(&runtime_pool)
+            .await?,
+        1,
+        "a failed status-media unlink remains durably retryable"
+    );
+    sqlx::query("UPDATE rustodon.durable_jobs SET run_at = clock_timestamp() WHERE kind = $1")
+        .bind(LOCAL_MEDIA_CLEANUP_JOB_KIND)
+        .execute(&runtime_pool)
+        .await?;
+    assert!(
+        executor
+            .process_one(
+                "status-media-delete-recovered",
+                &[Lane::Maintenance],
+                Duration::seconds(30)
+            )
+            .await?
+    );
+    for path in &status_paths {
+        assert!(status_worker_root.open_file(Path::new(path)).is_err());
+    }
+
+    drop(executor);
+    drop(status_worker_root);
     drop(worker_root);
     drop(faulted_root);
     drop(media_root);
@@ -8658,6 +8908,18 @@ async fn activitypub_account_updates_are_fanned_out_and_stale_jobs_are_fenced()
     .bind(ACCOUNT)
     .fetch_optional(&writer_pool)
     .await?;
+    sqlx::query("DELETE FROM custom_emojis WHERE id = 12992")
+        .execute(&writer_pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO custom_emojis
+             (id, shortcode, domain, image_content_type, image_file_name, image_file_size,
+              image_storage_schema_version, disabled, visible_in_picker, created_at, updated_at)
+         VALUES (12992, 'actorupdateblob', NULL, 'image/png', 'actor-update.png', 68,
+                 1, false, false, clock_timestamp(), clock_timestamp())",
+    )
+    .execute(&writer_pool)
+    .await?;
     sqlx::query("DELETE FROM follows WHERE account_id = $1 AND target_account_id = $2")
         .bind(REMOTE_FOLLOWER)
         .bind(ACCOUNT)
@@ -8681,7 +8943,7 @@ async fn activitypub_account_updates_are_fanned_out_and_stale_jobs_are_fenced()
     .execute(&writer_pool)
     .await?;
     let updated_at = sqlx::query_scalar::<_, NaiveDateTime>(
-        "UPDATE accounts SET display_name = 'Worker actor update', updated_at = clock_timestamp()
+        "UPDATE accounts SET display_name = 'Worker actor update :actorupdateblob:', updated_at = clock_timestamp()
           WHERE id = $1 RETURNING updated_at",
     )
     .bind(ACCOUNT)
@@ -8747,7 +9009,19 @@ async fn activitypub_account_updates_are_fanned_out_and_stale_jobs_are_fenced()
         update_body["to"][0],
         "https://www.w3.org/ns/activitystreams#Public"
     );
-    assert_eq!(update_body["object"]["name"], "Worker actor update");
+    assert_eq!(
+        update_body["object"]["name"],
+        "Worker actor update :actorupdateblob:"
+    );
+    let profile_emoji = update_body["object"]["tag"]
+        .as_array()
+        .and_then(|tags| tags.iter().find(|tag| tag["type"] == "Emoji"))
+        .ok_or("outbound actor Update omitted its profile emoji")?;
+    assert_eq!(profile_emoji["name"], ":actorupdateblob:");
+    assert_eq!(
+        profile_emoji["id"],
+        "https://fixture-v4-6-5.rustodon.invalid/emojis/12992"
+    );
     assert_eq!(
         update_body["id"],
         format!(
@@ -8951,6 +9225,9 @@ async fn activitypub_account_updates_are_fanned_out_and_stale_jobs_are_fenced()
     .bind(ACCOUNT.to_string())
     .execute(&writer_pool)
     .await?;
+    sqlx::query("DELETE FROM custom_emojis WHERE id = 12992")
+        .execute(&writer_pool)
+        .await?;
     sqlx::query(
         "UPDATE accounts SET shared_inbox_url = $1, inbox_url = $2, protocol = $3
           WHERE id = $4",

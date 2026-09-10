@@ -1,0 +1,97 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -P -- "$(dirname -- "$0")/../.." && pwd)
+test_root=$(mktemp -d "${TMPDIR:-/tmp}/rustodon-browser-smoke-test.XXXXXX")
+trap 'rm -rf "$test_root"' EXIT HUP INT TERM
+mkdir -p "$test_root/bin"
+
+cat > "$test_root/bin/agent-browser" <<'EOF'
+#!/bin/sh
+case "$*" in
+  'session id --scope worktree --prefix rustodon-browser') printf '%s\n' test-session ;;
+  *' get count #mastodon') printf '%s\n' 1 ;;
+  *' eval document.body.className') printf '%s\n' app-body ;;
+  *' eval '*initial-state*) printf '%s\n' true ;;
+  *' eval '*) printf '%s\n' true ;;
+  *' get text '*) printf '%s\n' 'Profile details Save changes' ;;
+  *' get url') printf '%s\n' 'http://fixture.invalid:18080/about' ;;
+  *' errors'*) printf '%s\n' 'No page errors' ;;
+  *' network requests'*) ;;
+  *' open '*) ;;
+  *' wait '*) ;;
+  *' fill '*) ;;
+  *' cookies '*) ;;
+  *' pushstate '*) ;;
+  *' close') ;;
+  *) printf 'unexpected agent-browser command: %s\n' "$*" >&2; exit 70 ;;
+esac
+EOF
+
+cat > "$test_root/bin/curl" <<'EOF'
+#!/bin/sh
+dump_header=''
+output=''
+cookie=''
+data=''
+url=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dump-header) dump_header=$2; shift 2 ;;
+    --output) output=$2; shift 2 ;;
+    --cookie) cookie=$2; shift 2 ;;
+    --data-urlencode)
+      case "$2" in csrf_token=*) data=$2 ;; esac
+      shift 2
+      ;;
+    http://*) url=$1; shift ;;
+    --resolve|--header|--cookie-jar|--write-out|--max-time) shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+case "$url:$dump_header:$data" in
+  */auth/sign_in:?*:)
+    printf '%s\n' 'Set-Cookie: __Host-csrf_token=sign-in-cookie; Path=/; Secure; HttpOnly' > "$dump_header"
+    printf '%s\n' '<input type="hidden" name="csrf_token" value="sign-in-rendered">' > "$output"
+    ;;
+  */auth/sign_in:?*:csrf_token=sign-in-rendered)
+    [ "$cookie" = '__Host-csrf_token=sign-in-cookie' ] || exit 81
+    printf '%s\n' 'Set-Cookie: _mastodon_session=browser-session; Path=/; HttpOnly' > "$dump_header"
+    printf '%s\n' '302|https://fixture.invalid/'
+    ;;
+  */settings/profile:?*:)
+    [ "$cookie" = '_mastodon_session=browser-session' ] || exit 82
+    printf '%s\n' 'Set-Cookie: __Host-csrf_token=logout-cookie; Path=/; Secure; HttpOnly' > "$dump_header"
+    printf '%s\n' '<input type="hidden" name="csrf_token" value="logout-rendered">' > "$output"
+    ;;
+  */auth/sign_out::csrf_token=logout-rendered)
+    [ "$cookie" = '__Host-csrf_token=logout-cookie; _mastodon_session=browser-session' ] || exit 83
+    printf '%s\n' 302
+    ;;
+  */settings/profile::)
+    [ "$cookie" = '_mastodon_session=browser-session' ] || exit 84
+    printf '%s\n' '302|https://fixture.invalid/auth/sign_in'
+    ;;
+  *) exit 85 ;;
+esac
+EOF
+
+chmod +x "$test_root/bin/agent-browser" "$test_root/bin/curl"
+output=$(PATH="$test_root/bin:$PATH" \
+  RUSTODON_BROWSER_AUTH=true \
+  RUSTODON_BROWSER_EMAIL=alice@fixture.invalid \
+  RUSTODON_BROWSER_PASSWORD=fixture-password \
+  RUSTODON_BROWSER_OTP=fixture-otp \
+  "$ROOT/tools/rustodon-browser-smoke" \
+  http://fixture.invalid:18080 fixture.invalid)
+
+case "$output" in
+  *'browser web-client smoke passed'*) ;;
+  *)
+    printf 'unexpected browser smoke output: %s\n' "$output" >&2
+    exit 1
+    ;;
+esac
+
+printf '%s\n' 'rustodon-browser-smoke shell tests passed'

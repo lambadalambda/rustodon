@@ -492,6 +492,58 @@ pub struct CustomEmojiProjection {
     pub featured: Option<bool>,
 }
 
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub(crate) struct RestAnnouncementRow {
+    pub id: i64,
+    pub text: String,
+    pub starts_at: Option<NaiveDateTime>,
+    pub ends_at: Option<NaiveDateTime>,
+    pub all_day: bool,
+    pub published_at: Option<NaiveDateTime>,
+    pub updated_at: NaiveDateTime,
+    pub status_ids: Option<Vec<i64>>,
+    pub read: bool,
+}
+
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub(crate) struct RestAnnouncementReactionRow {
+    pub announcement_id: i64,
+    pub name: String,
+    pub count: i64,
+    pub me: bool,
+    pub custom_emoji_id: Option<i64>,
+    pub shortcode: Option<String>,
+    pub domain: Option<String>,
+    pub image_file_name: Option<String>,
+    pub image_storage_schema_version: Option<i32>,
+    pub visible_in_picker: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnnouncementReactionProjection {
+    pub name: String,
+    pub count: i64,
+    pub me: bool,
+    pub custom_emoji: Option<CustomEmojiProjection>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnnouncementProjection {
+    pub id: i64,
+    pub text: String,
+    pub starts_at: Option<NaiveDateTime>,
+    pub ends_at: Option<NaiveDateTime>,
+    pub all_day: bool,
+    pub published_at: Option<NaiveDateTime>,
+    pub updated_at: NaiveDateTime,
+    pub read: bool,
+    pub mentions: Vec<MentionProjection>,
+    pub statuses: Vec<StatusProjection>,
+    pub tags: Vec<String>,
+    pub emojis: Vec<CustomEmojiProjection>,
+    pub reactions: Vec<AnnouncementReactionProjection>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, sqlx::FromRow)]
 pub struct RestCustomEmojiRow {
     pub id: i64,

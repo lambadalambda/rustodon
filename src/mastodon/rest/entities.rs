@@ -375,6 +375,34 @@ pub struct RestCustomEmoji {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RestAnnouncementReaction {
+    pub name: String,
+    pub count: i64,
+    pub me: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub static_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RestAnnouncement {
+    pub id: DecimalId,
+    pub content: String,
+    pub starts_at: Option<ApiDateTime>,
+    pub ends_at: Option<ApiDateTime>,
+    pub all_day: bool,
+    pub published_at: Option<ApiDateTime>,
+    pub updated_at: ApiDateTime,
+    pub read: bool,
+    pub mentions: Vec<RestMention>,
+    pub statuses: Vec<RestStatus>,
+    pub tags: Vec<RestShallowTag>,
+    pub emojis: Vec<RestCustomEmoji>,
+    pub reactions: Vec<RestAnnouncementReaction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RestPollOption {
     pub title: String,
     pub votes_count: Option<i64>,
