@@ -31,6 +31,7 @@ pub const NOTIFICATION_UNFILTER_JOB_KIND: &str = "rustodon.mastodon.unfilter_not
 pub const NOTIFICATION_CLEANUP_JOB_KIND: &str = "rustodon.mastodon.cleanup_filtered_notifications";
 pub const ACCOUNT_DELETION_DELAY_DAYS: i64 = 30;
 pub const MASTODON_DOMAIN_PURGE_JOB_KIND: &str = "rustodon.mastodon.purge_domain";
+pub const LOCAL_MEDIA_CLEANUP_JOB_KIND: &str = "rustodon.mastodon.cleanup_local_media";
 const STREAM_EVENT_ORDERING_LOCK_KEY: &str = "rustodon.mastodon.stream_event.commit_order";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

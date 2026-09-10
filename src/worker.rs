@@ -23,10 +23,10 @@ use crate::jobs::{
     ACTIVITYPUB_ANNOUNCE_RESOLVE_JOB_KIND, ACTIVITYPUB_DELIVERY_JOB_KIND,
     ACTIVITYPUB_INBOX_JOB_KIND, ACTIVITYPUB_MEDIA_FETCH_JOB_KIND,
     ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND, ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND, ClaimedJob,
-    JobError, JobSpec, Lane, MASTODON_ACCOUNT_PURGE_JOB_KIND, MASTODON_DOMAIN_BLOCK_JOB_KIND,
-    MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND, NOTIFICATION_CREATE_JOB_KIND,
-    NOTIFICATION_UNFILTER_JOB_KIND, Queue, WorkerHeartbeat, record_outbox_once_in,
-    record_stream_event_in,
+    JobError, JobSpec, LOCAL_MEDIA_CLEANUP_JOB_KIND, Lane, MASTODON_ACCOUNT_PURGE_JOB_KIND,
+    MASTODON_DOMAIN_BLOCK_JOB_KIND, MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND,
+    NOTIFICATION_CREATE_JOB_KIND, NOTIFICATION_UNFILTER_JOB_KIND, Queue, WorkerHeartbeat,
+    record_outbox_once_in, record_stream_event_in,
 };
 use crate::mail::MailRuntime;
 use crate::mastodon::activitypub_inbox::{
@@ -38,8 +38,8 @@ use crate::mastodon::{
     StatusVisibility, WriteError, WriteRepository, activitypub,
 };
 use crate::paperclip::{
-    PaperclipAttachment, PaperclipMetadata, PaperclipRoot, prepare_media_attachment,
-    write_prepared_media,
+    PaperclipAttachment, PaperclipMetadata, PaperclipRoot, parse_paperclip_path,
+    prepare_media_attachment, write_prepared_media,
 };
 use crate::remote::{
     RemoteAccountResolver, RemoteFetchError, RemoteFetchLimits, RemoteFetcher,
@@ -1395,6 +1395,106 @@ fn safe_cleanup_path(path: &str) -> bool {
         has_component = true;
     }
     has_component
+}
+
+async fn process_local_media_cleanup_job(
+    pool: PgPool,
+    root: PaperclipRoot,
+    arguments: &Value,
+) -> Result<(), HandlerFailure> {
+    let account_id = arguments
+        .get("account_id")
+        .and_then(Value::as_i64)
+        .filter(|id| *id > 0)
+        .ok_or_else(|| HandlerFailure::permanent("local media cleanup account ID is invalid"))?;
+    let media_id = arguments
+        .get("media_id")
+        .and_then(Value::as_i64)
+        .filter(|id| *id > 0)
+        .ok_or_else(|| HandlerFailure::permanent("local media cleanup media ID is invalid"))?;
+    let action = arguments
+        .get("action")
+        .and_then(Value::as_str)
+        .filter(|action| matches!(*action, "rollback_create" | "delete"))
+        .ok_or_else(|| HandlerFailure::permanent("local media cleanup action is invalid"))?;
+    let paths = arguments
+        .get("paths")
+        .and_then(Value::as_array)
+        .ok_or_else(|| HandlerFailure::permanent("local media cleanup paths are missing"))?
+        .iter()
+        .map(|path| {
+            path.as_str()
+                .filter(|path| safe_cleanup_path(path))
+                .filter(|path| {
+                    parse_paperclip_path(path).is_some_and(|parsed| {
+                        parsed.id() == media_id
+                            && matches!(
+                                parsed.attachment(),
+                                PaperclipAttachment::MediaFile
+                                    | PaperclipAttachment::MediaThumbnail
+                            )
+                    })
+                })
+                .map(str::to_owned)
+                .ok_or_else(|| HandlerFailure::permanent("local media cleanup path is invalid"))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if paths.is_empty() {
+        return Err(HandlerFailure::permanent(
+            "local media cleanup paths are missing",
+        ));
+    }
+
+    let writer = WriteRepository::from_pool(pool.clone());
+    writer
+        .with_account_lock(account_id, || async {
+            let mut transaction = pool.begin().await?;
+            let row = sqlx::query_as::<_, (Option<i64>, Option<String>)>(
+                "SELECT status_id, file_file_name FROM media_attachments
+                   WHERE id = $1 AND account_id = $2 FOR UPDATE",
+            )
+            .bind(media_id)
+            .bind(account_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if action == "rollback_create"
+                && row
+                    .as_ref()
+                    .is_some_and(|(_, file_name)| file_name.is_some())
+            {
+                transaction.commit().await?;
+                return Ok(());
+            }
+            if row
+                .as_ref()
+                .is_some_and(|(status_id, _)| status_id.is_some())
+            {
+                return Err(WriteError::Validation(
+                    "local media cleanup target is attached",
+                ));
+            }
+            for path in &paths {
+                root.remove_file(Path::new(path))?;
+            }
+            sqlx::query(
+                "DELETE FROM media_attachments
+                   WHERE id = $1 AND account_id = $2 AND status_id IS NULL",
+            )
+            .bind(media_id)
+            .bind(account_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| match error {
+            WriteError::Validation(_) | WriteError::InvalidInput(_) => {
+                HandlerFailure::permanent("local media cleanup target is invalid")
+            }
+            WriteError::Filesystem(_) => HandlerFailure::retry("local media unlink failed"),
+            _ => HandlerFailure::retry("local media cleanup failed"),
+        })
 }
 
 async fn process_notification_job(pool: PgPool, arguments: &Value) -> Result<(), HandlerFailure> {
@@ -4326,6 +4426,19 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
         .as_ref()
         .and_then(|config| config.media_root.clone());
     if let Some(mastodon_writer) = mastodon_writer {
+        if let Some(media_root) = domain_block_media_root.clone() {
+            let cleanup_pool = mastodon_writer.clone();
+            handlers.register(
+                LOCAL_MEDIA_CLEANUP_JOB_KIND,
+                Lane::Maintenance,
+                ResourceClass::Media,
+                move |job| {
+                    let pool = cleanup_pool.clone();
+                    let root = media_root.clone();
+                    async move { process_local_media_cleanup_job(pool, root, &job.arguments).await }
+                },
+            )?;
+        }
         let status_writer = mastodon_writer.clone();
         handlers.register(
             STATUS_NOTIFICATION_JOB_KIND,

@@ -14,27 +14,30 @@ use rustodon::jobs::{
     ACTIVITYPUB_ANNOUNCE_RESOLVE_JOB_KIND, ACTIVITYPUB_DELIVERY_JOB_KIND,
     ACTIVITYPUB_INBOX_JOB_KIND, ACTIVITYPUB_MEDIA_FETCH_JOB_KIND,
     ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND, ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND, JobError,
-    JobSpec, Lane, MASTODON_ACCOUNT_PURGE_JOB_KIND, MASTODON_DOMAIN_BLOCK_JOB_KIND,
-    MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND, NOTIFICATION_CREATE_JOB_KIND,
-    NOTIFICATION_UNFILTER_JOB_KIND, Queue, RetryResult, WorkerHeartbeat, enqueue_in,
-    record_outbox_in, record_outbox_once_in,
+    JobSpec, LOCAL_MEDIA_CLEANUP_JOB_KIND, Lane, MASTODON_ACCOUNT_PURGE_JOB_KIND,
+    MASTODON_DOMAIN_BLOCK_JOB_KIND, MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND,
+    NOTIFICATION_CREATE_JOB_KIND, NOTIFICATION_UNFILTER_JOB_KIND, Queue, RetryResult,
+    WorkerHeartbeat, enqueue_in, record_outbox_in, record_outbox_once_in,
 };
 use rustodon::mail::REPORT_JOB_KIND;
 use rustodon::mastodon::rest::InstanceRuntimeConfig;
 use rustodon::mastodon::{
     AccountProfileUpdate, AccountProfileValue, BearerAuthenticator, HttpSignatureRequest,
     HttpSignatureSigner, MediaAttachmentCreate, MediaAttachmentUpdate, NotificationPolicyUpdate,
-    Repository, StatusUpdate, WRITE_BLOCKS, WRITE_FOLLOWS, WRITE_NOTIFICATIONS, WRITE_REPORTS,
-    WRITE_STATUSES, WriteError, WriteOptions, WriteRepository, activitypub, body_digest_header,
-    sign_http_signature_with_headers,
+    Repository, StatusUpdate, WRITE_BLOCKS, WRITE_FOLLOWS, WRITE_MEDIA, WRITE_NOTIFICATIONS,
+    WRITE_REPORTS, WRITE_STATUSES, WriteError, WriteOptions, WriteRepository, activitypub,
+    body_digest_header, sign_http_signature_with_headers,
 };
 use rustodon::operational_schema::{MigrationError, validate};
 use rustodon::paperclip::{
     PaperclipAttachment, PaperclipMetadata, PaperclipRoot, prepare_media_attachment,
+    write_prepared_media,
 };
 #[cfg(feature = "test-support")]
-use rustodon::paperclip::{PaperclipCommitFault, PaperclipWriteFault};
+use rustodon::paperclip::{PaperclipCommitFault, PaperclipRemoveFault, PaperclipWriteFault};
 use rustodon::streaming::STREAM_EVENT_KIND;
+#[cfg(feature = "test-support")]
+use rustodon::web::cleanup_media_after_response_failure_for_test;
 use rustodon::worker::{
     ActivityPubDeliveryConfig, HandlerFailure, HandlerRegistry, ResourceClass, WorkerError,
     WorkerExecutor, infrastructure_handlers, infrastructure_handlers_with_writer,
@@ -5920,6 +5923,257 @@ async fn activitypub_media_fetch_fails_closed_without_losing_the_status()
 #[tokio::test]
 #[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
 #[allow(clippy::too_many_lines)]
+async fn local_media_jobs_reconcile_create_and_delete_crash_boundaries()
+-> Result<(), Box<dyn std::error::Error>> {
+    const ALICE: i64 = 116_844_606_259_201_001;
+    const ORIGIN: &str = "https://fixture-v4-6-5.rustodon.invalid/";
+
+    let runtime_url = std::env::var("RUSTODON_WORKER_DATABASE_URL")?;
+    let owner_url = std::env::var("RUSTODON_WORKER_OWNER_DATABASE_URL")?;
+    let runtime_pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&runtime_url)
+        .await?;
+    let writer_pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&owner_url)
+        .await?;
+    reset().await?;
+    let root_path = std::env::temp_dir().join(format!(
+        "rustodon-local-media-durability-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root_path);
+    fs::create_dir(&root_path)?;
+    let media_root = PaperclipRoot::open(&root_path)?;
+    let writer = WriteRepository::from_pool(writer_pool.clone());
+    let repository = Repository::from_pool(writer_pool.clone());
+    let authenticator = BearerAuthenticator::new(repository.clone());
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_static("Bearer fixture-bearer-token-v4-6-5"),
+    );
+    let authenticated = authenticator.authenticate(&headers, WRITE_MEDIA).await?;
+    let bytes = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/attachment.jpg")?;
+    let prepared = prepare_media_attachment(ALICE, "local.jpg", "image/jpeg", &bytes)?;
+    let create = MediaAttachmentCreate {
+        file_name: prepared.file_name.clone(),
+        content_type: prepared.content_type.clone(),
+        file_size: prepared.file_size,
+        file_meta: prepared.file_meta.clone(),
+        blurhash: prepared.blurhash.clone(),
+        description: Some("durable local media".to_owned()),
+        focus: AccountProfileValue::Unchanged,
+    };
+    let queue = Queue::new(runtime_pool.clone());
+    let config = ActivityPubDeliveryConfig {
+        origin: Url::parse(ORIGIN)?,
+        local_domain: "fixture-v4-6-5.rustodon.invalid".to_owned(),
+        media_root_url: "/system".to_owned(),
+        media_root: Some(media_root.clone()),
+        limited_federation: false,
+        remote_media_endpoint: None,
+        remote_delivery_endpoint: None,
+        remote_fetch_endpoint: None,
+    };
+    let handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
+        &queue,
+        Some(writer_pool.clone()),
+        None,
+        Some(config.clone()),
+    )?;
+    let executor = WorkerExecutor::new(queue.clone(), handlers, 1, 1)?;
+
+    let abandoned_id = writer
+        .stage_media_attachment(&authenticated, &create)
+        .await?;
+    assert_eq!(
+        repository
+            .media_attachment(ALICE, abandoned_id)
+            .await?
+            .and_then(|media| media.file_file_name),
+        None,
+        "staged creation has no published expected-file metadata"
+    );
+    let abandoned_metadata = PaperclipMetadata {
+        attachment: PaperclipAttachment::MediaFile,
+        id: abandoned_id,
+        remote: false,
+        storage_schema_version: Some(1),
+        file_name: prepared.file_name.clone(),
+        content_type: Some(prepared.content_type.clone()),
+        variant: None,
+    };
+    let abandoned_paths = write_prepared_media(&media_root, &abandoned_metadata, &prepared)?;
+    assert_eq!(queue.dispatch_outbox(100).await?, 1);
+    assert!(
+        executor
+            .process_one(
+                "local-create-rollback",
+                &[Lane::Maintenance],
+                Duration::seconds(30)
+            )
+            .await?
+    );
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM media_attachments WHERE id = $1)"
+        )
+        .bind(abandoned_id)
+        .fetch_one(&writer_pool)
+        .await?
+    );
+    for path in abandoned_paths {
+        assert!(media_root.open_file(Path::new(&path)).is_err());
+    }
+
+    let published_id = writer
+        .stage_media_attachment(&authenticated, &create)
+        .await?;
+    let published_metadata = PaperclipMetadata {
+        id: published_id,
+        ..abandoned_metadata
+    };
+    let published_paths = write_prepared_media(&media_root, &published_metadata, &prepared)?;
+    writer
+        .publish_media_attachment(&authenticated, published_id, &create)
+        .await?;
+    assert!(
+        repository
+            .media_attachment(ALICE, published_id)
+            .await?
+            .is_some()
+    );
+    assert_eq!(queue.dispatch_outbox(100).await?, 1);
+    assert!(
+        executor
+            .process_one(
+                "local-create-published",
+                &[Lane::Maintenance],
+                Duration::seconds(30)
+            )
+            .await?
+    );
+    for path in &published_paths {
+        assert!(media_root.open_file(Path::new(path)).is_ok());
+    }
+
+    let faulted_writer = writer.clone().with_local_media_cleanup_intent_fault();
+    assert!(
+        cleanup_media_after_response_failure_for_test(
+            &media_root,
+            &faulted_writer,
+            &authenticated,
+            published_id,
+        )
+        .await
+        .is_err(),
+        "a failed cleanup-intent write rejects response-failure cleanup"
+    );
+    assert!(
+        repository
+            .media_attachment(ALICE, published_id)
+            .await?
+            .is_some(),
+        "the failed transaction preserves published metadata"
+    );
+    for path in &published_paths {
+        assert!(
+            media_root.open_file(Path::new(path)).is_ok(),
+            "published files remain until cleanup intent commits"
+        );
+    }
+
+    let faulted_root =
+        PaperclipRoot::open(&root_path)?.with_remove_fault(PaperclipRemoveFault::fail_once());
+    writer
+        .delete_media_attachment(&authenticated, published_id)
+        .await?;
+    assert!(
+        repository
+            .media_attachment(ALICE, published_id)
+            .await?
+            .is_none(),
+        "metadata deletion and cleanup intent commit atomically"
+    );
+    for path in &published_paths {
+        let _ = faulted_root.remove_file(Path::new(path));
+    }
+    assert!(
+        published_paths
+            .iter()
+            .any(|path| faulted_root.open_file(Path::new(path)).is_ok())
+    );
+
+    assert_eq!(queue.dispatch_outbox(100).await?, 1);
+    let worker_root =
+        PaperclipRoot::open(&root_path)?.with_remove_fault(PaperclipRemoveFault::fail_once());
+    let faulted_config = ActivityPubDeliveryConfig {
+        media_root: Some(worker_root.clone()),
+        ..config
+    };
+    let handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
+        &queue,
+        Some(writer_pool.clone()),
+        None,
+        Some(faulted_config),
+    )?;
+    let executor = WorkerExecutor::new(queue.clone(), handlers, 1, 1)?;
+    assert!(
+        executor
+            .process_one(
+                "local-delete-retry",
+                &[Lane::Maintenance],
+                Duration::seconds(30)
+            )
+            .await?
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("SELECT attempts FROM rustodon.durable_jobs WHERE kind = $1")
+            .bind(LOCAL_MEDIA_CLEANUP_JOB_KIND)
+            .fetch_one(&runtime_pool)
+            .await?,
+        1,
+        "a failed worker unlink remains durably retryable"
+    );
+    sqlx::query("UPDATE rustodon.durable_jobs SET run_at = clock_timestamp() WHERE kind = $1")
+        .bind(LOCAL_MEDIA_CLEANUP_JOB_KIND)
+        .execute(&runtime_pool)
+        .await?;
+    assert!(
+        executor
+            .process_one(
+                "local-delete-recovered",
+                &[Lane::Maintenance],
+                Duration::seconds(30)
+            )
+            .await?
+    );
+    for path in &published_paths {
+        assert!(worker_root.open_file(Path::new(path)).is_err());
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM rustodon.durable_jobs WHERE kind = $1")
+            .bind(LOCAL_MEDIA_CLEANUP_JOB_KIND)
+            .fetch_one(&runtime_pool)
+            .await?,
+        0
+    );
+
+    drop(executor);
+    drop(worker_root);
+    drop(faulted_root);
+    drop(media_root);
+    fs::remove_dir_all(root_path)?;
+    reset().await?;
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+#[allow(clippy::too_many_lines)]
 async fn activitypub_media_fetch_reclaims_after_lease_fence()
 -> Result<(), Box<dyn std::error::Error>> {
     const BOB: i64 = 116_844_606_259_202_001;
@@ -9456,7 +9710,7 @@ async fn stale_authenticated_account_writes_are_rejected_after_deletion_request(
         );
         assert!(matches!(
             writer
-                .create_media_attachment(
+                .stage_media_attachment(
                     &authenticated,
                     &MediaAttachmentCreate {
                         file_name: "stale-upload.png".to_owned(),

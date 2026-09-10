@@ -4,6 +4,11 @@ use std::future::Future;
 use std::io;
 use std::net::IpAddr;
 use std::time::Duration;
+#[cfg(feature = "test-support")]
+use std::{
+    sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bcrypt::{DEFAULT_COST, hash};
@@ -44,10 +49,11 @@ use crate::jobs::{
     ACCOUNT_DELETION_DELAY_DAYS, ACTIVITYPUB_ACCOUNT_DELETE_JOB_KIND,
     ACTIVITYPUB_ACCOUNT_UPDATE_JOB_KIND, ACTIVITYPUB_DELIVERY_JOB_KIND,
     ACTIVITYPUB_MEDIA_FETCH_JOB_KIND, ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
-    ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND, JobError, JobSpec, Lane, MASTODON_ACCOUNT_PURGE_JOB_KIND,
-    MASTODON_DOMAIN_BLOCK_JOB_KIND, MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND,
-    NOTIFICATION_CREATE_JOB_KIND, NOTIFICATION_UNFILTER_JOB_KIND, record_outbox_in,
-    record_outbox_once_in, record_stream_event_in,
+    ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND, JobError, JobSpec, LOCAL_MEDIA_CLEANUP_JOB_KIND, Lane,
+    MASTODON_ACCOUNT_PURGE_JOB_KIND, MASTODON_DOMAIN_BLOCK_JOB_KIND,
+    MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND, NOTIFICATION_CREATE_JOB_KIND,
+    NOTIFICATION_UNFILTER_JOB_KIND, record_outbox_in, record_outbox_once_in,
+    record_stream_event_in,
 };
 use crate::mail::report_job;
 use crate::paperclip::{PaperclipAttachment, PaperclipMetadata, rails_blank};
@@ -610,6 +616,8 @@ impl From<io::Error> for WriteError {
 pub struct WriteRepository {
     pool: PgPool,
     active_record_encryption: Option<ActiveRecordEncryptionConfig>,
+    #[cfg(feature = "test-support")]
+    local_media_cleanup_intent_fault: Option<Arc<AtomicBool>>,
 }
 
 fn two_factor_attempt_is_rate_limited(failures: i64) -> bool {
@@ -652,6 +660,8 @@ impl WriteRepository {
         Ok(Self {
             pool,
             active_record_encryption: None,
+            #[cfg(feature = "test-support")]
+            local_media_cleanup_intent_fault: None,
         })
     }
 
@@ -660,6 +670,8 @@ impl WriteRepository {
         Self {
             pool,
             active_record_encryption: None,
+            #[cfg(feature = "test-support")]
+            local_media_cleanup_intent_fault: None,
         }
     }
 
@@ -669,6 +681,13 @@ impl WriteRepository {
         encryption: ActiveRecordEncryptionConfig,
     ) -> Self {
         self.active_record_encryption = Some(encryption);
+        self
+    }
+
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_local_media_cleanup_intent_fault(mut self) -> Self {
+        self.local_media_cleanup_intent_fault = Some(Arc::new(AtomicBool::new(true)));
         self
     }
 
@@ -4748,20 +4767,20 @@ impl WriteRepository {
         Ok(())
     }
 
-    pub async fn create_media_attachment(
+    pub async fn stage_media_attachment(
         &self,
         authenticated: &AuthenticatedBearer,
         create: &MediaAttachmentCreate,
     ) -> Result<i64, WriteError> {
         let account_id = write_account(authenticated, WRITE_MEDIA)?;
         self.with_account_lock(account_id, || async {
-            self.create_media_attachment_locked(authenticated, create)
+            self.stage_media_attachment_locked(authenticated, create)
                 .await
         })
         .await
     }
 
-    pub(crate) async fn create_media_attachment_locked(
+    pub(crate) async fn stage_media_attachment_locked(
         &self,
         authenticated: &AuthenticatedBearer,
         create: &MediaAttachmentCreate,
@@ -4775,21 +4794,67 @@ impl WriteRepository {
                account_id, type, processing, description, remote_url,
                file_content_type, file_file_name, file_file_size, file_meta,
                file_storage_schema_version, file_updated_at, blurhash, created_at, updated_at
-             ) VALUES ($1, 0, 2, $2, '', $3, $4, $5, $6::json, 1,
-                       clock_timestamp(), $7, clock_timestamp(), clock_timestamp())
+             ) VALUES ($1, 0, 0, $2, '', NULL, NULL, NULL, $3::json, NULL,
+                       NULL, $4, clock_timestamp(), clock_timestamp())
              RETURNING id",
         )
         .bind(account_id)
         .bind(create.description.as_deref())
-        .bind(&create.content_type)
-        .bind(&create.file_name)
-        .bind(create.file_size)
         .bind(file_meta)
         .bind(&create.blurhash)
         .fetch_one(&mut *transaction)
         .await?;
+        record_outbox_in(
+            &mut transaction,
+            &local_media_create_cleanup_job(account_id, id, create)?,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(id)
+    }
+
+    pub(crate) async fn publish_media_attachment_locked(
+        &self,
+        authenticated: &AuthenticatedBearer,
+        id: i64,
+        create: &MediaAttachmentCreate,
+    ) -> Result<(), WriteError> {
+        let (account_id, mut transaction) =
+            self.begin_account_write(authenticated, WRITE_MEDIA).await?;
+        validate_media_attachment_create(create)?;
+        let updated = sqlx::query(
+            "UPDATE media_attachments SET processing = 2, file_content_type = $3,
+                 file_file_name = $4, file_file_size = $5, file_storage_schema_version = 1,
+                 file_updated_at = clock_timestamp(), updated_at = clock_timestamp()
+               WHERE id = $1 AND account_id = $2 AND status_id IS NULL
+                 AND remote_url = '' AND file_file_name IS NULL",
+        )
+        .bind(id)
+        .bind(account_id)
+        .bind(&create.content_type)
+        .bind(&create.file_name)
+        .bind(create.file_size)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(WriteError::NotFound);
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn publish_media_attachment(
+        &self,
+        authenticated: &AuthenticatedBearer,
+        id: i64,
+        create: &MediaAttachmentCreate,
+    ) -> Result<(), WriteError> {
+        let account_id = write_account(authenticated, WRITE_MEDIA)?;
+        self.with_account_lock(account_id, || async {
+            self.publish_media_attachment_locked(authenticated, id, create)
+                .await
+        })
+        .await
     }
 
     pub async fn update_media_attachment(
@@ -4817,7 +4882,7 @@ impl WriteRepository {
         validate_media_attachment_update(update)?;
         let current_meta = sqlx::query_scalar::<_, Option<Value>>(
             "SELECT file_meta FROM media_attachments
-             WHERE id = $1 AND account_id = $2 AND status_id IS NULL
+             WHERE id = $1 AND account_id = $2 AND status_id IS NULL AND processing = 2
              FOR UPDATE",
         )
         .bind(id)
@@ -4893,11 +4958,33 @@ impl WriteRepository {
                 "Media attachment is currently used by a status",
             ));
         }
-        sqlx::query("DELETE FROM media_attachments WHERE id = $1 AND account_id = $2")
-            .bind(id)
-            .bind(account_id)
-            .execute(&mut *transaction)
-            .await?;
+        let paths = local_media_deletion_paths(&media)?;
+        #[cfg(feature = "test-support")]
+        if self
+            .local_media_cleanup_intent_fault
+            .as_ref()
+            .is_some_and(|fault| fault.swap(false, Ordering::AcqRel))
+        {
+            return Err(WriteError::InvalidInput(
+                "injected local media cleanup intent failure",
+            ));
+        }
+        record_outbox_in(
+            &mut transaction,
+            &local_media_cleanup_job(account_id, id, "delete", &paths),
+        )
+        .await?;
+        let deleted = sqlx::query(
+            "DELETE FROM media_attachments
+              WHERE id = $1 AND account_id = $2 AND status_id IS NULL",
+        )
+        .bind(id)
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await?;
+        if deleted.rows_affected() != 1 {
+            return Err(WriteError::Conflict);
+        }
         transaction.commit().await?;
         Ok(media)
     }
@@ -12645,6 +12732,92 @@ fn validate_media_attachment_create(create: &MediaAttachmentCreate) -> Result<()
         return Err(WriteError::Validation("media description is too long"));
     }
     validate_media_focus(&create.focus)
+}
+
+fn local_media_create_cleanup_job(
+    account_id: i64,
+    media_id: i64,
+    create: &MediaAttachmentCreate,
+) -> Result<JobSpec, WriteError> {
+    let metadata = PaperclipMetadata {
+        attachment: PaperclipAttachment::MediaFile,
+        id: media_id,
+        remote: false,
+        storage_schema_version: Some(1),
+        file_name: create.file_name.clone(),
+        content_type: Some(create.content_type.clone()),
+        variant: None,
+    };
+    let paths = ["original", "small"]
+        .into_iter()
+        .filter_map(|style| metadata.relative_path(style))
+        .collect::<Vec<_>>();
+    if paths.len() != 2 {
+        return Err(WriteError::Validation("invalid media image metadata"));
+    }
+    Ok(local_media_cleanup_job(
+        account_id,
+        media_id,
+        "rollback_create",
+        &paths,
+    ))
+}
+
+fn local_media_deletion_paths(media: &MediaAttachment) -> Result<Vec<String>, WriteError> {
+    let mut paths = Vec::new();
+    if let Some(file_name) = media.file_file_name.as_ref() {
+        let metadata = PaperclipMetadata {
+            attachment: PaperclipAttachment::MediaFile,
+            id: media.id,
+            remote: false,
+            storage_schema_version: media.file_storage_schema_version,
+            file_name: file_name.clone(),
+            content_type: media.file_content_type.clone(),
+            variant: None,
+        };
+        paths.extend(
+            ["original", "small"]
+                .into_iter()
+                .filter_map(|style| metadata.relative_path(style)),
+        );
+    }
+    if let Some(file_name) = media.thumbnail_file_name.as_ref() {
+        let metadata = PaperclipMetadata {
+            attachment: PaperclipAttachment::MediaThumbnail,
+            id: media.id,
+            remote: false,
+            storage_schema_version: media.thumbnail_storage_schema_version,
+            file_name: file_name.clone(),
+            content_type: media.thumbnail_content_type.clone(),
+            variant: None,
+        };
+        paths.extend(metadata.relative_path("original"));
+    }
+    if paths.is_empty() {
+        return Err(WriteError::NotFound);
+    }
+    paths.sort_unstable();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn local_media_cleanup_job(
+    account_id: i64,
+    media_id: i64,
+    action: &str,
+    paths: &[String],
+) -> JobSpec {
+    JobSpec::new(
+        Lane::Maintenance,
+        LOCAL_MEDIA_CLEANUP_JOB_KIND,
+        json!({
+            "account_id": account_id,
+            "media_id": media_id,
+            "action": action,
+            "paths": paths,
+        }),
+    )
+    .logical_key(format!("mastodon:media:{media_id}:{action}"))
 }
 
 fn validate_media_attachment_update(update: &MediaAttachmentUpdate) -> Result<(), WriteError> {

@@ -4115,6 +4115,7 @@ async fn write_repository_updates_account_profile_and_user_settings_transactiona
 
 #[tokio::test]
 #[ignore = "starts a restored Mastodon PostgreSQL fixture through the Mise task"]
+#[allow(clippy::too_many_lines)]
 async fn write_repository_creates_updates_and_deletes_unattached_image_media()
 -> Result<(), Box<dyn std::error::Error>> {
     let database_url = database_url();
@@ -4130,7 +4131,7 @@ async fn write_repository_creates_updates_and_deletes_unattached_image_media()
     );
     let authenticated = authenticator.authenticate(&headers, WRITE_MEDIA).await?;
     let id = writer
-        .create_media_attachment(
+        .stage_media_attachment(
             &authenticated,
             &MediaAttachmentCreate {
                 file_name: "fixture-media.jpg".to_owned(),
@@ -4145,6 +4146,38 @@ async fn write_repository_creates_updates_and_deletes_unattached_image_media()
                 focus: AccountProfileValue::Unchanged,
             },
         )
+        .await?;
+    assert_eq!(
+        repository
+            .media_attachment(ALICE, id)
+            .await?
+            .and_then(|media| media.file_file_name),
+        None,
+        "a staged row must not publish expected-file metadata"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT file_file_name FROM media_attachments WHERE id = $1"
+        )
+        .bind(id)
+        .fetch_one(writer.pool())
+        .await?,
+        None
+    );
+    let create = MediaAttachmentCreate {
+        file_name: "fixture-media.jpg".to_owned(),
+        content_type: "image/jpeg".to_owned(),
+        file_size: 123,
+        file_meta: serde_json::json!({
+            "original": {"width": 600, "height": 400, "size": "600x400"},
+            "small": {"width": 588, "height": 392, "size": "588x392"},
+        }),
+        blurhash: Some("L00000000000000000000000000000000".to_owned()),
+        description: Some("Created media".to_owned()),
+        focus: AccountProfileValue::Unchanged,
+    };
+    writer
+        .publish_media_attachment(&authenticated, id, &create)
         .await?;
     let created = repository
         .media_attachment(ALICE, id)
@@ -4186,9 +4219,89 @@ async fn write_repository_creates_updates_and_deletes_unattached_image_media()
         WriteError::Validation("Media attachment is currently used by a status")
     ));
 
-    let deleted = writer.delete_media_attachment(&authenticated, id).await?;
+    sqlx::query(
+        "UPDATE media_attachments SET thumbnail_content_type = 'image/jpeg',
+             thumbnail_file_name = 'fixture-thumbnail.jpg', thumbnail_file_size = 17,
+             thumbnail_storage_schema_version = 1, thumbnail_updated_at = clock_timestamp()
+           WHERE id = $1",
+    )
+    .bind(id)
+    .execute(writer.pool())
+    .await?;
+    let status_id = sqlx::query_scalar::<_, i64>(
+        "SELECT status_id FROM media_attachments WHERE id = $1 AND status_id IS NOT NULL",
+    )
+    .bind(116_844_842_188_806_001_i64)
+    .fetch_one(writer.pool())
+    .await?;
+    let mut mastodon_attach = writer.pool().begin().await?;
+    sqlx::query("UPDATE media_attachments SET status_id = $2 WHERE id = $1")
+        .bind(id)
+        .bind(status_id)
+        .execute(&mut *mastodon_attach)
+        .await?;
+    let raced_delete = writer.delete_media_attachment(&authenticated, id);
+    tokio::pin!(raced_delete);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), raced_delete.as_mut())
+            .await
+            .is_err(),
+        "deletion waits for an in-flight Mastodon status attachment"
+    );
+    mastodon_attach.commit().await?;
+    assert!(matches!(
+        raced_delete.await,
+        Err(WriteError::Validation(
+            "Media attachment is currently used by a status"
+        ))
+    ));
+    sqlx::query("UPDATE media_attachments SET status_id = NULL WHERE id = $1")
+        .bind(id)
+        .execute(writer.pool())
+        .await?;
+
+    let mut mastodon_processing = writer.pool().begin().await?;
+    sqlx::query("UPDATE media_attachments SET processing = 0 WHERE id = $1")
+        .bind(id)
+        .execute(&mut *mastodon_processing)
+        .await?;
+    let raced_delete = writer.delete_media_attachment(&authenticated, id);
+    tokio::pin!(raced_delete);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), raced_delete.as_mut())
+            .await
+            .is_err(),
+        "deletion waits for an in-flight Mastodon processing update"
+    );
+    mastodon_processing.commit().await?;
+    let deleted = raced_delete.await?;
     assert_eq!(deleted.id, id);
     assert!(repository.media_attachment(ALICE, id).await?.is_none());
+    let cleanup_paths = sqlx::query_scalar::<_, Vec<String>>(
+        "SELECT ARRAY(
+             SELECT jsonb_array_elements_text(payload #> '{arguments,paths}')
+           ) FROM rustodon.outbox_events
+          WHERE kind = $1 AND payload #>> '{arguments,media_id}' = $2
+            AND payload #>> '{arguments,action}' = 'delete'",
+    )
+    .bind(rustodon::jobs::LOCAL_MEDIA_CLEANUP_JOB_KIND)
+    .bind(id.to_string())
+    .fetch_one(writer.pool())
+    .await?;
+    assert!(
+        cleanup_paths
+            .iter()
+            .any(|path| path.contains("/thumbnails/"))
+    );
+    assert_eq!(
+        sqlx::query("UPDATE media_attachments SET processing = 2 WHERE id = $1")
+            .bind(id)
+            .execute(writer.pool())
+            .await?
+            .rows_affected(),
+        0,
+        "a cross-runtime processing update cannot overwrite an atomically deleted row"
+    );
     Ok(())
 }
 

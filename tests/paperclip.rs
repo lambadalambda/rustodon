@@ -6,13 +6,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use image::AnimationDecoder;
 use image::codecs::gif::GifDecoder;
-#[cfg(feature = "test-support")]
-use rustodon::paperclip::PaperclipWriteFault;
 use rustodon::paperclip::{
     PaperclipAttachment, PaperclipMetadata, PaperclipRoot, encode_url_path, open_paperclip_file,
     parse_paperclip_path, partitioned_id, prepare_account_media, prepare_media_attachment,
     write_prepared_media,
 };
+#[cfg(feature = "test-support")]
+use rustodon::paperclip::{PaperclipDirectorySyncFault, PaperclipRemoveFault, PaperclipWriteFault};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -618,6 +618,79 @@ fn paperclip_root_can_write_and_remove_clean_relative_files() {
         .remove_file(relative)
         .expect("written file is removed");
     assert!(paperclip.open_file(relative).is_err());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn paperclip_remove_fault_is_consumed_and_removal_remains_idempotent() {
+    let root = temp_root("paperclip-remove-fault");
+    let relative = Path::new("media_attachments/files/000/000/104/original/media.jpg");
+    let paperclip = PaperclipRoot::open(&root)
+        .expect("root is safe")
+        .with_remove_fault(PaperclipRemoveFault::fail_once());
+    paperclip
+        .write_file(relative, b"media")
+        .expect("file is written");
+
+    assert_eq!(
+        paperclip
+            .remove_file(relative)
+            .expect_err("the first unlink is faulted")
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert!(paperclip.open_file(relative).is_ok());
+    paperclip.remove_file(relative).expect("retry removes file");
+    paperclip
+        .remove_file(relative)
+        .expect("missing files are successful");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn removing_a_missing_file_syncs_its_existing_directory() {
+    let root = temp_root("paperclip-missing-remove-sync");
+    let relative = Path::new("media_attachments/files/000/000/105/original/missing.jpg");
+    fs::create_dir_all(root.join(relative.parent().unwrap())).unwrap();
+    let paperclip = PaperclipRoot::open(&root)
+        .expect("root is safe")
+        .with_directory_sync_fault(PaperclipDirectorySyncFault::fail_once());
+
+    assert_eq!(
+        paperclip
+            .remove_file(relative)
+            .expect_err("ENOENT must still sync the containing directory")
+            .kind(),
+        std::io::ErrorKind::Other
+    );
+    paperclip
+        .remove_file(relative)
+        .expect("the consumed sync fault permits an idempotent retry");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn retry_resyncs_a_directory_whose_creation_sync_failed() {
+    let root = temp_root("paperclip-directory-create-sync-retry");
+    let relative = Path::new("media_attachments/files/000/000/106/original/media.jpg");
+    let paperclip = PaperclipRoot::open(&root)
+        .expect("root is safe")
+        .with_directory_sync_fault(PaperclipDirectorySyncFault::fail_once());
+
+    assert_eq!(
+        paperclip
+            .write_file(relative, b"media")
+            .expect_err("the first created-directory sync is faulted")
+            .kind(),
+        std::io::ErrorKind::Other
+    );
+    paperclip
+        .write_file(relative, b"media")
+        .expect("retry resyncs the existing directory chain");
+    assert!(paperclip.open_file(relative).is_ok());
     let _ = fs::remove_dir_all(root);
 }
 

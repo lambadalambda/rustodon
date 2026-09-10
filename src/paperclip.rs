@@ -15,7 +15,8 @@ use image::{
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use rustix::fd::OwnedFd;
 use rustix::fs::{
-    AtFlags, FileType, Mode, OFlags, ResolveFlags, fchmod, fstat, mkdirat, open, openat2, unlinkat,
+    AtFlags, FileType, Mode, OFlags, ResolveFlags, fchmod, fstat, fsync, mkdirat, open, openat2,
+    unlinkat,
 };
 use rustix::io::Errno;
 use serde_json::{Value, json};
@@ -191,6 +192,55 @@ impl PaperclipWriteFault {
 pub struct PaperclipCommitFault {
     fail_before_commit: AtomicBool,
     fail_after_commit: AtomicBool,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+pub struct PaperclipRemoveFault {
+    remaining: AtomicUsize,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+pub struct PaperclipDirectorySyncFault {
+    fail: AtomicBool,
+}
+
+#[cfg(feature = "test-support")]
+impl PaperclipDirectorySyncFault {
+    #[must_use]
+    pub fn fail_once() -> Self {
+        Self {
+            fail: AtomicBool::new(true),
+        }
+    }
+
+    fn should_fail(&self) -> bool {
+        self.fail.swap(false, Ordering::AcqRel)
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl PaperclipRemoveFault {
+    #[must_use]
+    pub fn fail_once() -> Self {
+        Self::fail_times(1)
+    }
+
+    #[must_use]
+    pub fn fail_times(failures: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(failures),
+        }
+    }
+
+    fn should_fail(&self) -> bool {
+        self.remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -713,6 +763,10 @@ pub struct PaperclipRoot {
     write_fault: Option<Arc<PaperclipWriteFault>>,
     #[cfg(feature = "test-support")]
     commit_fault: Option<Arc<PaperclipCommitFault>>,
+    #[cfg(feature = "test-support")]
+    remove_fault: Option<Arc<PaperclipRemoveFault>>,
+    #[cfg(feature = "test-support")]
+    directory_sync_fault: Option<Arc<PaperclipDirectorySyncFault>>,
 }
 
 impl PaperclipRoot {
@@ -759,6 +813,10 @@ impl PaperclipRoot {
             write_fault: None,
             #[cfg(feature = "test-support")]
             commit_fault: None,
+            #[cfg(feature = "test-support")]
+            remove_fault: None,
+            #[cfg(feature = "test-support")]
+            directory_sync_fault: None,
         })
     }
 
@@ -773,6 +831,20 @@ impl PaperclipRoot {
     #[must_use]
     pub fn with_commit_fault(mut self, fault: PaperclipCommitFault) -> Self {
         self.commit_fault = Some(Arc::new(fault));
+        self
+    }
+
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_remove_fault(mut self, fault: PaperclipRemoveFault) -> Self {
+        self.remove_fault = Some(Arc::new(fault));
+        self
+    }
+
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_directory_sync_fault(mut self, fault: PaperclipDirectorySyncFault) -> Self {
+        self.directory_sync_fault = Some(Arc::new(fault));
         self
     }
 
@@ -887,6 +959,7 @@ impl PaperclipRoot {
             let _ = unlinkat(&directory, file_name, AtFlags::empty());
             return Err(error);
         }
+        self.sync_directory(&directory)?;
         Ok(())
     }
 
@@ -902,6 +975,14 @@ impl PaperclipRoot {
                 "Paperclip paths must be clean and relative",
             ));
         }
+        #[cfg(feature = "test-support")]
+        if self
+            .remove_fault
+            .as_ref()
+            .is_some_and(|fault| fault.should_fail())
+        {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
         let file_name = relative_path.file_name().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -915,7 +996,7 @@ impl PaperclipRoot {
             Err(error) => return Err(error),
         };
         match unlinkat(&directory, file_name, AtFlags::empty()) {
-            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Ok(()) | Err(Errno::NOENT) => self.sync_directory(&directory),
             Err(error) => Err(error.into()),
         }
     }
@@ -937,7 +1018,7 @@ impl PaperclipRoot {
             };
             if create {
                 match mkdirat(&directory, component, Mode::from_bits_retain(0o755)) {
-                    Ok(()) | Err(Errno::EXIST) => {}
+                    Ok(()) | Err(Errno::EXIST) => self.sync_directory(&directory)?,
                     Err(error) => return Err(error.into()),
                 }
             }
@@ -956,6 +1037,18 @@ impl PaperclipRoot {
             }
         }
         Ok(directory)
+    }
+
+    fn sync_directory(&self, directory: &OwnedFd) -> io::Result<()> {
+        #[cfg(feature = "test-support")]
+        if self
+            .directory_sync_fault
+            .as_ref()
+            .is_some_and(|fault| fault.should_fail())
+        {
+            return Err(io::Error::other("injected directory sync failure"));
+        }
+        fsync(directory).map_err(Into::into)
     }
 }
 

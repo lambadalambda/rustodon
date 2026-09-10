@@ -12256,24 +12256,27 @@ async fn media_create(state: WebState, rack: RackParameters, headers: HeaderMap)
     match writer
         .with_account_lock(account_id, || async {
             let id = writer
-                .create_media_attachment_locked(&authenticated, &create)
+                .stage_media_attachment_locked(&authenticated, &create)
                 .await?;
             let metadata = media_metadata_from_prepared(id, &prepared);
-            let paths = match write_prepared_media(&state.media_root, &metadata, &prepared) {
-                Ok(paths) => paths,
-                Err(error) => {
-                    let _ = writer
-                        .delete_media_attachment_locked(&authenticated, id)
-                        .await;
-                    return Err(WriteError::Filesystem(error));
-                }
-            };
+            if let Err(error) = write_prepared_media(&state.media_root, &metadata, &prepared) {
+                remove_expected_media(&state.media_root, &metadata);
+                return Err(WriteError::Filesystem(error));
+            }
+            // A failed commit has an ambiguous outcome. Retain the files so either the
+            // published row is complete or its durable rollback intent removes them.
+            writer
+                .publish_media_attachment_locked(&authenticated, id, &create)
+                .await?;
             let response = media_response_for_id(&state, account_id, id).await;
             if !response.status().is_success() {
-                remove_written_media(&state.media_root, &paths);
-                let _ = writer
-                    .delete_media_attachment_locked(&authenticated, id)
-                    .await;
+                let _ = cleanup_media_after_response_failure(
+                    &state.media_root,
+                    writer,
+                    &authenticated,
+                    id,
+                )
+                .await;
             }
             Ok(response)
         })
@@ -12382,8 +12385,8 @@ async fn media_delete(
 
 async fn media_response_for_id(state: &WebState, account_id: i64, id: i64) -> Response<Body> {
     let media = match state.repository.media_attachment(account_id, id).await {
-        Ok(Some(media)) => media,
-        Ok(None) => return record_not_found(),
+        Ok(Some(media)) if media.file_file_name.is_some() => media,
+        Ok(Some(_) | None) => return record_not_found(),
         Err(_) => return internal_error(),
     };
     if media.processing.is_some_and(|processing| processing.0 == 3) {
@@ -12536,9 +12539,47 @@ fn remove_media_files(root: &PaperclipRoot, media: &crate::mastodon::MediaAttach
     }
 }
 
-fn remove_written_media(root: &PaperclipRoot, paths: &[String]) {
-    for path in paths {
-        let _ = root.remove_file(FsPath::new(path));
+async fn cleanup_media_after_response_failure(
+    root: &PaperclipRoot,
+    writer: &WriteRepository,
+    authenticated: &AuthenticatedBearer,
+    id: i64,
+) -> Result<(), WriteError> {
+    let media = writer
+        .delete_media_attachment_locked(authenticated, id)
+        .await?;
+    remove_media_files(root, &media);
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+/// Exercises the same ordered cleanup used after media response serialization fails.
+///
+/// # Errors
+///
+/// Returns the metadata transaction error without unlinking any published files.
+pub async fn cleanup_media_after_response_failure_for_test(
+    root: &PaperclipRoot,
+    writer: &WriteRepository,
+    authenticated: &AuthenticatedBearer,
+    id: i64,
+) -> Result<(), WriteError> {
+    let account_id = authenticated
+        .require_user()
+        .map_err(|_| WriteError::Unauthorized)?
+        .account_id();
+    writer
+        .with_account_lock(account_id, || async {
+            cleanup_media_after_response_failure(root, writer, authenticated, id).await
+        })
+        .await
+}
+
+fn remove_expected_media(root: &PaperclipRoot, metadata: &PaperclipMetadata) {
+    for style in ["original", "small"] {
+        if let Some(path) = metadata.relative_path(style) {
+            let _ = root.remove_file(FsPath::new(&path));
+        }
     }
 }
 
