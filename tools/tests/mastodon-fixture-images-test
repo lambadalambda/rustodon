@@ -1,0 +1,56 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -P -- "$(dirname -- "$0")/../.." && pwd)
+test_root=$(mktemp -d "${TMPDIR:-/tmp}/rustodon-fixture-images.XXXXXX")
+trap 'rm -rf "$test_root"' EXIT HUP INT TERM
+# Load only the production function, without starting fixture resources.
+sed -n '/^verify_image() {$/,/^}$/p' "$ROOT/tools/mastodon-fixture" > "$test_root/function.sh"
+. "$test_root/function.sh"
+PLATFORM=linux/amd64
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+run_podman() {
+  printf '%s\n' "$*" >> "$test_root/calls"
+  case "$1 $2" in
+    'image inspect')
+      if [ "$cache" = missing ] && [ ! -f "$test_root/pulled" ]; then return 1; fi
+      printf '%s\n' "$mock_inspected"
+      ;;
+    'manifest inspect')
+      [ "$registry" = available ] || return 75
+      printf '{"digest": "%s"}\n' "$index_child"
+      ;;
+    'pull --quiet') touch "$test_root/pulled" ;;
+    *) die "unexpected Podman call: $*" ;;
+  esac
+}
+
+check_case() {
+  name=$1 cache=$2 registry=$3 mock_inspected=$4 index_child=$5 expected=$6
+  rm -f "$test_root/pulled"
+  : > "$test_root/calls"
+  if (set -e; verify_image test index@sha256:index sha256:child image@sha256:child) > "$test_root/output" 2>&1; then
+    actual=pass
+  else
+    actual=fail
+  fi
+  if [ "$actual" != "$expected" ]; then
+    cat "$test_root/output" >&2
+    die "$name: expected $expected, got $actual"
+  fi
+}
+
+check_case cached missing offline 'linux/amd64|sha256:child' sha256:child fail
+check_case cached-match present offline 'linux/amd64|sha256:child' sha256:child pass
+[ "$(wc -l < "$test_root/calls" | tr -d ' ')" = 1 ] || die 'cache hit contacted registry'
+check_case cached-wrong-digest present available 'linux/amd64|sha256:other' sha256:child fail
+[ "$(wc -l < "$test_root/calls" | tr -d ' ')" = 1 ] || die 'cache mismatch contacted registry'
+check_case cached-wrong-platform present available 'linux/arm64|sha256:child' sha256:child fail
+check_case cold-match missing available 'linux/amd64|sha256:child' sha256:child pass
+[ -f "$test_root/pulled" ] || die 'cache miss did not pull'
+check_case wrong-index missing available 'linux/amd64|sha256:child' sha256:other fail
+[ ! -f "$test_root/pulled" ] || die 'wrong index still pulled'
+check_case pulled-wrong-digest missing available 'linux/amd64|sha256:other' sha256:child fail
+
+printf '%s\n' 'mastodon-fixture image cache shell tests passed'

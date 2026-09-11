@@ -117,6 +117,14 @@ verify_image() {
   manifest_digest=$3
   child_image=$4
 
+  # Immutable child pins can be verified locally; repeated registry index requests
+  # needlessly make cached, disposable tests depend on pull quotas and connectivity.
+  if inspected=$(run_podman image inspect "$child_image" --format '{{.Os}}/{{.Architecture}}|{{.Digest}}' 2>/dev/null); then
+    [ "$inspected" = "$PLATFORM|$manifest_digest" ] ||
+      die "$image_label cached child mismatch: expected $PLATFORM|$manifest_digest, got $inspected"
+    return
+  fi
+
   manifest=$(run_podman manifest inspect "$index_image")
   printf '%s\n' "$manifest" | grep -F "\"digest\": \"$manifest_digest\"" >/dev/null 2>&1 ||
     die "$image_label index does not contain pinned linux/amd64 child $manifest_digest"
