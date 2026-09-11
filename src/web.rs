@@ -11566,8 +11566,10 @@ fn oauth_client_credentials(
         return oauth_basic_client_credentials(headers);
     }
     let client_id = oauth_scalar(parameters, "client_id")?.ok_or(())?;
-    let client_secret = oauth_scalar(parameters, "client_secret")?.ok_or(())?;
-    if client_id.is_empty() || client_secret.is_empty() {
+    // Parse identity here; each grant/revocation authenticates confidential clients
+    // in the repository. Public clients need not supply a secret.
+    let client_secret = oauth_scalar(parameters, "client_secret")?.unwrap_or_default();
+    if client_id.is_empty() {
         return Err(());
     }
     Ok((client_id.to_owned(), client_secret.to_owned()))
@@ -11587,7 +11589,7 @@ fn oauth_basic_client_credentials(headers: &HeaderMap) -> Result<(String, String
     let decoded = STANDARD.decode(encoded).map_err(|_| ())?;
     let decoded = String::from_utf8(decoded).map_err(|_| ())?;
     let (client_id, client_secret) = decoded.split_once(':').ok_or(())?;
-    if client_id.is_empty() || client_secret.is_empty() {
+    if client_id.is_empty() {
         return Err(());
     }
     Ok((client_id.to_owned(), client_secret.to_owned()))

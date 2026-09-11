@@ -9514,7 +9514,7 @@ impl WriteRepository {
         token: Option<&str>,
         token_type_hint: Option<&str>,
     ) -> Result<(), OAuthTokenRevocationError> {
-        if client_id.trim().is_empty() || client_secret.is_empty() {
+        if client_id.trim().is_empty() {
             return Err(OAuthTokenRevocationError::InvalidClient);
         }
         let mut transaction = self.pool.begin().await?;
@@ -9528,7 +9528,10 @@ impl WriteRepository {
         else {
             return Err(OAuthTokenRevocationError::InvalidClient);
         };
-        if !confidential || !constant_time_string_equal(&stored_secret, client_secret) {
+        if confidential
+            && (client_secret.is_empty()
+                || !constant_time_string_equal(&stored_secret, client_secret))
+        {
             return Err(OAuthTokenRevocationError::InvalidClient);
         }
         let Some(token) = token.filter(|token| !token.is_empty()) else {
@@ -9572,7 +9575,7 @@ impl WriteRepository {
             transaction.commit().await?;
             return Ok(());
         };
-        if token_application_id.is_some_and(|id| id != application_id) {
+        if token_application_id != Some(application_id) {
             return Err(OAuthTokenRevocationError::UnauthorizedClient);
         }
         sqlx::query(

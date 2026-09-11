@@ -186,4 +186,81 @@ disabled/suspended/nonlocal recipients, and account-follow-plus-tag overlap were
 but not individually exercised by this matrix. Fixture owner writes do not prove
 production-role permissions. No live peer/browser/mobile, fresh registry verification,
 or complete all-target release gate is claimed. The registry-cache harness repair
-belongs to the parent task and is not included here. R14/R15 remain open and untouched.
+belongs to the parent task and is not included here. R14/R15 were not included in R12.
+
+## R14 — public PKCE own-token revocation: implemented and verified
+
+- OAuth credential parsing now accepts an omitted form secret or empty Basic
+  password. Authentication remains in the repository: public clients identify
+  themselves; confidential clients must supply a nonempty matching secret for
+  revocation. The other OAuth grant handlers retain their existing authentication.
+- Revocation requires the token's application ID to equal the identified application's
+  ID exactly, rejecting cross-application and applicationless tokens before writes.
+  Existing token-row locking, transactionality, push-subscription cleanup and stream
+  token-kill recording are preserved. No browser credential functions changed.
+- `tests/public_oauth_revocation.rs` runs real HTTP authorization GET, CSRF-protected
+  consent POST, S256 code exchange, successful bearer use, revocation and rejected
+  bearer use. Two public clients revoke without a secret (form identity and Basic
+  empty password). Public-to-public and public-to-confidential revocation return 403
+  while victim bearers remain usable. Confidential missing/empty/wrong form secrets
+  fail; correct confidential Basic succeeds. Applicationless-token revocation fails
+  and its bearer remains usable.
+- Fixture setup seeds applications and an authenticated consent session; it does not
+  exercise or modify password authentication. Redirect following is disabled, so no
+  callback origin, live credentials, tunnel, or remote peer is contacted.
+
+### Exact remote RED/GREEN evidence
+
+Parent cache-safe fixture commit `52fa99a` was first cherry-picked as `183a8e0`.
+The real harness was used throughout: **no temporary bypass, registry retry,
+credentials, unpinning, or harness verification repair in the R14 commit**.
+All execution ran through `ssh lain@secunda.local bash -s`, from
+`/home/lain/rustodon-parity/clients`, with `export CARGO_BUILD_JOBS=2`.
+The new test was staged before syncing tracked changed files only, excluding `.git`,
+`target`, `.local-instance*`, `.env*`, without `--delete`. The parent fixture fix's
+tracked files were also synchronized before RED.
+
+```sh
+# RED before the production OAuth changes:
+tools/mastodon-fixture schema-read-test public_oauth_revocation > /tmp/r14-red.log 2>&1
+# GREEN after the production OAuth changes:
+tools/mastodon-fixture schema-read-test public_oauth_revocation > /tmp/r14-green.log 2>&1
+cargo test --locked --lib > /tmp/r14-unit.log 2>&1
+cargo clippy --locked --all-features --lib --test public_oauth_revocation -- -D warnings
+rustfmt --edition 2024 --check src/mastodon/write_repository.rs src/web.rs tests/public_oauth_revocation.rs
+sh -n tools/mastodon-fixture
+tools/mastodon-fixture schema-read-test > /tmp/r14-schema-all.log 2>&1
+```
+
+- **RED:** exit 101, one failing test (9.73s). Both public clients successfully
+  authorized/exchanged but revocation returned 403 `unauthorized_client`, leaving
+  bearers accepted (200). Confidential revocation returned 200 and bearer use 401.
+- **GREEN:** one passed test (8.95s), including both public-client revocation forms,
+  complete HTTP consent/S256 lifecycle, cross-app denial and surviving victim bearers,
+  confidential authentication controls, and applicationless-token protection.
+- Library tests: **236 passed, 2 ignored** (2.62s). Targeted all-features Clippy,
+  changed-source formatting and shell syntax passed.
+- Full real restored-schema command: **41 passed** across five fresh fixture
+  databases: schema **37** (20.87s), saved-status authorization **1** (9.47s),
+  R11 **1** (9.85s), R12 **1** (13.05s), R14 **1** (10.68s). The SSH call exceeded
+  its 120-second wait; the remote run continued, and its completed log and fixture
+  cleanup were checked before returning.
+- Independent read-only `explore` correctness and architecture/DRY review approved
+  the supplied change scope and inspected source/test, including all shared OAuth
+  parser callers. It found no substantive blockers; execution evidence was supplied
+  by the implementing agent because the reviewer lacked Git/SSH tools.
+
+### Limits / optional follow-up
+
+Fixture owner writes do not prove production-role permissions; the consent session
+was seeded, not obtained by password login. No fresh Rails differential, live
+browser/mobile/peer, or full all-target release gate is claimed. The pinned source
+revision was rechecked remotely at `/home/lain/repos/rustodon/target/mastodon-v4.6.5`
+(canonical `/workspace/rustodon/target/mastodon-v4.6.5`),
+`1440d55b139e39ec722c2a3db7f60b66cd889048`; no source fetched or changed.
+
+Optional follow-up: explicit HTTP negatives for confidential empty-password Basic
+and public `client_credentials` requests. Source review also noted pre-existing
+handling of an anomalous confidential application with an empty stored secret in
+code exchange; that separate hardening was not included. R15 remains untouched/open,
+and no browser credential functions or issue indexes were changed.
