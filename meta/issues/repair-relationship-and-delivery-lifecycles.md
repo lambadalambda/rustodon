@@ -33,6 +33,14 @@ Correct accepted-follow preference updates, delivery cancellation ordering, and 
 - Independent read-only correctness/architecture review found no blockers. Applied its small suggestions (unlocked remote case; remove redundant completion query). Review did not independently execute tests or read Git diff/upstream; it reviewed the scoped working-tree source.
 - Deferred: this prevents new duplicate requests; repairing already-corrupt accepted-follow/pending-request pairs needs separately scoped cleanup.
 
+### R08 — cancellation ordering
+
+- Claiming now fences all earlier non-dead members of the same ordered stream (kind/key), retaining the immediate-predecessor check for legacy/keyless compatibility. Ordered enqueue allocates IDs under the stream marker lock; unlike `run_at`, IDs remain ordered after retries. Physical cancellation no longer disconnects successors from earlier live work.
+- Added a real writer/two-executor/HTTP schedule: Like A held live at the receiver → queue Like B → cancel B → dispatch Undo B → probe second worker → unlike A → probe again → release A → drain Undo B then Undo A. Assert B is deleted, neither Undo overtakes A, exactly three wire bodies, original Like identity in Undo A, and no leftover delivery jobs/favourites.
+- Secunda RED: `CARGO_BUILD_JOBS=2 LIFECYCLE_FILTER=lifecycles::cancellation tools/.lifecycles-fixture worker-test` failed at `Undo B must remain fenced by live Like A after Like B is cancelled` (`target/r08-red.log`). GREEN: the same command passed the full cancellation lifecycle (`target/r08-green.log`). The Docker Hub index-manifest rate-limit interruption was resolved by the parent-owned cache-safe fixture repair `52fa99a` (cherry-picked here as `735a218`); no credentials or unpinning used.
+- Independent read-only correctness/architecture review found no blockers. Secunda Clippy passed. `cargo test --locked --all-targets --all-features` passed 406 tests with the pinned-source link temporarily absent (ignored DB/source gates are not counted as passes).
+- Deferred performance observation: the all-earlier correlated scan may merit a stream-expression partial index after backlog measurement; queue-performance work remains outside this fix.
+
 ### Remaining work
 
-- R08 and R10 follow as separate red/green commits. Regression tests live in `tests/workers/lifecycles.rs` to minimize shared-test conflicts; `tests/workers.rs` only declares the module.
+- R10 follows as a separate red/green commit. Regression tests live under `tests/workers/` to minimize shared-test conflicts; `tests/workers.rs` only declares the lifecycle module.

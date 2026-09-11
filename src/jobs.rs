@@ -460,6 +460,9 @@ impl Queue {
         let lanes = lanes.iter().map(|lane| lane.as_str()).collect::<Vec<_>>();
         let lease_milliseconds = lease_duration.num_milliseconds();
         let mut transaction = self.pool.begin().await?;
+        // Ordered enqueue allocates IDs under the stream marker lock. Fence every earlier
+        // live member, not just the immediate predecessor: cancellation may delete that link,
+        // and retries may move its run_at beyond its successors.
         let row = sqlx::query(
             "WITH candidate AS ( \
                SELECT job.id FROM rustodon.durable_jobs job \
@@ -477,6 +480,12 @@ impl Queue {
                      AND (predecessor.arguments ->> '_rustodon_ordering_key' IS NULL \
                           OR predecessor.arguments ->> '_rustodon_ordering_key' = \
                              job.arguments ->> '_rustodon_ordering_key')) \
+                 AND NOT EXISTS ( \
+                   SELECT 1 FROM rustodon.durable_jobs earlier \
+                   WHERE earlier.kind = job.kind AND earlier.id < job.id \
+                     AND earlier.dead_at IS NULL \
+                     AND earlier.arguments ->> '_rustodon_ordering_key' = \
+                         job.arguments ->> '_rustodon_ordering_key') \
                ORDER BY job.run_at, job.id FOR UPDATE OF job SKIP LOCKED LIMIT 1) \
              UPDATE rustodon.durable_jobs job \
               SET attempts = CASE WHEN attempts < max_attempts THEN attempts + 1 ELSE attempts END, \

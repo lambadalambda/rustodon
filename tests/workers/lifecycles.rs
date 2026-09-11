@@ -292,3 +292,184 @@ async fn enqueue_accept(
     );
     Ok(())
 }
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "requires the disposable worker PostgreSQL fixture"]
+#[allow(clippy::too_many_lines)]
+async fn cancellation_keeps_undo_behind_live_earlier_like() -> TestResult {
+    const REMOTE: i64 = -331;
+    let pool = sqlx::PgPool::connect(&std::env::var("RUSTODON_WORKER_OWNER_DATABASE_URL")?).await?;
+    let runtime = sqlx::PgPool::connect(&std::env::var("RUSTODON_WORKER_DATABASE_URL")?).await?;
+    reset().await?;
+    let queue = Queue::new(runtime);
+    let writer = WriteRepository::from_pool(pool.clone());
+    let authenticated = authenticate(
+        &pool,
+        "fixture-bearer-token-v4-6-5",
+        rustodon::mastodon::WRITE_FAVOURITES,
+    )
+    .await?;
+    let original_inboxes: (String, String) =
+        sqlx::query_as("SELECT inbox_url, shared_inbox_url FROM accounts WHERE id = $1")
+            .bind(REMOTE)
+            .fetch_one(&pool)
+            .await?;
+    let received = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let app = axum::Router::new().route(
+        "/inbox",
+        axum::routing::post({
+            let received = received.clone();
+            let started = started.clone();
+            let release = release.clone();
+            move |axum::Json(body): axum::Json<Value>| {
+                let received = received.clone();
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    let first = {
+                        let mut received = received.lock().await;
+                        received.push(body);
+                        received.len() == 1
+                    };
+                    if first {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                    http::StatusCode::ACCEPTED
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let inbox = format!("http://remote.fixture.invalid:{}/inbox", endpoint.port());
+    sqlx::query("UPDATE accounts SET inbox_url = $2, shared_inbox_url = '' WHERE id = $1")
+        .bind(REMOTE)
+        .bind(&inbox)
+        .execute(&pool)
+        .await?;
+    let mut statuses = Vec::new();
+    for label in ["a", "b"] {
+        let id: i64 = sqlx::query_scalar("INSERT INTO statuses (account_id, text, spoiler_text, visibility, local, uri, url, language, sensitive, reply, created_at, updated_at) VALUES ($1, 'cancellation target', '', 0, false, $2, $2, 'en', false, false, clock_timestamp(), clock_timestamp()) RETURNING id")
+            .bind(REMOTE).bind(format!("https://remote.fixture.invalid/statuses/cancellation-{label}"))
+            .fetch_one(&pool).await?;
+        statuses.push(id);
+    }
+    let mut config = federation_config();
+    config.remote_delivery_endpoint = Some(endpoint);
+    let handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
+        &queue,
+        Some(pool.clone()),
+        None,
+        Some(config),
+    )?;
+    let first_executor = WorkerExecutor::new(queue.clone(), handlers.clone(), 1, 1)?;
+    let second_executor = WorkerExecutor::new(queue.clone(), handlers, 1, 1)?;
+    writer
+        .set_favourite_with_origin(&authenticated, statuses[0], true, Some(ORIGIN), false)
+        .await?;
+    while queue.dispatch_outbox(100).await? > 0 {}
+    let first = tokio::spawn(async move {
+        first_executor
+            .process_one("live-like-a", &[Lane::Push], Duration::seconds(30))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified()).await?;
+    writer
+        .set_favourite_with_origin(&authenticated, statuses[1], true, Some(ORIGIN), false)
+        .await?;
+    while queue.dispatch_outbox(100).await? > 0 {}
+    let like_b: i64 = sqlx::query_scalar("SELECT id FROM rustodon.durable_jobs WHERE kind = $1 AND arguments -> 'body' ->> 'type' = 'Like' AND lease_owner IS NULL")
+        .bind(ACTIVITYPUB_DELIVERY_JOB_KIND).fetch_one(queue.pool()).await?;
+    writer
+        .set_favourite_with_origin(&authenticated, statuses[1], false, Some(ORIGIN), false)
+        .await?;
+    while queue.dispatch_outbox(100).await? > 0 {}
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM rustodon.durable_jobs WHERE id = $1)"
+        )
+        .bind(like_b)
+        .fetch_one(queue.pool())
+        .await?,
+        "the intermediate queued Like was cancelled"
+    );
+    assert!(
+        !second_executor
+            .process_one("undo-b-probe", &[Lane::Push], Duration::seconds(30))
+            .await?,
+        "Undo B must remain fenced by live Like A after Like B is cancelled"
+    );
+    writer
+        .set_favourite_with_origin(&authenticated, statuses[0], false, Some(ORIGIN), false)
+        .await?;
+    while queue.dispatch_outbox(100).await? > 0 {}
+    assert!(
+        !second_executor
+            .process_one("undo-a-probe", &[Lane::Push], Duration::seconds(30))
+            .await?,
+        "neither Undo may overtake live Like A"
+    );
+    release.notify_one();
+    assert!(first.await??);
+    for _ in 0..2 {
+        assert!(
+            second_executor
+                .process_one("undo-worker", &[Lane::Push], Duration::seconds(30))
+                .await?
+        );
+    }
+    let bodies = received.lock().await;
+    assert_eq!(
+        bodies.len(),
+        3,
+        "cancelled Like B must never reach the wire"
+    );
+    assert_eq!(bodies[0]["type"], "Like");
+    assert_eq!(bodies[1]["type"], "Undo");
+    assert_eq!(bodies[2]["type"], "Undo");
+    assert_eq!(
+        bodies[1]["object"]["object"],
+        "https://remote.fixture.invalid/statuses/cancellation-b"
+    );
+    assert_eq!(bodies[2]["object"]["id"], bodies[0]["id"]);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM rustodon.durable_jobs WHERE kind = $1")
+            .bind(ACTIVITYPUB_DELIVERY_JOB_KIND)
+            .fetch_one(queue.pool())
+            .await?,
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM favourites WHERE account_id = $1 AND status_id = ANY($2)"
+        )
+        .bind(ALICE)
+        .bind(&statuses)
+        .fetch_one(&pool)
+        .await?,
+        0
+    );
+    drop(bodies);
+    server.abort();
+    sqlx::query("UPDATE accounts SET inbox_url = $2, shared_inbox_url = $3 WHERE id = $1")
+        .bind(REMOTE)
+        .bind(original_inboxes.0)
+        .bind(original_inboxes.1)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM status_stats WHERE status_id = ANY($1)")
+        .bind(&statuses)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM statuses WHERE id = ANY($1)")
+        .bind(&statuses)
+        .execute(&pool)
+        .await?;
+    reset().await?;
+    Ok(())
+}
