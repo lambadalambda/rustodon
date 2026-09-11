@@ -47,6 +47,11 @@ enum ProcessMode {
 
 #[derive(Debug, Subcommand)]
 enum AdminCommand {
+    /// Refresh one existing remote account by its stored canonical actor ID and queue cache repair
+    RefreshRemoteAccount {
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+        account_id: i64,
+    },
     /// Create or upgrade the separately owned Rustodon operational schema
     MigrateOperationalSchema,
     /// Report worker lane coverage, scheduler liveness, queue depth, and dead letters
@@ -163,6 +168,9 @@ async fn run_admin(command: AdminCommand) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let AdminCommand::RefreshRemoteAccount { account_id } = &command {
+        return run_admin_refresh_remote_account(&config, *account_id).await;
+    }
     if let AdminCommand::ResolveReport {
         report_id,
         actor_account_id,
@@ -327,6 +335,7 @@ async fn run_admin(command: AdminCommand) -> ExitCode {
         } => {
             return run_admin_create_user(&config, &email, &username, password).await;
         }
+        AdminCommand::RefreshRemoteAccount { .. } => unreachable!("remote refresh handled above"),
         AdminCommand::ResolveReport { .. } => unreachable!("report resolution handled above"),
         AdminCommand::DeleteStatus { .. } => unreachable!("status deletion handled above"),
         AdminCommand::ReconcileAccountStats { .. } => {
@@ -343,6 +352,45 @@ async fn run_admin(command: AdminCommand) -> ExitCode {
         AdminCommand::PurgeDomain { .. } => unreachable!("domain purge handled above"),
     }
     ExitCode::SUCCESS
+}
+
+async fn run_admin_refresh_remote_account(config: &Config, account_id: i64) -> ExitCode {
+    let database = config.write_database.as_ref().unwrap_or(&config.database);
+    let Ok(options) = preflight::postgres_options_for(database) else {
+        eprintln!("remote refresh database configuration failed");
+        return ExitCode::FAILURE;
+    };
+    let Ok(pool) = connect_pool(options, database.pool_size).await else {
+        eprintln!("remote refresh database connection failed");
+        return ExitCode::FAILURE;
+    };
+    // This command only refreshes metadata and enqueues work. The worker opens the
+    // media root and performs bounded downloads; operator CLI never writes files.
+    let federation = ActivityPubDeliveryConfig {
+        origin: config.domains.canonical_origin.clone(),
+        local_domain: config.domains.local_domain.clone(),
+        media_root_url: String::new(),
+        media_root: None,
+        limited_federation: config.limited_federation,
+        #[cfg(feature = "test-support")]
+        remote_media_endpoint: None,
+        #[cfg(feature = "test-support")]
+        remote_delivery_endpoint: None,
+        #[cfg(feature = "test-support")]
+        remote_fetch_endpoint: None,
+    };
+    match rustodon::worker::refresh_remote_account(pool, &federation, account_id).await {
+        Ok(()) => {
+            println!(
+                "Remote account {account_id} refreshed; profile cache checks queued for the worker"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("remote refresh failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 async fn run_admin_resolve_report(

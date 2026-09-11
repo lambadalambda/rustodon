@@ -87,6 +87,7 @@ pub enum RemoteFetchError {
     InvalidRepresentation,
     IdentityMismatch,
     OriginMismatch,
+    PolicyDenied,
     Signing,
     DomainBudgetExceeded,
 }
@@ -111,6 +112,7 @@ impl fmt::Display for RemoteFetchError {
             Self::InvalidRepresentation => "remote response is not valid JSON",
             Self::IdentityMismatch => "remote response identity does not match the requested ID",
             Self::OriginMismatch => "remote response origin does not match the requested account",
+            Self::PolicyDenied => "remote URL is denied by policy",
             Self::Signing => "remote request could not be signed",
             Self::DomainBudgetExceeded => "remote host request budget is exhausted",
         })
@@ -520,6 +522,55 @@ impl RemoteFetcher {
             .await
     }
 
+    /// Check policy before every hop, retaining SSRF, timeout, byte and redirect
+    /// bounds. Return every visited URL for installation-time policy fencing.
+    pub(crate) async fn get_with_policy<F, Fut>(
+        &self,
+        url: Url,
+        policy: F,
+    ) -> Result<(RemoteResponse, Vec<Url>), RemoteFetchError>
+    where
+        F: Fn(Url) -> Fut,
+        Fut: Future<Output = Result<(), RemoteFetchError>>,
+    {
+        let endpoint = None;
+        #[cfg(feature = "test-support")]
+        let endpoint = {
+            if self.test_endpoint.is_some() && !cfg!(debug_assertions) {
+                return Err(RemoteFetchError::Client);
+            }
+            self.test_endpoint.or(endpoint)
+        };
+        let addresses = endpoint.map(|_| {
+            vec![
+                vec![SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 443)];
+                self.limits.max_redirects + 1
+            ]
+        });
+        let visited = std::sync::Mutex::new(Vec::new());
+        let response = tokio::time::timeout(
+            self.limits.request_timeout,
+            self.get_with_redirects(url, &[], None, None, endpoint, addresses, |url| {
+                let policy = &policy;
+                let visited = &visited;
+                async move {
+                    policy(url.clone()).await?;
+                    visited
+                        .lock()
+                        .map_err(|_| RemoteFetchError::Client)?
+                        .push(url);
+                    Ok(())
+                }
+            }),
+        )
+        .await
+        .map_err(|_| RemoteFetchError::Request)??;
+        Ok((
+            response,
+            visited.into_inner().map_err(|_| RemoteFetchError::Client)?,
+        ))
+    }
+
     /// Fetches a response through an explicit test endpoint without changing production DNS
     /// policy. This exists only for deterministic integration fixtures.
     ///
@@ -572,6 +623,7 @@ impl RemoteFetcher {
                 None,
                 Some(endpoint),
                 Some(vec![resolved_addresses]),
+                |_| std::future::ready(Ok(())),
             ),
         )
         .await
@@ -605,6 +657,7 @@ impl RemoteFetcher {
                 None,
                 Some(endpoint),
                 Some(resolved_address_sets),
+                |_| std::future::ready(Ok(())),
             ),
         )
         .await
@@ -801,6 +854,7 @@ impl RemoteFetcher {
                 signer,
                 endpoint,
                 policy_addresses,
+                |_| std::future::ready(Ok(())),
             ),
         )
         .await
@@ -818,6 +872,16 @@ impl RemoteFetcher {
         #[cfg(all(debug_assertions, feature = "test-support"))]
         if let Some(peer) = self.test_peer()? {
             peer.endpoint(url)?;
+        }
+        #[cfg(feature = "test-support")]
+        if self.test_endpoint.is_some() {
+            if !cfg!(debug_assertions) {
+                return Err(RemoteFetchError::Client);
+            }
+            return validate_resolved_addresses(&[SocketAddr::new(
+                Ipv4Addr::new(8, 8, 8, 8).into(),
+                443,
+            )]);
         }
         self.with_domain_permit(url, || async {
             #[cfg(all(debug_assertions, feature = "test-support"))]
@@ -904,7 +968,8 @@ impl RemoteFetcher {
         result
     }
 
-    async fn get_with_redirects(
+    #[allow(clippy::too_many_arguments)]
+    async fn get_with_redirects<F, Fut>(
         &self,
         mut url: Url,
         accepted_content_types: &[&str],
@@ -912,9 +977,15 @@ impl RemoteFetcher {
         signer: Option<&HttpSignatureSigner<'_>>,
         endpoint_override: Option<SocketAddr>,
         policy_address_sets: Option<Vec<Vec<SocketAddr>>>,
-    ) -> Result<RemoteResponse, RemoteFetchError> {
+        policy: F,
+    ) -> Result<RemoteResponse, RemoteFetchError>
+    where
+        F: Fn(Url) -> Fut,
+        Fut: Future<Output = Result<(), RemoteFetchError>>,
+    {
         for redirect_count in 0..=self.limits.max_redirects {
             validate_remote_url(&url)?;
+            policy(url.clone()).await?;
             if expected_origin.is_some_and(|expected| !same_origin_url(&url, expected)) {
                 return Err(RemoteFetchError::OriginMismatch);
             }
@@ -2001,6 +2072,8 @@ fn parse_remote_actor_document(
     ))
 }
 
+// Nested options encode absent/null/value, matching Update presence semantics.
+#[allow(clippy::option_option)]
 fn actor_image_field(value: Option<&Value>) -> Result<Option<Option<String>>, RemoteFetchError> {
     value
         .map(|value| {
@@ -3518,6 +3591,46 @@ mod tests {
             optional_remote_url(&href, "url").unwrap().unwrap().as_str(),
             "https://remote.example/@alice"
         );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn profile_fetch_checks_every_redirect_before_contact_and_retains_history() {
+        let redirect = b"HTTP/1.1 302 Found\r\nLocation: http://cdn.fixture.invalid/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let (endpoint, server) = local_http_responses(vec![redirect.clone()]);
+        let fetcher =
+            RemoteFetcher::new(RemoteFetchLimits::default()).with_test_endpoint(Some(endpoint));
+        let result = fetcher
+            .get_with_policy(
+                Url::parse("http://images.fixture.invalid/start").unwrap(),
+                |url| async move {
+                    if url.host_str() == Some("cdn.fixture.invalid") {
+                        Err(RemoteFetchError::PolicyDenied)
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(RemoteFetchError::PolicyDenied)));
+        server.join().unwrap();
+        let (endpoint, server) = local_http_responses(vec![redirect,
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 3\r\nConnection: close\r\n\r\nPNG".to_vec()]);
+        let fetcher =
+            RemoteFetcher::new(RemoteFetchLimits::default()).with_test_endpoint(Some(endpoint));
+        let (response, visited) = fetcher
+            .get_with_policy(
+                Url::parse("http://images.fixture.invalid/start").unwrap(),
+                |_| async { Ok(()) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.body, b"PNG");
+        assert_eq!(
+            visited.iter().filter_map(Url::host_str).collect::<Vec<_>>(),
+            ["images.fixture.invalid", "cdn.fixture.invalid"]
+        );
+        server.join().unwrap();
     }
 
     #[test]

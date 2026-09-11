@@ -862,13 +862,29 @@ impl WriteRepository {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, WriteError>>,
     {
+        self.with_remote_domains_locks(&[domain], operation).await
+    }
+
+    pub(crate) async fn with_remote_domains_locks<F, Fut, T>(
+        &self,
+        domains: &[&str],
+        operation: F,
+    ) -> Result<T, WriteError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, WriteError>>,
+    {
         let mut connection =
             PgConnection::connect_with(self.pool.connect_options().as_ref()).await?;
         sqlx::query("SET lock_timeout TO '10s'")
             .execute(&mut connection)
             .await?;
         let mut lock_transaction = Connection::begin(&mut connection).await?;
-        for scope in remote_domain_lock_scopes(domain) {
+        let scopes = domains
+            .iter()
+            .flat_map(|domain| remote_domain_lock_scopes(domain))
+            .collect::<std::collections::BTreeSet<_>>();
+        for scope in scopes {
             lock_domain_scope(&mut lock_transaction, &scope).await?;
         }
         let result = operation().await;
@@ -3073,8 +3089,34 @@ impl WriteRepository {
             return Err(WriteError::InvalidInput("remote actor handle is invalid"));
         }
         self.with_remote_domain_locks(domain, || async {
-            self.upsert_remote_actor_locked(username, domain, limited_federation, actor)
+            self.upsert_remote_actor_locked(username, domain, limited_federation, actor, None)
                 .await
+        })
+        .await
+    }
+
+    /// Refresh only an existing, still-identical remote row; operator recovery must
+    /// never create an account or replace its authentication keys.
+    pub(crate) async fn refresh_remote_actor(
+        &self,
+        account_id: i64,
+        username: &str,
+        domain: &str,
+        limited_federation: bool,
+        actor: &RemoteActor,
+    ) -> Result<i64, WriteError> {
+        if username.trim().is_empty() || !actor.username.eq_ignore_ascii_case(username) {
+            return Err(WriteError::Validation("remote refresh handle changed"));
+        }
+        self.with_remote_domain_locks(domain, || async {
+            self.upsert_remote_actor_locked(
+                username,
+                domain,
+                limited_federation,
+                actor,
+                Some(account_id),
+            )
+            .await
         })
         .await
     }
@@ -3086,6 +3128,7 @@ impl WriteRepository {
         domain: &str,
         limited_federation: bool,
         actor: &RemoteActor,
+        existing_id: Option<i64>,
     ) -> Result<i64, WriteError> {
         let mut transaction = self.pool.begin().await?;
         if !remote_domain_allowed_in_transaction(&mut transaction, domain, limited_federation)
@@ -3116,6 +3159,14 @@ impl WriteRepository {
         .bind(uri)
         .fetch_optional(&mut *transaction)
         .await?;
+        if let Some(expected_id) = existing_id {
+            let same_remote: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1 AND domain = $2 AND uri = $3 AND lower(username) = lower($4))"
+            ).bind(expected_id).bind(domain).bind(uri).bind(username).fetch_one(&mut *transaction).await?;
+            if uri_account_id != Some(expected_id) || !same_remote {
+                return Err(WriteError::Validation("remote refresh identity changed"));
+            }
+        }
         let handle_account = sqlx::query_as::<_, (i64, Option<String>)>(
             "SELECT id, uri FROM accounts
              WHERE lower(username) = lower($1) AND lower(domain) = lower($2)
@@ -3180,7 +3231,8 @@ impl WriteRepository {
         sqlx::query(
             "UPDATE accounts SET username = $2, domain = $3, actor_type = $4,
                 display_name = $5, note = $6, uri = $7, url = $8, inbox_url = $9,
-                 shared_inbox_url = $10, protocol = 1, public_key = '',
+                 shared_inbox_url = $10, protocol = 1,
+                 public_key = CASE WHEN $13 THEN public_key ELSE '' END,
                 followers_url = COALESCE($11, followers_url),
                 following_url = COALESCE($12, following_url),
                 last_webfingered_at = clock_timestamp(),
@@ -3199,6 +3251,7 @@ impl WriteRepository {
         .bind(actor.shared_inbox.as_ref().map_or("", Url::as_str))
         .bind(actor.followers.as_ref().map(Url::as_str))
         .bind(actor.following.as_ref().map(Url::as_str))
+        .bind(existing_id.is_some())
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
@@ -3220,7 +3273,17 @@ impl WriteRepository {
         .bind(actor.suspended)
         .execute(&mut *transaction)
         .await?;
-        reconcile_remote_actor_keypairs(&mut transaction, account_id, actor).await?;
+        if existing_id.is_none() {
+            reconcile_remote_actor_keypairs(&mut transaction, account_id, actor).await?;
+        }
+        super::profile_media::persist_images(
+            &mut transaction,
+            account_id,
+            actor.avatar.as_ref(),
+            actor.header.as_ref(),
+            true,
+        )
+        .await?;
         sqlx::query(
             "INSERT INTO account_stats (account_id, created_at, updated_at)
              VALUES ($1, clock_timestamp(), clock_timestamp())
@@ -3337,8 +3400,6 @@ impl WriteRepository {
                 indexable = COALESCE($15, indexable),
                 fields = COALESCE($16, fields),
                 also_known_as = COALESCE($17, also_known_as),
-                avatar_remote_url = CASE WHEN $18 THEN $19 ELSE avatar_remote_url END,
-                header_remote_url = CASE WHEN $20 THEN COALESCE($21, '') ELSE header_remote_url END,
                 updated_at = clock_timestamp()
               WHERE id = $1",
         )
@@ -3359,10 +3420,6 @@ impl WriteRepository {
         .bind(indexable)
         .bind(fields)
         .bind(also_known_as)
-        .bind(avatar_set)
-        .bind(avatar_remote_url)
-        .bind(header_set)
-        .bind(header_remote_url)
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
@@ -3383,6 +3440,14 @@ impl WriteRepository {
         .bind(account_id)
         .bind(suspended)
         .execute(&mut *transaction)
+        .await?;
+        super::profile_media::persist_images(
+            &mut transaction,
+            account_id,
+            avatar_set.then_some(&avatar_remote_url),
+            header_set.then_some(&header_remote_url),
+            false,
+        )
         .await?;
         transaction.commit().await?;
         Ok(())

@@ -30,6 +30,10 @@ pub const ACTIVITYPUB_DELIVERY_JOB_KIND: &str = "rustodon.activitypub.deliver";
 pub const ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND: &str = "rustodon.activitypub.resolve_thread";
 pub const ACTIVITYPUB_ANNOUNCE_RESOLVE_JOB_KIND: &str = "rustodon.activitypub.resolve_announce";
 pub const ACTIVITYPUB_NOTE_RESOLVE_JOB_KIND: &str = "rustodon.activitypub.resolve_note";
+pub const ACTIVITYPUB_PROFILE_MEDIA_FETCH_JOB_KIND: &str =
+    "rustodon.activitypub.fetch_profile_media";
+pub const ACTIVITYPUB_PROFILE_MEDIA_CLEANUP_JOB_KIND: &str =
+    "rustodon.activitypub.cleanup_profile_media";
 pub const ACTIVITYPUB_MEDIA_FETCH_JOB_KIND: &str = "rustodon.activitypub.fetch_media";
 pub const ACTIVITYPUB_EMOJI_FETCH_JOB_KIND: &str = "rustodon.activitypub.fetch_emoji";
 pub const ACTIVITYPUB_EMOJI_CLEANUP_JOB_KIND: &str = "rustodon.activitypub.cleanup_emoji";

@@ -3,6 +3,7 @@ pub(crate) mod activitypub_inbox;
 mod auth;
 mod oauth;
 pub mod policy;
+pub(crate) mod profile_media;
 mod records;
 mod repository;
 pub mod rest;

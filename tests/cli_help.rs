@@ -122,3 +122,23 @@ fn web_requires_valid_configuration_without_exposing_secrets() {
     assert!(!stderr.contains("must-not-appear"));
     assert!(!stderr.contains("not implemented yet"));
 }
+
+#[test]
+fn remote_refresh_is_an_existing_account_only_operator_command() {
+    let output = rustodon()
+        .args(["admin", "refresh-remote-account", "--help"])
+        .env_clear()
+        .output()
+        .expect("help runs without configuration");
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("--account-id"));
+    assert!(!help.contains("--actor-uri"));
+    let output = rustodon()
+        .args(["admin", "refresh-remote-account"])
+        .env_clear()
+        .output()
+        .expect("CLI runs");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--account-id"));
+}

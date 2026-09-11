@@ -2,6 +2,9 @@
 #[path = "workers/reply_emoji_grants.rs"]
 mod reply_emoji_grants;
 
+#[path = "workers/profile_media.rs"]
+mod profile_media;
+
 #[path = "workers/lifecycles.rs"]
 mod lifecycles;
 

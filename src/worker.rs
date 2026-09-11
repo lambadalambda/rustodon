@@ -1,3 +1,5 @@
+mod profile_media;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
@@ -23,7 +25,8 @@ use crate::jobs::{
     ACTIVITYPUB_ANNOUNCE_RESOLVE_JOB_KIND, ACTIVITYPUB_DELIVERY_JOB_KIND,
     ACTIVITYPUB_EMOJI_CLEANUP_JOB_KIND, ACTIVITYPUB_EMOJI_FETCH_JOB_KIND,
     ACTIVITYPUB_INBOX_JOB_KIND, ACTIVITYPUB_MEDIA_FETCH_JOB_KIND,
-    ACTIVITYPUB_NOTE_RESOLVE_JOB_KIND, ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
+    ACTIVITYPUB_NOTE_RESOLVE_JOB_KIND, ACTIVITYPUB_PROFILE_MEDIA_CLEANUP_JOB_KIND,
+    ACTIVITYPUB_PROFILE_MEDIA_FETCH_JOB_KIND, ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
     ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND, ClaimedJob, JobError, JobSpec,
     LOCAL_MEDIA_CLEANUP_JOB_KIND, Lane, MASTODON_ACCOUNT_PURGE_JOB_KIND,
     MASTODON_DOMAIN_BLOCK_JOB_KIND, MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND,
@@ -140,6 +143,79 @@ pub struct ActivityPubDeliveryConfig {
     pub remote_delivery_endpoint: Option<std::net::SocketAddr>,
     #[cfg(feature = "test-support")]
     pub remote_fetch_endpoint: Option<std::net::SocketAddr>,
+}
+
+/// Operator-only recovery of an existing remote account using its DB canonical ID.
+/// Uses the signed, identity/WebFinger/SSRF-validated resolver and the normal image
+/// persistence/outbox path. No relationships, local suspensions or keys are replaced.
+///
+/// # Errors
+/// Fails closed on missing/local accounts, policy denial, invalid identity, absent
+/// instance signing keys, transport failures or persistence failures.
+pub async fn refresh_remote_account(
+    pool: PgPool,
+    config: &ActivityPubDeliveryConfig,
+    account_id: i64,
+) -> Result<(), HandlerFailure> {
+    let repository = Repository::from_pool(pool.clone());
+    let account = repository
+        .account(account_id)
+        .await
+        .map_err(|_| HandlerFailure::retry("remote refresh account lookup failed"))?
+        .ok_or_else(|| HandlerFailure::permanent("remote refresh account does not exist"))?;
+    let domain = account
+        .domain
+        .as_deref()
+        .filter(|domain| !domain.is_empty())
+        .ok_or_else(|| HandlerFailure::permanent("remote refresh requires a remote account"))?;
+    if !repository
+        .remote_domain_allowed(domain, config.limited_federation)
+        .await
+        .map_err(|_| HandlerFailure::retry("remote refresh policy lookup failed"))?
+    {
+        return Err(HandlerFailure::permanent(
+            "remote refresh domain is not allowed",
+        ));
+    }
+    let actor_url = Url::parse(&account.uri).map_err(|_| {
+        HandlerFailure::permanent("remote refresh account has no canonical actor ID")
+    })?;
+    let instance = repository
+        .account(-99)
+        .await
+        .map_err(|_| HandlerFailure::retry("instance actor lookup failed"))?
+        .ok_or_else(|| HandlerFailure::permanent("instance actor is missing"))?;
+    let private_key = instance
+        .private_key
+        .as_ref()
+        .filter(|key| key.is_present())
+        .ok_or_else(|| HandlerFailure::permanent("instance actor has no private key"))?;
+    let key_id = format!(
+        "{}#main-key",
+        activitypub::actor_url(&config.origin, &instance)
+    );
+    let signer = HttpSignatureSigner {
+        key_id: &key_id,
+        private_key_pem: private_key.as_str(),
+    };
+    let fetcher = RemoteFetcher::new(RemoteFetchLimits::default());
+    #[cfg(feature = "test-support")]
+    let fetcher = fetcher.with_test_endpoint(config.remote_fetch_endpoint);
+    let actor = RemoteAccountResolver::new(fetcher)
+        .resolve_actor_uri_with_signer(&actor_url, Some(&signer))
+        .await
+        .map_err(|error| remote_thread_fetch_failure(&error))?;
+    WriteRepository::from_pool(pool)
+        .refresh_remote_actor(
+            account_id,
+            &account.username,
+            domain,
+            config.limited_federation,
+            &actor,
+        )
+        .await
+        .map_err(|_| HandlerFailure::retry("remote refresh persistence failed"))?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2158,6 +2234,7 @@ fn delivery_failure(
         | RemoteFetchError::BodyTooLarge
         | RemoteFetchError::IdentityMismatch
         | RemoteFetchError::OriginMismatch
+        | RemoteFetchError::PolicyDenied
         | RemoteFetchError::Signing => HandlerFailure::permanent("remote delivery is invalid"),
         _ => HandlerFailure::retry("remote delivery failed"),
     }
@@ -2175,6 +2252,7 @@ fn inbox_remote_failure(error: &RemoteFetchError) -> HandlerFailure {
         | RemoteFetchError::InvalidRepresentation
         | RemoteFetchError::IdentityMismatch
         | RemoteFetchError::OriginMismatch
+        | RemoteFetchError::PolicyDenied
         | RemoteFetchError::Signing
         | RemoteFetchError::BlockedAddress(_) => {
             HandlerFailure::permanent(format!("remote inbox actor is invalid: {error}"))
@@ -2234,6 +2312,7 @@ fn remote_thread_fetch_failure(error: &RemoteFetchError) -> HandlerFailure {
         | RemoteFetchError::InvalidRepresentation
         | RemoteFetchError::IdentityMismatch
         | RemoteFetchError::OriginMismatch
+        | RemoteFetchError::PolicyDenied
         | RemoteFetchError::Signing
         | RemoteFetchError::BlockedAddress(_) => {
             HandlerFailure::permanent(format!("remote reply parent is invalid: {error}"))
@@ -2274,6 +2353,7 @@ fn remote_announce_fetch_failure(error: &RemoteFetchError) -> HandlerFailure {
         | RemoteFetchError::InvalidRepresentation
         | RemoteFetchError::IdentityMismatch
         | RemoteFetchError::OriginMismatch
+        | RemoteFetchError::PolicyDenied
         | RemoteFetchError::Signing
         | RemoteFetchError::BlockedAddress(_) => {
             HandlerFailure::permanent(format!("remote Announce target is invalid: {error}"))
@@ -5404,6 +5484,49 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
                 },
             )?;
             if let Some(media_root) = federation.media_root.clone() {
+                let profile_pool = mastodon_writer.clone();
+                let profile_queue = queue.clone();
+                let profile_config = federation.clone();
+                let profile_fetcher = remote_fetcher.clone();
+                let profile_root = media_root.clone();
+                handlers.register(
+                    ACTIVITYPUB_PROFILE_MEDIA_FETCH_JOB_KIND,
+                    Lane::Pull,
+                    ResourceClass::Media,
+                    move |job| {
+                        let pool = profile_pool.clone();
+                        let queue = profile_queue.clone();
+                        let config = profile_config.clone();
+                        let fetcher = profile_fetcher.clone();
+                        let root = profile_root.clone();
+                        async move {
+                            profile_media::fetch_profile_image(
+                                pool,
+                                queue,
+                                &config,
+                                &fetcher,
+                                root,
+                                &job.arguments,
+                            )
+                            .await
+                        }
+                    },
+                )?;
+                let profile_pool = mastodon_writer.clone();
+                let profile_root = media_root.clone();
+                handlers.register(
+                    ACTIVITYPUB_PROFILE_MEDIA_CLEANUP_JOB_KIND,
+                    Lane::Maintenance,
+                    ResourceClass::Media,
+                    move |job| {
+                        let pool = profile_pool.clone();
+                        let root = profile_root.clone();
+                        async move {
+                            profile_media::cleanup_profile_images(pool, root, &job.arguments).await
+                        }
+                    },
+                )?;
+
                 let emoji_cleanup_pool = mastodon_writer.clone();
                 let emoji_cleanup_root = media_root.clone();
                 handlers.register(
