@@ -17,3 +17,4 @@
 - [ ] [Run essential parity gates and peer tests on Secunda](issues/run-essential-parity-gates-on-secunda.md)
 - [ ] [Add isolated bidirectional federation peer tests](issues/add-isolated-federation-peer-tests.md)
 - [ ] [Accept ordinary ActivityPub tag atom identifiers](issues/accept-activitypub-tag-atom-identifiers.md)
+- [ ] [Restore v2 account search for clients](issues/restore-v2-account-search.md)
