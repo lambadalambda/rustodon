@@ -24,3 +24,4 @@
 - [ ] [Repair remote reply-thread persistence](issues/repair-remote-reply-thread-persistence.md)
 - [ ] [Diagnose missing remote avatar and banner](issues/diagnose-missing-remote-avatar-and-banner.md)
 - [ ] [Return empty results for unimplemented frontend API reads](issues/return-empty-unimplemented-api-reads.md)
+- [ ] [Diagnose missing remote animated media](issues/diagnose-missing-remote-animated-media.md)
