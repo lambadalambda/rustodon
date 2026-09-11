@@ -92,3 +92,19 @@ After integrating R01/R02/R03/R04/R06/R13 on Secunda:
    scenarios. Source/build guard tests alone are not Pleroma federation evidence.
 
 R17/R18 and the separately noted stress/legacy-history limits remain deferred.
+
+### Source-only continuation integrated
+
+- Atom metadata repair: `a3fe48a`; v2 account-search reuse: `0d513f5`.
+- Expanded peer test source is merged in separate privacy, Note lifecycle,
+  profile Update, and Like/private Announce Undo commits. Independent source
+  reviews approved after corrections; none of the expanded scenarios is claimed
+  green. The historical public smoke passed on its earlier source revision, not
+  on this final combined tree.
+- Add `tools/mastodon-fixture schema-read-test v2_account_search` explicitly to
+  the resumed gates; it is a named opt-in library fixture regression.
+- Run all five peer scenarios (`public`, `privacy`, `notes`, `profile`,
+  `interactions`) and current audit/multipart unit regressions as documented in
+  `docs/federation-peer-smoke.md`. Each scenario starts fresh peers.
+- Source-only work is complete for this continuation. Runtime acceptance remains
+  blocked on Secunda access and, separately, the Pleroma base-image quota.
