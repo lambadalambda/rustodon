@@ -6,6 +6,7 @@ mod differential {
     pub mod harness;
     pub mod normalization;
     pub mod read_only;
+    pub mod reauth;
     pub mod safety;
     pub mod writes;
 }
@@ -7054,4 +7055,16 @@ fn checked_instance_fixture() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         return Err("instance-v2 fixture does not match the pinned deterministic baseline".into());
     }
     Ok(bytes)
+}
+
+#[tokio::test]
+#[ignore = "requires guarded PostgreSQL clones from tools/mastodon-fixture"]
+async fn browser_recovery_fences() -> Result<(), Box<dyn std::error::Error>> {
+    let config =
+        DifferentialConfig::from_process_environment(&PathBuf::from(env!("CARGO_MANIFEST_DIR")))?;
+    tokio::time::timeout(
+        std::time::Duration::from_mins(2),
+        differential::reauth::recovery_fences(config),
+    )
+    .await?
 }

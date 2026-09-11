@@ -10335,33 +10335,32 @@ async fn browser_security_update(
             "The new password confirmation does not match.",
         );
     }
-    let user = match state.repository.user(session.user_id).await {
-        Ok(Some(user)) => user,
-        Ok(None) => return record_not_found(),
-        Err(_) => return internal_error(),
-    };
-    if !verify_password(current_password, user.encrypted_password.as_str()) {
-        return browser_settings_error_response(
-            &state,
-            &headers,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "The current password is incorrect.",
-        );
-    }
     let Some(writer) = state.write_repository.as_ref() else {
         return internal_error();
     };
-    match writer
-        .reset_user_password_by_email(&user.email, password)
+    let authentication = match writer
+        .verify_current_password(session.user_id, current_password)
         .await
     {
-        Ok(true) => browser_redirect_response("/auth/sign_in"),
-        Ok(false) | Err(WriteError::InvalidInput(_) | WriteError::Validation(_)) => {
+        Ok(authentication) => authentication,
+        Err(WriteError::Unauthorized) => {
+            return browser_settings_error_response(
+                &state,
+                &headers,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "The current password is incorrect.",
+            );
+        }
+        Err(_) => return internal_error(),
+    };
+    match writer.change_user_password(&authentication, password).await {
+        Ok(()) => browser_redirect_response("/auth/sign_in"),
+        Err(WriteError::Unauthorized | WriteError::InvalidInput(_) | WriteError::Validation(_)) => {
             browser_settings_error_response(
                 &state,
                 &headers,
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "The new password could not be saved.",
+                "The new password could not be saved. Please authenticate again.",
             )
         }
         Err(_) => internal_error(),
@@ -11047,7 +11046,7 @@ async fn browser_sign_in(
         }
     };
     let Ok(session_id) = writer
-        .create_browser_session(authentication.user_id, ip, user_agent)
+        .create_browser_session(&authentication, ip, user_agent)
         .await
     else {
         return internal_error();

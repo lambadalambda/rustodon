@@ -3917,7 +3917,7 @@ pub(crate) async fn run_browser_authentication_case(
                 .map_err(|error| format!("{label}: non-memorial account was rejected: {error}"))?;
             let session_id = lifecycle_writer
                 .create_browser_session(
-                    authentication.user_id,
+                    &authentication,
                     IpNetwork::from("192.0.2.10".parse::<std::net::IpAddr>()?),
                     "rustodon-browser-lifecycle-test",
                 )
@@ -4117,7 +4117,7 @@ pub(crate) async fn run_browser_authentication_case(
     }
     let session_id = writer
         .create_browser_session(
-            authentication.user_id,
+            &authentication,
             IpNetwork::from("192.0.2.10".parse::<std::net::IpAddr>()?),
             "rustodon-browser-auth-test",
         )
@@ -4430,21 +4430,21 @@ pub(crate) async fn run_account_settings_case(
     let browser_media_state_before =
         account_media_state(rust_writer.url(), BROWSER_MEDIA_ACCOUNT_ID).await?;
     let writer = WriteRepository::connect(rust_writer.url()).await?;
-    let session_id = writer
-        .create_browser_session(
-            MARKER_USER_ID,
-            IpNetwork::from("192.0.2.20".parse::<std::net::IpAddr>()?),
-            "rustodon-account-settings-test",
-        )
-        .await?;
+    let session_id = super::reauth::fixture_browser_session(
+        rust_writer.url(),
+        MARKER_USER_ID,
+        IpNetwork::from("192.0.2.20".parse::<std::net::IpAddr>()?),
+        "rustodon-account-settings-test",
+    )
+    .await?;
     let mut browser = BrowserFormState::new(Some(&session_id));
-    let browser_media_session_id = writer
-        .create_browser_session(
-            BROWSER_MEDIA_USER_ID,
-            IpNetwork::from("192.0.2.21".parse::<std::net::IpAddr>()?),
-            "rustodon-account-media-test",
-        )
-        .await?;
+    let browser_media_session_id = super::reauth::fixture_browser_session(
+        rust_writer.url(),
+        BROWSER_MEDIA_USER_ID,
+        IpNetwork::from("192.0.2.21".parse::<std::net::IpAddr>()?),
+        "rustodon-account-media-test",
+    )
+    .await?;
     let mut browser_media = BrowserFormState::new(Some(&browser_media_session_id));
     let profile_image = std::fs::read(MEDIA_FIXTURE)?;
     let mut created_status_ids = Vec::new();
@@ -4953,13 +4953,13 @@ pub(crate) async fn run_browser_two_factor_management_case(
     let writer = rustodon::mastodon::WriteRepository::connect(rust_writer.url())
         .await?
         .with_active_record_encryption(encryption.clone());
-    let session_id = writer
-        .create_browser_session(
-            USER_ID,
-            IpNetwork::from("192.0.2.30".parse::<std::net::IpAddr>()?),
-            "rustodon-browser-2fa-test",
-        )
-        .await?;
+    let session_id = super::reauth::fixture_browser_session(
+        rust_writer.url(),
+        USER_ID,
+        IpNetwork::from("192.0.2.30".parse::<std::net::IpAddr>()?),
+        "rustodon-browser-2fa-test",
+    )
+    .await?;
     let mut browser = BrowserFormState::new(Some(&session_id));
     let operation = async {
         let methods = load_browser_form(
@@ -6294,13 +6294,13 @@ pub(crate) async fn run_oauth_authorization_code_case(
     )
     .map_err(|error| format!("OAuth authorization-code replay: {error}"))?;
     let writer = WriteRepository::connect(rust_writer.url()).await?;
-    let session_id = writer
-        .create_browser_session(
-            101,
-            IpNetwork::from("192.0.2.10".parse::<std::net::IpAddr>()?),
-            "rustodon-oauth-consent-test",
-        )
-        .await?;
+    let session_id = super::reauth::fixture_browser_session(
+        rust_writer.url(),
+        101,
+        IpNetwork::from("192.0.2.10".parse::<std::net::IpAddr>()?),
+        "rustodon-oauth-consent-test",
+    )
+    .await?;
     let consent_query = format!(
         "client_id=rustodon-fixture-client-v4-6-5&redirect_uri=urn%3Aietf%3Awg%3Aoauth%3A2.0%3Aoob&response_type=code&scope=read&state=consent-state&code_challenge={challenge}&code_challenge_method=S256"
     );

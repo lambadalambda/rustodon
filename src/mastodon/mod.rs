@@ -49,5 +49,6 @@ pub use write_repository::{
     OAuthTokenRevocationError, REPORT_RATE_LIMIT, ReblogWriteOutcome, RemoteFollowOutcome,
     RemoteFollowWriteOutcome, RemoteInteractionWriteOutcome, RemoteNoteWriteOutcome,
     RemoteUndoReferenceKind, STATUS_NOTIFICATION_JOB_KIND, StatusMediaAttributeUpdate,
-    StatusUpdate, StatusWriteOutcome, WriteError, WriteOptions, WriteOutcome, WriteRepository,
+    StatusUpdate, StatusWriteOutcome, VerifiedPassword, WriteError, WriteOptions, WriteOutcome,
+    WriteRepository,
 };

@@ -360,11 +360,19 @@ pub enum BrowserAuthenticationMethod {
     BackupCode,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrowserAuthentication {
     pub user_id: i64,
     pub account_id: i64,
     pub method: BrowserAuthenticationMethod,
+    password: VerifiedPassword,
+}
+
+/// A password check tied to the exact stored credential, never caller-supplied authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedPassword {
+    user_id: i64,
+    encrypted_password: super::types::SecretText,
 }
 
 #[derive(Debug)]
@@ -8868,7 +8876,53 @@ impl WriteRepository {
             user_id: user.id,
             account_id: user.account_id,
             method,
+            password: VerifiedPassword {
+                user_id: user.id,
+                encrypted_password: user.encrypted_password,
+            },
         })
+    }
+
+    /// Verifies a current password; authorized writes must fence this proof in their transaction.
+    pub async fn verify_current_password(
+        &self,
+        user_id: i64,
+        password: &str,
+    ) -> Result<VerifiedPassword, WriteError> {
+        let encrypted_password = sqlx::query_scalar::<_, super::types::SecretText>(
+            "SELECT encrypted_password FROM users WHERE id = $1",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(WriteError::Unauthorized)?;
+        if !verify_password(password, encrypted_password.as_str()) {
+            return Err(WriteError::Unauthorized);
+        }
+        Ok(VerifiedPassword {
+            user_id,
+            encrypted_password,
+        })
+    }
+
+    /// Changes a password only if the checked credential is still current under the user lock.
+    pub async fn change_user_password(
+        &self,
+        authentication: &VerifiedPassword,
+        password: &str,
+    ) -> Result<(), WriteError> {
+        validate_local_password(password)?;
+        let mut transaction = self.pool.begin().await?;
+        let account_id = lock_verified_password_in(&mut transaction, authentication).await?;
+        replace_user_password_in(
+            &mut transaction,
+            authentication.user_id,
+            account_id,
+            password,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Enables TOTP authentication and returns the one-time backup codes.
@@ -9029,39 +9083,7 @@ impl WriteRepository {
             transaction.commit().await?;
             return Ok(false);
         };
-        let encrypted_password =
-            hash(password, DEFAULT_COST).map_err(|_| WriteError::Validation("invalid password"))?;
-        sqlx::query(
-            "UPDATE users SET encrypted_password = $1, reset_password_token = NULL, \
-                    reset_password_sent_at = NULL, sign_in_token = NULL, \
-                    sign_in_token_sent_at = NULL, updated_at = clock_timestamp() \
-             WHERE id = $2",
-        )
-        .bind(encrypted_password)
-        .bind(user_id)
-        .execute(&mut *transaction)
-        .await?;
-        sqlx::query("DELETE FROM session_activations WHERE user_id = $1")
-            .bind(user_id)
-            .execute(&mut *transaction)
-            .await?;
-        sqlx::query(
-            "DELETE FROM web_push_subscriptions subscription \
-             USING oauth_access_tokens access_token \
-             WHERE subscription.access_token_id = access_token.id \
-               AND access_token.resource_owner_id = $1",
-        )
-        .bind(user_id)
-        .execute(&mut *transaction)
-        .await?;
-        revoke_user_access_tokens_in(&mut transaction, user_id, account_id).await?;
-        sqlx::query(
-            "UPDATE oauth_access_grants SET revoked_at = COALESCE(revoked_at, clock_timestamp()) \
-             WHERE resource_owner_id = $1 AND revoked_at IS NULL",
-        )
-        .bind(user_id)
-        .execute(&mut *transaction)
-        .await?;
+        replace_user_password_in(&mut transaction, user_id, account_id, password).await?;
         transaction.commit().await?;
         Ok(true)
     }
@@ -9362,52 +9384,22 @@ impl WriteRepository {
             transaction.commit().await?;
             return Ok(false);
         };
-        let encrypted_password =
-            hash(password, DEFAULT_COST).map_err(|_| WriteError::Validation("invalid password"))?;
-        sqlx::query(
-            "UPDATE users SET encrypted_password = $1, reset_password_token = NULL, \
-                    reset_password_sent_at = NULL, sign_in_token = NULL, \
-                    sign_in_token_sent_at = NULL, updated_at = clock_timestamp() \
-             WHERE id = $2",
-        )
-        .bind(encrypted_password)
-        .bind(user_id)
-        .execute(&mut *transaction)
-        .await?;
-        sqlx::query("DELETE FROM session_activations WHERE user_id = $1")
-            .bind(user_id)
-            .execute(&mut *transaction)
-            .await?;
-        sqlx::query(
-            "DELETE FROM web_push_subscriptions subscription \
-             USING oauth_access_tokens access_token \
-             WHERE subscription.access_token_id = access_token.id \
-               AND access_token.resource_owner_id = $1",
-        )
-        .bind(user_id)
-        .execute(&mut *transaction)
-        .await?;
-        revoke_user_access_tokens_in(&mut transaction, user_id, account_id).await?;
-        sqlx::query(
-            "UPDATE oauth_access_grants SET revoked_at = COALESCE(revoked_at, clock_timestamp()) \
-             WHERE resource_owner_id = $1 AND revoked_at IS NULL",
-        )
-        .bind(user_id)
-        .execute(&mut *transaction)
-        .await?;
+        replace_user_password_in(&mut transaction, user_id, account_id, password).await?;
         transaction.commit().await?;
         Ok(true)
     }
 
     pub async fn create_browser_session(
         &self,
-        user_id: i64,
+        authentication: &BrowserAuthentication,
         ip: IpNetwork,
         user_agent: &str,
-    ) -> sqlx::Result<String> {
+    ) -> Result<String, WriteError> {
         let session_id = random_urlsafe_base64(32);
         let access_token = random_urlsafe_base64(32);
         let mut transaction = self.pool.begin().await?;
+        lock_verified_password_in(&mut transaction, &authentication.password).await?;
+        let user_id = authentication.password.user_id;
         let application_id = sqlx::query_scalar::<_, i64>(
             "SELECT id FROM oauth_applications WHERE superapp = true ORDER BY id LIMIT 1",
         )
@@ -14593,6 +14585,64 @@ async fn record_token_kill_stream_event(
         JobError::Sqlx(error) => error,
         other => sqlx::Error::Protocol(other.to_string()),
     })
+}
+
+// The password hash is the credential version: bcrypt resets generate a fresh salt even
+// when the plaintext is reused. Recovery and all fenced writes serialize on this row.
+async fn lock_verified_password_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    authentication: &VerifiedPassword,
+) -> Result<i64, WriteError> {
+    sqlx::query_scalar(
+        "SELECT account_id FROM users WHERE id = $1 AND encrypted_password = $2 FOR UPDATE",
+    )
+    .bind(authentication.user_id)
+    .bind(authentication.encrypted_password.as_str())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(WriteError::Unauthorized)
+}
+
+async fn replace_user_password_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_id: i64,
+    account_id: i64,
+    password: &str,
+) -> Result<(), WriteError> {
+    let encrypted_password =
+        hash(password, DEFAULT_COST).map_err(|_| WriteError::Validation("invalid password"))?;
+    sqlx::query(
+        "UPDATE users SET encrypted_password = $1, reset_password_token = NULL, \
+                    reset_password_sent_at = NULL, sign_in_token = NULL, \
+                    sign_in_token_sent_at = NULL, updated_at = clock_timestamp() \
+             WHERE id = $2",
+    )
+    .bind(encrypted_password)
+    .bind(user_id)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query("DELETE FROM session_activations WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut **transaction)
+        .await?;
+    sqlx::query(
+        "DELETE FROM web_push_subscriptions subscription \
+             USING oauth_access_tokens access_token \
+             WHERE subscription.access_token_id = access_token.id \
+               AND access_token.resource_owner_id = $1",
+    )
+    .bind(user_id)
+    .execute(&mut **transaction)
+    .await?;
+    revoke_user_access_tokens_in(transaction, user_id, account_id).await?;
+    sqlx::query(
+        "UPDATE oauth_access_grants SET revoked_at = COALESCE(revoked_at, clock_timestamp()) \
+             WHERE resource_owner_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(user_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 async fn revoke_user_access_tokens_in(
