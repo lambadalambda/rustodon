@@ -114,3 +114,31 @@ synchronized, with the three tracked public symlinks recreated separately; no `.
 
 The issue remains open for the parent's live deployment/recovery and rendered-media
 verification. No live origin, live environment or instance workload was contacted.
+
+
+## Combined worker-gate follow-up
+
+- Reproduced the combined-suite physical-file assertion failure in the original task
+  worktree: `tools/mastodon-fixture worker-test` reports **69 passed, 1 failed** in
+  `full-workers-red.log`. The same superseded cached avatar path remains after Ingress.
+- Root cause is an outdated test execution boundary, not lost cleanup: Update now
+  clears stale profile metadata and durably stores the old paths for Maintenance.
+  Delete's current-row sweep cannot rediscover those superseded paths. The legacy test
+  processed only Ingress and asserted physical cleanup without dispatching/running the
+  newly queued Maintenance work.
+- The regression now verifies both undispatched cleanup records survive Delete with
+  exactly the original avatar/header paths, dispatches through the real outbox and
+  executes only Maintenance (no synthetic-origin network requests), checks that cleanup
+  is acknowledged rather than retrying/dead-lettered, and retains all physical-file
+  deletion assertions. No production cleanup behavior is changed.
+- After the test correction, the original unfiltered worker Rust suite passes
+  **70/70**, including all eight profile-media cases (`full-workers-green.log`).
+  The enclosing harness subsequently fails its separate worker-readiness phase with
+  `PF_WRITE_DATABASE_PRIVILEGES` (`target/worker-log-121347`); this older worktree lacks
+  the parent's grant/startup fixes. No grant changes were made for this follow-up.
+- Secunda `cargo fmt --all` ran before the successful full worker tests and its
+  formatted test source was retrieved. Follow-up Clippy could not be confirmed:
+  SSH became unresponsive, then `secunda.local` stopped resolving. This is a remaining
+  verification limitation, not a reported Clippy success.
+- Independent review approved the test/doc-only correction: durable paths and physical
+  cleanup remain asserted; no production change or manual unlink masks lost work.

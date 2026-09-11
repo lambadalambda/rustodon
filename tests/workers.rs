@@ -4676,6 +4676,81 @@ async fn activitypub_actor_update_and_delete_are_processed_idempotently()
                 .fetch_one(&writer_pool)
                 .await?;
         assert_eq!(profile_media_state, (None, None));
+        // Update transferred the superseded profile paths into durable cleanup
+        // events before clearing metadata. Delete must not lose that work; its
+        // current-row media sweep cannot rediscover those old paths.
+        let cleanup_kind = rustodon::jobs::ACTIVITYPUB_PROFILE_MEDIA_CLEANUP_JOB_KIND;
+        let cleanup_paths: Vec<Value> = sqlx::query_scalar(
+            "SELECT payload #> '{arguments,paths}' FROM rustodon.outbox_events
+              WHERE kind = $1 AND payload #>> '{arguments,account_id}' = $2
+                AND dispatched_at IS NULL ORDER BY id",
+        )
+        .bind(cleanup_kind)
+        .bind(actor_id.to_string())
+        .fetch_all(&runtime_pool)
+        .await?;
+        let expected_paths = actor_media_metadata
+            .iter()
+            .filter(|metadata| {
+                matches!(
+                    metadata.attachment,
+                    PaperclipAttachment::AccountAvatar | PaperclipAttachment::AccountHeader
+                )
+            })
+            .flat_map(|metadata| {
+                ["original", "static"]
+                    .into_iter()
+                    .filter_map(|style| metadata.relative_path(style))
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            cleanup_paths.len(),
+            2,
+            "both profile cleanup events must survive Delete"
+        );
+        let stored_paths = cleanup_paths
+            .iter()
+            .flat_map(|paths| {
+                paths
+                    .as_array()
+                    .expect("cleanup paths must be an array")
+                    .iter()
+                    .map(|path| {
+                        path.as_str()
+                            .expect("cleanup path must be a string")
+                            .to_owned()
+                    })
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            stored_paths, expected_paths,
+            "cleanup must retain exact superseded paths"
+        );
+        while queue.dispatch_outbox(100).await? != 0 {}
+        // Run only Maintenance: draining Pull/Push here could contact synthetic origins.
+        for _ in &cleanup_paths {
+            assert!(
+                executor
+                    .process_one(
+                        "actor-profile-cleanup",
+                        &[Lane::Maintenance],
+                        Duration::seconds(30)
+                    )
+                    .await?
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM rustodon.durable_jobs
+              WHERE kind = $1 AND arguments ->> 'account_id' = $2",
+            )
+            .bind(cleanup_kind)
+            .bind(actor_id.to_string())
+            .fetch_one(&runtime_pool)
+            .await?,
+            0,
+            "profile cleanup must complete, not retry or dead-letter"
+        );
         for metadata in &actor_media_metadata {
             for style in ["original", "small", "static"] {
                 if let Some(path) = metadata.relative_path(style) {
