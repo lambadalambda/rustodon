@@ -1,0 +1,225 @@
+#!/bin/bash
+# Real Mastodon <-> Rustodon smoke; Secunda only, no production environment.
+set -euo pipefail
+[[ $(hostname) == secunda && $PWD == /home/lain/rustodon-parity/peer-tests ]] || {
+  echo 'Run only on Secunda in /home/lain/rustodon-parity/peer-tests' >&2; exit 2;
+}
+[[ $# == 0 ]] || { echo 'No arguments accepted' >&2; exit 2; }
+if [[ ${PEER_SMOKE_DEADLINE:-0} != 1 ]]; then
+  exec timeout --signal=TERM --kill-after=60 600 env PEER_SMOKE_DEADLINE=1 "$0" </dev/null
+fi
+export CARGO_BUILD_JOBS=2
+MASTODON_FIXTURE_LIBRARY=1 source tools/mastodon-fixture
+SOURCE_DIR=/home/lain/repos/rustodon/target/mastodon-v4.6.5
+[[ $(git -C "$SOURCE_DIR" rev-parse HEAD) == "$REVISION" ]] || die 'pinned source mismatch'
+verify_static "$FIXTURE_DIR"
+# Reuse cached pinned images; never pull or rebuild upstream for this smoke.
+for image in "$MASTODON_IMAGE" "$POSTGRES_IMAGE" "$REDIS_IMAGE"; do
+  run_podman image exists "$image" || die "missing pinned image: $image"
+  [[ $(run_podman image inspect "$image" --format '{{.Os}}/{{.Architecture}}|{{.Digest}}') == "$PLATFORM|${image##*@}" ]] || die "cached image platform/digest mismatch: $image"
+done
+cargo build --locked --features test-support --bin rustodon
+cargo test --locked --features test-support --test federation_peers --no-run
+RUN="peer-$$"
+RUN_ROOT="$ROOT/target/$RUN"
+mkdir -m 700 "$RUN_ROOT"
+printf '%s\n' "$RUN" > "$RUN_ROOT/.peer-run"
+PIDS=()
+EXTRA_CONTAINERS=()
+cleanup() {
+  status=$?
+  trap - EXIT
+  if [[ -n ${RUSTODON_DB:-} ]]; then
+    psql_peer "$RUSTODON_DB" -c 'SELECT id, kind, attempts, last_error, dead_at FROM rustodon.durable_jobs ORDER BY id LIMIT 30' >"$RUN_ROOT/rustodon-jobs.log" 2>&1 || true
+    for side in mastodon rustodon; do
+      psql_peer "rustodon_peer_$$_$side" -c 'SELECT a.id, a.username, a.domain, a.uri, u.approved, u.confirmed_at FROM accounts a LEFT JOIN users u ON u.account_id=a.id ORDER BY a.id' >"$RUN_ROOT/$side-accounts.log" 2>&1 || true
+      psql_peer "rustodon_peer_$$_$side" -c 'SELECT account_id, target_account_id FROM follows' -c 'SELECT account_id, target_account_id FROM follow_requests' >"$RUN_ROOT/$side-follows.log" 2>&1 || true
+    done
+  fi
+  for name in "${EXTRA_CONTAINERS[@]}"; do
+    run_podman logs "$name" >"$RUN_ROOT/$name.log" 2>&1 || true
+    run_podman rm -f --volumes "$name" >/dev/null 2>&1 || true
+  done
+  for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
+  for _ in {1..50}; do
+    alive=0
+    for pid in "${PIDS[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
+    [[ $alive == 1 ]] || break
+    sleep .1
+  done
+  for pid in "${PIDS[@]}"; do kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; done
+  finished_pg=$PG_CONTAINER; finished_redis=$REDIS_CONTAINER
+  finished_volume=$PG_VOLUME; finished_network=$NETWORK
+  cleanup_containers
+  for name in "${EXTRA_CONTAINERS[@]}" "$finished_pg" "$finished_redis"; do
+    [[ -z $name ]] || verify_podman_resource_absent container "$name" || status=1
+  done
+  [[ -z $finished_volume ]] || verify_podman_resource_absent volume "$finished_volume" || status=1
+  [[ -z $finished_network ]] || verify_podman_resource_absent network "$finished_network" || status=1
+  # Retain logs, never retain generated keys or token-bearing environment.
+  rm -f "$RUN_ROOT"/*.key "$RUN_ROOT"/*.crt "$RUN_ROOT"/*.csr "$RUN_ROOT"/*.srl "$RUN_ROOT"/*.env
+  echo "peer smoke exit=$status evidence=$RUN_ROOT"
+  exit "$status"
+}
+start_database publish
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+DB_PORT=$(run_podman port "$PG_CONTAINER" 5432/tcp); DB_PORT=${DB_PORT##*:}
+start_differential_redis publish
+REDIS_PORT=$(run_podman port "$REDIS_CONTAINER" 6379/tcp); REDIS_PORT=${REDIS_PORT##*:}
+psql_peer() {
+  run_podman exec -i "$PG_CONTAINER" psql -X --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$1" "${@:2}"
+}
+psql_peer "$DATABASE_NAME" < "$FIXTURE_DIR/database.sql" >"$RUN_ROOT/restore.log"
+# Keep only schema metadata; no fixture actors, identities, graph or statuses.
+psql_peer "$DATABASE_NAME" >>"$RUN_ROOT/restore.log" <<'SQL'
+SELECT 'TRUNCATE ' || string_agg(format('%I.%I', schemaname, tablename), ', ') || ' RESTART IDENTITY CASCADE;'
+FROM pg_tables WHERE schemaname = 'public' AND tablename NOT IN ('schema_migrations', 'ar_internal_metadata') \gexec
+SQL
+for side in mastodon rustodon; do
+  db="rustodon_peer_$$_$side"
+  psql_peer postgres -c "CREATE DATABASE $db TEMPLATE $DATABASE_NAME" >/dev/null
+  psql_peer "$db" -c "COMMENT ON DATABASE $db IS '$RUN/$side'" >/dev/null
+  mkdir -m 777 "$RUN_ROOT/$side-media"
+done
+MASTODON_DB="rustodon_peer_$$_mastodon"
+RUSTODON_DB="rustodon_peer_$$_rustodon"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=Disposable peer CA' \
+  -keyout "$RUN_ROOT/ca.key" -out "$RUN_ROOT/ca.crt" >"$RUN_ROOT/tls.log" 2>&1
+openssl req -newkey rsa:2048 -nodes -subj '/CN=mastodon.peer.invalid' \
+  -keyout "$RUN_ROOT/server.key" -out "$RUN_ROOT/server.csr" >>"$RUN_ROOT/tls.log" 2>&1
+printf 'subjectAltName=DNS:mastodon.peer.invalid,DNS:rustodon.peer.invalid\n' > "$RUN_ROOT/server.ext"
+openssl x509 -req -in "$RUN_ROOT/server.csr" -CA "$RUN_ROOT/ca.crt" -CAkey "$RUN_ROOT/ca.key" \
+  -CAcreateserial -days 1 -extfile "$RUN_ROOT/server.ext" -out "$RUN_ROOT/server.crt" >>"$RUN_ROOT/tls.log" 2>&1
+# Dynamic HTTP ports are reserved only during allocation; bind collisions fail readiness.
+free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
+MASTODON_PORT=$(free_port)
+RUSTODON_PORT=$(free_port)
+for side in mastodon rustodon; do
+  port=$MASTODON_PORT; [[ $side != rustodon ]] || port=$RUSTODON_PORT
+  python3 tools/peer-tests/tls-proxy.py "$RUN_ROOT" "$side.peer.invalid" "$port" >"$RUN_ROOT/$side-tls.log" 2>&1 &
+  PIDS+=("$!")
+done
+wait_file() { for _ in {1..50}; do [[ ! -s $1 ]] || return 0; sleep .1; done; die "missing $1"; }
+wait_file "$RUN_ROOT/mastodon.peer.invalid.port"
+wait_file "$RUN_ROOT/rustodon.peer.invalid.port"
+ORIGINS="{\"https://mastodon.peer.invalid\":\"127.0.0.1:$(cat "$RUN_ROOT/mastodon.peer.invalid.port")\",\"https://rustodon.peer.invalid\":\"127.0.0.1:$(cat "$RUN_ROOT/rustodon.peer.invalid.port")\"}"
+# Fixed disposable secrets, not inherited from the invoking shell.
+COMMON=(
+  SECRET_KEY_BASE=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  OTP_SECRET=abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+  ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY=11111111111111111111111111111111
+  ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT=22222222222222222222222222222222
+  ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY=33333333333333333333333333333333
+)
+MASTODON_DB_USER=$DATABASE_USER
+MASTODON_DB_PASSWORD=$DATABASE_PASSWORD
+mastodon() {
+  name=$1; side=$2; shift 2
+  local args=() redis_db=0
+  [[ $side != rustodon ]] || redis_db=1
+  for value in "${COMMON[@]}"; do args+=(--env "$value"); done
+  run_podman run --rm --name "$name" --network host --user 0 \
+    --memory 1200m --cpus 1 --pids-limit 256 \
+    --volume "$ROOT/tools/peer-tests:/peer:ro" \
+    --volume "$RUN_ROOT/ca.crt:/peer-ca.crt:ro" \
+    --volume "$ROOT/tools/peer-tests/mastodon-transport.rb:/opt/mastodon/config/initializers/peer_transport.rb:ro" \
+    --volume "$RUN_ROOT/$side-media:/opt/mastodon/public/system:rw" \
+    "${args[@]}" --env RAILS_ENV=production --env NODE_ENV=production \
+    --env DB_HOST=127.0.0.1 --env "DB_PORT=$DB_PORT" --env "DB_NAME=rustodon_peer_$$_$side" \
+    --env "DB_USER=$MASTODON_DB_USER" --env "DB_PASS=$MASTODON_DB_PASSWORD" --env DB_SSLMODE=disable \
+    --env REDIS_HOST=127.0.0.1 --env "REDIS_PORT=$REDIS_PORT" --env "REDIS_DB=$redis_db" \
+    --env "LOCAL_DOMAIN=$side.peer.invalid" --env "WEB_DOMAIN=$side.peer.invalid" \
+    --env "RUSTODON_TEST_PEER_ORIGINS=$ORIGINS" --env SSL_CERT_FILE=/peer-ca.crt \
+    --env "PEER_USERNAME=$side" --env "EMAIL_DOMAIN_ALLOWLIST=$side.peer.invalid" \
+    --env BIND=127.0.0.1 --env "PORT=$MASTODON_PORT" --env WEB_CONCURRENCY=0 \
+    --env MIN_THREADS=2 --env MAX_THREADS=2 --env DB_POOL=4 --env RAILS_LOG_LEVEL=info \
+    --env RAILS_SERVE_STATIC_FILES=true --env S3_ENABLED=false --env ES_ENABLED=false \
+    --env PAPERCLIP_ROOT_PATH=/opt/mastodon/public/system --env PAPERCLIP_ROOT_URL=/system \
+    "$MASTODON_IMAGE" "$@"
+}
+for side in mastodon rustodon; do
+  EXTRA_CONTAINERS+=("$RUN-seed-$side")
+  mastodon "$RUN-seed-$side" "$side" bundle exec rails runner /peer/seed.rb >"$RUN_ROOT/$side-seed.log" 2>&1
+done
+# Upstream runtime can write only its own database, never the Rustodon peer.
+MASTODON_DB_USER=mastodon_peer_runtime
+MASTODON_DB_PASSWORD=peer-only-runtime-password
+psql_peer "$MASTODON_DB" >"$RUN_ROOT/mastodon-grants.log" <<SQL
+CREATE ROLE $MASTODON_DB_USER LOGIN NOINHERIT PASSWORD '$MASTODON_DB_PASSWORD' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+REVOKE ALL ON DATABASE $MASTODON_DB FROM PUBLIC;
+GRANT CONNECT, TEMP ON DATABASE $MASTODON_DB TO $MASTODON_DB_USER;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO $MASTODON_DB_USER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO $MASTODON_DB_USER;
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO $MASTODON_DB_USER;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO $MASTODON_DB_USER;
+ALTER MATERIALIZED VIEW public.instances OWNER TO $MASTODON_DB_USER;
+SQL
+RUST_DATABASE="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$DB_PORT/$RUSTODON_DB"
+RUNTIME_DATABASE="postgresql://$WORKER_RUNTIME:$WORKER_RUNTIME_PASSWORD@127.0.0.1:$DB_PORT/$RUSTODON_DB"
+WRITER_DATABASE="postgresql://$DIFFERENTIAL_WRITER:$DIFFERENTIAL_WRITER_PASSWORD@127.0.0.1:$DB_PORT/$RUSTODON_DB"
+psql_peer "$RUSTODON_DB" >"$RUN_ROOT/grants.log" <<SQL
+CREATE ROLE $OPERATIONAL_MIGRATOR LOGIN PASSWORD '$OPERATIONAL_MIGRATOR_PASSWORD' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+CREATE ROLE $WORKER_RUNTIME LOGIN NOINHERIT PASSWORD '$WORKER_RUNTIME_PASSWORD' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE $DIFFERENTIAL_WRITER LOGIN PASSWORD '$DIFFERENTIAL_WRITER_PASSWORD' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+REVOKE ALL ON DATABASE $RUSTODON_DB FROM PUBLIC;
+GRANT CONNECT, CREATE ON DATABASE $RUSTODON_DB TO $OPERATIONAL_MIGRATOR;
+GRANT CONNECT ON DATABASE $RUSTODON_DB TO $WORKER_RUNTIME;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO $WORKER_RUNTIME, $OPERATIONAL_MIGRATOR;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO $WORKER_RUNTIME, $OPERATIONAL_MIGRATOR;
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO $WORKER_RUNTIME, $OPERATIONAL_MIGRATOR;
+SQL
+LOCAL_DOMAIN=rustodon.peer.invalid
+CUTOVER_MEDIA_ROOT="$RUN_ROOT/rustodon-media"
+run_worker_cli "postgresql://$OPERATIONAL_MIGRATOR:$OPERATIONAL_MIGRATOR_PASSWORD@127.0.0.1:$DB_PORT/$RUSTODON_DB" admin migrate-operational-schema >"$RUN_ROOT/migrate.log" 2>&1
+psql_peer "$RUSTODON_DB" >>"$RUN_ROOT/grants.log" <<SQL
+GRANT USAGE ON SCHEMA rustodon TO $WORKER_RUNTIME;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE rustodon.durable_jobs, rustodon.outbox_events, rustodon.idempotency_keys, rustodon.ordering_markers, rustodon.domain_health, rustodon.heartbeats, rustodon.rate_limit_windows TO $WORKER_RUNTIME;
+GRANT SELECT, INSERT, DELETE ON TABLE rustodon.remote_fetch_leases TO $WORKER_RUNTIME;
+GRANT SELECT ON TABLE rustodon.schema_migrations TO $WORKER_RUNTIME;
+GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq TO $WORKER_RUNTIME;
+SQL
+prepare_differential_writer_database "$RUSTODON_DB" >>"$RUN_ROOT/grants.log"
+rustodon() {
+  exec env -i PATH="$PATH" HOME="$HOME" "${COMMON[@]}" \
+    LOCAL_DOMAIN=rustodon.peer.invalid WEB_DOMAIN=rustodon.peer.invalid \
+    DATABASE_URL="$RUNTIME_DATABASE" WRITE_DATABASE_URL="$WRITER_DATABASE" \
+    PAPERCLIP_ROOT_PATH="$RUN_ROOT/rustodon-media" BIND=127.0.0.1 PORT="$RUSTODON_PORT" \
+    RUSTODON_TEST_PEER_ORIGINS="$ORIGINS" RUSTODON_TEST_PEER_CA="$RUN_ROOT/ca.crt" \
+    WORKER_CONCURRENCY=2 WORKER_HEARTBEAT_SECONDS=1 WORKER_POLL_MILLISECONDS=100 \
+    "$ROOT/target/debug/rustodon" "$@"
+}
+EXTRA_CONTAINERS+=("$RUN-web" "$RUN-sidekiq")
+mastodon "$RUN-web" mastodon bundle exec puma -C config/puma.rb >"$RUN_ROOT/mastodon-web.log" 2>&1 & PIDS+=("$!")
+mastodon "$RUN-sidekiq" mastodon bundle exec sidekiq -c 2 >"$RUN_ROOT/mastodon-sidekiq.log" 2>&1 & PIDS+=("$!")
+rustodon web >"$RUN_ROOT/rustodon-web.log" 2>&1 & PIDS+=("$!")
+rustodon worker >"$RUN_ROOT/rustodon-worker.log" 2>&1 & PIDS+=("$!")
+for port in "$MASTODON_PORT" "$RUSTODON_PORT"; do
+  ready=0
+  for _ in {1..90}; do
+    if curl --noproxy '*' --connect-timeout 1 --max-time 2 -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1; then ready=1; break; fi
+    sleep 1
+  done
+  [[ $ready == 1 ]] || die "web readiness failed: $port"
+done
+# Both federation workers must be live before any scenario is attempted.
+ready=0
+for _ in {1..60}; do
+  if (rustodon admin worker-readiness) >"$RUN_ROOT/rustodon-readiness.log" 2>&1 &&
+     [[ $(run_podman exec "$REDIS_CONTAINER" redis-cli SCARD processes) -gt 0 ]]; then
+    ready=1; break
+  fi
+  sleep 1
+done
+[[ $ready == 1 ]] || die 'federation workers did not become ready'
+# The ignored test validates the run marker and DB comments before API mutations.
+env -i PATH="$PATH" HOME="$HOME" CARGO_BUILD_JOBS=2 \
+  PEER_RUN="$RUN" PEER_ROOT="$RUN_ROOT" \
+  PEER_MASTODON_HTTP="http://127.0.0.1:$MASTODON_PORT" PEER_RUSTODON_HTTP="http://127.0.0.1:$RUSTODON_PORT" \
+  PEER_MASTODON_DATABASE="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$DB_PORT/$MASTODON_DB" \
+  PEER_RUSTODON_DATABASE="$RUST_DATABASE" \
+  cargo test --locked --features test-support --test federation_peers -- --ignored --nocapture --test-threads=1 \
+  2>&1 | tee "$RUN_ROOT/smoke.log"
