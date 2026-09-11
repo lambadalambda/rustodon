@@ -14667,6 +14667,7 @@ async fn revoke_user_access_tokens_in(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn record_status_stream_events(
     transaction: &mut Transaction<'_, Postgres>,
     status_id: i64,
@@ -14674,6 +14675,9 @@ async fn record_status_stream_events(
     version: i64,
 ) -> Result<(), WriteError> {
     let deleting = event == "delete";
+    // The tag-follow UNION mirrors rest_home_timeline_ids' hashtag branch, including
+    // its policy exclusions. Delete callers have already tombstoned the status, but
+    // retain its tags; only that tombstone check is relaxed for hashtag recipients.
     let recipients = sqlx::query_scalar::<_, i64>(
         "WITH recipients AS ( \
            SELECT status.account_id \
@@ -14757,6 +14761,39 @@ async fn record_status_stream_events(
                   SELECT 1 FROM account_domain_blocks author_domain_block \
                   WHERE author_domain_block.account_id = follow.account_id \
                   AND author_domain_block.domain = author.domain)) \
+           UNION \
+             SELECT tag_follow.account_id \
+               FROM statuses status \
+               JOIN accounts author ON author.id = status.account_id \
+               JOIN statuses_tags status_tag ON status_tag.status_id = status.id \
+               JOIN tag_follows tag_follow ON tag_follow.tag_id = status_tag.tag_id \
+               JOIN accounts recipient ON recipient.id = tag_follow.account_id \
+                AND recipient.domain IS NULL AND recipient.suspended_at IS NULL \
+               JOIN users recipient_user ON recipient_user.account_id = recipient.id \
+                AND recipient_user.disabled IS FALSE \
+              WHERE status.id = $1 AND ($2 OR status.deleted_at IS NULL) \
+                AND status.visibility = 0 AND status.reblog_of_id IS NULL \
+                AND author.suspended_at IS NULL AND author.silenced_at IS NULL \
+                AND NOT EXISTS (SELECT 1 FROM blocks blocked_by \
+                  WHERE blocked_by.account_id = status.account_id \
+                    AND blocked_by.target_account_id = tag_follow.account_id) \
+                AND NOT EXISTS (SELECT 1 FROM blocks blocked \
+                  WHERE blocked.account_id = tag_follow.account_id \
+                    AND blocked.target_account_id = status.account_id) \
+                AND NOT EXISTS (SELECT 1 FROM mutes muted \
+                  WHERE muted.account_id = tag_follow.account_id \
+                    AND muted.target_account_id = status.account_id) \
+                AND NOT EXISTS (SELECT 1 FROM mentions mention \
+                  WHERE mention.status_id = status.id AND NOT mention.silent \
+                    AND (EXISTS (SELECT 1 FROM blocks mention_block \
+                      WHERE mention_block.account_id = tag_follow.account_id \
+                        AND mention_block.target_account_id = mention.account_id) \
+                    OR EXISTS (SELECT 1 FROM mutes mention_mute \
+                      WHERE mention_mute.account_id = tag_follow.account_id \
+                        AND mention_mute.target_account_id = mention.account_id))) \
+                AND (author.domain IS NULL OR NOT EXISTS (SELECT 1 FROM account_domain_blocks domain_block \
+                  WHERE domain_block.account_id = tag_follow.account_id \
+                    AND domain_block.domain = author.domain)) \
             ) SELECT account_id FROM recipients ORDER BY account_id",
     )
     .bind(status_id)

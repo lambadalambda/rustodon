@@ -2821,16 +2821,17 @@ case "$command" in
   schema-read-test)
     case "${1:-}" in
       '')
-        [ "$#" -eq 0 ] || die 'schema-read-test accepts only qualified_local_mentions'
+        [ "$#" -eq 0 ] || die 'schema-read-test accepts only qualified_local_mentions or followed_hashtag_streams'
         schema_read_test
         schema_read_test "$FIXTURE_DIR" saved_status_authorization
         schema_read_test "$FIXTURE_DIR" qualified_local_mentions
+        schema_read_test "$FIXTURE_DIR" followed_hashtag_streams
         ;;
-      qualified_local_mentions)
-        [ "$#" -eq 1 ] || die 'schema-read-test accepts only qualified_local_mentions'
-        schema_read_test "$FIXTURE_DIR" qualified_local_mentions
+      qualified_local_mentions|followed_hashtag_streams)
+        [ "$#" -eq 1 ] || die 'schema-read-test accepts only qualified_local_mentions or followed_hashtag_streams'
+        schema_read_test "$FIXTURE_DIR" "$1"
         ;;
-      *) die 'schema-read-test accepts only qualified_local_mentions' ;;
+      *) die 'schema-read-test accepts only qualified_local_mentions or followed_hashtag_streams' ;;
     esac
     ;;
   operational-schema-test)
