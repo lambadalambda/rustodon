@@ -23,6 +23,7 @@ After the parent restores Secunda, run each scenario in a fresh invocation:
 ```sh
 CARGO_BUILD_JOBS=2 tools/federation-peer-smoke public
 CARGO_BUILD_JOBS=2 tools/federation-peer-smoke privacy
+CARGO_BUILD_JOBS=2 tools/federation-peer-smoke notes
 ```
 
 `privacy` creates followers-only and direct Notes in both directions. The normal
@@ -35,8 +36,19 @@ checks require recipient 200, nonrecipient/outsider/anonymous 404; origin-side
 outsider/anonymous access must also be denied. These REST probes do not fetch
 the canonical ActivityPub status URL. No wire identifier is rewritten.
 
+`notes` is also **source-only, unexecuted**. It creates public and followers-only
+Notes in each direction, waits for received state plus signed Create, edits
+content and warning through the originating REST API, and requires Update to
+change the same received row without changing URI or visibility. Private access
+must remain denied after editing; Public-addressed Create/Update attempts are
+rejected. Delete then requires both a signed Delete and retirement of that
+previously observed row, followed by REST 404 for the former author/recipient.
+The no-canonical-status-GET audit is checked throughout. Tombstone audience
+privacy is not asserted. Ordinary `tag:` atomUri values are never altered by
+the runner; parent fix `a3fe48a` is integrated, with its execution also pending.
+
 Pending verification includes source compilation, formatting/Clippy, observer
-bootstrap, unit regressions, both commands above and repeated cleanup. TDD for
+bootstrap, unit regressions, all commands above and repeated cleanup. TDD for
 changes after the outage is deferred rather than simulated; no local workload
 or further SSH attempt is allowed until the parent restores access.
 
@@ -97,8 +109,9 @@ both database comments before mutation, then:
    object and public audience in each TLS forwarder's identity-only audit, and
    rejects any recorded GET of either new status URL.
 
-The scenario has a three-minute overall deadline and two-second SQL statement
-and pool-acquisition limits; the complete harness has a ten-minute deadline
+The public/privacy scenarios have a three-minute overall deadline; notes has
+six minutes. SQL statement and pool-acquisition limits are two seconds; the
+complete harness has a ten-minute deadline
 with a final kill deadline after cleanup's grace period. This is sequential
 peer convergence, not a simultaneous reciprocal-follow stress test. A trial
 with overlapping follows hit a pinned Mastodon `account_stats` deadlock and

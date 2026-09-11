@@ -288,12 +288,12 @@ async fn smoke() -> Result<()> {
         (&mastodon, &rustodon, &statuses[0]),
         (&rustodon, &mastodon, &statuses[1]),
     ] {
-        assert_push_audit(&root, sender, receiver, uri)?;
+        assert_no_status_get(&root, sender, receiver, uri)?;
     }
     Ok(())
 }
 
-fn assert_push_audit(
+fn assert_no_status_get(
     root: &std::path::Path,
     sender: &Peer,
     receiver: &Peer,
@@ -312,7 +312,7 @@ fn assert_push_audit(
         );
     }
     println!(
-        "PASS signed inbox Create audit and no status GET: {} -> {}",
+        "PASS no canonical status GET: {} -> {}",
         sender.name, receiver.name
     );
     Ok(())
@@ -371,7 +371,7 @@ fn parse_audit(text: &str) -> Result<Vec<Value>> {
 }
 
 fn has_push_audit(root: &std::path::Path, sender: &Peer, receiver: &Peer, uri: &str) -> Result<bool> {
-    has_activity_audit(root, sender, receiver, uri, "Create", None, true)
+    has_activity_audit(root, sender, receiver, uri, "Create", None, Some(true))
 }
 
 fn has_activity_audit(
@@ -381,7 +381,7 @@ fn has_activity_audit(
     uri: &str,
     kind: &str,
     audience: Option<&str>,
-    public: bool,
+    public: Option<bool>,
 ) -> Result<bool> {
     let path = root.join(format!("{}.peer.invalid.jsonl", receiver.name));
     let audit = match std::fs::read_to_string(path) {
@@ -398,7 +398,7 @@ fn has_activity_audit(
             && event["activity"] == kind
             && event["object"] == uri
             && event["actor"] == sender.actor()
-            && event["public"] == public
+            && public.is_none_or(|expected| event["public"] == expected)
             && audience.is_none_or(|recipient| event["recipients"].as_array().is_some_and(|values| values.iter().any(|value| value == recipient)))
             && event["signed"] == true
             && event["status"]
@@ -455,11 +455,11 @@ async fn private_note(root: &std::path::Path, run: &str, client: &Client, sender
     for _ in 0..60 {
         received_id = sqlx::query_scalar::<_, i64>("SELECT s.id FROM statuses s JOIN accounts a ON a.id=s.account_id WHERE s.uri=$1 AND a.uri=$2 AND s.local=false AND s.visibility=$3 AND strpos(s.text,$4)>0 AND s.deleted_at IS NULL")
             .bind(uri).bind(sender.actor()).bind(expected_visibility).bind(&marker).fetch_optional(&receiver.pool).await?;
-        if received_id.is_some() && has_activity_audit(root, sender, receiver, uri, "Create", Some(&audience), false)? {break;}
+        if received_id.is_some() && has_activity_audit(root, sender, receiver, uri, "Create", Some(&audience), Some(false))? {break;}
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     let id = received_id.ok_or_else(|| format!("BLOCKED {visibility} PUSH {} -> {}: {uri} not received",sender.name,receiver.name))?;
-    assert!(has_activity_audit(root,sender,receiver,uri,"Create",Some(&audience),false)?, "missing signed private inbox Create for {uri}");
+    assert!(has_activity_audit(root,sender,receiver,uri,"Create",Some(&audience),Some(false))?, "missing signed private inbox Create for {uri}");
     let allowed = if visibility == "private" {&receiver.token} else {&recipient_token};
     let denied = if visibility == "private" {&recipient_token} else {&receiver.token};
     let path = format!("/api/v1/statuses/{id}");
@@ -473,7 +473,7 @@ async fn private_note(root: &std::path::Path, run: &str, client: &Client, sender
     }
     let audit = std::fs::read_to_string(root.join(format!("{}.peer.invalid.jsonl",receiver.name)))?;
     reject_public_private_deliveries(&parse_audit(&audit)?, &sender.actor(), uri)?;
-    assert_push_audit(root,sender,receiver,uri)?;
+    assert_no_status_get(root,sender,receiver,uri)?;
     println!("PASS {visibility} PUSH/authorization {} -> {}: recipient allowed; nonrecipient/outsider/anonymous denied: {uri}",sender.name,receiver.name);
     Ok(())
 }
@@ -493,7 +493,7 @@ async fn assert_rest_access(peer: &Peer, client: &Client, token: Option<&str>, p
 }
 
 fn reject_public_private_deliveries(events: &[Value], actor: &str, uri: &str) -> Result<()> {
-    if events.iter().any(|event| event["method"] == "POST" && event["activity"] == "Create"
+    if events.iter().any(|event| event["method"] == "POST" && matches!(event["activity"].as_str(), Some("Create" | "Update"))
         && event["actor"] == actor && event["object"] == uri && event["public"] == true) {
         return Err(format!("private status {uri} was also addressed to Public").into());
     }
@@ -504,8 +504,133 @@ fn reject_public_private_deliveries(events: &[Value], actor: &str, uri: &str) ->
 fn privacy_audit_rejects_public_attempt_even_with_successful_private_delivery() {
     let private = serde_json::json!({"method":"POST","activity":"Create","actor":"actor","object":"note","public":false,"status":202});
     assert!(reject_public_private_deliveries(std::slice::from_ref(&private),"actor","note").is_ok());
-    for status in [202, 403, 500] {
-        let public = serde_json::json!({"method":"POST","activity":"Create","actor":"actor","object":"note","public":true,"status":status});
-        assert!(reject_public_private_deliveries(&[private.clone(),public],"actor","note").is_err());
+    for kind in ["Create", "Update"] {
+        for status in [202, 403, 500] {
+            let public = serde_json::json!({"method":"POST","activity":kind,"actor":"actor","object":"note","public":true,"status":status});
+            assert!(reject_public_private_deliveries(&[private.clone(),public],"actor","note").is_err());
+        }
     }
+}
+
+struct Note {
+    id: String,
+    uri: String,
+    marker: String,
+    visibility: &'static str,
+    warning: String,
+}
+
+async fn create_note(smoke: &Smoke, author: &Peer, visibility: &'static str, marker: String) -> Result<Note> {
+    let created = author.api(&smoke.client, Method::POST, "/api/v1/statuses",
+        &[("status", &marker), ("visibility", visibility)]).await?;
+    let uri = created["uri"].as_str().ok_or("missing created Note URI")?.to_owned();
+    assert!(uri.starts_with(&format!("{}/statuses/", author.actor())), "unexpected Note identity: {uri}");
+    assert_eq!(created["visibility"], visibility);
+    Ok(Note {
+        id: created["id"].as_str().ok_or("missing created Note ID")?.to_owned(),
+        uri, marker, visibility, warning: String::new(),
+    })
+}
+
+async fn wait_note(smoke: &Smoke, sender: &Peer, receiver: &Peer, note: &Note, kind: &str) -> Result<i64> {
+    let visibility = match note.visibility {
+        "public" => 0,
+        "private" => 2,
+        _ => return Err("unsupported Note scenario visibility".into()),
+    };
+    let followers = format!("{}/followers", sender.actor());
+    let audience = (visibility == 2).then_some(followers.as_str());
+    for _ in 0..60 {
+        let id = sqlx::query_scalar::<_, i64>(
+            "SELECT s.id FROM statuses s JOIN accounts a ON a.id=s.account_id WHERE s.uri=$1 AND a.uri=$2 AND NOT s.local AND s.visibility=$3 AND strpos(s.text,$4)>0 AND s.spoiler_text=$5 AND (NOT $6 OR s.edited_at IS NOT NULL) AND s.deleted_at IS NULL")
+            .bind(&note.uri).bind(sender.actor()).bind(visibility).bind(&note.marker)
+            .bind(&note.warning).bind(kind == "Update").fetch_optional(&receiver.pool).await?;
+        if let Some(id) = id
+            && has_activity_audit(&smoke.root, sender, receiver, &note.uri, kind, audience, Some(visibility == 0))? {
+            assert_no_status_get(&smoke.root, sender, receiver, &note.uri)?;
+            return Ok(id);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err(format!("BLOCKED {kind} {} Note {} -> {}: {} not converged", note.visibility, sender.name, receiver.name, note.uri).into())
+}
+
+#[tokio::test]
+#[ignore = "requires task-owned live peers from tools/federation-peer-smoke notes"]
+async fn note_create_edit_delete_both_directions() -> Result<()> {
+    tokio::time::timeout(Duration::from_mins(6), note_lifecycle()).await?
+}
+
+async fn note_lifecycle() -> Result<()> {
+    let smoke = setup().await?;
+    let mut completed = Vec::new();
+    for (sender, receiver) in [(&smoke.mastodon, &smoke.rustodon), (&smoke.rustodon, &smoke.mastodon)] {
+        for visibility in ["public", "private"] {
+            let mut note = create_note(&smoke, sender, visibility,
+                format!("{}-{}-{visibility}-lifecycle", smoke.run, sender.name)).await?;
+            let received_id = wait_note(&smoke, sender, receiver, &note, "Create").await?;
+            check_note_access(&smoke, sender, receiver, &note, received_id).await?;
+            println!("PASS {visibility} Create {} -> {}: {}", sender.name, receiver.name, note.uri);
+
+            note.marker.push_str("-edited");
+            note.warning = format!("{} edited warning", smoke.run);
+            let edited = sender.api(&smoke.client, Method::PUT, &format!("/api/v1/statuses/{}", note.id),
+                &[("status", &note.marker), ("spoiler_text", &note.warning)]).await?;
+            // Do not mask/rewrite Mastodon's atomUri or any serialized identifier.
+            assert_eq!(edited["uri"], note.uri);
+            assert_eq!(edited["visibility"], visibility);
+            let edited_id = wait_note(&smoke, sender, receiver, &note, "Update").await?;
+            assert_eq!(edited_id, received_id, "Update replaced the received object identity");
+            check_note_access(&smoke, sender, receiver, &note, received_id).await?;
+            println!("PASS {visibility} Update {} -> {}: {}", sender.name, receiver.name, note.uri);
+
+            sender.api(&smoke.client, Method::DELETE, &format!("/api/v1/statuses/{}", note.id), &[]).await?;
+            wait_note_deleted(&smoke, sender, receiver, &note, received_id).await?;
+            completed.push((sender, receiver, note));
+        }
+    }
+    // Include delayed attempts/GETs that arrived while later lifecycles ran.
+    for (sender, receiver, note) in completed {
+        assert_no_status_get(&smoke.root, sender, receiver, &note.uri)?;
+        if note.visibility == "private" {
+            let audit = std::fs::read_to_string(smoke.root.join(format!("{}.peer.invalid.jsonl", receiver.name)))?;
+            reject_public_private_deliveries(&parse_audit(&audit)?, &sender.actor(), &note.uri)?;
+        }
+    }
+    Ok(())
+}
+
+async fn check_note_access(smoke: &Smoke, sender: &Peer, receiver: &Peer, note: &Note, received_id: i64) -> Result<()> {
+    let path = format!("/api/v1/statuses/{received_id}");
+    assert_rest_access(receiver, &smoke.client, Some(&receiver.token), &path, Some(&note.uri)).await?;
+    if note.visibility == "private" {
+        for (peer, id) in [(sender, note.id.clone()), (receiver, received_id.to_string())] {
+            let outsider = token_for(peer, &format!("{}_outsider", peer.name)).await?;
+            for token in [Some(outsider.as_str()), None] {
+                assert_rest_access(peer, &smoke.client, token, &format!("/api/v1/statuses/{id}"), None).await?;
+            }
+        }
+        let audit = std::fs::read_to_string(smoke.root.join(format!("{}.peer.invalid.jsonl", receiver.name)))?;
+        // Both the original Create and its full-content Update must stay private.
+        reject_public_private_deliveries(&parse_audit(&audit)?, &sender.actor(), &note.uri)?;
+    }
+    Ok(())
+}
+
+async fn wait_note_deleted(smoke: &Smoke, sender: &Peer, receiver: &Peer, note: &Note, received_id: i64) -> Result<()> {
+    for _ in 0..60 {
+        let gone: bool = sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM statuses WHERE id=$1 AND deleted_at IS NULL)")
+            .bind(received_id).fetch_one(&receiver.pool).await?;
+        // Tombstone audience is not constrained here; this asserts received deletion.
+        if gone && has_activity_audit(&smoke.root, sender, receiver, &note.uri, "Delete", None, None)? {
+            assert_no_status_get(&smoke.root, sender, receiver, &note.uri)?;
+            for (peer, id) in [(sender, note.id.clone()), (receiver, received_id.to_string())] {
+                assert_rest_access(peer, &smoke.client, Some(&peer.token), &format!("/api/v1/statuses/{id}"), None).await?;
+            }
+            println!("PASS {} Delete {} -> {}: {} retired on receiver", note.visibility, sender.name, receiver.name, note.uri);
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err(format!("BLOCKED Delete {} -> {}: {} remains active or lacks signed Delete", sender.name, receiver.name, note.uri).into())
 }

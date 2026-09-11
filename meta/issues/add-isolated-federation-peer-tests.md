@@ -116,6 +116,24 @@ All commands below ran in the prescribed Secunda workspace with two Cargo jobs.
   bounded extensions. The parent owns ordinary `tag:` atom identifier handling;
   the runner must not rewrite wire identifiers or repair production code.
 
+## Note lifecycle extension — source only, unexecuted
+
+- `tools/federation-peer-smoke notes` selects a fresh, sequential six-minute
+  Create → Update → Delete scenario for public and followers-only Notes in both
+  directions. Each phase requires exact received identity/state and a matching
+  signed successful inbox activity. Update must preserve the received row ID,
+  URI and visibility while changing content, warning and edit timestamp.
+- Private origin/receiver outsider and anonymous REST access is checked before
+  and after editing. Public-addressed private Create/Update attempts fail. Delete
+  requires retirement of the positively observed row and author/recipient REST
+  denial. Tombstone audience privacy is not claimed.
+- No resolver fetch manufactures received state, and canonical status GETs fail
+  the audit. No wire metadata is rewritten. Parent `a3fe48a` (local cherry-pick
+  `e7e7002`) handles ordinary `tag:` atomUri metadata; its execution is pending too.
+- All new lifecycle compilation, formatting/lint, unit and live verification is
+  deferred until Secunda returns. Source TDD was unavailable during the outage;
+  no lifecycle pass is claimed. The issue remains open.
+
 ## Pleroma quota decision
 
 The exact v2.10.2 source archive and guarded build helper are prepared, but the

@@ -4,12 +4,13 @@ set -euo pipefail
 [[ $(hostname) == secunda && $PWD == /home/lain/rustodon-parity/peer-tests ]] || {
   echo 'Run only on Secunda in /home/lain/rustodon-parity/peer-tests' >&2; exit 2;
 }
-[[ $# -le 1 ]] || { echo 'Use public or privacy' >&2; exit 2; }
+[[ $# -le 1 ]] || { echo 'Use public, privacy or notes' >&2; exit 2; }
 SCENARIO=${1:-public}
 case "$SCENARIO" in
   public) TEST=discovery_follow_and_public_push_both_directions ;;
   privacy) TEST=private_notes_recipient_and_outsider_both_directions ;;
-  *) echo 'Use public or privacy' >&2; exit 2 ;;
+  notes) TEST=note_create_edit_delete_both_directions ;;
+  *) echo 'Use public, privacy or notes' >&2; exit 2 ;;
 esac
 if [[ ${PEER_SMOKE_DEADLINE:-0} != 1 ]]; then
   exec timeout --signal=TERM --kill-after=60 600 env PEER_SMOKE_DEADLINE=1 "$0" "$SCENARIO" </dev/null
