@@ -399,6 +399,23 @@ SELECT
       AND pg_catalog.has_table_privilege(role.oid, 'public.collections', 'DELETE')
       AND pg_catalog.has_table_privilege(role.oid, 'public.custom_emojis', 'SELECT')
       AND pg_catalog.has_table_privilege(role.oid, 'public.custom_emojis', 'DELETE')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.custom_emojis', 'shortcode', 'INSERT')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.custom_emojis', 'domain', 'INSERT')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.custom_emojis', 'uri', 'INSERT')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.custom_emojis', 'image_remote_url', 'INSERT')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.custom_emojis', 'disabled', 'INSERT')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.custom_emojis', 'visible_in_picker', 'INSERT')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.custom_emojis', 'created_at', 'INSERT')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.custom_emojis', 'updated_at', 'INSERT')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.custom_emojis', 'uri', 'UPDATE')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.custom_emojis', 'image_remote_url', 'UPDATE')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.custom_emojis', 'updated_at', 'UPDATE')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.custom_emojis', 'image_content_type', 'UPDATE')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.custom_emojis', 'image_file_name', 'UPDATE')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.custom_emojis', 'image_file_size', 'UPDATE')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.custom_emojis', 'image_storage_schema_version', 'UPDATE')
+      AND pg_catalog.has_column_privilege(role.oid, 'public.custom_emojis', 'image_updated_at', 'UPDATE')
+      AND pg_catalog.has_sequence_privilege(role.oid, 'public.custom_emojis_id_seq', 'USAGE')
       AND pg_catalog.has_table_privilege(role.oid, 'public.custom_filters', 'SELECT')
        AND pg_catalog.has_table_privilege(role.oid, 'public.custom_filters', 'DELETE')
         AND pg_catalog.has_table_privilege(role.oid, 'public.featured_tags', 'SELECT')
@@ -1119,6 +1136,8 @@ SELECT
                  'session_activations_id_seq', 'status_edits_id_seq', 'status_pins_id_seq',
                  'status_stats_id_seq', 'statuses_id_seq', 'tags_id_seq', 'tombstones_id_seq',
                  'users_id_seq'))
+               OR (namespace.nspname = 'public' AND relation.relname = 'custom_emojis_id_seq'
+                   AND acl.privilege_type = 'USAGE')
                OR (namespace.nspname = 'rustodon' AND relation.relname = 'outbox_events_id_seq')
              )
            )
@@ -1237,6 +1256,10 @@ SELECT
                'username', 'private_key', 'public_key', 'created_at', 'updated_at', 'domain',
                'actor_type', 'display_name', 'note', 'uri', 'url', 'inbox_url',
                'shared_inbox_url', 'protocol', 'last_webfingered_at'))
+            OR (namespace.nspname = 'public' AND relation.relname = 'custom_emojis'
+                AND attribute.attname IN (
+                  'shortcode', 'domain', 'uri', 'image_remote_url', 'disabled',
+                  'visible_in_picker', 'created_at', 'updated_at'))
             OR (namespace.nspname = 'public' AND relation.relname = 'users'
                 AND attribute.attname IN (
                   'account_id', 'email', 'encrypted_password', 'approved', 'confirmed_at',
@@ -1256,6 +1279,11 @@ SELECT
                'suspended_at', 'suspension_origin', 'uri', 'url', 'inbox_url', 'outbox_url',
                'followers_url', 'following_url', 'shared_inbox_url', 'protocol', 'public_key',
                'last_webfingered_at', 'updated_at'))
+            OR (namespace.nspname = 'public' AND relation.relname = 'custom_emojis'
+                AND attribute.attname IN (
+                  'uri', 'image_remote_url', 'updated_at', 'image_content_type',
+                  'image_file_name', 'image_file_size', 'image_storage_schema_version',
+                  'image_updated_at'))
             OR (namespace.nspname = 'public' AND relation.relname = 'users'
                 AND attribute.attname IN (
                    'settings', 'consumed_timestep', 'otp_backup_codes', 'otp_required_for_login',

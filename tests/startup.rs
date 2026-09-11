@@ -483,6 +483,119 @@ async fn unsafe_writer_roles_bind_no_web_service() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+// Keep these independent of the production policy: each missing permission must fail closed.
+const EMOJI_INSERT_COLUMNS: &[&str] = &[
+    "shortcode",
+    "domain",
+    "uri",
+    "image_remote_url",
+    "disabled",
+    "visible_in_picker",
+    "created_at",
+    "updated_at",
+];
+const EMOJI_UPDATE_COLUMNS: &[&str] = &[
+    "uri",
+    "image_remote_url",
+    "updated_at",
+    "image_content_type",
+    "image_file_name",
+    "image_file_size",
+    "image_storage_schema_version",
+    "image_updated_at",
+];
+
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+async fn emoji_writer_privileges_are_required_and_exact() -> Result<(), Box<dyn std::error::Error>>
+{
+    let runtime_url = std::env::var("RUSTODON_STARTUP_DATABASE_URL")?;
+    let owner_url = std::env::var("RUSTODON_STARTUP_OWNER_DATABASE_URL")?;
+    let writer_url = std::env::var("RUSTODON_STARTUP_WRITE_DATABASE_URL")?;
+    let environment = command_with_writer("web", &runtime_url, unused_port()?, Some(&writer_url))
+        .get_envs()
+        .filter_map(|(key, value)| {
+            value.map(|value| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+        })
+        .collect();
+    let config = rustodon::config::Config::from_environment(&environment)?;
+    assert!(
+        rustodon::preflight::writer_diagnostics(&config)
+            .await
+            .is_empty()
+    );
+    let mut owner = PgConnection::connect(&owner_url).await?;
+    let mut mutations = Vec::new();
+    for (privilege, columns) in [
+        ("INSERT", EMOJI_INSERT_COLUMNS),
+        ("UPDATE", EMOJI_UPDATE_COLUMNS),
+    ] {
+        for column in columns {
+            mutations.push((
+                format!("REVOKE {privilege} ({column}) ON public.custom_emojis FROM rustodon_differential_writer"),
+                format!("GRANT {privilege} ({column}) ON public.custom_emojis TO rustodon_differential_writer"),
+            ));
+        }
+        mutations.push((
+            format!("GRANT {privilege} ON public.custom_emojis TO rustodon_differential_writer"),
+            format!("REVOKE {privilege} ON public.custom_emojis FROM rustodon_differential_writer; GRANT {privilege} ({}) ON public.custom_emojis TO rustodon_differential_writer", columns.join(", ")),
+        ));
+    }
+    mutations.push((
+        "REVOKE USAGE ON SEQUENCE public.custom_emojis_id_seq FROM rustodon_differential_writer"
+            .into(),
+        "GRANT USAGE ON SEQUENCE public.custom_emojis_id_seq TO rustodon_differential_writer"
+            .into(),
+    ));
+    for privilege in [
+        "UPDATE (disabled)",
+        "UPDATE (visible_in_picker)",
+        "UPDATE (category_id)",
+        "UPDATE (shortcode)",
+        "UPDATE (domain)",
+        "INSERT (id)",
+        "INSERT (category_id)",
+    ] {
+        mutations.push((
+            format!("GRANT {privilege} ON public.custom_emojis TO rustodon_differential_writer"),
+            format!("REVOKE {privilege} ON public.custom_emojis FROM rustodon_differential_writer"),
+        ));
+    }
+    for privilege in ["SELECT", "UPDATE"] {
+        mutations.push((
+            format!("GRANT {privilege} ON SEQUENCE public.custom_emojis_id_seq TO rustodon_differential_writer"),
+            format!("REVOKE {privilege} ON SEQUENCE public.custom_emojis_id_seq FROM rustodon_differential_writer"),
+        ));
+    }
+    mutations.push((
+        "GRANT UPDATE (image_remote_url) ON public.custom_emojis TO rustodon_differential_writer WITH GRANT OPTION".into(),
+        "REVOKE GRANT OPTION FOR UPDATE (image_remote_url) ON public.custom_emojis FROM rustodon_differential_writer".into(),
+    ));
+    for (mutate, restore) in mutations {
+        sqlx::raw_sql(&mutate).execute(&mut owner).await?;
+        let diagnostics = rustodon::preflight::writer_diagnostics(&config).await;
+        sqlx::raw_sql(&restore).execute(&mut owner).await?;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == "PF_WRITE_DATABASE_PRIVILEGES"),
+            "accepted {mutate}: {diagnostics:?}"
+        );
+        assert!(
+            rustodon::preflight::writer_diagnostics(&config)
+                .await
+                .is_empty(),
+            "restore failed for {mutate}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
 async fn least_privilege_writer_can_lock_account_deletion_requests()

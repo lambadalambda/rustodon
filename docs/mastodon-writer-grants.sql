@@ -188,6 +188,19 @@ GRANT SELECT, DELETE ON TABLE
 GRANT SELECT, INSERT ON TABLE public.tombstones TO :"writer_role";
 GRANT UPDATE (silent, updated_at) ON TABLE public.mentions TO :"writer_role";
 
+-- Remote Note emoji ingestion and cache installation. INSERT initializes moderation
+-- flags; UPDATE cannot change moderation, category, ID, shortcode, or domain.
+-- Any granted UPDATE column also permits the ingestion SELECT ... FOR UPDATE lock.
+GRANT INSERT (
+  shortcode, domain, uri, image_remote_url, disabled, visible_in_picker,
+  created_at, updated_at
+) ON TABLE public.custom_emojis TO :"writer_role";
+GRANT UPDATE (
+  uri, image_remote_url, updated_at, image_content_type, image_file_name,
+  image_file_size, image_storage_schema_version, image_updated_at
+) ON TABLE public.custom_emojis TO :"writer_role";
+GRANT USAGE ON SEQUENCE public.custom_emojis_id_seq TO :"writer_role";
+
 GRANT USAGE, SELECT ON SEQUENCE
   public.account_conversations_id_seq, public.account_deletion_requests_id_seq,
   public.account_relationship_severance_events_id_seq,

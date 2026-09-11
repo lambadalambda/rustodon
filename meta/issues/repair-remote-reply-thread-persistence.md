@@ -20,3 +20,114 @@ Following recovery of Pleroma Notes with nullable sensitivity, reply-thread job 
 
 - Related: [missing followed posts](diagnose-missing-followed-lain-com-posts.md).
 - Live source at start: `f9b6af7`; recovered child `117252276514092511`.
+
+## Bounded emoji writer repair (verified; deployment pending)
+
+- Parent-provided live evidence: PostgreSQL `permission denied for table custom_emojis`
+  at 11:55:57, 11:56:27, and 12:00:13 matches job 472's three attempts. The
+  dedicated writer has SELECT/DELETE but no column INSERT/UPDATE or sequence USAGE.
+  The remote parent actor was already imported; no profile/avatar repair is in scope.
+- `upsert_remote_emojis` locks with `FOR UPDATE`, inserts remote metadata and queues
+  emoji fetches; the cache worker updates only image metadata. Grant those columns
+  and sequence USAGE, not table-wide INSERT/UPDATE or moderation UPDATE. Match
+  preflight's allowlist and required privileges; leave runtime grants unchanged.
+- All workloads use `/home/lain/rustodon-parity/reply-emoji-grants` on Secunda with
+  its own target directory. No production role changes or live-instance access.
+
+### Implementation and verification
+
+- Added eight INSERT columns and eight UPDATE columns for `custom_emojis`, plus
+  USAGE only on `custom_emojis_id_seq`. Preflight requires every new privilege and
+  permits exactly those additions. Moderation/category/shortcode/domain UPDATE,
+  broad table INSERT/UPDATE, sequence SELECT/UPDATE, and grant options stay fenced.
+  Runtime privileges are unchanged.
+- New `tests/workers/reply_emoji_grants.rs` uses the actual dedicated writer, not
+  the fixture owner, through the fetched-parent thread handler. It covers generated
+  emoji IDs, existing metadata refresh without moderation/creation-time changes,
+  durable job completion, parent/child/conversation/reply-count persistence,
+  exact emoji outbox payloads, and both original/static cache installations.
+  The owner connection is fixture setup/cleanup only. A two-line feature-gated
+  thread-fetcher endpoint hook reuses the existing debug-only fixture transport;
+  ordinary release transport and profile/avatar handling are unchanged.
+- TDD red: `red-worker.log` reports job 1 retained with attempts=1 and
+  `remote reply thread persistence failed` before grants changed. The preceding
+  transport setup attempt hit HTTPS against the plain HTTP fixture; using an HTTP
+  test parent URI reached the intended persistence boundary.
+- TDD red: `red-startup.log` reports old preflight accepting
+  `REVOKE INSERT (shortcode) ON public.custom_emojis ...`. It ends 3 passed / 2
+  failed: the expected negative-test failure, plus a later readiness refusal
+  because that failed test's restore added a privilege the old policy rejected.
+- Green, all on Secunda in `/home/lain/rustodon-parity/reply-emoji-grants`, with
+  `CARGO_BUILD_JOBS=4` and `CARGO_TARGET_DIR` unset (task-local target):
+  - Filtered worker harness: 1 passed, 62 filtered; worker lifecycle also passed
+    (`green-worker.log`). Exact task-local harness generation/invocation:
+    ```sh
+    # Reference checkout revision verified read-only before this link was created.
+    ln -s /home/lain/repos/rustodon/target/mastodon-v4.6.5 target/mastodon-v4.6.5
+    sed 's/--test workers -- /--test workers reply_emoji_grants -- /' \
+      tools/mastodon-fixture > tools/reply-emoji-fixture
+    chmod +x tools/reply-emoji-fixture
+    tools/reply-emoji-fixture worker-test > green-worker.log 2>&1
+    ```
+    The untracked task-local harness changes only Cargo's test filter, not fixture
+    roles/grants/setup/teardown. The full ignored worker suite was not run.
+  - `tools/mastodon-fixture startup-test`: 5 passed, including 29 emoji privilege
+    mutations (17 missing required privileges and 12 over-grants), web/worker
+    fail-closed checks, and healthy readiness (`green-startup.log`).
+  - After removing only this task's reference symlink:
+    `cargo fmt --all --check` (`green-fmt.log`);
+    `cargo test --locked --all-targets --all-features`: 422 passed, 153 ignored
+    across 29 test binaries (`green-tests.log`);
+    `cargo clippy --locked --all-targets --all-features -- -D warnings`
+    (`green-clippy.log`), all successful.
+- Independent read-only review `ca8f3799-e92d-4602-bad4-3cd2d0815eb4`: no
+  correctness, least-privilege, or architecture blocker. Its runtime sequence
+  coverage nit was addressed by checking both USAGE and UPDATE. Failed-test
+  panic cleanup remains a nonblocking fixture-hygiene observation; no unrelated
+  cleanup refactor was added.
+
+### Minimal deployment delta (not applied here)
+
+The parent owns backup/stop, application of this transaction, candidate preflight,
+start/cutover, and replay. The old binary rejects these additional grants; the new
+binary requires them. Do not use a broad grant refresh or resume the old binary
+until applying the inverse. Supply the actual dedicated writer as `writer_role`;
+never substitute the runtime role. These statements assume the verified previous
+state (no emoji INSERT/UPDATE column grants and no sequence USAGE).
+
+```sql
+\set ON_ERROR_STOP on
+BEGIN;
+GRANT INSERT (
+  shortcode, domain, uri, image_remote_url, disabled, visible_in_picker,
+  created_at, updated_at
+) ON TABLE public.custom_emojis TO :"writer_role";
+GRANT UPDATE (
+  uri, image_remote_url, updated_at, image_content_type, image_file_name,
+  image_file_size, image_storage_schema_version, image_updated_at
+) ON TABLE public.custom_emojis TO :"writer_role";
+GRANT USAGE ON SEQUENCE public.custom_emojis_id_seq TO :"writer_role";
+COMMIT;
+```
+
+Inverse transaction for rollback to the previous grant contract:
+
+```sql
+\set ON_ERROR_STOP on
+BEGIN;
+REVOKE INSERT (
+  shortcode, domain, uri, image_remote_url, disabled, visible_in_picker,
+  created_at, updated_at
+) ON TABLE public.custom_emojis FROM :"writer_role";
+REVOKE UPDATE (
+  uri, image_remote_url, updated_at, image_content_type, image_file_name,
+  image_file_size, image_storage_schema_version, image_updated_at
+) ON TABLE public.custom_emojis FROM :"writer_role";
+REVOKE USAGE ON SEQUENCE public.custom_emojis_id_seq FROM :"writer_role";
+COMMIT;
+```
+
+No live-instance files, credentials, production roles, or sibling target were
+accessed or changed. Profile-media sibling work remains separate; this repair
+adds no account grants. Issue remains open for parent-managed deployment/replay
+verification of job 472 and the original child/parent relationship.

@@ -5381,6 +5381,9 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
             let thread_pool = mastodon_writer.clone();
             let thread_config = federation.clone();
             let thread_fetcher = remote_fetcher.clone();
+            #[cfg(feature = "test-support")]
+            let thread_fetcher =
+                thread_fetcher.with_test_endpoint(federation.remote_fetch_endpoint);
             handlers.register(
                 ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND,
                 Lane::Pull,

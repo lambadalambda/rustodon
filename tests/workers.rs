@@ -1,3 +1,7 @@
+#[cfg(feature = "test-support")]
+#[path = "workers/reply_emoji_grants.rs"]
+mod reply_emoji_grants;
+
 #[path = "workers/lifecycles.rs"]
 mod lifecycles;
 
