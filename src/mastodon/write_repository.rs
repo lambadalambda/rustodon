@@ -3263,9 +3263,11 @@ impl WriteRepository {
         let fields = remote_actor_fields(object)?;
         let also_known_as = remote_actor_aliases(object)?;
         let avatar_set = object.get("icon").is_some();
-        let avatar_remote_url = remote_actor_object_uri(object, "icon")?;
+        let avatar_remote_url = super::activitypub_inbox::actor_image_uri(object.get("icon"))
+            .map_err(|_| WriteError::InvalidInput("remote actor image URI is invalid"))?;
         let header_set = object.get("image").is_some();
-        let header_remote_url = remote_actor_object_uri(object, "image")?;
+        let header_remote_url = super::activitypub_inbox::actor_image_uri(object.get("image"))
+            .map_err(|_| WriteError::InvalidInput("remote actor image URI is invalid"))?;
 
         let mut transaction = self.pool.begin().await?;
         let account =

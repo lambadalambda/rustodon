@@ -4423,6 +4423,8 @@ async fn activitypub_actor_update_and_delete_are_processed_idempotently()
             "preferredUsername": username,
             "name": "Fixture Updated Actor :actor_profile_blob:",
             "summary": "Fixture updated summary #actorprofile",
+            "icon": {"type": "Image", "mediaType": "image/png", "url": "https://media.fixture.invalid/updated-avatar.png"},
+            "image": {"type": "Image", "mediaType": "image/jpeg", "url": "https://media.fixture.invalid/updated-header.jpg"},
             "url": url.as_deref().unwrap_or(&actor_uri),
             "inbox": inbox_url,
             "outbox": outbox_url,
@@ -4535,6 +4537,22 @@ async fn activitypub_actor_update_and_delete_are_processed_idempotently()
                 );
             }
             if logical_key == "activitypub:test-actor-update" {
+                assert_eq!(
+                    sqlx::query_as::<_, (String, String, Option<String>, String)>(
+                        "SELECT display_name, note, avatar_remote_url, header_remote_url
+                           FROM accounts WHERE id = $1",
+                    )
+                    .bind(actor_id)
+                    .fetch_one(&writer_pool)
+                    .await?,
+                    (
+                        "Fixture Updated Actor :actor_profile_blob:".to_owned(),
+                        "Fixture updated summary #actorprofile".to_owned(),
+                        Some("https://media.fixture.invalid/updated-avatar.png".to_owned()),
+                        "https://media.fixture.invalid/updated-header.jpg".to_owned(),
+                    ),
+                    "full actor Update must persist profile text and Image.url media",
+                );
                 let profile_emoji = sqlx::query_as::<_, (i64, String, bool, bool)>(
                     "SELECT id, image_remote_url, disabled, visible_in_picker
                        FROM custom_emojis

@@ -1895,6 +1895,16 @@ mod tests {
         assert_eq!(value["object"]["tag"][0]["name"], ":party_blob:");
         assert_eq!(value["object"]["tag"][1]["type"], "Hashtag");
         assert_eq!(value["object"]["tag"][1]["name"], "#profiletag");
+
+        let parsed = crate::mastodon::activitypub_inbox::parse_activity(&value.to_string())
+            .expect("serialized actor Update with Image.url must parse");
+        assert_eq!(
+            parsed,
+            crate::mastodon::activitypub_inbox::InboxActivity::UpdateActor {
+                actor_uri: "https://example.test/users/alice".to_owned(),
+                object: value["object"].clone(),
+            }
+        );
     }
 
     #[test]

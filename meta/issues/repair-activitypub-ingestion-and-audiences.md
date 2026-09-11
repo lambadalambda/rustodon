@@ -36,3 +36,24 @@ Accept ordinary serializer-produced documents and preserve the audience fields n
 - Logs: `/home/lain/rustodon-parity/null-summary-{red,green,workers,library,clippy}.log`.
   Independent review found no blockers. R05/R06/R09 and real-peer acceptance
   remain open; this does not claim complete ingestion/audience parity.
+
+## R06 actor Image.url Updates — verified
+
+- Inbox validation and persistence share a media-only URI extractor. Standard
+  `Image.url` wins over image identity; legacy string/id/href values retain the
+  existing URI checks. Actor identity URI parsing is unchanged.
+- Serializer-produced full actor Update now roundtrips through the inbox. Tests
+  cover invalid schemes/shapes and URL precedence; the restored actor lifecycle
+  asserts profile text and both persisted media URLs before deletion.
+- Secunda RED: serialized Update rejected with `Activity`. A second run with
+  validation fixed but persistence unchanged proved avatar `None` and header
+  empty despite updated profile text. Its early assertion also left fixture data
+  that caused two later failures; all disappeared in GREEN.
+- GREEN: library **242 passed, 2 ignored**, restored worker **49/49**, formatting,
+  and all-target/all-feature Clippy with warnings denied. Logs beneath
+  `/home/lain/rustodon-parity/`: `actor-media-red.log`,
+  `actor-media-worker-red.log`, `actor-media-worker-green.log`,
+  `actor-media-library.log`, `actor-media-clippy.log`.
+- Independent review's test-import blocker was fixed and re-reviewed; no remaining
+  blockers. These gates preceded integration of R01; combined gates follow.
+  Real-peer profile convergence and the remaining audience criteria stay open.

@@ -401,9 +401,7 @@ fn parse_actor_update_parts(
         }
     }
     for field in ["icon", "image"] {
-        if let Some(value) = object.get(field) {
-            optional_uri(Some(value))?;
-        }
+        actor_image_uri(object.get(field))?;
     }
     if let Some(value) = object.get("suspended")
         && !value.is_null()
@@ -757,6 +755,17 @@ fn first_uri(value: Option<&Value>) -> Result<String, InboxParseError> {
     }
 }
 
+/// Actor media embeds its resource URI in Image.url, unlike actor identity fields.
+/// Share extraction with persistence so accepted Updates cannot silently lose media.
+pub(crate) fn actor_image_uri(value: Option<&Value>) -> Result<Option<String>, InboxParseError> {
+    match value {
+        Some(Value::Object(object)) if object.contains_key("url") => {
+            required_uri(object.get("url")).map(Some)
+        }
+        _ => optional_uri(value),
+    }
+}
+
 fn optional_uri(value: Option<&Value>) -> Result<Option<String>, InboxParseError> {
     match value {
         None | Some(Value::Null) => Ok(None),
@@ -811,12 +820,59 @@ fn value_or_id(value: Option<&Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use chrono::DateTime;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
         InboxActivity, InboxParseError, MAX_REMOTE_EMOJIS, MAX_REMOTE_TAGS, RemoteEmojiTag,
         parse_activity, parse_job_arguments, parse_note_emojis,
     };
+
+    #[test]
+    fn actor_image_urls_retain_uri_validation_and_legacy_shapes() {
+        let image =
+            json!({"id": "https://remote.example/image/1", "url": "https://cdn.example/image.png"});
+        assert_eq!(
+            super::actor_image_uri(Some(&image)).expect("valid image"),
+            Some("https://cdn.example/image.png".to_owned())
+        );
+        assert!(
+            super::actor_image_uri(Some(&json!({
+                "id": "https://remote.example/image/1", "url": "file:///tmp/image.png"
+            })))
+            .is_err()
+        );
+        for field in ["icon", "image"] {
+            for (value, valid) in [
+                (Value::Null, true),
+                (json!("https://cdn.example/image.png"), true),
+                (json!({"id": "https://cdn.example/image.png"}), true),
+                (
+                    json!({"type": "Image", "url": "https://cdn.example/image.png"}),
+                    true,
+                ),
+                (
+                    json!({"type": "Image", "url": "file:///tmp/image.png"}),
+                    false,
+                ),
+                (json!({"type": "Image", "url": "/image.png"}), false),
+                (json!({"type": "Image", "url": true}), false),
+                (json!({"type": "Image"}), false),
+                (json!(42), false),
+            ] {
+                let mut activity = json!({
+                    "type": "Update",
+                    "actor": "https://remote.example/users/alice",
+                    "object": {"id": "https://remote.example/users/alice", "type": "Person"}
+                });
+                activity["object"][field] = value.clone();
+                assert_eq!(
+                    parse_activity(&activity.to_string()).is_ok(),
+                    valid,
+                    "{field}: {value}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn parses_the_durable_inbox_job_contract() {
