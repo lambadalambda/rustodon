@@ -1,0 +1,7 @@
+.git
+.containerignore
+.env
+.env.*
+.local-instance
+.local-instance-backups
+target

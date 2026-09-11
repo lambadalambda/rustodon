@@ -24,3 +24,12 @@ Exercise the complete v1 federation profile against a pinned Mastodon 4.6.5 peer
 - Live peer discovery, bidirectional state convergence, and peer-side
   idempotency remain unverified; this issue stays open until that external run
   is available.
+- A 2026-09-11 live setup at `rustodon-lain.tunnel.eosrift.com` resolved and
+  persisted `Gargron@mastodon.social`, proving Rustodon's outbound WebFinger and
+  actor-fetch path. A temporary pinned Mastodon 4.6.5 peer then resolved the
+  local WebFinger document, but its signed actor GET (key ID ending in
+  `/actor#main-key`) received HTTP 503 from Rustodon during remote signer-key
+  resolution. The peer therefore could not ingest the Rustodon account. No
+  complete signature or secret was retained. This is the first live peer
+  reproduction and the next investigation should isolate the signer-key
+  resolution failure before attempting the bidirectional activity matrix.

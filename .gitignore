@@ -4,3 +4,6 @@
 !.env.example
 *.swp
 *.swo
+
+.local-instance/
+.local-instance-backups/
