@@ -18,3 +18,4 @@
 - [ ] [Repair relationship and delivery lifecycles](issues/repair-relationship-and-delivery-lifecycles.md)
 - [ ] [Close reviewed client workflow gaps](issues/close-reviewed-client-workflow-gaps.md)
 - [ ] [Run essential parity gates and peer tests on Secunda](issues/run-essential-parity-gates-on-secunda.md)
+- [ ] [Add isolated bidirectional federation peer tests](issues/add-isolated-federation-peer-tests.md)
