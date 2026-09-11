@@ -738,3 +738,54 @@ fn extension_is(file_name: &str, extension: &str) -> bool {
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.eq_ignore_ascii_case(extension))
 }
+
+#[test]
+fn profile_images_reject_excessive_gif_work() {
+    for bytes in [
+        gif_with_blank_frames(1, 1, 257),
+        gif_with_blank_frames(512, 512, 65),
+    ] {
+        assert!(
+            prepare_account_media(
+                PaperclipAttachment::AccountAvatar,
+                42,
+                "avatar.gif",
+                "image/gif",
+                &bytes
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn prepared_profile_writer_repairs_truncated_original() {
+    let directory =
+        std::env::temp_dir().join(format!("rustodon-profile-writer-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let root = PaperclipRoot::open(&directory).unwrap();
+    let prepared = prepare_account_media(
+        PaperclipAttachment::AccountAvatar,
+        42,
+        "avatar.gif",
+        "image/gif",
+        &gif_with_blank_frames(2, 2, 2),
+    )
+    .unwrap();
+    let metadata = metadata(
+        PaperclipAttachment::AccountAvatar,
+        42,
+        true,
+        Some(1),
+        &prepared.file_name,
+        Some("image/gif"),
+    );
+    let original = metadata.relative_path("original").unwrap();
+    root.write_file(Path::new(&original), b"partial").unwrap();
+    rustodon::paperclip::write_prepared_account_media(&root, &metadata, &prepared).unwrap();
+    assert_eq!(
+        fs::read(directory.join(original)).unwrap(),
+        prepared.original_bytes
+    );
+    fs::remove_dir_all(directory).unwrap();
+}

@@ -696,10 +696,17 @@ fn process_gif(
     decoder
         .set_limits(image_limits())
         .map_err(|_| AccountMediaError::InvalidImage)?;
-    let mut original_bytes = Vec::new();
+    let mut original_bytes = BoundedImageBytes(Vec::new());
     {
         let mut encoder = GifEncoder::new(&mut original_bytes);
-        for frame in decoder.into_frames().take(3000) {
+        for (index, frame) in decoder.into_frames().enumerate() {
+            let frames = u64::try_from(index + 1).map_err(|_| AccountMediaError::TooLarge)?;
+            if frames > 256
+                || frames * u64::from(input_width) * u64::from(input_height) > 16_777_216
+                || frames * u64::from(width) * u64::from(height) > 67_108_864
+            {
+                return Err(AccountMediaError::TooLarge);
+            }
             let frame = frame.map_err(|_| AccountMediaError::InvalidImage)?;
             let frame = transform_gif_frame(frame, attachment, input_width, input_height);
             encoder
@@ -707,7 +714,22 @@ fn process_gif(
                 .map_err(|_| AccountMediaError::InvalidImage)?;
         }
     }
-    Ok((original_bytes, Some(static_bytes), width, height))
+    Ok((original_bytes.0, Some(static_bytes), width, height))
+}
+
+/// Bound the encoder while it writes, rather than checking a potentially huge Vec afterward.
+struct BoundedImageBytes(Vec<u8>);
+impl Write for BoundedImageBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > ACCOUNT_MEDIA_LIMIT.saturating_sub(self.0.len()) {
+            return Err(io::Error::other("profile image output limit exceeded"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn transform_gif_frame(
@@ -1167,6 +1189,32 @@ pub fn write_prepared_media(
     Ok(vec![original, small])
 }
 
+/// Writes the original and optional static derivative of a prepared profile image.
+///
+/// # Errors
+/// Returns an I/O error if safe Paperclip writes fail.
+pub fn write_prepared_account_media(
+    root: &PaperclipRoot,
+    metadata: &PaperclipMetadata,
+    prepared: &PreparedAccountMedia,
+) -> std::io::Result<Vec<String>> {
+    let original = metadata.relative_path("original").ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid media path")
+    })?;
+    let mut paths = vec![original];
+    write_prepared_file(root, Path::new(&paths[0]), &prepared.original_bytes)?;
+    if let Some(static_bytes) = prepared.static_bytes.as_ref() {
+        let static_path = metadata.relative_path("static").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid static profile path")
+        })?;
+        // The original may already be referenced by a committed row. The caller's
+        // row-aware reconciliation, not a partial-write error, decides what to unlink.
+        write_prepared_file(root, Path::new(&static_path), static_bytes)?;
+        paths.push(static_path);
+    }
+    Ok(paths)
+}
+
 /// Writes a prepared custom emoji beneath its Paperclip original and static paths.
 ///
 /// # Errors
@@ -1442,4 +1490,16 @@ fn safe_relative_path(path: &Path) -> bool {
         count += 1;
     }
     count > 0
+}
+
+#[cfg(test)]
+mod profile_output_tests {
+    use super::*;
+    #[test]
+    fn profile_encoder_output_is_bounded_during_writes() {
+        let mut output = BoundedImageBytes(vec![0; ACCOUNT_MEDIA_LIMIT - 1]);
+        assert_eq!(output.write(&[1]).unwrap(), 1);
+        assert!(output.write(&[2]).is_err());
+        assert_eq!(output.0.len(), ACCOUNT_MEDIA_LIMIT);
+    }
 }
