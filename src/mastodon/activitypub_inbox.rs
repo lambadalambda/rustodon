@@ -1043,13 +1043,19 @@ mod tests {
                 "object": {"id": "https://remote.example/statuses/1", "type": "Tombstone", "atomUri": atom}
             });
             assert!(matches!(
-                parse_activity(&activity.to_string()).expect("opaque metadata must not reject Delete"),
+                parse_activity(&activity.to_string())
+                    .expect("opaque metadata must not reject Delete"),
                 InboxActivity::DeleteNote { atom_uri: None, .. }
             ));
             activity["object"]["id"] = json!("tag:remote.example,2026-07-01:objectId=1");
             assert!(parse_activity(&activity.to_string()).is_err());
         }
-        for invalid in [json!(42), json!([]), json!("file:///tmp/status"), json!("relative")] {
+        for invalid in [
+            json!(42),
+            json!([]),
+            json!("file:///tmp/status"),
+            json!("relative"),
+        ] {
             assert!(super::optional_atom_uri(Some(&invalid)).is_err());
         }
     }

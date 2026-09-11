@@ -2409,9 +2409,16 @@ mod tests {
         );
         let parsed = crate::mastodon::activitypub_inbox::parse_activity(&delete.to_string())
             .expect("serialized tag-bearing Tombstone must parse");
-        assert!(matches!(parsed,
-            crate::mastodon::activitypub_inbox::InboxActivity::DeleteNote { atom_uri: None, .. }
-        ), "opaque tag metadata is not an authenticated lookup alias");
+        assert!(
+            matches!(
+                parsed,
+                crate::mastodon::activitypub_inbox::InboxActivity::DeleteNote {
+                    atom_uri: None,
+                    ..
+                }
+            ),
+            "opaque tag metadata is not an authenticated lookup alias"
+        );
     }
 
     #[test]

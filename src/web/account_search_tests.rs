@@ -80,10 +80,12 @@ async fn results(
 }
 
 async fn remote_rows(pool: &PgPool) -> TestResult<i64> {
-    Ok(sqlx::query_scalar("SELECT count(*) FROM accounts WHERE domain = $1")
-        .bind(REMOTE_DOMAIN)
-        .fetch_one(pool)
-        .await?)
+    Ok(
+        sqlx::query_scalar("SELECT count(*) FROM accounts WHERE domain = $1")
+            .bind(REMOTE_DOMAIN)
+            .fetch_one(pool)
+            .await?,
+    )
 }
 
 #[tokio::test]
@@ -95,7 +97,10 @@ async fn v2_accounts_reuse_search_and_authenticated_resolution() -> TestResult {
     crate::operational_schema::migrate(&mut connection).await?;
     let writer = WriteRepository::connect(&owner_url).await?;
     let repository = Repository::connect(&std::env::var("RUSTODON_MASTODON_DATABASE_URL")?).await?;
-    for (token, scopes) in [(SEARCH_TOKEN, "read:search"), (ACCOUNTS_TOKEN, "read:accounts")] {
+    for (token, scopes) in [
+        (SEARCH_TOKEN, "read:search"),
+        (ACCOUNTS_TOKEN, "read:accounts"),
+    ] {
         sqlx::query(
             "INSERT INTO oauth_access_tokens (token, scopes, resource_owner_id, application_id, created_at) \
              SELECT $1, $2, resource_owner_id, application_id, clock_timestamp() \
@@ -119,7 +124,9 @@ async fn v2_accounts_reuse_search_and_authenticated_resolution() -> TestResult {
     .await?;
     // Fixture-only signer: never use an instance environment or live credential.
     sqlx::query("UPDATE accounts SET private_key = $1 WHERE id = -99")
-        .bind(include_str!("../../tests/fixtures/http-signature-private.pem"))
+        .bind(include_str!(
+            "../../tests/fixtures/http-signature-private.pem"
+        ))
         .execute(writer.pool())
         .await?;
 
@@ -133,23 +140,29 @@ async fn v2_accounts_reuse_search_and_authenticated_resolution() -> TestResult {
         async move {
             fetches.fetch_add(1, Ordering::SeqCst);
             let (content_type, body) = if uri.path() == "/.well-known/webfinger" {
-                ("application/jrd+json", json!({
-                    "subject": format!("acct:discovered@{REMOTE_DOMAIN}"),
-                    "links": [{"rel": "self", "type": "application/activity+json",
-                        "href": format!("http://{REMOTE_DOMAIN}/users/discovered")}]
-                }))
+                (
+                    "application/jrd+json",
+                    json!({
+                        "subject": format!("acct:discovered@{REMOTE_DOMAIN}"),
+                        "links": [{"rel": "self", "type": "application/activity+json",
+                            "href": format!("http://{REMOTE_DOMAIN}/users/discovered")}]
+                    }),
+                )
             } else {
                 assert_eq!(uri.path(), "/users/discovered");
                 if headers.contains_key("signature") {
                     signed.fetch_add(1, Ordering::SeqCst);
                 }
-                ("application/activity+json", json!({
-                    "@context": "https://www.w3.org/ns/activitystreams",
-                    "id": format!("http://{REMOTE_DOMAIN}/users/discovered"),
-                    "type": "Person", "preferredUsername": "discovered",
-                    // validate_target checks a literal public address, with no DNS or HTTP request.
-                    "inbox": "https://8.8.8.8/inbox"
-                }))
+                (
+                    "application/activity+json",
+                    json!({
+                        "@context": "https://www.w3.org/ns/activitystreams",
+                        "id": format!("http://{REMOTE_DOMAIN}/users/discovered"),
+                        "type": "Person", "preferredUsername": "discovered",
+                        // validate_target checks a literal public address, with no DNS or HTTP request.
+                        "inbox": "https://8.8.8.8/inbox"
+                    }),
+                )
             };
             ([(CONTENT_TYPE, content_type)], body.to_string())
         }
@@ -158,12 +171,22 @@ async fn v2_accounts_reuse_search_and_authenticated_resolution() -> TestResult {
     let mock_endpoint = mock_listener.local_addr()?;
     let mock_server = tokio::spawn(async move { axum::serve(mock_listener, mock).await });
     let mut state = WebState::new(
-        repository, Url::parse(&format!("https://{DOMAIN}/"))?, DOMAIN, "/system",
-        std::env::temp_dir(), runtime(), Vec::new(), vec![DOMAIN.to_owned()],
-    )?.with_write_repository(writer.clone());
+        repository,
+        Url::parse(&format!("https://{DOMAIN}/"))?,
+        DOMAIN,
+        "/system",
+        std::env::temp_dir(),
+        runtime(),
+        Vec::new(),
+        vec![DOMAIN.to_owned()],
+    )?
+    .with_write_repository(writer.clone());
     // Existing debug-only transport hook; no new production injection API.
     state.remote_account_resolver = RemoteAccountResolver::new(
-        state.remote_fetcher.clone().with_test_endpoint(Some(mock_endpoint)),
+        state
+            .remote_fetcher
+            .clone()
+            .with_test_endpoint(Some(mock_endpoint)),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let base = format!("http://{}", listener.local_addr()?);
@@ -190,36 +213,75 @@ async fn v2_accounts_reuse_search_and_authenticated_resolution() -> TestResult {
     ] {
         let (code, v1) = search(&client, &base, false, query, Some(TOKEN)).await?;
         assert_eq!(code, 200);
-        let v2 = results(&client, &base, &format!("{query}&type=accounts"), Some(SEARCH_TOKEN)).await?;
+        let v2 = results(
+            &client,
+            &base,
+            &format!("{query}&type=accounts"),
+            Some(SEARCH_TOKEN),
+        )
+        .await?;
         assert_eq!(v2["accounts"], v1, "{query}");
     }
     let anonymous_following = results(&client, &base, "q=alice&following=true", None).await?;
     assert_eq!(anonymous_following["accounts"], json!([]));
-    let zero = results(&client, &base, "q=alice&type=accounts&limit=0", Some(SEARCH_TOKEN)).await?;
+    let zero = results(
+        &client,
+        &base,
+        "q=alice&type=accounts&limit=0",
+        Some(SEARCH_TOKEN),
+    )
+    .await?;
     assert_eq!(zero["accounts"], json!([]));
     let untyped = results(&client, &base, "q=alice&offset=999", Some(SEARCH_TOKEN)).await?;
     let first = results(&client, &base, "q=alice", Some(SEARCH_TOKEN)).await?;
     assert_eq!(untyped, first, "existing untyped search ignores offset");
     for kind in ["hashtags", "statuses", "unknown"] {
-        let body = results(&client, &base, &format!("q=alice&type={kind}"), Some(SEARCH_TOKEN)).await?;
+        let body = results(
+            &client,
+            &base,
+            &format!("q=alice&type={kind}"),
+            Some(SEARCH_TOKEN),
+        )
+        .await?;
         assert_eq!(body["accounts"], json!([]));
     }
-    let tags = results(&client, &base, "q=fixturetag&type=hashtags", Some(SEARCH_TOKEN)).await?;
+    let tags = results(
+        &client,
+        &base,
+        "q=fixturetag&type=hashtags",
+        Some(SEARCH_TOKEN),
+    )
+    .await?;
     assert!(!tags["hashtags"].as_array().expect("hashtags").is_empty());
     let all = results(&client, &base, "q=fixturetag", Some(SEARCH_TOKEN)).await?;
     assert_eq!(all["hashtags"], tags["hashtags"]);
-    let accounts = results(&client, &base, "q=fixturetag&type=accounts", Some(SEARCH_TOKEN)).await?;
+    let accounts = results(
+        &client,
+        &base,
+        "q=fixturetag&type=accounts",
+        Some(SEARCH_TOKEN),
+    )
+    .await?;
     assert_eq!(accounts["hashtags"], json!([]));
     for (v2, query, token, code) in [
         (true, "q=alice", Some(ACCOUNTS_TOKEN), 403),
         (false, "q=alice", Some(SEARCH_TOKEN), 403),
         (false, "q=alice", None, 401),
         (true, "q=alice&type=accounts&offset=0", None, 401),
-        (true, "q=alice&type=accounts&offset=-1", Some(SEARCH_TOKEN), 400),
+        (
+            true,
+            "q=alice&type=accounts&offset=-1",
+            Some(SEARCH_TOKEN),
+            400,
+        ),
         (true, "q=alice&limit=-1", Some(SEARCH_TOKEN), 400),
         (true, "type=accounts", Some(SEARCH_TOKEN), 400),
     ] {
-        assert_eq!(search(&client, &base, v2, query, token).await?.0, code, "{query}");
+        assert_eq!(
+            search(&client, &base, v2, query, token).await?.0,
+            code,
+            "{query}"
+        );
     }
 
     let remote_query = format!("q=discovered%40{REMOTE_DOMAIN}&resolve=true");
@@ -229,23 +291,61 @@ async fn v2_accounts_reuse_search_and_authenticated_resolution() -> TestResult {
         let body = results(&client, &base, &remote_query, token).await?;
         assert_eq!(body["accounts"], json!([]));
     }
-    for suffix in ["&type=hashtags", "&type=statuses", "&type=accounts&offset=1", "&limit=0"] {
-        let body = results(&client, &base, &format!("{remote_query}{suffix}"), Some(SEARCH_TOKEN)).await?;
+    for suffix in [
+        "&type=hashtags",
+        "&type=statuses",
+        "&type=accounts&offset=1",
+        "&limit=0",
+    ] {
+        let body = results(
+            &client,
+            &base,
+            &format!("{remote_query}{suffix}"),
+            Some(SEARCH_TOKEN),
+        )
+        .await?;
         assert_eq!(body["accounts"], json!([]));
     }
     assert_eq!(fetches.load(Ordering::SeqCst), 0);
     assert_eq!(remote_rows(writer.pool()).await?, 0);
-    let resolved = results(&client, &base, &format!("{remote_query}&type=accounts"), Some(SEARCH_TOKEN)).await?;
-    assert_eq!(resolved["accounts"].as_array().expect("resolved accounts").len(), 1);
-    assert_eq!(resolved["accounts"][0]["acct"], format!("discovered@{REMOTE_DOMAIN}"));
-    assert_eq!(fetches.load(Ordering::SeqCst), 2, "WebFinger and actor GET only");
-    assert_eq!(signed_fetches.load(Ordering::SeqCst), 1, "actor fetch stays signed");
+    let resolved = results(
+        &client,
+        &base,
+        &format!("{remote_query}&type=accounts"),
+        Some(SEARCH_TOKEN),
+    )
+    .await?;
+    assert_eq!(
+        resolved["accounts"]
+            .as_array()
+            .expect("resolved accounts")
+            .len(),
+        1
+    );
+    assert_eq!(
+        resolved["accounts"][0]["acct"],
+        format!("discovered@{REMOTE_DOMAIN}")
+    );
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        2,
+        "WebFinger and actor GET only"
+    );
+    assert_eq!(
+        signed_fetches.load(Ordering::SeqCst),
+        1,
+        "actor fetch stays signed"
+    );
     assert_eq!(remote_rows(writer.pool()).await?, 1);
     for token in [None, Some(SEARCH_TOKEN)] {
         let cached = results(&client, &base, &remote_query, token).await?;
         assert_eq!(cached["accounts"], resolved["accounts"]);
     }
-    assert_eq!(fetches.load(Ordering::SeqCst), 2, "anonymous/cache hits never refetch");
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        2,
+        "anonymous/cache hits never refetch"
+    );
     server.abort();
     mock_server.abort();
     Ok(())

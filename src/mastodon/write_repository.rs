@@ -17657,7 +17657,10 @@ mod tests {
             let note = RemoteNoteData::parse(&object, actor)
                 .expect("tag metadata must not reject the Note");
             assert_eq!(note.uri, "https://remote.example/statuses/1");
-            assert!(note.atom_uri.is_none(), "tags must not become lookup aliases");
+            assert!(
+                note.atom_uri.is_none(),
+                "tags must not become lookup aliases"
+            );
         }
         for invalid in [
             json!(42),
@@ -17671,7 +17674,10 @@ mod tests {
         }
         object["atomUri"] = json!("https://remote.example/objects/1");
         assert_eq!(
-            RemoteNoteData::parse(&object, actor).unwrap().atom_uri.as_deref(),
+            RemoteNoteData::parse(&object, actor)
+                .unwrap()
+                .atom_uri
+                .as_deref(),
             Some("https://remote.example/objects/1")
         );
         object["atomUri"] = json!("tag:remote.example,2026-07-01:opaque");

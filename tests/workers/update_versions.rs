@@ -167,7 +167,8 @@ async fn delivered_updates(profile: bool) -> TestResult {
         .bind(SENDER).fetch_one(&pool).await?;
     // Legacy local rows serialize a tag atomUri even though their AP ID is HTTPS.
     // Its tagging authority need not equal WEB_DOMAIN and must not grant alias authority.
-    let atom_uri = format!("tag:account-domain.invalid,2026-07-01:objectId={status_id}:objectType=Status");
+    let atom_uri =
+        format!("tag:account-domain.invalid,2026-07-01:objectId={status_id}:objectType=Status");
     sqlx::query("UPDATE statuses SET uri = $2 WHERE id = $1")
         .bind(status_id)
         .bind(&atom_uri)
@@ -177,7 +178,11 @@ async fn delivered_updates(profile: bool) -> TestResult {
         "INSERT INTO statuses (account_id, text, spoiler_text, visibility, local, uri,
           created_at, updated_at) VALUES ($1, 'untouched legacy victim', '', 0, false, $2,
           clock_timestamp(), clock_timestamp()) RETURNING id",
-    ).bind(BOB).bind(&atom_uri).fetch_one(&remote_pool).await?;
+    )
+    .bind(BOB)
+    .bind(&atom_uri)
+    .fetch_one(&remote_pool)
+    .await?;
     let result = std::panic::AssertUnwindSafe(async {
     if !profile {
         queue
@@ -352,10 +357,15 @@ async fn delivered_updates(profile: bool) -> TestResult {
     Ok::<(), Box<dyn std::error::Error>>(())
     }).catch_unwind().await;
     server.abort();
-    sqlx::query("DELETE FROM statuses WHERE id = $1").bind(victim_status_id).execute(&remote_pool).await?;
+    sqlx::query("DELETE FROM statuses WHERE id = $1")
+        .bind(victim_status_id)
+        .execute(&remote_pool)
+        .await?;
     for pool in [&pool, &remote_pool] {
         sqlx::query("DELETE FROM tombstones WHERE account_id = ANY($1)")
-            .bind(vec![SENDER, REMOTE_SENDER]).execute(pool).await?;
+            .bind(vec![SENDER, REMOTE_SENDER])
+            .execute(pool)
+            .await?;
         sqlx::query("DELETE FROM status_edits WHERE status_id IN (SELECT id FROM statuses WHERE account_id = ANY($1))").bind(vec![SENDER, REMOTE_SENDER]).execute(pool).await?;
         sqlx::query("DELETE FROM status_stats WHERE status_id IN (SELECT id FROM statuses WHERE account_id = ANY($1))").bind(vec![SENDER, REMOTE_SENDER]).execute(pool).await?;
         sqlx::query("DELETE FROM statuses WHERE account_id = ANY($1)")

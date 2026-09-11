@@ -110,7 +110,9 @@ impl Peer {
         path: &str,
         form: &[(&str, &str)],
     ) -> Result<Value> {
-        let response = self.request(client, Some(&self.token), method, path, form).await?;
+        let response = self
+            .request(client, Some(&self.token), method, path, form)
+            .await?;
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
@@ -119,12 +121,23 @@ impl Peer {
         Ok(serde_json::from_str(&body)?)
     }
 
-    async fn request(&self, client: &Client, token: Option<&str>, method: Method, path: &str, form: &[(&str, &str)]) -> Result<reqwest::Response> {
+    async fn request(
+        &self,
+        client: &Client,
+        token: Option<&str>,
+        method: Method,
+        path: &str,
+        form: &[(&str, &str)],
+    ) -> Result<reqwest::Response> {
         let request = client
             .request(method.clone(), self.http.join(path)?)
             .header("Host", format!("{}.peer.invalid", self.name))
             .header("X-Forwarded-Proto", "https");
-        let request = if let Some(token) = token { request.bearer_auth(token) } else { request };
+        let request = if let Some(token) = token {
+            request.bearer_auth(token)
+        } else {
+            request
+        };
         let request = if method == Method::GET {
             request.query(form)
         } else {
@@ -228,11 +241,23 @@ async fn setup() -> Result<Smoke> {
     // This is sequential convergence, not simultaneous reciprocal-follow stress.
     follow_and_accept(&client, &mastodon, &rustodon, rust_on_masto, masto_on_rust).await?;
     follow_and_accept(&client, &rustodon, &mastodon, masto_on_rust, rust_on_masto).await?;
-    Ok(Smoke { root, run, client, mastodon, rustodon })
+    Ok(Smoke {
+        root,
+        run,
+        client,
+        mastodon,
+        rustodon,
+    })
 }
 
 async fn smoke() -> Result<()> {
-    let Smoke {root, run, client, mastodon, rustodon} = setup().await?;
+    let Smoke {
+        root,
+        run,
+        client,
+        mastodon,
+        rustodon,
+    } = setup().await?;
     let mut statuses = Vec::new();
     for peer in [&mastodon, &rustodon] {
         let marker = format!("{run}-{}-public-push", peer.name);
@@ -370,7 +395,12 @@ fn parse_audit(text: &str) -> Result<Vec<Value>> {
         .collect::<std::result::Result<_, _>>()?)
 }
 
-fn has_push_audit(root: &std::path::Path, sender: &Peer, receiver: &Peer, uri: &str) -> Result<bool> {
+fn has_push_audit(
+    root: &std::path::Path,
+    sender: &Peer,
+    receiver: &Peer,
+    uri: &str,
+) -> Result<bool> {
     has_activity_audit(root, sender, receiver, uri, "Create", None, Some(true))
 }
 
@@ -398,8 +428,11 @@ fn has_activity_audit(
     Ok(events.iter().any(|event| {
         matches_received_activity(event, &sender.actor(), kind, uri)
             && public.is_none_or(|expected| event[public_field] == expected)
-            && audience.is_none_or(|recipient| event[recipients_field].as_array()
-                .is_some_and(|values| values.iter().any(|value| value == recipient)))
+            && audience.is_none_or(|recipient| {
+                event[recipients_field]
+                    .as_array()
+                    .is_some_and(|values| values.iter().any(|value| value == recipient))
+            })
     }))
 }
 
@@ -410,16 +443,27 @@ async fn private_notes_recipient_and_outsider_both_directions() -> Result<()> {
 }
 
 async fn privacy() -> Result<()> {
-    let Smoke {root, run, client, mastodon, rustodon} = setup().await?;
+    let Smoke {
+        root,
+        run,
+        client,
+        mastodon,
+        rustodon,
+    } = setup().await?;
     let mut completed = Vec::new();
     for (sender, receiver) in [(&mastodon, &rustodon), (&rustodon, &mastodon)] {
         for visibility in ["private", "direct"] {
-            completed.push((sender, receiver, private_note(&root, &run, &client, sender, receiver, visibility).await?));
+            completed.push((
+                sender,
+                receiver,
+                private_note(&root, &run, &client, sender, receiver, visibility).await?,
+            ));
         }
     }
     for (sender, receiver, uri) in completed {
         assert_no_status_get(&root, sender, receiver, &uri)?;
-        let audit = std::fs::read_to_string(root.join(format!("{}.peer.invalid.jsonl", receiver.name)))?;
+        let audit =
+            std::fs::read_to_string(root.join(format!("{}.peer.invalid.jsonl", receiver.name)))?;
         reject_public_private_deliveries(&parse_audit(&audit)?, &sender.actor(), &uri)?;
     }
     Ok(())
@@ -430,7 +474,14 @@ async fn token_for(peer: &Peer, username: &str) -> Result<String> {
         .bind(username).fetch_one(&peer.pool).await?)
 }
 
-async fn private_note(root: &std::path::Path, run: &str, client: &Client, sender: &Peer, receiver: &Peer, visibility: &str) -> Result<String> {
+async fn private_note(
+    root: &std::path::Path,
+    run: &str,
+    client: &Client,
+    sender: &Peer,
+    receiver: &Peer,
+    visibility: &str,
+) -> Result<String> {
     let recipient = format!("{}_recipient", receiver.name);
     let outsider_token = token_for(receiver, &format!("{}_outsider", receiver.name)).await?;
     let recipient_token = token_for(receiver, &recipient).await?;
@@ -438,65 +489,157 @@ async fn private_note(root: &std::path::Path, run: &str, client: &Client, sender
     let text = if visibility == "direct" {
         // Resolve only the recipient ACTOR, never a status URL.
         let acct = format!("{recipient}@{}.peer.invalid", receiver.name);
-        let resolved = sender.api(client, Method::GET, "/api/v1/accounts/search", &[("q", &acct), ("resolve", "true")]).await?;
-        assert_eq!(resolved.as_array().ok_or("recipient search missing")?.len(), 1);
+        let resolved = sender
+            .api(
+                client,
+                Method::GET,
+                "/api/v1/accounts/search",
+                &[("q", &acct), ("resolve", "true")],
+            )
+            .await?;
+        assert_eq!(
+            resolved.as_array().ok_or("recipient search missing")?.len(),
+            1
+        );
         format!("@{acct} {marker}")
-    } else { marker.clone() };
-    let created = sender.api(client, Method::POST, "/api/v1/statuses", &[("status", &text), ("visibility", visibility)]).await?;
-    let uri = created["uri"].as_str().ok_or("missing private status URI")?;
+    } else {
+        marker.clone()
+    };
+    let created = sender
+        .api(
+            client,
+            Method::POST,
+            "/api/v1/statuses",
+            &[("status", &text), ("visibility", visibility)],
+        )
+        .await?;
+    let uri = created["uri"]
+        .as_str()
+        .ok_or("missing private status URI")?;
     let origin_id = created["id"].as_str().ok_or("missing private status ID")?;
     assert_eq!(created["visibility"], visibility);
-    let expected_visibility = if visibility == "private" {2} else {3};
+    let expected_visibility = if visibility == "private" { 2 } else { 3 };
     let audience = if visibility == "private" {
         format!("{}/followers", sender.actor())
     } else {
         sqlx::query_scalar::<_, String>("SELECT uri FROM accounts WHERE username=$1 AND domain=$2")
-            .bind(&recipient).bind(format!("{}.peer.invalid", receiver.name)).fetch_one(&sender.pool).await?
+            .bind(&recipient)
+            .bind(format!("{}.peer.invalid", receiver.name))
+            .fetch_one(&sender.pool)
+            .await?
     };
     let mut received_id = None;
     for _ in 0..60 {
         received_id = sqlx::query_scalar::<_, i64>("SELECT s.id FROM statuses s JOIN accounts a ON a.id=s.account_id WHERE s.uri=$1 AND a.uri=$2 AND s.local=false AND s.visibility=$3 AND strpos(s.text,$4)>0 AND s.deleted_at IS NULL")
             .bind(uri).bind(sender.actor()).bind(expected_visibility).bind(&marker).fetch_optional(&receiver.pool).await?;
-        if received_id.is_some() && has_activity_audit(root, sender, receiver, uri, "Create", Some(&audience), Some(false))? {break;}
+        if received_id.is_some()
+            && has_activity_audit(
+                root,
+                sender,
+                receiver,
+                uri,
+                "Create",
+                Some(&audience),
+                Some(false),
+            )?
+        {
+            break;
+        }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    let id = received_id.ok_or_else(|| format!("BLOCKED {visibility} PUSH {} -> {}: {uri} not received",sender.name,receiver.name))?;
-    assert!(has_activity_audit(root,sender,receiver,uri,"Create",Some(&audience),Some(false))?, "missing signed private inbox Create for {uri}");
-    let allowed = if visibility == "private" {&receiver.token} else {&recipient_token};
-    let denied = if visibility == "private" {&recipient_token} else {&receiver.token};
+    let id = received_id.ok_or_else(|| {
+        format!(
+            "BLOCKED {visibility} PUSH {} -> {}: {uri} not received",
+            sender.name, receiver.name
+        )
+    })?;
+    assert!(
+        has_activity_audit(
+            root,
+            sender,
+            receiver,
+            uri,
+            "Create",
+            Some(&audience),
+            Some(false)
+        )?,
+        "missing signed private inbox Create for {uri}"
+    );
+    let allowed = if visibility == "private" {
+        &receiver.token
+    } else {
+        &recipient_token
+    };
+    let denied = if visibility == "private" {
+        &recipient_token
+    } else {
+        &receiver.token
+    };
     let path = format!("/api/v1/statuses/{id}");
-    assert_rest_access(receiver,client,Some(allowed),&path,Some(uri)).await?;
-    for token in [Some(denied.as_str()),Some(outsider_token.as_str()),None] {
-        assert_rest_access(receiver,client,token,&path,None).await?;
+    assert_rest_access(receiver, client, Some(allowed), &path, Some(uri)).await?;
+    for token in [Some(denied.as_str()), Some(outsider_token.as_str()), None] {
+        assert_rest_access(receiver, client, token, &path, None).await?;
     }
-    let local_outsider = token_for(sender,&format!("{}_outsider",sender.name)).await?;
-    for token in [Some(local_outsider.as_str()),None] {
-        assert_rest_access(sender,client,token,&format!("/api/v1/statuses/{origin_id}"),None).await?;
+    let local_outsider = token_for(sender, &format!("{}_outsider", sender.name)).await?;
+    for token in [Some(local_outsider.as_str()), None] {
+        assert_rest_access(
+            sender,
+            client,
+            token,
+            &format!("/api/v1/statuses/{origin_id}"),
+            None,
+        )
+        .await?;
     }
-    let audit = std::fs::read_to_string(root.join(format!("{}.peer.invalid.jsonl",receiver.name)))?;
+    let audit =
+        std::fs::read_to_string(root.join(format!("{}.peer.invalid.jsonl", receiver.name)))?;
     reject_public_private_deliveries(&parse_audit(&audit)?, &sender.actor(), uri)?;
-    assert_no_status_get(root,sender,receiver,uri)?;
-    println!("PASS {visibility} PUSH/authorization {} -> {}: recipient allowed; nonrecipient/outsider/anonymous denied: {uri}",sender.name,receiver.name);
+    assert_no_status_get(root, sender, receiver, uri)?;
+    println!(
+        "PASS {visibility} PUSH/authorization {} -> {}: recipient allowed; nonrecipient/outsider/anonymous denied: {uri}",
+        sender.name, receiver.name
+    );
     Ok(uri.to_owned())
 }
 
-async fn assert_rest_access(peer: &Peer, client: &Client, token: Option<&str>, path: &str, expected_uri: Option<&str>) -> Result<()> {
-    let response = peer.request(client,token,Method::GET,path,&[]).await?;
+async fn assert_rest_access(
+    peer: &Peer,
+    client: &Client,
+    token: Option<&str>,
+    path: &str,
+    expected_uri: Option<&str>,
+) -> Result<()> {
+    let response = peer.request(client, token, Method::GET, path, &[]).await?;
     let status = response.status();
     let body = response.text().await?;
     if let Some(uri) = expected_uri {
-        assert_eq!(status,reqwest::StatusCode::OK,"{} {path}: {body}",peer.name);
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "{} {path}: {body}",
+            peer.name
+        );
         let json: Value = serde_json::from_str(&body)?;
-        assert_eq!(json["uri"],uri);
+        assert_eq!(json["uri"], uri);
     } else {
-        assert_eq!(status,reqwest::StatusCode::NOT_FOUND,"{} private access unexpectedly exposed {path}: {body}",peer.name);
+        assert_eq!(
+            status,
+            reqwest::StatusCode::NOT_FOUND,
+            "{} private access unexpectedly exposed {path}: {body}",
+            peer.name
+        );
     }
     Ok(())
 }
 
 fn reject_public_private_deliveries(events: &[Value], actor: &str, uri: &str) -> Result<()> {
-    if events.iter().any(|event| event["method"] == "POST" && matches!(event["activity"].as_str(), Some("Create" | "Update"))
-        && event["actor"] == actor && event["object"] == uri && event["public"] == true) {
+    if events.iter().any(|event| {
+        event["method"] == "POST"
+            && matches!(event["activity"].as_str(), Some("Create" | "Update"))
+            && event["actor"] == actor
+            && event["object"] == uri
+            && event["public"] == true
+    }) {
         return Err(format!("private status {uri} was also addressed to Public").into());
     }
     Ok(())
@@ -505,11 +648,16 @@ fn reject_public_private_deliveries(events: &[Value], actor: &str, uri: &str) ->
 #[test]
 fn privacy_audit_rejects_public_attempt_even_with_successful_private_delivery() {
     let private = serde_json::json!({"method":"POST","activity":"Create","actor":"actor","object":"note","public":false,"status":202});
-    assert!(reject_public_private_deliveries(std::slice::from_ref(&private),"actor","note").is_ok());
+    assert!(
+        reject_public_private_deliveries(std::slice::from_ref(&private), "actor", "note").is_ok()
+    );
     for kind in ["Create", "Update"] {
         for status in [202, 403, 500] {
             let public = serde_json::json!({"method":"POST","activity":kind,"actor":"actor","object":"note","public":true,"status":status});
-            assert!(reject_public_private_deliveries(&[private.clone(),public],"actor","note").is_err());
+            assert!(
+                reject_public_private_deliveries(&[private.clone(), public], "actor", "note")
+                    .is_err()
+            );
         }
     }
 }
@@ -522,19 +670,48 @@ struct Note {
     warning: String,
 }
 
-async fn create_note(smoke: &Smoke, author: &Peer, visibility: &'static str, marker: String) -> Result<Note> {
-    let created = author.api(&smoke.client, Method::POST, "/api/v1/statuses",
-        &[("status", &marker), ("visibility", visibility)]).await?;
-    let uri = created["uri"].as_str().ok_or("missing created Note URI")?.to_owned();
-    assert!(uri.starts_with(&format!("{}/statuses/", author.actor())), "unexpected Note identity: {uri}");
+async fn create_note(
+    smoke: &Smoke,
+    author: &Peer,
+    visibility: &'static str,
+    marker: String,
+) -> Result<Note> {
+    let created = author
+        .api(
+            &smoke.client,
+            Method::POST,
+            "/api/v1/statuses",
+            &[("status", &marker), ("visibility", visibility)],
+        )
+        .await?;
+    let uri = created["uri"]
+        .as_str()
+        .ok_or("missing created Note URI")?
+        .to_owned();
+    assert!(
+        uri.starts_with(&format!("{}/statuses/", author.actor())),
+        "unexpected Note identity: {uri}"
+    );
     assert_eq!(created["visibility"], visibility);
     Ok(Note {
-        id: created["id"].as_str().ok_or("missing created Note ID")?.to_owned(),
-        uri, marker, visibility, warning: String::new(),
+        id: created["id"]
+            .as_str()
+            .ok_or("missing created Note ID")?
+            .to_owned(),
+        uri,
+        marker,
+        visibility,
+        warning: String::new(),
     })
 }
 
-async fn wait_note(smoke: &Smoke, sender: &Peer, receiver: &Peer, note: &Note, kind: &str) -> Result<i64> {
+async fn wait_note(
+    smoke: &Smoke,
+    sender: &Peer,
+    receiver: &Peer,
+    note: &Note,
+    kind: &str,
+) -> Result<i64> {
     let visibility = match note.visibility {
         "public" => 0,
         "private" => 2,
@@ -548,13 +725,26 @@ async fn wait_note(smoke: &Smoke, sender: &Peer, receiver: &Peer, note: &Note, k
             .bind(&note.uri).bind(sender.actor()).bind(visibility).bind(&note.marker)
             .bind(&note.warning).bind(kind == "Update").fetch_optional(&receiver.pool).await?;
         if let Some(id) = id
-            && has_activity_audit(&smoke.root, sender, receiver, &note.uri, kind, audience, Some(visibility == 0))? {
+            && has_activity_audit(
+                &smoke.root,
+                sender,
+                receiver,
+                &note.uri,
+                kind,
+                audience,
+                Some(visibility == 0),
+            )?
+        {
             assert_no_status_get(&smoke.root, sender, receiver, &note.uri)?;
             return Ok(id);
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    Err(format!("BLOCKED {kind} {} Note {} -> {}: {} not converged", note.visibility, sender.name, receiver.name, note.uri).into())
+    Err(format!(
+        "BLOCKED {kind} {} Note {} -> {}: {} not converged",
+        note.visibility, sender.name, receiver.name, note.uri
+    )
+    .into())
 }
 
 #[tokio::test]
@@ -566,27 +756,57 @@ async fn note_create_edit_delete_both_directions() -> Result<()> {
 async fn note_lifecycle() -> Result<()> {
     let smoke = setup().await?;
     let mut completed = Vec::new();
-    for (sender, receiver) in [(&smoke.mastodon, &smoke.rustodon), (&smoke.rustodon, &smoke.mastodon)] {
+    for (sender, receiver) in [
+        (&smoke.mastodon, &smoke.rustodon),
+        (&smoke.rustodon, &smoke.mastodon),
+    ] {
         for visibility in ["public", "private"] {
-            let mut note = create_note(&smoke, sender, visibility,
-                format!("{}-{}-{visibility}-lifecycle", smoke.run, sender.name)).await?;
+            let mut note = create_note(
+                &smoke,
+                sender,
+                visibility,
+                format!("{}-{}-{visibility}-lifecycle", smoke.run, sender.name),
+            )
+            .await?;
             let received_id = wait_note(&smoke, sender, receiver, &note, "Create").await?;
             check_note_access(&smoke, sender, receiver, &note, received_id).await?;
-            println!("PASS {visibility} Create {} -> {}: {}", sender.name, receiver.name, note.uri);
+            println!(
+                "PASS {visibility} Create {} -> {}: {}",
+                sender.name, receiver.name, note.uri
+            );
 
             note.marker.push_str("-edited");
             note.warning = format!("{} edited warning", smoke.run);
-            let edited = sender.api(&smoke.client, Method::PUT, &format!("/api/v1/statuses/{}", note.id),
-                &[("status", &note.marker), ("spoiler_text", &note.warning)]).await?;
+            let edited = sender
+                .api(
+                    &smoke.client,
+                    Method::PUT,
+                    &format!("/api/v1/statuses/{}", note.id),
+                    &[("status", &note.marker), ("spoiler_text", &note.warning)],
+                )
+                .await?;
             // Do not mask/rewrite Mastodon's atomUri or any serialized identifier.
             assert_eq!(edited["uri"], note.uri);
             assert_eq!(edited["visibility"], visibility);
             let edited_id = wait_note(&smoke, sender, receiver, &note, "Update").await?;
-            assert_eq!(edited_id, received_id, "Update replaced the received object identity");
+            assert_eq!(
+                edited_id, received_id,
+                "Update replaced the received object identity"
+            );
             check_note_access(&smoke, sender, receiver, &note, received_id).await?;
-            println!("PASS {visibility} Update {} -> {}: {}", sender.name, receiver.name, note.uri);
+            println!(
+                "PASS {visibility} Update {} -> {}: {}",
+                sender.name, receiver.name, note.uri
+            );
 
-            sender.api(&smoke.client, Method::DELETE, &format!("/api/v1/statuses/{}", note.id), &[]).await?;
+            sender
+                .api(
+                    &smoke.client,
+                    Method::DELETE,
+                    &format!("/api/v1/statuses/{}", note.id),
+                    &[],
+                )
+                .await?;
             wait_note_deleted(&smoke, sender, receiver, &note, received_id).await?;
             completed.push((sender, receiver, note));
         }
@@ -595,46 +815,114 @@ async fn note_lifecycle() -> Result<()> {
     for (sender, receiver, note) in completed {
         assert_no_status_get(&smoke.root, sender, receiver, &note.uri)?;
         if note.visibility == "private" {
-            let audit = std::fs::read_to_string(smoke.root.join(format!("{}.peer.invalid.jsonl", receiver.name)))?;
+            let audit = std::fs::read_to_string(
+                smoke
+                    .root
+                    .join(format!("{}.peer.invalid.jsonl", receiver.name)),
+            )?;
             reject_public_private_deliveries(&parse_audit(&audit)?, &sender.actor(), &note.uri)?;
         }
     }
     Ok(())
 }
 
-async fn check_note_access(smoke: &Smoke, sender: &Peer, receiver: &Peer, note: &Note, received_id: i64) -> Result<()> {
+async fn check_note_access(
+    smoke: &Smoke,
+    sender: &Peer,
+    receiver: &Peer,
+    note: &Note,
+    received_id: i64,
+) -> Result<()> {
     let path = format!("/api/v1/statuses/{received_id}");
-    assert_rest_access(receiver, &smoke.client, Some(&receiver.token), &path, Some(&note.uri)).await?;
+    assert_rest_access(
+        receiver,
+        &smoke.client,
+        Some(&receiver.token),
+        &path,
+        Some(&note.uri),
+    )
+    .await?;
     if note.visibility == "private" {
-        for (peer, id) in [(sender, note.id.clone()), (receiver, received_id.to_string())] {
+        for (peer, id) in [
+            (sender, note.id.clone()),
+            (receiver, received_id.to_string()),
+        ] {
             let outsider = token_for(peer, &format!("{}_outsider", peer.name)).await?;
             for token in [Some(outsider.as_str()), None] {
-                assert_rest_access(peer, &smoke.client, token, &format!("/api/v1/statuses/{id}"), None).await?;
+                assert_rest_access(
+                    peer,
+                    &smoke.client,
+                    token,
+                    &format!("/api/v1/statuses/{id}"),
+                    None,
+                )
+                .await?;
             }
         }
-        let audit = std::fs::read_to_string(smoke.root.join(format!("{}.peer.invalid.jsonl", receiver.name)))?;
+        let audit = std::fs::read_to_string(
+            smoke
+                .root
+                .join(format!("{}.peer.invalid.jsonl", receiver.name)),
+        )?;
         // Both the original Create and its full-content Update must stay private.
         reject_public_private_deliveries(&parse_audit(&audit)?, &sender.actor(), &note.uri)?;
     }
     Ok(())
 }
 
-async fn wait_note_deleted(smoke: &Smoke, sender: &Peer, receiver: &Peer, note: &Note, received_id: i64) -> Result<()> {
+async fn wait_note_deleted(
+    smoke: &Smoke,
+    sender: &Peer,
+    receiver: &Peer,
+    note: &Note,
+    received_id: i64,
+) -> Result<()> {
     for _ in 0..60 {
-        let gone: bool = sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM statuses WHERE id=$1 AND deleted_at IS NULL)")
-            .bind(received_id).fetch_one(&receiver.pool).await?;
+        let gone: bool = sqlx::query_scalar(
+            "SELECT NOT EXISTS(SELECT 1 FROM statuses WHERE id=$1 AND deleted_at IS NULL)",
+        )
+        .bind(received_id)
+        .fetch_one(&receiver.pool)
+        .await?;
         // Tombstone audience is not constrained here; this asserts received deletion.
-        if gone && has_activity_audit(&smoke.root, sender, receiver, &note.uri, "Delete", None, None)? {
+        if gone
+            && has_activity_audit(
+                &smoke.root,
+                sender,
+                receiver,
+                &note.uri,
+                "Delete",
+                None,
+                None,
+            )?
+        {
             assert_no_status_get(&smoke.root, sender, receiver, &note.uri)?;
-            for (peer, id) in [(sender, note.id.clone()), (receiver, received_id.to_string())] {
-                assert_rest_access(peer, &smoke.client, Some(&peer.token), &format!("/api/v1/statuses/{id}"), None).await?;
+            for (peer, id) in [
+                (sender, note.id.clone()),
+                (receiver, received_id.to_string()),
+            ] {
+                assert_rest_access(
+                    peer,
+                    &smoke.client,
+                    Some(&peer.token),
+                    &format!("/api/v1/statuses/{id}"),
+                    None,
+                )
+                .await?;
             }
-            println!("PASS {} Delete {} -> {}: {} retired on receiver", note.visibility, sender.name, receiver.name, note.uri);
+            println!(
+                "PASS {} Delete {} -> {}: {} retired on receiver",
+                note.visibility, sender.name, receiver.name, note.uri
+            );
             return Ok(());
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    Err(format!("BLOCKED Delete {} -> {}: {} remains active or lacks signed Delete", sender.name, receiver.name, note.uri).into())
+    Err(format!(
+        "BLOCKED Delete {} -> {}: {} remains active or lacks signed Delete",
+        sender.name, receiver.name, note.uri
+    )
+    .into())
 }
 
 #[tokio::test]
@@ -648,11 +936,19 @@ async fn profile_updates() -> Result<()> {
     let mut encoded = std::io::Cursor::new(Vec::new());
     image::DynamicImage::new_rgb8(32, 32).write_to(&mut encoded, image::ImageFormat::Png)?;
     let mut checkpoints = Vec::new();
-    for (sender, receiver) in [(&smoke.mastodon, &smoke.rustodon), (&smoke.rustodon, &smoke.mastodon)] {
-        checkpoints.push((sender, profile_update(&smoke, sender, receiver, encoded.get_ref()).await?));
+    for (sender, receiver) in [
+        (&smoke.mastodon, &smoke.rustodon),
+        (&smoke.rustodon, &smoke.mastodon),
+    ] {
+        checkpoints.push((
+            sender,
+            profile_update(&smoke, sender, receiver, encoded.get_ref()).await?,
+        ));
     }
     for (sender, checkpoint) in checkpoints {
-        let source_log = smoke.root.join(format!("{}.peer.invalid.jsonl", sender.name));
+        let source_log = smoke
+            .root
+            .join(format!("{}.peer.invalid.jsonl", sender.name));
         assert_no_actor_get_after(&source_log, checkpoint, &sender.actor())?;
     }
     Ok(())
@@ -663,10 +959,16 @@ const PROFILE_BOUNDARY: &str = "rustodon-peer-profile-boundary";
 fn profile_multipart(marker: &str, image: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
     for (name, value) in [
-        ("display_name", marker), ("note", marker), ("bot", "true"),
-        ("locked", "true"), ("discoverable", "true"), ("indexable", "true"),
-        ("fields_attributes[0][name]", "Peer run"), ("fields_attributes[0][value]", marker),
-        ("avatar_description", "Peer avatar"), ("header_description", "Peer header"),
+        ("display_name", marker),
+        ("note", marker),
+        ("bot", "true"),
+        ("locked", "true"),
+        ("discoverable", "true"),
+        ("indexable", "true"),
+        ("fields_attributes[0][name]", "Peer run"),
+        ("fields_attributes[0][value]", marker),
+        ("avatar_description", "Peer avatar"),
+        ("header_description", "Peer header"),
     ] {
         body.extend_from_slice(format!("--{PROFILE_BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes());
     }
@@ -679,63 +981,134 @@ fn profile_multipart(marker: &str, image: &[u8]) -> Vec<u8> {
     body
 }
 
-async fn profile_update(smoke: &Smoke, sender: &Peer, receiver: &Peer, image: &[u8]) -> Result<usize> {
+async fn profile_update(
+    smoke: &Smoke,
+    sender: &Peer,
+    receiver: &Peer,
+    image: &[u8],
+) -> Result<usize> {
     let marker = format!("{}-{}-profile", smoke.run, sender.name);
     let path = "/api/v1/accounts/update_credentials";
-    let before = sender.api(&smoke.client, Method::GET, "/api/v1/accounts/verify_credentials", &[]).await?;
-    let remote_id: i64 = sqlx::query_scalar("SELECT id FROM accounts WHERE uri=$1 AND domain IS NOT NULL")
-        .bind(sender.actor()).fetch_one(&receiver.pool).await?;
-    let source_log = smoke.root.join(format!("{}.peer.invalid.jsonl", sender.name));
+    let before = sender
+        .api(
+            &smoke.client,
+            Method::GET,
+            "/api/v1/accounts/verify_credentials",
+            &[],
+        )
+        .await?;
+    let remote_id: i64 =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE uri=$1 AND domain IS NOT NULL")
+            .bind(sender.actor())
+            .fetch_one(&receiver.pool)
+            .await?;
+    let source_log = smoke
+        .root
+        .join(format!("{}.peer.invalid.jsonl", sender.name));
     let checkpoint = parse_audit(&std::fs::read_to_string(&source_log)?)?.len();
-    let response = smoke.client.patch(sender.http.join(path)?)
+    let response = smoke
+        .client
+        .patch(sender.http.join(path)?)
         .header("Host", format!("{}.peer.invalid", sender.name))
-        .header("X-Forwarded-Proto", "https").bearer_auth(&sender.token)
-        .header("Content-Type", format!("multipart/form-data; boundary={PROFILE_BOUNDARY}"))
-        .body(profile_multipart(&marker, image)).send().await?;
+        .header("X-Forwarded-Proto", "https")
+        .bearer_auth(&sender.token)
+        .header(
+            "Content-Type",
+            format!("multipart/form-data; boundary={PROFILE_BOUNDARY}"),
+        )
+        .body(profile_multipart(&marker, image))
+        .send()
+        .await?;
     let status = response.status();
     let body = response.text().await?;
-    assert_eq!(status, reqwest::StatusCode::OK, "{} full profile PATCH: {body}", sender.name);
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "{} full profile PATCH: {body}",
+        sender.name
+    );
     let updated: Value = serde_json::from_str(&body)?;
     assert_eq!(updated["display_name"], marker);
     assert_eq!(updated["bot"], true);
     assert_eq!(updated["locked"], true);
-    let note = updated["note"].as_str().ok_or("missing rendered profile note")?;
+    let note = updated["note"]
+        .as_str()
+        .ok_or("missing rendered profile note")?;
     assert!(note.contains(&marker));
-    assert_eq!(updated["fields"].as_array().ok_or("missing source profile fields")?.len(), 1);
+    assert_eq!(
+        updated["fields"]
+            .as_array()
+            .ok_or("missing source profile fields")?
+            .len(),
+        1
+    );
     assert_eq!(updated["fields"][0]["name"], "Peer run");
     assert_eq!(updated["fields"][0]["value"], marker);
     let expected_fields = serde_json::json!([{"name":"Peer run","value":marker}]);
-    let avatar = updated["avatar"].as_str().ok_or("missing uploaded avatar URL")?;
-    let header = updated["header"].as_str().ok_or("missing uploaded header URL")?;
+    let avatar = updated["avatar"]
+        .as_str()
+        .ok_or("missing uploaded avatar URL")?;
+    let header = updated["header"]
+        .as_str()
+        .ok_or("missing uploaded header URL")?;
     for field in ["avatar", "header"] {
         let url = updated[field].as_str().ok_or("missing profile media URL")?;
         assert!(url.starts_with(&format!("https://{}.peer.invalid/", sender.name)));
-        assert_ne!(updated[field], before[field], "profile upload returned unchanged default media");
+        assert_ne!(
+            updated[field], before[field],
+            "profile upload returned unchanged default media"
+        );
     }
     let uploaded: bool = sqlx::query_scalar("SELECT avatar_file_name IS NOT NULL AND header_file_name IS NOT NULL AND avatar_content_type LIKE 'image/%' AND header_content_type LIKE 'image/%' AND avatar_file_size > 0 AND header_file_size > 0 AND avatar_updated_at IS NOT NULL AND header_updated_at IS NOT NULL AND avatar_description='Peer avatar' AND header_description='Peer header' FROM accounts WHERE id=$1")
         .bind(sender.local_id).fetch_one(&sender.pool).await?;
-    assert!(uploaded, "source profile did not retain both uploads/descriptions");
+    assert!(
+        uploaded,
+        "source profile did not retain both uploads/descriptions"
+    );
     for _ in 0..60 {
         let received: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts WHERE id=$1 AND uri=$2 AND domain IS NOT NULL AND display_name=$3 AND note=$4 AND actor_type='Service' AND locked AND discoverable AND indexable AND jsonb_array_length(fields)=1 AND fields @> $5 AND avatar_remote_url=$6 AND header_remote_url=$7)")
             .bind(remote_id).bind(sender.actor()).bind(&marker).bind(note).bind(&expected_fields)
             .bind(avatar).bind(header).fetch_one(&receiver.pool).await?;
-        if received && has_activity_audit(&smoke.root, sender, receiver, &sender.actor(), "Update", None, None)? {
+        if received
+            && has_activity_audit(
+                &smoke.root,
+                sender,
+                receiver,
+                &sender.actor(),
+                "Update",
+                None,
+                None,
+            )?
+        {
             assert_no_actor_get_after(&source_log, checkpoint, &sender.actor())?;
-            println!("PASS full actor Update PUSH {} -> {}: identity, text, flags, fields, avatar/header URLs", sender.name, receiver.name);
+            println!(
+                "PASS full actor Update PUSH {} -> {}: identity, text, flags, fields, avatar/header URLs",
+                sender.name, receiver.name
+            );
             return Ok(checkpoint);
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    Err(format!("BLOCKED full actor Update {} -> {}: {} profile state or signed Update missing", sender.name, receiver.name, sender.actor()).into())
+    Err(format!(
+        "BLOCKED full actor Update {} -> {}: {} profile state or signed Update missing",
+        sender.name,
+        receiver.name,
+        sender.actor()
+    )
+    .into())
 }
 
 fn assert_no_actor_get_after(path: &std::path::Path, checkpoint: usize, actor: &str) -> Result<()> {
     let actor_url = Url::parse(actor)?;
     let events = parse_audit(&std::fs::read_to_string(path)?)?;
     for event in events.iter().skip(checkpoint) {
-        assert!(!(event["method"] == "GET" && event["path"].as_str()
-            .is_some_and(|path| path.split('?').next() == Some(actor_url.path()))),
-            "profile was fetched after mutation rather than exclusively pushed: {actor}");
+        assert!(
+            !(event["method"] == "GET"
+                && event["path"]
+                    .as_str()
+                    .is_some_and(|path| path.split('?').next() == Some(actor_url.path()))),
+            "profile was fetched after mutation rather than exclusively pushed: {actor}"
+        );
     }
     Ok(())
 }
@@ -744,8 +1117,18 @@ fn assert_no_actor_get_after(path: &std::path::Path, checkpoint: usize, actor: &
 fn full_profile_multipart_contains_both_images_and_fields() {
     let body = profile_multipart("unique-profile-marker", b"image-fixture-bytes");
     let text = String::from_utf8(body).unwrap();
-    for field in ["display_name", "note", "bot", "locked", "discoverable", "indexable",
-        "fields_attributes[0][name]", "fields_attributes[0][value]", "avatar", "header"] {
+    for field in [
+        "display_name",
+        "note",
+        "bot",
+        "locked",
+        "discoverable",
+        "indexable",
+        "fields_attributes[0][name]",
+        "fields_attributes[0][value]",
+        "avatar",
+        "header",
+    ] {
         assert!(text.contains(&format!("name=\"{field}\"")));
     }
     assert_eq!(text.matches("image-fixture-bytes").count(), 2);
@@ -755,34 +1138,66 @@ fn full_profile_multipart_contains_both_images_and_fields() {
 
 fn matches_received_activity(event: &Value, actor: &str, kind: &str, object: &str) -> bool {
     event["method"] == "POST"
-        && event["path"].as_str().is_some_and(|path| path.ends_with("/inbox"))
-        && event["activity"] == kind && event["object"] == object
-        && event["actor"] == actor && event["signed"] == true
-        && event["status"].as_u64().is_some_and(|status| (200..300).contains(&status))
+        && event["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("/inbox"))
+        && event["activity"] == kind
+        && event["object"] == object
+        && event["actor"] == actor
+        && event["signed"] == true
+        && event["status"]
+            .as_u64()
+            .is_some_and(|status| (200..300).contains(&status))
 }
 
-fn observed_activity_id(smoke: &Smoke, sender: &Peer, receiver: &Peer, kind: &str, object: &str) -> Result<Option<String>> {
-    let path = smoke.root.join(format!("{}.peer.invalid.jsonl", receiver.name));
+fn observed_activity_id(
+    smoke: &Smoke,
+    sender: &Peer,
+    receiver: &Peer,
+    kind: &str,
+    object: &str,
+) -> Result<Option<String>> {
+    let path = smoke
+        .root
+        .join(format!("{}.peer.invalid.jsonl", receiver.name));
     let events = parse_audit(&std::fs::read_to_string(path)?)?;
     Ok(events.iter().find_map(|event| {
         matches_received_activity(event, &sender.actor(), kind, object)
-            .then(|| event["activity_id"].as_str().filter(|id| !id.is_empty()).map(str::to_owned))
+            .then(|| {
+                event["activity_id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+            })
             .flatten()
     }))
 }
 
-fn has_received_private_boost(events: &[Value], actor: &str, target: &str, boost_uri: &str, followers: &str) -> bool {
+fn has_received_private_boost(
+    events: &[Value],
+    actor: &str,
+    target: &str,
+    boost_uri: &str,
+    followers: &str,
+) -> bool {
     events.iter().any(|event| {
         matches_received_activity(event, actor, "Announce", target)
-            && event["activity_id"] == boost_uri && event["outer_public"] == false
-            && event["outer_recipients"].as_array()
+            && event["activity_id"] == boost_uri
+            && event["outer_public"] == false
+            && event["outer_recipients"]
+                .as_array()
                 .is_some_and(|values| values.iter().any(|value| value == followers))
     })
 }
 
 fn reject_public_boost_attempts(events: &[Value], actor: &str, target: &str) -> Result<()> {
-    if events.iter().any(|event| event["method"] == "POST" && event["activity"] == "Announce"
-        && event["actor"] == actor && event["object"] == target && event["outer_public"] == true) {
+    if events.iter().any(|event| {
+        event["method"] == "POST"
+            && event["activity"] == "Announce"
+            && event["actor"] == actor
+            && event["object"] == target
+            && event["outer_public"] == true
+    }) {
         return Err(format!("private Announce of {target} was addressed to Public").into());
     }
     Ok(())
@@ -807,89 +1222,220 @@ async fn like_and_private_announce_undo_both_directions() -> Result<()> {
 async fn interactions() -> Result<()> {
     let smoke = setup().await?;
     let mut completed = Vec::new();
-    for (author, reactor) in [(&smoke.mastodon, &smoke.rustodon), (&smoke.rustodon, &smoke.mastodon)] {
-        let note = create_note(&smoke, author, "public",
-            format!("{}-{}-interaction-target", smoke.run, author.name)).await?;
+    for (author, reactor) in [
+        (&smoke.mastodon, &smoke.rustodon),
+        (&smoke.rustodon, &smoke.mastodon),
+    ] {
+        let note = create_note(
+            &smoke,
+            author,
+            "public",
+            format!("{}-{}-interaction-target", smoke.run, author.name),
+        )
+        .await?;
         let target_on_reactor = wait_note(&smoke, author, reactor, &note, "Create").await?;
         like_and_undo(&smoke, reactor, author, &note, target_on_reactor).await?;
-        let boost_uri = private_boost_and_undo(&smoke, reactor, author, &note, target_on_reactor).await?;
+        let boost_uri =
+            private_boost_and_undo(&smoke, reactor, author, &note, target_on_reactor).await?;
         completed.push((author, reactor, note, boost_uri));
     }
     for (author, reactor, note, boost_uri) in completed {
         assert_no_status_get(&smoke.root, author, reactor, &note.uri)?;
         assert_no_status_get(&smoke.root, reactor, author, &boost_uri)?;
-        let audit = std::fs::read_to_string(smoke.root.join(format!("{}.peer.invalid.jsonl", author.name)))?;
+        let audit = std::fs::read_to_string(
+            smoke
+                .root
+                .join(format!("{}.peer.invalid.jsonl", author.name)),
+        )?;
         reject_public_boost_attempts(&parse_audit(&audit)?, &reactor.actor(), &note.uri)?;
     }
     Ok(())
 }
 
-async fn like_and_undo(smoke: &Smoke, sender: &Peer, receiver: &Peer, note: &Note, target_on_sender: i64) -> Result<()> {
+async fn like_and_undo(
+    smoke: &Smoke,
+    sender: &Peer,
+    receiver: &Peer,
+    note: &Note,
+    target_on_sender: i64,
+) -> Result<()> {
     let target_on_receiver: i64 = note.id.parse()?;
-    sender.api(&smoke.client, Method::POST, &format!("/api/v1/statuses/{target_on_sender}/favourite"), &[]).await?;
+    sender
+        .api(
+            &smoke.client,
+            Method::POST,
+            &format!("/api/v1/statuses/{target_on_sender}/favourite"),
+            &[],
+        )
+        .await?;
     let mut observed = None;
     for _ in 0..60 {
         let favourite_id: Option<i64> = sqlx::query_scalar("SELECT f.id FROM favourites f JOIN accounts a ON a.id=f.account_id WHERE a.uri=$1 AND f.status_id=$2")
             .bind(sender.actor()).bind(target_on_receiver).fetch_optional(&receiver.pool).await?;
         if let Some(id) = favourite_id
-            && let Some(activity_id) = observed_activity_id(smoke, sender, receiver, "Like", &note.uri)? {
+            && let Some(activity_id) =
+                observed_activity_id(smoke, sender, receiver, "Like", &note.uri)?
+        {
             observed = Some((id, activity_id));
             break;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    let (favourite_id, activity_id) = observed.ok_or_else(|| format!("BLOCKED Like {} -> {}: {} not received with signed identity", sender.name, receiver.name, note.uri))?;
-    println!("PASS Like {} -> {}: target {} received favourite {favourite_id}", sender.name, receiver.name, note.uri);
-    sender.api(&smoke.client, Method::POST, &format!("/api/v1/statuses/{target_on_sender}/unfavourite"), &[]).await?;
+    let (favourite_id, activity_id) = observed.ok_or_else(|| {
+        format!(
+            "BLOCKED Like {} -> {}: {} not received with signed identity",
+            sender.name, receiver.name, note.uri
+        )
+    })?;
+    println!(
+        "PASS Like {} -> {}: target {} received favourite {favourite_id}",
+        sender.name, receiver.name, note.uri
+    );
+    sender
+        .api(
+            &smoke.client,
+            Method::POST,
+            &format!("/api/v1/statuses/{target_on_sender}/unfavourite"),
+            &[],
+        )
+        .await?;
     for _ in 0..60 {
         let gone: bool = sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM favourites f JOIN accounts a ON a.id=f.account_id WHERE (a.uri=$1 AND f.status_id=$2) OR f.id=$3)")
             .bind(sender.actor()).bind(target_on_receiver).bind(favourite_id).fetch_one(&receiver.pool).await?;
-        if gone && has_activity_audit(&smoke.root, sender, receiver, &activity_id, "Undo", None, None)? {
-            assert_rest_access(receiver, &smoke.client, Some(&receiver.token), &format!("/api/v1/statuses/{}", note.id), Some(&note.uri)).await?;
+        if gone
+            && has_activity_audit(
+                &smoke.root,
+                sender,
+                receiver,
+                &activity_id,
+                "Undo",
+                None,
+                None,
+            )?
+        {
+            assert_rest_access(
+                receiver,
+                &smoke.client,
+                Some(&receiver.token),
+                &format!("/api/v1/statuses/{}", note.id),
+                Some(&note.uri),
+            )
+            .await?;
             assert_no_status_get(&smoke.root, receiver, sender, &note.uri)?;
-            println!("PASS Undo Like {} -> {}: exact wire Like {activity_id} retired", sender.name, receiver.name);
+            println!(
+                "PASS Undo Like {} -> {}: exact wire Like {activity_id} retired",
+                sender.name, receiver.name
+            );
             return Ok(());
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    Err(format!("BLOCKED Undo Like {} -> {}: favourite persists or exact Undo missing", sender.name, receiver.name).into())
+    Err(format!(
+        "BLOCKED Undo Like {} -> {}: favourite persists or exact Undo missing",
+        sender.name, receiver.name
+    )
+    .into())
 }
 
-async fn private_boost_and_undo(smoke: &Smoke, sender: &Peer, receiver: &Peer, note: &Note, target_on_sender: i64) -> Result<String> {
-    let response = sender.api(&smoke.client, Method::POST, &format!("/api/v1/statuses/{target_on_sender}/reblog"), &[("visibility", "private")]).await?;
+async fn private_boost_and_undo(
+    smoke: &Smoke,
+    sender: &Peer,
+    receiver: &Peer,
+    note: &Note,
+    target_on_sender: i64,
+) -> Result<String> {
+    let response = sender
+        .api(
+            &smoke.client,
+            Method::POST,
+            &format!("/api/v1/statuses/{target_on_sender}/reblog"),
+            &[("visibility", "private")],
+        )
+        .await?;
     assert_eq!(response["visibility"], "private");
     assert_eq!(response["reblog"]["uri"], note.uri);
-    let boost_uri = response["uri"].as_str().ok_or("missing private boost URI")?.to_owned();
-    let boost_id = response["id"].as_str().ok_or("missing private boost ID")?.to_owned();
+    let boost_uri = response["uri"]
+        .as_str()
+        .ok_or("missing private boost URI")?
+        .to_owned();
+    let boost_id = response["id"]
+        .as_str()
+        .ok_or("missing private boost ID")?
+        .to_owned();
     assert!(boost_uri.starts_with(&format!("{}/statuses/", sender.actor())));
     assert_ne!(boost_uri, note.uri);
     let received_id = wait_private_boost(smoke, sender, receiver, note, &boost_uri).await?;
     let path = format!("/api/v1/statuses/{received_id}");
-    assert_rest_access(receiver, &smoke.client, Some(&receiver.token), &path, Some(&boost_uri)).await?;
+    assert_rest_access(
+        receiver,
+        &smoke.client,
+        Some(&receiver.token),
+        &path,
+        Some(&boost_uri),
+    )
+    .await?;
     for (peer, id) in [(sender, boost_id), (receiver, received_id.to_string())] {
         let outsider = token_for(peer, &format!("{}_outsider", peer.name)).await?;
         for token in [Some(outsider.as_str()), None] {
-            assert_rest_access(peer, &smoke.client, token, &format!("/api/v1/statuses/{id}"), None).await?;
+            assert_rest_access(
+                peer,
+                &smoke.client,
+                token,
+                &format!("/api/v1/statuses/{id}"),
+                None,
+            )
+            .await?;
         }
     }
-    let audit = std::fs::read_to_string(smoke.root.join(format!("{}.peer.invalid.jsonl", receiver.name)))?;
+    let audit = std::fs::read_to_string(
+        smoke
+            .root
+            .join(format!("{}.peer.invalid.jsonl", receiver.name)),
+    )?;
     reject_public_boost_attempts(&parse_audit(&audit)?, &sender.actor(), &note.uri)?;
-    println!("PASS private Announce {} -> {}: follower received {boost_uri}; outsider/anonymous denied", sender.name, receiver.name);
+    println!(
+        "PASS private Announce {} -> {}: follower received {boost_uri}; outsider/anonymous denied",
+        sender.name, receiver.name
+    );
     // Unreblog acts on the original target, not the newly created wrapper ID.
-    sender.api(&smoke.client, Method::POST, &format!("/api/v1/statuses/{target_on_sender}/unreblog"), &[]).await?;
+    sender
+        .api(
+            &smoke.client,
+            Method::POST,
+            &format!("/api/v1/statuses/{target_on_sender}/unreblog"),
+            &[],
+        )
+        .await?;
     wait_boost_undone(smoke, sender, receiver, note, &boost_uri, received_id).await?;
     Ok(boost_uri)
 }
 
-async fn wait_private_boost(smoke: &Smoke, sender: &Peer, receiver: &Peer, note: &Note, boost_uri: &str) -> Result<i64> {
+async fn wait_private_boost(
+    smoke: &Smoke,
+    sender: &Peer,
+    receiver: &Peer,
+    note: &Note,
+    boost_uri: &str,
+) -> Result<i64> {
     let original_id: i64 = note.id.parse()?;
     let followers = format!("{}/followers", sender.actor());
     for _ in 0..60 {
         let id: Option<i64> = sqlx::query_scalar("SELECT b.id FROM statuses b JOIN accounts a ON a.id=b.account_id WHERE b.uri=$1 AND a.uri=$2 AND b.reblog_of_id=$3 AND NOT b.local AND b.visibility=2 AND b.deleted_at IS NULL")
             .bind(boost_uri).bind(sender.actor()).bind(original_id).fetch_optional(&receiver.pool).await?;
-        let audit = std::fs::read_to_string(smoke.root.join(format!("{}.peer.invalid.jsonl", receiver.name)))?;
+        let audit = std::fs::read_to_string(
+            smoke
+                .root
+                .join(format!("{}.peer.invalid.jsonl", receiver.name)),
+        )?;
         if let Some(id) = id
-            && has_received_private_boost(&parse_audit(&audit)?, &sender.actor(), &note.uri, boost_uri, &followers) {
+            && has_received_private_boost(
+                &parse_audit(&audit)?,
+                &sender.actor(),
+                &note.uri,
+                boost_uri,
+                &followers,
+            )
+        {
             assert_no_status_get(&smoke.root, receiver, sender, &note.uri)?;
             assert_no_status_get(&smoke.root, sender, receiver, boost_uri)?;
             return Ok(id);
@@ -899,30 +1445,64 @@ async fn wait_private_boost(smoke: &Smoke, sender: &Peer, receiver: &Peer, note:
     Err(format!("BLOCKED private Announce {} -> {}: {boost_uri} not received with exact actor/target/audience", sender.name, receiver.name).into())
 }
 
-async fn wait_boost_undone(smoke: &Smoke, sender: &Peer, receiver: &Peer, note: &Note, boost_uri: &str, received_id: i64) -> Result<()> {
+async fn wait_boost_undone(
+    smoke: &Smoke,
+    sender: &Peer,
+    receiver: &Peer,
+    note: &Note,
+    boost_uri: &str,
+    received_id: i64,
+) -> Result<()> {
     for _ in 0..60 {
         let gone: bool = sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM statuses WHERE (id=$1 OR uri=$2) AND deleted_at IS NULL)")
             .bind(received_id).bind(boost_uri).fetch_one(&receiver.pool).await?;
         // Undo's outer audience is not assumed private; correlate its object to Announce ID.
-        if gone && has_activity_audit(&smoke.root, sender, receiver, boost_uri, "Undo", None, None)? {
-            assert_rest_access(receiver, &smoke.client, Some(&receiver.token), &format!("/api/v1/statuses/{received_id}"), None).await?;
-            assert_rest_access(receiver, &smoke.client, Some(&receiver.token), &format!("/api/v1/statuses/{}", note.id), Some(&note.uri)).await?;
+        if gone && has_activity_audit(&smoke.root, sender, receiver, boost_uri, "Undo", None, None)?
+        {
+            assert_rest_access(
+                receiver,
+                &smoke.client,
+                Some(&receiver.token),
+                &format!("/api/v1/statuses/{received_id}"),
+                None,
+            )
+            .await?;
+            assert_rest_access(
+                receiver,
+                &smoke.client,
+                Some(&receiver.token),
+                &format!("/api/v1/statuses/{}", note.id),
+                Some(&note.uri),
+            )
+            .await?;
             let original_id: i64 = note.id.parse()?;
             let original_public: bool = sqlx::query_scalar("SELECT visibility=0 AND deleted_at IS NULL AND reblog_of_id IS NULL FROM statuses WHERE id=$1")
                 .bind(original_id).fetch_one(&receiver.pool).await?;
-            assert!(original_public, "Undo Announce changed the original public Note");
-            println!("PASS Undo Announce {} -> {}: {boost_uri} retired; public target unchanged", sender.name, receiver.name);
+            assert!(
+                original_public,
+                "Undo Announce changed the original public Note"
+            );
+            println!(
+                "PASS Undo Announce {} -> {}: {boost_uri} retired; public target unchanged",
+                sender.name, receiver.name
+            );
             return Ok(());
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    Err(format!("BLOCKED Undo Announce {} -> {}: {boost_uri} remains active or exact Undo missing", sender.name, receiver.name).into())
+    Err(format!(
+        "BLOCKED Undo Announce {} -> {}: {boost_uri} remains active or exact Undo missing",
+        sender.name, receiver.name
+    )
+    .into())
 }
 
 #[test]
 fn private_boost_identity_and_audience_require_one_received_event() {
     let exact = serde_json::json!({"method":"POST","path":"/inbox","activity":"Announce","activity_id":"boost","actor":"actor","object":"note","signed":true,"status":202,"outer_public":false,"outer_recipients":["followers"]});
-    let received = |events: &[Value]| has_received_private_boost(events, "actor", "note", "boost", "followers");
+    let received = |events: &[Value]| {
+        has_received_private_boost(events, "actor", "note", "boost", "followers")
+    };
     assert!(received(std::slice::from_ref(&exact)));
     let mut missing_audience = exact.clone();
     missing_audience["outer_recipients"] = serde_json::json!([]);
@@ -930,9 +1510,12 @@ fn private_boost_identity_and_audience_require_one_received_event() {
     other_id["activity_id"] = serde_json::json!("other-boost");
     assert!(!received(&[missing_audience, other_id.clone()]));
     assert!(received(&[other_id, exact.clone()]));
-    for (key, value) in [("signed", serde_json::json!(false)),
-        ("status", serde_json::json!(403)), ("status", Value::Null),
-        ("outer_public", serde_json::json!(true))] {
+    for (key, value) in [
+        ("signed", serde_json::json!(false)),
+        ("status", serde_json::json!(403)),
+        ("status", Value::Null),
+        ("outer_public", serde_json::json!(true)),
+    ] {
         let mut invalid = exact.clone();
         invalid[key] = value;
         assert!(!received(&[invalid]));
@@ -943,12 +1526,19 @@ fn private_boost_identity_and_audience_require_one_received_event() {
 fn activity_correlation_requires_matching_signed_successful_inbox_event() {
     let event = serde_json::json!({"method":"POST","path":"/inbox","activity":"Like","actor":"actor","object":"note","signed":true,"status":202});
     assert!(matches_received_activity(&event, "actor", "Like", "note"));
-    for (key, value) in [("method",serde_json::json!("GET")), ("path",serde_json::json!("/outbox")),
-        ("actor",serde_json::json!("other")), ("object",serde_json::json!("other")),
-        ("activity",serde_json::json!("Undo")), ("signed",serde_json::json!(false)),
-        ("status",serde_json::json!(403))] {
+    for (key, value) in [
+        ("method", serde_json::json!("GET")),
+        ("path", serde_json::json!("/outbox")),
+        ("actor", serde_json::json!("other")),
+        ("object", serde_json::json!("other")),
+        ("activity", serde_json::json!("Undo")),
+        ("signed", serde_json::json!(false)),
+        ("status", serde_json::json!(403)),
+    ] {
         let mut invalid = event.clone();
         invalid[key] = value;
-        assert!(!matches_received_activity(&invalid, "actor", "Like", "note"));
+        assert!(!matches_received_activity(
+            &invalid, "actor", "Like", "note"
+        ));
     }
 }
