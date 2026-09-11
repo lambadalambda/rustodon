@@ -71,3 +71,14 @@ Accept ordinary serializer-produced documents and preserve the audience fields n
   Logs: `/home/lain/rustodon-parity/audiences/target/r05-*`.
 - Inbound fixture jobs start after signature verification; actual peer signatures
   and follower receipt remain separate acceptance work. R09 is still pending.
+
+## R09 canonical local Announce audiences — verified in fixtures
+
+- Writer, Undo writer and worker share one visibility-aware helper deriving the
+  local followers URI from the canonical actor URI, never stored collection text.
+- Both fresh-account regressions failed with empty `to` before the fix. GREEN on
+  Secunda: worker **52/52**, schema **37/37**, ActivityPub units **22/22**,
+  formatting and warnings-denied Clippy. Independent review approved.
+- Logs: `/home/lain/rustodon-parity/audiences/target/r09-{red,green,schema,unit,clippy}.log`.
+  Outbound mock capture proves the audience, not real-peer follower ingestion;
+  that last acceptance criterion remains open in the expanding peer suite.

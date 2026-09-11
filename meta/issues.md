@@ -12,8 +12,6 @@
 - [ ] [Address release-readiness review findings](issues/address-release-readiness-review-findings.md)
 - [ ] [Set up a local federating Rustodon instance](issues/set-up-local-federating-instance.md)
 - [ ] [Repair ActivityPub ingestion and audiences](issues/repair-activitypub-ingestion-and-audiences.md)
-- [ ] [Repair relationship and delivery lifecycles](issues/repair-relationship-and-delivery-lifecycles.md)
-- [ ] [Close reviewed client workflow gaps](issues/close-reviewed-client-workflow-gaps.md)
 - [ ] [Run essential parity gates and peer tests on Secunda](issues/run-essential-parity-gates-on-secunda.md)
 - [ ] [Add isolated bidirectional federation peer tests](issues/add-isolated-federation-peer-tests.md)
 - [ ] [Accept ordinary ActivityPub tag atom identifiers](issues/accept-activitypub-tag-atom-identifiers.md)

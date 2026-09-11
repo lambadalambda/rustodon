@@ -53,3 +53,42 @@ After integrating R01/R02/R03/R04/R06/R13 on Secunda:
   and `combined-browser_{recovery_fences,reauthentication_limits}.log`.
 - This checkpoint is not a final parity gate: audience/lifecycle/client repairs
   and real peer acceptance remain in progress.
+
+## Latest completed gates and outage
+
+- The integrated R05/R07 checkpoint passed **57 restored-worker tests**, ordinary
+  all-target/all-feature tests, formatting and warnings-denied Clippy. Logs:
+  `/home/lain/rustodon-parity/combined-audience-{tests,workers,clippy}.log`.
+- All seven `tools/ci-differential` invocations passed at that checkpoint; log:
+  `/home/lain/rustodon-parity/combined-core-differential.log`.
+- R08/R09/R10 and R11/R12/R14/R15 were subsequently integrated from independently
+  reviewed, remotely tested topical commits. Initial real Mastodon public push
+  smoke and test-only transport also passed remotely in their isolated task.
+  These are not a substitute for a final combined-tree run.
+- Secunda then stopped resolving in SSH. The attempted atom-tag parser/worker RED
+  timed out; its logs are unavailable and its result is unknown. Do not count it
+  as an executed regression pass or failure.
+- The user requested continuing without Secunda for now. Continue source edits,
+  Git and independent source review only: **no local builds, tests, formatting,
+  lint, or container fallback**. Atom-tag repair, expanded peer scenarios and v2
+  account-search followup require execution when access returns.
+- Pleroma remains separately blocked by Docker Hub anonymous pull quota. The user
+  chose waiting for reset, not configuring registry authentication.
+
+### Resume verification (Secunda only)
+
+1. Reconcile only the recorded timed-out run's processes/resources before starting
+   another fixture. Do not prune other task containers, images or volumes.
+2. Sync tracked source and new tests, excluding ignored instance/config/target
+   content. Keep the shared pinned upstream source read-only.
+3. Run formatting; ordinary all-target/all-feature tests and warnings-denied
+   Clippy; fixture worker and schema-read suites; both recovery/reauthentication
+   differentials; `tools/ci-differential`.
+4. Run the documented peer-transport enabled/disabled gates and actual Mastodon
+   smoke/privacy/lifecycle scenarios against the integrated source. Preserve
+   received-state/privacy evidence and record every blocked scenario explicitly.
+5. Only after quota reset, retry the exact missing Pleroma bases through the
+   documented guarded build procedure, then bootstrap and exercise the shared
+   scenarios. Source/build guard tests alone are not Pleroma federation evidence.
+
+R17/R18 and the separately noted stress/legacy-history limits remain deferred.

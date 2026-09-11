@@ -53,3 +53,5 @@
 - [x] [Fix fetched ActivityPub object provenance](issues/fix-fetched-activitypub-object-provenance.md)
 - [x] [Restore saved-status authorization](issues/restore-saved-status-authorization.md)
 - [x] [Fence browser reauthentication and recovery](issues/fence-browser-reauthentication-and-recovery.md)
+- [x] [Repair relationship and delivery lifecycles](issues/repair-relationship-and-delivery-lifecycles.md)
+- [x] [Close reviewed client workflow gaps](issues/close-reviewed-client-workflow-gaps.md)
