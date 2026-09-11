@@ -138,6 +138,120 @@ pub struct RemoteFetcher {
     test_endpoint: Option<SocketAddr>,
     limits: RemoteFetchLimits,
     domain_budget: RemoteDomainBudget,
+    #[cfg(all(debug_assertions, feature = "test-support"))]
+    test_peer: Result<Option<Arc<TestPeerTransport>>, ()>,
+}
+
+// This capability is absent unless BOTH build gates are enabled. Configuration is
+// snapshotted at construction; invalid/partial opt-ins poison the fetcher rather
+// than falling back to public DNS. Synthetic endpoint fixtures remain separate.
+#[cfg(all(debug_assertions, feature = "test-support"))]
+#[derive(Debug)]
+struct TestPeerTransport {
+    origins: HashMap<String, SocketAddr>,
+    ca: reqwest::Certificate,
+}
+
+#[cfg(all(debug_assertions, feature = "test-support"))]
+impl TestPeerTransport {
+    fn from_env() -> Result<Option<Arc<Self>>, ()> {
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
+
+        let origins = std::env::var_os("RUSTODON_TEST_PEER_ORIGINS");
+        let ca = std::env::var_os("RUSTODON_TEST_PEER_CA");
+        match (origins, ca) {
+            (None, None) => Ok(None),
+            (Some(origins), Some(ca)) => {
+                let origins = Self::parse_origins(origins.to_str().ok_or(())?)?;
+                let pem = std::fs::read_to_string(ca).map_err(|_| ())?;
+                // Accept exactly one explicit PEM certificate, not an empty bundle,
+                // unrelated PEM objects, or a valid certificate followed by junk.
+                let body = pem
+                    .trim()
+                    .strip_prefix("-----BEGIN CERTIFICATE-----")
+                    .and_then(|pem| pem.strip_suffix("-----END CERTIFICATE-----"))
+                    .ok_or(())?;
+                if body.contains("-----") {
+                    return Err(());
+                }
+                let der = CertificateDer::from_pem_slice(pem.as_bytes()).map_err(|_| ())?;
+                rustls::RootCertStore::empty()
+                    .add(der.clone())
+                    .map_err(|_| ())?;
+                let ca = reqwest::Certificate::from_der(der.as_ref()).map_err(|_| ())?;
+                Ok(Some(Arc::new(Self { origins, ca })))
+            }
+            _ => Err(()),
+        }
+    }
+
+    fn parse_origins(json: &str) -> Result<HashMap<String, SocketAddr>, ()> {
+        // Reject duplicate JSON keys rather than silently taking the last endpoint.
+        struct Origins;
+        impl<'de> serde::de::Visitor<'de> for Origins {
+            type Value = HashMap<String, SocketAddr>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(
+                    "a nonempty map of canonical HTTPS .invalid origins to loopback sockets",
+                )
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut origins = HashMap::new();
+                while let Some((origin, endpoint)) = map.next_entry::<String, SocketAddr>()? {
+                    let valid = Url::parse(&origin).is_ok_and(|url| {
+                        validate_remote_url(&url).is_ok()
+                            && url.scheme() == "https"
+                            && url.origin().ascii_serialization() == origin
+                            && url.host_str().is_some_and(|host| {
+                                host.len() <= 253
+                                    && host.ends_with(".invalid")
+                                    && host.split('.').all(|label| {
+                                        !label.is_empty()
+                                            && label.len() <= 63
+                                            && !label.starts_with('-')
+                                            && !label.ends_with('-')
+                                            && label.bytes().all(|byte| {
+                                                byte.is_ascii_lowercase()
+                                                    || byte.is_ascii_digit()
+                                                    || byte == b'-'
+                                            })
+                                    })
+                            })
+                    });
+                    if !valid
+                        || !endpoint.ip().is_loopback()
+                        || endpoint.port() == 0
+                        || origins.insert(origin, endpoint).is_some()
+                    {
+                        return Err(serde::de::Error::custom(
+                            "invalid or duplicate test peer origin/endpoint",
+                        ));
+                    }
+                }
+                if origins.is_empty() {
+                    return Err(serde::de::Error::custom("empty test peer map"));
+                }
+                Ok(origins)
+            }
+        }
+        use serde::Deserializer;
+        let mut deserializer = serde_json::Deserializer::from_str(json);
+        let origins = deserializer.deserialize_map(Origins).map_err(|_| ())?;
+        deserializer.end().map_err(|_| ())?;
+        Ok(origins)
+    }
+
+    fn endpoint(&self, url: &Url) -> Result<SocketAddr, RemoteFetchError> {
+        self.origins
+            .get(&url.origin().ascii_serialization())
+            .copied()
+            .ok_or(RemoteFetchError::InvalidUrl)
+    }
 }
 
 /// Per-host cap for concurrent work against each canonical remote host.
@@ -356,6 +470,8 @@ impl RemoteFetcher {
             test_endpoint: None,
             limits: limits.bounded(),
             domain_budget,
+            #[cfg(all(debug_assertions, feature = "test-support"))]
+            test_peer: TestPeerTransport::from_env(),
         }
     }
 
@@ -369,13 +485,19 @@ impl RemoteFetcher {
     /// Creates a fetcher with different transport limits while retaining this fetcher's budget.
     #[must_use]
     pub fn with_limits(&self, limits: RemoteFetchLimits) -> Self {
-        Self::with_domain_budget(limits, self.domain_budget.clone())
+        Self {
+            limits: limits.bounded(),
+            ..self.clone()
+        }
     }
 
     /// Creates a fetcher that coordinates its host budget through the operational database.
     #[must_use]
     pub fn with_operational_pool(&self, pool: sqlx::PgPool) -> Self {
-        Self::with_domain_budget(self.limits, self.domain_budget.with_pool(pool))
+        Self {
+            domain_budget: self.domain_budget.with_pool(pool),
+            ..self.clone()
+        }
     }
 
     #[must_use]
@@ -693,7 +815,15 @@ impl RemoteFetcher {
     /// publicly routable.
     pub async fn validate_target(&self, url: &Url) -> Result<(), RemoteFetchError> {
         validate_remote_url(url)?;
+        #[cfg(all(debug_assertions, feature = "test-support"))]
+        if let Some(peer) = self.test_peer()? {
+            peer.endpoint(url)?;
+        }
         self.with_domain_permit(url, || async {
+            #[cfg(all(debug_assertions, feature = "test-support"))]
+            if self.test_peer()?.is_some() {
+                return Ok(());
+            }
             let addresses =
                 tokio::time::timeout(self.limits.request_timeout, resolve_remote_addresses(url))
                     .await
@@ -701,6 +831,62 @@ impl RemoteFetcher {
             validate_resolved_addresses(&addresses)
         })
         .await
+    }
+
+    #[cfg(all(debug_assertions, feature = "test-support"))]
+    fn test_peer(&self) -> Result<Option<&TestPeerTransport>, RemoteFetchError> {
+        self.test_peer
+            .as_ref()
+            .map(|peer| peer.as_deref())
+            .map_err(|()| RemoteFetchError::Client)
+    }
+
+    async fn transport_client(
+        &self,
+        url: &Url,
+        endpoint_override: Option<SocketAddr>,
+        policy_addresses: Option<&[SocketAddr]>,
+    ) -> Result<(reqwest::Client, Url), RemoteFetchError> {
+        let builder = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .no_proxy()
+            .connect_timeout(self.limits.connect_timeout)
+            .timeout(self.limits.request_timeout)
+            .user_agent("Rustodon/0.1");
+        let host = url.host_str().ok_or(RemoteFetchError::InvalidUrl)?;
+        #[cfg(all(debug_assertions, feature = "test-support"))]
+        if let Some(peer) = self.test_peer()? {
+            // Never combine peer routing with the synthetic DNS-policy fixtures.
+            if endpoint_override.is_some() || policy_addresses.is_some() {
+                return Err(RemoteFetchError::Client);
+            }
+            let endpoint = peer.endpoint(url)?;
+            let mut transport_url = url.clone();
+            // Reqwest gives explicit URL ports precedence over resolver overrides.
+            // Only the connection port changes: SNI/verification use the original
+            // hostname, and Host/signatures/redirects/response URLs use `url`.
+            transport_url
+                .set_port(Some(endpoint.port()))
+                .map_err(|()| RemoteFetchError::InvalidUrl)?;
+            let client = builder
+                .resolve_to_addrs(host, &[endpoint])
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(peer.ca.clone())
+                .build()
+                .map_err(|_| RemoteFetchError::Client)?;
+            return Ok((client, transport_url));
+        }
+        let addresses = if let Some(endpoint) = endpoint_override {
+            vec![endpoint]
+        } else {
+            resolve_remote_addresses(url).await?
+        };
+        validate_resolved_addresses(policy_addresses.unwrap_or(&addresses))?;
+        let client = builder
+            .resolve_to_addrs(host, &addresses)
+            .build()
+            .map_err(|_| RemoteFetchError::Client)?;
+        Ok((client, url.clone()))
     }
 
     async fn with_domain_permit<T, F, Fut>(
@@ -732,30 +918,23 @@ impl RemoteFetcher {
             if expected_origin.is_some_and(|expected| !same_origin_url(&url, expected)) {
                 return Err(RemoteFetchError::OriginMismatch);
             }
+            #[cfg(all(debug_assertions, feature = "test-support"))]
+            if let Some(peer) = self.test_peer()? {
+                peer.endpoint(&url)?;
+            }
             let hop_url = url.clone();
             let hop = self
                 .with_domain_permit(&url, || async {
-                    let addresses = if let Some(endpoint) = endpoint_override {
-                        vec![endpoint]
-                    } else {
-                        resolve_remote_addresses(&hop_url).await?
-                    };
                     let policy_addresses = policy_address_sets
                         .as_ref()
                         .and_then(|sets| sets.get(redirect_count))
-                        .map_or(addresses.as_slice(), Vec::as_slice);
-                    validate_resolved_addresses(policy_addresses)?;
-                    let host = hop_url.host_str().ok_or(RemoteFetchError::InvalidUrl)?;
-                    let client = reqwest::Client::builder()
-                        .redirect(Policy::none())
-                        .no_proxy()
-                        .connect_timeout(self.limits.connect_timeout)
-                        .timeout(self.limits.request_timeout)
-                        .user_agent("Rustodon/0.1")
-                        .resolve_to_addrs(host, &addresses)
-                        .build()
-                        .map_err(|_| RemoteFetchError::Client)?;
-                    let mut request = client.get(hop_url.clone());
+                        .map(Vec::as_slice);
+                    let (client, transport_url) = self
+                        .transport_client(&hop_url, endpoint_override, policy_addresses)
+                        .await?;
+                    let mut request = client
+                        .get(transport_url)
+                        .header(HOST, remote_request_host(&hop_url)?);
                     if !accepted_content_types.is_empty() {
                         request = request.header(ACCEPT, accepted_content_types.join(", "));
                     }
@@ -817,32 +996,23 @@ impl RemoteFetcher {
             if !same_origin_url(&url, expected_origin) {
                 return Err(RemoteFetchError::OriginMismatch);
             }
+            #[cfg(all(debug_assertions, feature = "test-support"))]
+            if let Some(peer) = self.test_peer()? {
+                peer.endpoint(&url)?;
+            }
             let hop_url = url.clone();
             let hop = self
                 .with_domain_permit(&url, || async {
-                    let addresses = if let Some(endpoint) = endpoint_override {
-                        vec![endpoint]
-                    } else {
-                        resolve_remote_addresses(&hop_url).await?
-                    };
                     let policy_addresses = policy_address_sets
                         .as_ref()
                         .and_then(|sets| sets.get(redirect_count))
-                        .map_or(addresses.as_slice(), Vec::as_slice);
-                    validate_resolved_addresses(policy_addresses)?;
-                    let host = hop_url.host_str().ok_or(RemoteFetchError::InvalidUrl)?;
-                    let client = reqwest::Client::builder()
-                        .redirect(Policy::none())
-                        .no_proxy()
-                        .connect_timeout(self.limits.connect_timeout)
-                        .timeout(self.limits.request_timeout)
-                        .user_agent("Rustodon/0.1")
-                        .resolve_to_addrs(host, &addresses)
-                        .build()
-                        .map_err(|_| RemoteFetchError::Client)?;
+                        .map(Vec::as_slice);
+                    let (client, transport_url) = self
+                        .transport_client(&hop_url, endpoint_override, policy_addresses)
+                        .await?;
                     let headers = signed_post_headers(&hop_url, body, signer)?;
                     let response = client
-                        .post(hop_url.clone())
+                        .post(transport_url)
                         .headers(headers)
                         .header(CONTENT_TYPE, "application/activity+json")
                         .body(body.to_owned())
