@@ -267,10 +267,7 @@ fn parse_delete(
         Value::String(_) => (required_uri(Some(object))?, None),
         Value::Object(object) => (
             required_uri(object.get("id"))?,
-            object
-                .get("atomUri")
-                .map(|value| required_uri(Some(value)))
-                .transpose()?,
+            optional_atom_uri(object.get("atomUri"))?,
         ),
         _ => return Err(InboxParseError::Activity),
     };
@@ -766,6 +763,20 @@ pub(crate) fn actor_image_uri(value: Option<&Value>) -> Result<Option<String>, I
     }
 }
 
+/// OStatus tags are opaque metadata, not proof of an ActivityPub object's identity.
+/// Ignore them before lookup, forwarding, media cleanup, or tombstone selection.
+/// Legacy HTTP(S) aliases retain their existing validation and writer host checks.
+pub(crate) fn optional_atom_uri(value: Option<&Value>) -> Result<Option<String>, InboxParseError> {
+    if value.and_then(Value::as_str).is_some_and(|uri| {
+        uri.trim_start()
+            .get(..4)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("tag:"))
+    }) {
+        return Ok(None);
+    }
+    optional_uri(value)
+}
+
 fn optional_uri(value: Option<&Value>) -> Result<Option<String>, InboxParseError> {
     match value {
         None | Some(Value::Null) => Ok(None),
@@ -1015,6 +1026,31 @@ mod tests {
                 parse_activity(&activity.to_string()),
                 Err(InboxParseError::Activity)
             );
+        }
+    }
+
+    #[test]
+    fn atom_metadata_does_not_change_delete_identity() {
+        for atom in [
+            Value::Null,
+            json!("tag:remote.example,2026-07-01:objectId=1"),
+            json!("tag:victim.example,2026-07-01:objectId=2"),
+            json!("TAG:opaque"),
+            json!("tag:"),
+        ] {
+            let mut activity = json!({
+                "type": "Delete", "actor": "https://remote.example/users/alice",
+                "object": {"id": "https://remote.example/statuses/1", "type": "Tombstone", "atomUri": atom}
+            });
+            assert!(matches!(
+                parse_activity(&activity.to_string()).expect("opaque metadata must not reject Delete"),
+                InboxActivity::DeleteNote { atom_uri: None, .. }
+            ));
+            activity["object"]["id"] = json!("tag:remote.example,2026-07-01:objectId=1");
+            assert!(parse_activity(&activity.to_string()).is_err());
+        }
+        for invalid in [json!(42), json!([]), json!("file:///tmp/status"), json!("relative")] {
+            assert!(super::optional_atom_uri(Some(&invalid)).is_err());
         }
     }
 

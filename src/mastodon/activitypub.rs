@@ -2407,6 +2407,11 @@ mod tests {
             delete["object"]["atomUri"],
             "tag:example.test,1970-01-01:objectId=7;objectType=Status"
         );
+        let parsed = crate::mastodon::activitypub_inbox::parse_activity(&delete.to_string())
+            .expect("serialized tag-bearing Tombstone must parse");
+        assert!(matches!(parsed,
+            crate::mastodon::activitypub_inbox::InboxActivity::DeleteNote { atom_uri: None, .. }
+        ), "opaque tag metadata is not an authenticated lookup alias");
     }
 
     #[test]

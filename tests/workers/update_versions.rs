@@ -139,7 +139,7 @@ async fn delivered_updates(profile: bool) -> TestResult {
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let mut sender_config = federation_config();
     sender_config.origin = Url::parse(SENDER_ORIGIN)?;
-    "sender.fixture.invalid".clone_into(&mut sender_config.local_domain);
+    "account-domain.invalid".clone_into(&mut sender_config.local_domain);
     sender_config.remote_delivery_endpoint = Some(endpoint);
     let sender = WorkerExecutor::new(
         queue.clone(),
@@ -165,13 +165,19 @@ async fn delivered_updates(profile: bool) -> TestResult {
     )?;
     let status_id: i64 = sqlx::query_scalar("INSERT INTO statuses (account_id, text, spoiler_text, visibility, local, language, created_at, updated_at) VALUES ($1, 'original', 'version test', 0, true, 'en', '2026-07-01'::timestamp, '2026-07-01'::timestamp) RETURNING id")
         .bind(SENDER).fetch_one(&pool).await?;
-    // Persist an HTTP status URI, as restored local Mastodon rows may have. This
-    // isolates Update identity from the separately tracked tag: atomUri ingress defect.
+    // Legacy local rows serialize a tag atomUri even though their AP ID is HTTPS.
+    // Its tagging authority need not equal WEB_DOMAIN and must not grant alias authority.
+    let atom_uri = format!("tag:account-domain.invalid,2026-07-01:objectId={status_id}:objectType=Status");
     sqlx::query("UPDATE statuses SET uri = $2 WHERE id = $1")
         .bind(status_id)
-        .bind(format!("{ACTOR}/statuses/{status_id}"))
+        .bind(&atom_uri)
         .execute(&pool)
         .await?;
+    let victim_status_id: i64 = sqlx::query_scalar(
+        "INSERT INTO statuses (account_id, text, spoiler_text, visibility, local, uri,
+          created_at, updated_at) VALUES ($1, 'untouched legacy victim', '', 0, false, $2,
+          clock_timestamp(), clock_timestamp()) RETURNING id",
+    ).bind(BOB).bind(&atom_uri).fetch_one(&remote_pool).await?;
     let result = std::panic::AssertUnwindSafe(async {
     if !profile {
         queue
@@ -311,10 +317,45 @@ async fn delivered_updates(profile: bool) -> TestResult {
     assert_eq!(delivered[0]["object"]["id"], delivered[1]["object"]["id"]);
     assert_ne!(delivered[0]["object"], delivered[1]["object"]);
     assert_eq!(requests.lock().await.len(), if profile { 3 } else { 4 });
+    if !profile {
+        assert_eq!(delivered[0]["object"]["atomUri"], atom_uri);
+        sqlx::query("UPDATE statuses SET deleted_at = clock_timestamp() WHERE id = $1")
+            .bind(status_id).execute(&pool).await?;
+        queue.enqueue(&JobSpec::new(
+            Lane::Push, ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
+            json!({"status_id": status_id, "activity_type": "Delete"}),
+        ).logical_key("version:delete")).await?;
+        distribute_and_deliver(&queue, &sender).await?;
+        let (body, response) = requests.lock().await.last().cloned().unwrap();
+        assert_eq!(response, http::StatusCode::ACCEPTED);
+        let delete: Value = serde_json::from_slice(&body)?;
+        assert_eq!(delete["object"]["atomUri"], atom_uri);
+        apply_ingress(&receiver_queue, &receiver).await?;
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT deleted_at IS NOT NULL FROM statuses WHERE account_id = $1",
+        ).bind(REMOTE_SENDER).fetch_one(&remote_pool).await?);
+        assert_eq!(sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM tombstones WHERE uri = $1",
+        ).bind(&atom_uri).fetch_one(&remote_pool).await?, 0,
+        "opaque tags must never acquire tombstone authority");
+        assert_eq!(sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM tombstones WHERE account_id = $1 AND uri = $2",
+        ).bind(REMOTE_SENDER).bind(delivered[0]["object"]["id"].as_str())
+            .fetch_one(&remote_pool).await?, 1,
+        "the canonical ActivityPub ID must retain its deletion tombstone");
+    }
+    assert_eq!(sqlx::query_as::<_, (String, Option<NaiveDateTime>)>(
+        "SELECT text, deleted_at FROM statuses WHERE id = $1",
+    ).bind(victim_status_id).fetch_one(&remote_pool).await?,
+    ("untouched legacy victim".to_owned(), None),
+    "a tag matching another account's legacy URI grants no mutation authority");
     Ok::<(), Box<dyn std::error::Error>>(())
     }).catch_unwind().await;
     server.abort();
+    sqlx::query("DELETE FROM statuses WHERE id = $1").bind(victim_status_id).execute(&remote_pool).await?;
     for pool in [&pool, &remote_pool] {
+        sqlx::query("DELETE FROM tombstones WHERE account_id = ANY($1)")
+            .bind(vec![SENDER, REMOTE_SENDER]).execute(pool).await?;
         sqlx::query("DELETE FROM status_edits WHERE status_id IN (SELECT id FROM statuses WHERE account_id = ANY($1))").bind(vec![SENDER, REMOTE_SENDER]).execute(pool).await?;
         sqlx::query("DELETE FROM status_stats WHERE status_id IN (SELECT id FROM statuses WHERE account_id = ANY($1))").bind(vec![SENDER, REMOTE_SENDER]).execute(pool).await?;
         sqlx::query("DELETE FROM statuses WHERE account_id = ANY($1)")

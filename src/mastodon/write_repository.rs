@@ -11392,7 +11392,8 @@ impl RemoteNoteData {
             cc: remote_note_uri_array(object.get("cc"))?,
         };
         let (mentions, hashtags) = remote_note_tags(object.get("tag"))?;
-        let atom_uri = remote_note_optional_uri(object.get("atomUri"))?;
+        let atom_uri = super::activitypub_inbox::optional_atom_uri(object.get("atomUri"))
+            .map_err(|_| WriteError::InvalidInput("remote Note atom URI is invalid"))?;
         if let Some(atom_uri) = atom_uri.as_deref()
             && !same_remote_note_host(actor_uri, atom_uri)?
         {
@@ -17637,6 +17638,50 @@ mod tests {
         assert!(report_email_enabled(None));
         assert!(report_email_enabled(Some("{}")));
         assert!(report_email_enabled(Some("not json")));
+    }
+
+    #[test]
+    fn remote_note_atom_tags_are_metadata_not_lookup_authority() {
+        let actor = "https://remote.example/users/alice";
+        let mut object = json!({
+            "type": "Note", "id": "https://remote.example/statuses/1",
+            "attributedTo": actor, "content": "hello"
+        });
+        for tag in [
+            "tag:remote.example,2026-07-01:objectId=1:objectType=Status",
+            "tag:other.example,2026-07-01:objectId=2:objectType=Status",
+            "tag:",
+            "TAG:malformed opaque metadata",
+        ] {
+            object["atomUri"] = json!(tag);
+            let note = RemoteNoteData::parse(&object, actor)
+                .expect("tag metadata must not reject the Note");
+            assert_eq!(note.uri, "https://remote.example/statuses/1");
+            assert!(note.atom_uri.is_none(), "tags must not become lookup aliases");
+        }
+        for invalid in [
+            json!(42),
+            json!([]),
+            json!("file:///tmp/note"),
+            json!("relative"),
+            json!("https://victim.example/objects/1"),
+        ] {
+            object["atomUri"] = invalid;
+            assert!(RemoteNoteData::parse(&object, actor).is_err());
+        }
+        object["atomUri"] = json!("https://remote.example/objects/1");
+        assert_eq!(
+            RemoteNoteData::parse(&object, actor).unwrap().atom_uri.as_deref(),
+            Some("https://remote.example/objects/1")
+        );
+        object["atomUri"] = json!("tag:remote.example,2026-07-01:opaque");
+        object["id"] = json!("tag:remote.example,2026-07-01:opaque");
+        assert!(
+            RemoteNoteData::parse(&object, actor).is_err(),
+            "tag metadata cannot rescue a non-HTTP canonical ID"
+        );
+        // Canonical actor-host equality is enforced later by the writers, not
+        // this syntax parser; the existing provenance worker tests cover it.
     }
 
     #[test]
