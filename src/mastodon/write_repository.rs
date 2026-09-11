@@ -6620,7 +6620,16 @@ impl WriteRepository {
         }
 
         if following {
-            let request = !target_local || target_locked || source_silenced;
+            let existing_follow = sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM follows \
+                 WHERE account_id = $1 AND target_account_id = $2 FOR UPDATE",
+            )
+            .bind(account_id)
+            .bind(target_account_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            let request =
+                existing_follow.is_none() && (!target_local || target_locked || source_silenced);
             request_follow = request;
             if request {
                 let existing = sqlx::query_scalar::<_, i64>(
@@ -6685,70 +6694,59 @@ impl WriteRepository {
                         activity_uri = Some(follow_uri);
                     }
                 }
+            } else if existing_follow.is_some() {
+                update_follow_options(
+                    &mut transaction,
+                    "follows",
+                    account_id,
+                    target_account_id,
+                    reblogs,
+                    notify,
+                    languages,
+                )
+                .await?;
             } else {
-                let existing = sqlx::query_scalar::<_, i64>(
-                    "SELECT id FROM follows \
-                     WHERE account_id = $1 AND target_account_id = $2 FOR UPDATE",
+                let new_activity_id = sqlx::query_scalar::<_, i64>(
+                    "INSERT INTO follows ( \
+                       account_id, target_account_id, show_reblogs, notify, languages, \
+                       uri, created_at, updated_at) \
+                     VALUES ($1, $2, COALESCE($3, true), COALESCE($4, false), $5, NULL, \
+                             clock_timestamp(), clock_timestamp()) RETURNING id",
                 )
                 .bind(account_id)
                 .bind(target_account_id)
-                .fetch_optional(&mut *transaction)
+                .bind(reblogs)
+                .bind(notify)
+                .bind(languages)
+                .fetch_one(&mut *transaction)
                 .await?;
-                if existing.is_some() {
-                    update_follow_options(
-                        &mut transaction,
-                        "follows",
+                activity_id = Some(new_activity_id);
+                increment_follow_counts(&mut transaction, account_id, target_account_id).await?;
+                if let (Some(origin), Some(remote_delivery)) = (origin, &remote_delivery) {
+                    let follow_uri = local_follow_activity_uri(
+                        origin,
                         account_id,
                         target_account_id,
-                        reblogs,
-                        notify,
-                        languages,
-                    )
-                    .await?;
-                } else {
-                    let new_activity_id = sqlx::query_scalar::<_, i64>(
-                        "INSERT INTO follows ( \
-                           account_id, target_account_id, show_reblogs, notify, languages, \
-                           uri, created_at, updated_at) \
-                         VALUES ($1, $2, COALESCE($3, true), COALESCE($4, false), $5, NULL, \
-                                 clock_timestamp(), clock_timestamp()) RETURNING id",
+                        new_activity_id,
+                        false,
+                    );
+                    sqlx::query(
+                        "UPDATE follows SET uri = $3, updated_at = clock_timestamp() \
+                         WHERE account_id = $1 AND target_account_id = $2",
                     )
                     .bind(account_id)
                     .bind(target_account_id)
-                    .bind(reblogs)
-                    .bind(notify)
-                    .bind(languages)
-                    .fetch_one(&mut *transaction)
+                    .bind(&follow_uri)
+                    .execute(&mut *transaction)
                     .await?;
-                    activity_id = Some(new_activity_id);
-                    increment_follow_counts(&mut transaction, account_id, target_account_id)
-                        .await?;
-                    if let (Some(origin), Some(remote_delivery)) = (origin, &remote_delivery) {
-                        let follow_uri = local_follow_activity_uri(
-                            origin,
-                            account_id,
-                            target_account_id,
-                            new_activity_id,
-                            false,
-                        );
-                        sqlx::query(
-                            "UPDATE follows SET uri = $3, updated_at = clock_timestamp() \
-                             WHERE account_id = $1 AND target_account_id = $2",
-                        )
-                        .bind(account_id)
-                        .bind(target_account_id)
-                        .bind(&follow_uri)
-                        .execute(&mut *transaction)
-                        .await?;
-                        record_remote_follow_delivery(
-                            &mut transaction,
-                            account_id,
-                            remote_delivery,
-                            &follow_uri,
-                        )
-                        .await?;
-                        activity_uri = Some(follow_uri);
-                    }
+                    record_remote_follow_delivery(
+                        &mut transaction,
+                        account_id,
+                        remote_delivery,
+                        &follow_uri,
+                    )
+                    .await?;
+                    activity_uri = Some(follow_uri);
                 }
             }
         } else {
