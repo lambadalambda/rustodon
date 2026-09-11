@@ -57,3 +57,17 @@ Accept ordinary serializer-produced documents and preserve the audience fields n
 - Independent review's test-import blocker was fixed and re-reviewed; no remaining
   blockers. These gates preceded integration of R01; combined gates follow.
   Real-peer profile convergence and the remaining audience criteria stay open.
+
+## R05 discovered collections — verified
+
+- `RemoteActor` retains advertised followers/following URLs, including nonstandard
+  collection paths. Transactional upsert persists supplied collections and retains
+  existing URLs when the actor omits them.
+- Regression discovers an actor through WebFinger/actor GET, persists it, follows
+  it, accepts the follow, and ingests a shared-inbox followers-only Note without
+  preseeded `followers_url`. RED: no Note; GREEN: private visibility `2`.
+- Isolated Secunda worker **50/50**, schema **37/37**, targeted actor parser **2/2**,
+  formatting and all-target/all-feature Clippy passed. Independent review approved.
+  Logs: `/home/lain/rustodon-parity/audiences/target/r05-*`.
+- Inbound fixture jobs start after signature verification; actual peer signatures
+  and follower receipt remain separate acceptance work. R09 is still pending.

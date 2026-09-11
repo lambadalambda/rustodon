@@ -52,3 +52,4 @@
 - [x] [Restore clean-checkout quality gates](issues/restore-clean-checkout-quality-gates.md)
 - [x] [Fix fetched ActivityPub object provenance](issues/fix-fetched-activitypub-object-provenance.md)
 - [x] [Restore saved-status authorization](issues/restore-saved-status-authorization.md)
+- [x] [Fence browser reauthentication and recovery](issues/fence-browser-reauthentication-and-recovery.md)

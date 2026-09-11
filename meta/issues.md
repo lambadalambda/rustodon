@@ -11,7 +11,6 @@
 - [ ] [Harden the v1 release](issues/harden-v1-release.md)
 - [ ] [Address release-readiness review findings](issues/address-release-readiness-review-findings.md)
 - [ ] [Set up a local federating Rustodon instance](issues/set-up-local-federating-instance.md)
-- [ ] [Fence browser reauthentication and recovery](issues/fence-browser-reauthentication-and-recovery.md)
 - [ ] [Repair ActivityPub ingestion and audiences](issues/repair-activitypub-ingestion-and-audiences.md)
 - [ ] [Repair relationship and delivery lifecycles](issues/repair-relationship-and-delivery-lifecycles.md)
 - [ ] [Close reviewed client workflow gaps](issues/close-reviewed-client-workflow-gaps.md)
