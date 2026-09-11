@@ -169,3 +169,18 @@ verification of job 472 and the original child/parent relationship.
   surviving delayed apply after client failure, post-apply/pre-confirmation signal,
   candidate preflight failure, partial creation, start failure and inverse failure.
   These are mock evidence, not live rollback/restore tests.
+
+## NAS build-host authorization
+
+- User explicitly authorized using NAS Podman instead of unstable Secunda for
+  the remaining work. Keep workloads isolated and do not change the local default
+  Podman connection or touch unrelated NAS workloads.
+- The NAS host was reachable, but its existing Podman-worker LXC `124` was stopped.
+  Started that worker without configuration changes. Its new DHCP address is
+  `192.168.1.186`; the saved `podman-worker.local` name did not resolve. Direct SSH
+  uses the existing hostname's host-key identity; no authentication workaround.
+- Worker is x86-64 and already has Rust 1.97.1 cached. Plan: native NAS validation
+  in a bounded tool container, then cross-build the ARM64 release for the local
+  instance. Source sync excludes Git, targets, environments, instance state and
+  backups. No replacement Mastodon source will be fetched; the pending worker,
+  startup and API fixtures use committed fixture data and pinned container images.
