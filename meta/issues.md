@@ -20,3 +20,4 @@
 - [ ] [Render stale login rejection as authentication failure](issues/render-stale-login-rejection-as-authentication-failure.md)
 - [ ] [Define hashtag stream history cleanup](issues/define-hashtag-stream-history-cleanup.md)
 - [ ] [Investigate reciprocal follow convergence under concurrency](issues/investigate-reciprocal-follow-convergence.md)
+- [ ] [Diagnose missing posts from followed lain.com account](issues/diagnose-missing-followed-lain-com-posts.md)
