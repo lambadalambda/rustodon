@@ -48,5 +48,47 @@ After deploying the parity fixes, the local user reports that following `lain@la
 - Secunda passed 29 inbox tests, all 62 worker fixture tests, `cargo fmt --all
   --check` and all-target/all-feature Clippy with warnings denied. Logs:
   `/home/lain/rustodon-parity/nullable-sensitive-{red,green,workers,clippy}.log`.
-- Independent code review approved. Deployment and bounded replay verification
-  are pending; the five original dead-letter payloads will not be edited.
+- Independent code review approved.
+
+## Deployment and recovery — 2026-09-11 UTC
+
+- Deployed `f9b6af78f6863bef16960e918a426c2b13854213`, native ARM64 image
+  `da842de6c91857674c18051c2efdba8bc14297184ff324d91d9cbe1f5d99381a`, to both apps.
+  Used the existing resource-limited native deployment build exception; tests
+  and lint stayed on Secunda. No default/test-support features in the release.
+- App-only cutover evidence: `.local-instance/logs/deploy-20260911T115504Z/`.
+  Consistent backup: `.local-instance-backups/20260911T115509Z/`; files nonempty
+  mode 600, directory mode 700. No contents displayed or restore test performed.
+  PostgreSQL/Redis and local identities were preserved; follow row `2` unchanged.
+- Previous image `b2e9682f9a50040921a5b7358319fad8f45ebf0ba2f97c5235cad11cb6a01d94`
+  and stopped apps ending `-rollback-20260911T115504Z` remain available. Use the
+  application-only rollback procedure in the deployment issue with these names;
+  never start an old pair alongside the current apps or recreate data services.
+- Independently reviewed `.local-instance/retry-null-sensitive.sql` transaction
+  requeued exactly the five diagnosed jobs, guarded by IDs, signer/domain,
+  activity type, null sensitivity, error/attempt count and unleased dead state.
+  Worker was gracefully stopped with restart-on-error protection for the
+  transaction, then restarted. The recovery SQL preserved payloads,
+  order/idempotency keys, attempts and lease generations. Normal worker claiming
+  and validation resumed afterward.
+- All five ingress jobs completed; three statuses materialized with sensitivity
+  false and public visibility. IDs `117252276511693176`, `117252276513133141`,
+  `117252276514092511` are exposed by the public account-statuses API.
+- Ran the exact `rest_home_timeline_ids` SQL extracted from current repository
+  source, with the real viewer ID and no token access. Both top-level statuses
+  (`117252276511693176`, `117252276513133141`) appear on its first page. The third
+  is an unresolved reply and is not currently home-eligible. Local diagnostic
+  query: `.local-instance/logs/missing-lain-posts/home-check.sql`.
+- Preflight passed with the same two existing warnings; worker, local and public
+  readiness passed. No dead-letter jobs remained at postcheck.
+
+## Remaining verification
+
+- Keep open pending a fresh post delivered after the repaired deployment and
+  user-visible confirmation. Recovery proves processing of already accepted
+  signed deliveries, not a new end-to-end HTTP delivery after deployment.
+- The other two acknowledged Create jobs did not leave status rows; the exact
+  skip reason has not been established. Do not claim all five posts were restored.
+- Reply-thread job `472` is retrying with `remote reply thread persistence failed`;
+  the post itself is stored, but its parent is unresolved. This newly exposed
+  downstream issue was not repaired or bypassed as part of the nullable parser fix.
