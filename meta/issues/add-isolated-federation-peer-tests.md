@@ -134,6 +134,19 @@ All commands below ran in the prescribed Secunda workspace with two Cargo jobs.
   deferred until Secunda returns. Source TDD was unavailable during the outage;
   no lifecycle pass is claimed. The issue remains open.
 
+## Full profile Update extension — source only, unexecuted
+
+- `tools/federation-peer-smoke profile` keeps the same fresh setup and three-minute
+  bound. It PATCHes each peer with text, actor flags, a profile field and both PNG
+  uploads, then requires exact received actor identity, rendered note, flags,
+  fields and advertised avatar/header URLs plus signed inbox Update evidence.
+- Post-mutation actor-URL GETs fail the audit, including a final rescan after both
+  directions. The source uploads/descriptions must exist, but remote image
+  download and remote image-description persistence are not claimed.
+- Multipart source regression, compilation, format/lint, actual upload and live
+  propagation have **not run**. TDD execution is deferred due the host outage;
+  independent review is source-only and cannot establish profile acceptance.
+
 ## Pleroma quota decision
 
 The exact v2.10.2 source archive and guarded build helper are prepared, but the

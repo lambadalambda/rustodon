@@ -24,6 +24,7 @@ After the parent restores Secunda, run each scenario in a fresh invocation:
 CARGO_BUILD_JOBS=2 tools/federation-peer-smoke public
 CARGO_BUILD_JOBS=2 tools/federation-peer-smoke privacy
 CARGO_BUILD_JOBS=2 tools/federation-peer-smoke notes
+CARGO_BUILD_JOBS=2 tools/federation-peer-smoke profile
 ```
 
 `privacy` creates followers-only and direct Notes in both directions. The normal
@@ -46,6 +47,17 @@ previously observed row, followed by REST 404 for the former author/recipient.
 The no-canonical-status-GET audit is checked throughout. Tombstone audience
 privacy is not asserted. Ordinary `tag:` atomUri values are never altered by
 the runner; parent fix `a3fe48a` is integrated, with its execution also pending.
+
+`profile` is **source-only, unexecuted**. After reciprocal follows, each author
+PATCHes text, bot/locked/discoverable/indexable flags, a profile field, and both
+avatar/header PNG uploads in one full API request. Source checks require both
+uploads/descriptions; receiver checks bind the existing actor ID/URI, rendered
+note, flags, field and exact advertised media URLs to a signed inbox Update.
+Actor-URL GETs after mutation are rejected through the end of the scenario, so
+refreshing an actor cannot substitute for Update ingestion. URL convergence is
+not a claim of successful remote image download. The multipart unit regression,
+image encoding/upload and all live assertions await Secunda; no profile pass is
+claimed.
 
 Pending verification includes source compilation, formatting/Clippy, observer
 bootstrap, unit regressions, all commands above and repeated cleanup. TDD for
@@ -109,7 +121,7 @@ both database comments before mutation, then:
    object and public audience in each TLS forwarder's identity-only audit, and
    rejects any recorded GET of either new status URL.
 
-The public/privacy scenarios have a three-minute overall deadline; notes has
+The public/privacy/profile scenarios have a three-minute overall deadline; notes has
 six minutes. SQL statement and pool-acquisition limits are two seconds; the
 complete harness has a ten-minute deadline
 with a final kill deadline after cleanup's grace period. This is sequential

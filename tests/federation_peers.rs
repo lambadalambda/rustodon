@@ -634,3 +634,119 @@ async fn wait_note_deleted(smoke: &Smoke, sender: &Peer, receiver: &Peer, note: 
     }
     Err(format!("BLOCKED Delete {} -> {}: {} remains active or lacks signed Delete", sender.name, receiver.name, note.uri).into())
 }
+
+#[tokio::test]
+#[ignore = "requires task-owned live peers from tools/federation-peer-smoke profile"]
+async fn full_profile_update_both_directions() -> Result<()> {
+    tokio::time::timeout(Duration::from_mins(3), profile_updates()).await?
+}
+
+async fn profile_updates() -> Result<()> {
+    let smoke = setup().await?;
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(32, 32).write_to(&mut encoded, image::ImageFormat::Png)?;
+    let mut checkpoints = Vec::new();
+    for (sender, receiver) in [(&smoke.mastodon, &smoke.rustodon), (&smoke.rustodon, &smoke.mastodon)] {
+        checkpoints.push((sender, profile_update(&smoke, sender, receiver, encoded.get_ref()).await?));
+    }
+    for (sender, checkpoint) in checkpoints {
+        let source_log = smoke.root.join(format!("{}.peer.invalid.jsonl", sender.name));
+        assert_no_actor_get_after(&source_log, checkpoint, &sender.actor())?;
+    }
+    Ok(())
+}
+
+const PROFILE_BOUNDARY: &str = "rustodon-peer-profile-boundary";
+
+fn profile_multipart(marker: &str, image: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (name, value) in [
+        ("display_name", marker), ("note", marker), ("bot", "true"),
+        ("locked", "true"), ("discoverable", "true"), ("indexable", "true"),
+        ("fields_attributes[0][name]", "Peer run"), ("fields_attributes[0][value]", marker),
+        ("avatar_description", "Peer avatar"), ("header_description", "Peer header"),
+    ] {
+        body.extend_from_slice(format!("--{PROFILE_BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes());
+    }
+    for name in ["avatar", "header"] {
+        body.extend_from_slice(format!("--{PROFILE_BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{name}.png\"\r\nContent-Type: image/png\r\n\r\n").as_bytes());
+        body.extend_from_slice(image);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{PROFILE_BOUNDARY}--\r\n").as_bytes());
+    body
+}
+
+async fn profile_update(smoke: &Smoke, sender: &Peer, receiver: &Peer, image: &[u8]) -> Result<usize> {
+    let marker = format!("{}-{}-profile", smoke.run, sender.name);
+    let path = "/api/v1/accounts/update_credentials";
+    let before = sender.api(&smoke.client, Method::GET, "/api/v1/accounts/verify_credentials", &[]).await?;
+    let remote_id: i64 = sqlx::query_scalar("SELECT id FROM accounts WHERE uri=$1 AND domain IS NOT NULL")
+        .bind(sender.actor()).fetch_one(&receiver.pool).await?;
+    let source_log = smoke.root.join(format!("{}.peer.invalid.jsonl", sender.name));
+    let checkpoint = parse_audit(&std::fs::read_to_string(&source_log)?)?.len();
+    let response = smoke.client.patch(sender.http.join(path)?)
+        .header("Host", format!("{}.peer.invalid", sender.name))
+        .header("X-Forwarded-Proto", "https").bearer_auth(&sender.token)
+        .header("Content-Type", format!("multipart/form-data; boundary={PROFILE_BOUNDARY}"))
+        .body(profile_multipart(&marker, image)).send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    assert_eq!(status, reqwest::StatusCode::OK, "{} full profile PATCH: {body}", sender.name);
+    let updated: Value = serde_json::from_str(&body)?;
+    assert_eq!(updated["display_name"], marker);
+    assert_eq!(updated["bot"], true);
+    assert_eq!(updated["locked"], true);
+    let note = updated["note"].as_str().ok_or("missing rendered profile note")?;
+    assert!(note.contains(&marker));
+    assert_eq!(updated["fields"].as_array().ok_or("missing source profile fields")?.len(), 1);
+    assert_eq!(updated["fields"][0]["name"], "Peer run");
+    assert_eq!(updated["fields"][0]["value"], marker);
+    let expected_fields = serde_json::json!([{"name":"Peer run","value":marker}]);
+    let avatar = updated["avatar"].as_str().ok_or("missing uploaded avatar URL")?;
+    let header = updated["header"].as_str().ok_or("missing uploaded header URL")?;
+    for field in ["avatar", "header"] {
+        let url = updated[field].as_str().ok_or("missing profile media URL")?;
+        assert!(url.starts_with(&format!("https://{}.peer.invalid/", sender.name)));
+        assert_ne!(updated[field], before[field], "profile upload returned unchanged default media");
+    }
+    let uploaded: bool = sqlx::query_scalar("SELECT avatar_file_name IS NOT NULL AND header_file_name IS NOT NULL AND avatar_content_type LIKE 'image/%' AND header_content_type LIKE 'image/%' AND avatar_file_size > 0 AND header_file_size > 0 AND avatar_updated_at IS NOT NULL AND header_updated_at IS NOT NULL AND avatar_description='Peer avatar' AND header_description='Peer header' FROM accounts WHERE id=$1")
+        .bind(sender.local_id).fetch_one(&sender.pool).await?;
+    assert!(uploaded, "source profile did not retain both uploads/descriptions");
+    for _ in 0..60 {
+        let received: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts WHERE id=$1 AND uri=$2 AND domain IS NOT NULL AND display_name=$3 AND note=$4 AND actor_type='Service' AND locked AND discoverable AND indexable AND jsonb_array_length(fields)=1 AND fields @> $5 AND avatar_remote_url=$6 AND header_remote_url=$7)")
+            .bind(remote_id).bind(sender.actor()).bind(&marker).bind(note).bind(&expected_fields)
+            .bind(avatar).bind(header).fetch_one(&receiver.pool).await?;
+        if received && has_activity_audit(&smoke.root, sender, receiver, &sender.actor(), "Update", None, None)? {
+            assert_no_actor_get_after(&source_log, checkpoint, &sender.actor())?;
+            println!("PASS full actor Update PUSH {} -> {}: identity, text, flags, fields, avatar/header URLs", sender.name, receiver.name);
+            return Ok(checkpoint);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err(format!("BLOCKED full actor Update {} -> {}: {} profile state or signed Update missing", sender.name, receiver.name, sender.actor()).into())
+}
+
+fn assert_no_actor_get_after(path: &std::path::Path, checkpoint: usize, actor: &str) -> Result<()> {
+    let actor_url = Url::parse(actor)?;
+    let events = parse_audit(&std::fs::read_to_string(path)?)?;
+    for event in events.iter().skip(checkpoint) {
+        assert!(!(event["method"] == "GET" && event["path"].as_str()
+            .is_some_and(|path| path.split('?').next() == Some(actor_url.path()))),
+            "profile was fetched after mutation rather than exclusively pushed: {actor}");
+    }
+    Ok(())
+}
+
+#[test]
+fn full_profile_multipart_contains_both_images_and_fields() {
+    let body = profile_multipart("unique-profile-marker", b"image-fixture-bytes");
+    let text = String::from_utf8(body).unwrap();
+    for field in ["display_name", "note", "bot", "locked", "discoverable", "indexable",
+        "fields_attributes[0][name]", "fields_attributes[0][value]", "avatar", "header"] {
+        assert!(text.contains(&format!("name=\"{field}\"")));
+    }
+    assert_eq!(text.matches("image-fixture-bytes").count(), 2);
+    assert_eq!(text.matches("Content-Type: image/png\r\n").count(), 2);
+    assert!(text.ends_with(&format!("--{PROFILE_BOUNDARY}--\r\n")));
+}
