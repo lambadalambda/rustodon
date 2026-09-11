@@ -22,3 +22,4 @@
 - [ ] [Investigate reciprocal follow convergence under concurrency](issues/investigate-reciprocal-follow-convergence.md)
 - [ ] [Diagnose missing posts from followed lain.com account](issues/diagnose-missing-followed-lain-com-posts.md)
 - [ ] [Repair remote reply-thread persistence](issues/repair-remote-reply-thread-persistence.md)
+- [ ] [Diagnose missing remote avatar and banner](issues/diagnose-missing-remote-avatar-and-banner.md)
