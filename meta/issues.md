@@ -11,8 +11,6 @@
 - [ ] [Harden the v1 release](issues/harden-v1-release.md)
 - [ ] [Address release-readiness review findings](issues/address-release-readiness-review-findings.md)
 - [ ] [Set up a local federating Rustodon instance](issues/set-up-local-federating-instance.md)
-- [ ] [Fix fetched ActivityPub object provenance](issues/fix-fetched-activitypub-object-provenance.md)
-- [ ] [Restore saved-status authorization](issues/restore-saved-status-authorization.md)
 - [ ] [Fence browser reauthentication and recovery](issues/fence-browser-reauthentication-and-recovery.md)
 - [ ] [Repair ActivityPub ingestion and audiences](issues/repair-activitypub-ingestion-and-audiences.md)
 - [ ] [Repair relationship and delivery lifecycles](issues/repair-relationship-and-delivery-lifecycles.md)

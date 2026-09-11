@@ -50,3 +50,5 @@
 - [x] [Implement basic moderation and reconciliation](issues/implement-basic-moderation-and-reconciliation.md)
 - [x] [Review essential feature parity and federation robustness](issues/review-essential-feature-parity-and-federation-robustness.md)
 - [x] [Restore clean-checkout quality gates](issues/restore-clean-checkout-quality-gates.md)
+- [x] [Fix fetched ActivityPub object provenance](issues/fix-fetched-activitypub-object-provenance.md)
+- [x] [Restore saved-status authorization](issues/restore-saved-status-authorization.md)
