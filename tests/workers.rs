@@ -5095,6 +5095,7 @@ async fn activitypub_note_create_update_and_delete_are_processed_idempotently()
              "url": "https://remote.fixture.invalid/@bob/123",
              "content": "<p>Initial remote note :party_blob:</p>",
         "summary": null,
+        "sensitive": null,
              "likes": {"type": "Collection", "totalItems": 7},
              "shares": {"type": "Collection", "totalItems": 3},
               "to": ["https://www.w3.org/ns/activitystreams#Public"],
@@ -5130,6 +5131,7 @@ async fn activitypub_note_create_update_and_delete_are_processed_idempotently()
             "url": "https://remote.fixture.invalid/@bob/123",
             "content": "<p>Edited remote note :party_blob:</p>",
         "summary": null,
+        "sensitive": null,
              "to": ["https://remote.fixture.invalid/users/bob/followers"],
             "cc": [],
             "tag": [{
@@ -5328,6 +5330,13 @@ async fn activitypub_note_create_update_and_delete_are_processed_idempotently()
                 executor
                     .process_one("note-worker", &[Lane::Ingress], Duration::seconds(30))
                 .await?
+            );
+            assert!(
+                !sqlx::query_scalar::<_, bool>("SELECT sensitive FROM statuses WHERE uri = $1")
+                    .bind(NOTE_URI)
+                    .fetch_one(&writer_pool)
+                    .await?,
+                "nullable-sensitive Create must persist before its duplicate is processed"
             );
         }
     let note_status_id: i64 = sqlx::query_scalar("SELECT id FROM statuses WHERE uri = $1")
@@ -5697,6 +5706,13 @@ async fn activitypub_note_create_update_and_delete_are_processed_idempotently()
                     .await?
             );
             if logical_key == "activitypub:test-note-update" {
+                assert!(
+                    !sqlx::query_scalar::<_, bool>("SELECT sensitive FROM statuses WHERE uri = $1")
+                        .bind(NOTE_URI)
+                        .fetch_one(&writer_pool)
+                        .await?,
+                    "nullable-sensitive Update must retain the false default"
+                );
                 assert_eq!(
                     sqlx::query_as::<_, (String, bool, bool)>(
                         "SELECT image_remote_url, disabled, visible_in_picker

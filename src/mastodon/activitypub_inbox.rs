@@ -454,6 +454,7 @@ pub(crate) fn validate_note_object(
         return Err(InboxParseError::Activity);
     }
     if let Some(value) = object.get("sensitive")
+        && !value.is_null()
         && value.as_bool().is_none()
     {
         return Err(InboxParseError::Activity);
@@ -999,6 +1000,54 @@ mod tests {
                 && object_uri == "https://remote.example/statuses/1"
                 && activity["type"] == "Delete"
         ));
+    }
+
+    #[test]
+    fn note_sensitive_accepts_only_absent_null_or_boolean() {
+        for kind in ["Create", "Update"] {
+            for (sensitive, accepted) in [
+                (None, true),
+                (Some(Value::Null), true),
+                (Some(json!(false)), true),
+                (Some(json!(true)), true),
+                (Some(json!("false")), false),
+                (Some(json!(0)), false),
+                (Some(json!([])), false),
+                (Some(json!({})), false),
+            ] {
+                let mut activity = json!({
+                    "id": "https://remote.example/activities/nullable-sensitive",
+                    "type": kind,
+                    "actor": "https://remote.example/users/alice",
+                    "object": {
+                        "id": "https://remote.example/objects/nullable-sensitive",
+                        "type": "Note",
+                        "attributedTo": "https://remote.example/users/alice",
+                        "content": "<p>Nullable sensitivity regression</p>",
+                        "summary": "",
+                        "to": ["https://www.w3.org/ns/activitystreams#Public"]
+                    }
+                });
+                if let Some(value) = &sensitive {
+                    activity["object"]["sensitive"] = value.clone();
+                }
+                let parsed = parse_activity(&activity.to_string());
+                if accepted {
+                    let object = match parsed.expect("valid optional sensitivity") {
+                        InboxActivity::CreateNote { object, .. }
+                        | InboxActivity::UpdateNote { object, .. } => object,
+                        other => panic!("unexpected activity: {other:?}"),
+                    };
+                    assert_eq!(object.get("sensitive"), sensitive.as_ref());
+                } else {
+                    assert_eq!(
+                        parsed,
+                        Err(InboxParseError::Activity),
+                        "{kind}: {sensitive:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
