@@ -134,6 +134,8 @@ enum RemoteFetchHop {
 
 #[derive(Clone, Debug)]
 pub struct RemoteFetcher {
+    #[cfg(feature = "test-support")]
+    test_endpoint: Option<SocketAddr>,
     limits: RemoteFetchLimits,
     domain_budget: RemoteDomainBudget,
 }
@@ -350,9 +352,18 @@ impl RemoteFetcher {
         domain_budget: RemoteDomainBudget,
     ) -> Self {
         Self {
+            #[cfg(feature = "test-support")]
+            test_endpoint: None,
             limits: limits.bounded(),
             domain_budget,
         }
+    }
+
+    /// Routes resolver GETs through a fixture endpoint, never in release builds.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn with_test_endpoint(mut self, endpoint: Option<SocketAddr>) -> Self {
+        self.test_endpoint = endpoint;
+        self
     }
 
     /// Creates a fetcher with different transport limits while retaining this fetcher's budget.
@@ -645,6 +656,20 @@ impl RemoteFetcher {
         expected_origin: Option<Url>,
         signer: Option<&HttpSignatureSigner<'_>>,
     ) -> Result<RemoteResponse, RemoteFetchError> {
+        let endpoint = None;
+        #[cfg(feature = "test-support")]
+        let endpoint = {
+            if self.test_endpoint.is_some() && !cfg!(debug_assertions) {
+                return Err(RemoteFetchError::Client);
+            }
+            self.test_endpoint.or(endpoint)
+        };
+        let policy_addresses = endpoint.map(|_| {
+            vec![
+                vec![SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 443)];
+                self.limits.max_redirects + 1
+            ]
+        });
         tokio::time::timeout(
             self.limits.request_timeout,
             self.get_with_redirects(
@@ -652,8 +677,8 @@ impl RemoteFetcher {
                 accepted_content_types,
                 expected_origin.as_ref(),
                 signer,
-                None,
-                None,
+                endpoint,
+                policy_addresses,
             ),
         )
         .await
@@ -1042,6 +1067,8 @@ pub struct RemoteActor {
     pub profile_url: Option<Url>,
     pub inbox: Url,
     pub shared_inbox: Option<Url>,
+    pub followers: Option<Url>,
+    pub following: Option<Url>,
     pub public_keys: Vec<RemotePublicKey>,
     pub key_set_complete: bool,
 }
@@ -1790,6 +1817,8 @@ fn parse_remote_actor_document(
             profile_url,
             inbox,
             shared_inbox,
+            followers: optional_remote_url(&actor, "followers")?,
+            following: optional_remote_url(&actor, "following")?,
             public_keys: parsed_public_keys.embedded,
             key_set_complete: parsed_public_keys.references.is_empty(),
         },
@@ -3320,6 +3349,8 @@ mod tests {
                 "name": "Alice Example",
                 "url": "https://remote.example/@alice",
                 "inbox": "https://remote.example/users/alice/inbox",
+                "followers": "https://remote.example/collections/alice-subscribers",
+                "following": {"id": "https://remote.example/collections/alice-subscriptions"},
                 "endpoints": {"sharedInbox": "https://remote.example/inbox"},
                 "publicKey": {
                     "id": "https://remote.example/users/alice#main-key",
@@ -3346,6 +3377,14 @@ mod tests {
         assert_eq!(
             actor.shared_inbox.unwrap().as_str(),
             "https://remote.example/inbox"
+        );
+        assert_eq!(
+            actor.followers.unwrap().as_str(),
+            "https://remote.example/collections/alice-subscribers"
+        );
+        assert_eq!(
+            actor.following.unwrap().as_str(),
+            "https://remote.example/collections/alice-subscriptions"
         );
         assert_eq!(actor.public_keys.len(), 1);
         assert!(actor.key_set_complete);

@@ -17461,3 +17461,204 @@ async fn reset() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     Ok(())
 }
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+#[allow(clippy::too_many_lines)]
+async fn discovered_actor_follow_accept_allows_shared_inbox_private_note()
+-> Result<(), Box<dyn std::error::Error>> {
+    const ALICE: i64 = 116_844_606_259_201_001;
+    const ORIGIN: &str = "https://fixture-v4-6-5.rustodon.invalid/";
+    const ACTOR: &str = "http://fresh-audience.fixture.invalid/users/fresh";
+    // Deliberately not actor + /followers: retain the collection actually advertised.
+    const FOLLOWERS: &str = "http://fresh-audience.fixture.invalid/collections/subscribers";
+    const FOLLOWING: &str = "http://fresh-audience.fixture.invalid/collections/subscriptions";
+    let runtime_url = std::env::var("RUSTODON_WORKER_DATABASE_URL")?;
+    let owner_url = std::env::var("RUSTODON_WORKER_OWNER_DATABASE_URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&owner_url)
+        .await?;
+    let runtime = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&runtime_url)
+        .await?;
+    reset().await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM accounts WHERE uri = $1")
+            .bind(ACTOR)
+            .fetch_one(&pool)
+            .await?,
+        0
+    );
+    let repository = Repository::connect(&owner_url).await?;
+    let local = repository
+        .account(ALICE)
+        .await?
+        .ok_or("local actor missing")?;
+    let local_uri = activitypub::actor_url(&Url::parse(ORIGIN)?, &local);
+    let baseline_following: i64 =
+        sqlx::query_scalar("SELECT following_count FROM account_stats WHERE account_id = $1")
+            .bind(ALICE)
+            .fetch_one(&pool)
+            .await?;
+    let key_id = format!("{ACTOR}#main-key");
+    let actor_document = json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": ACTOR, "type": "Person", "preferredUsername": "fresh",
+        "summary": "Fresh discovery", "inbox": format!("{ACTOR}/inbox"),
+        "followers": FOLLOWERS, "following": FOLLOWING,
+        "endpoints": {"sharedInbox": "http://fresh-audience.fixture.invalid/inbox"},
+        "publicKey": {"id": key_id, "owner": ACTOR, "publicKeyPem": local.public_key}
+    });
+    let webfinger = json!({
+        "subject": "acct:fresh@fresh-audience.fixture.invalid",
+        "links": [{"rel": "self", "type": "application/activity+json", "href": ACTOR}]
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for (content_type, body) in [
+            ("application/activity+json", actor_document),
+            ("application/jrd+json", webfinger),
+        ] {
+            let (mut socket, _) = listener.accept().await?;
+            requests.push(fixture_delivery_request(&mut socket).await?);
+            let body = body.to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
+        }
+        Ok::<_, std::io::Error>(requests)
+    });
+    let delivery_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let delivery_endpoint = delivery_listener.local_addr()?;
+    let delivery_server = tokio::spawn(fixture_delivery_server(delivery_listener));
+    let queue = Queue::new(runtime);
+    let handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
+        &queue,
+        Some(pool.clone()),
+        None,
+        Some(ActivityPubDeliveryConfig {
+            origin: Url::parse(ORIGIN)?,
+            local_domain: "fixture-v4-6-5.rustodon.invalid".to_owned(),
+            media_root_url: "/system".to_owned(),
+            media_root: None,
+            limited_federation: false,
+            remote_media_endpoint: None,
+            remote_delivery_endpoint: Some(delivery_endpoint),
+            remote_fetch_endpoint: Some(endpoint),
+        }),
+    )?;
+    let executor = WorkerExecutor::new(queue.clone(), handlers, 1, 1)?;
+    // An inbox job starts after signature verification, just as for /inbox in production.
+    let first_note = format!("{ACTOR}/statuses/discovery");
+    queue.enqueue(&JobSpec::new(Lane::Ingress, ACTIVITYPUB_INBOX_JOB_KIND, json!({
+        "signature_key_id": key_id, "remote_domain": "fresh-audience.fixture.invalid",
+        "delivery_target_account_id": ALICE,
+        "body": json!({"id": format!("{first_note}/activity"), "type": "Create", "actor": ACTOR,
+            "object": {"id": first_note, "type": "Note", "attributedTo": ACTOR,
+                "content": "<p>Discovered</p>", "summary": "", "to": [local_uri]}}).to_string()
+    }))).await?;
+    assert!(
+        executor
+            .process_one(
+                "audience-discovery",
+                &[Lane::Ingress],
+                Duration::seconds(30)
+            )
+            .await?
+    );
+    let remote_id: i64 = sqlx::query_scalar("SELECT id FROM accounts WHERE uri = $1")
+        .bind(ACTOR)
+        .fetch_one(&pool)
+        .await?;
+    let requests = tokio::time::timeout(std::time::Duration::from_secs(5), server).await???;
+    assert!(String::from_utf8_lossy(&requests[0]).starts_with("GET /users/fresh "));
+    assert!(String::from_utf8_lossy(&requests[1]).starts_with("GET /.well-known/webfinger?"));
+    let writer = WriteRepository::connect(&owner_url).await?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer fixture-bearer-follow-v4-6-5"),
+    );
+    let authenticated = BearerAuthenticator::new(repository)
+        .authenticate(&headers, WRITE_FOLLOWS)
+        .await?;
+    let follow = writer
+        .set_follow_with_origin(
+            &authenticated,
+            remote_id,
+            true,
+            None,
+            None,
+            None,
+            Some(ORIGIN),
+            false,
+        )
+        .await?;
+    let follow_uri = follow.activity_uri.ok_or("Follow URI missing")?;
+    assert!(queue.dispatch_outbox(100).await? >= 1);
+    assert!(
+        executor
+            .process_one("audience-follow", &[Lane::Push], Duration::seconds(30))
+            .await?
+    );
+    let delivered =
+        tokio::time::timeout(std::time::Duration::from_secs(5), delivery_server).await???;
+    let body_start = delivered
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .ok_or("missing HTTP headers")?
+        + 4;
+    let delivered: Value = serde_json::from_slice(&delivered[body_start..])?;
+    assert_eq!(delivered["type"], "Follow");
+    assert_eq!(delivered["id"], follow_uri);
+    assert_eq!(delivered["object"], ACTOR);
+    let private_note = format!("{ACTOR}/statuses/private");
+    for body in [
+        json!({"type": "Accept", "actor": ACTOR, "object": follow_uri}),
+        json!({"id": format!("{private_note}/activity"), "type": "Create", "actor": ACTOR,
+            "object": {"id": private_note, "type": "Note", "attributedTo": ACTOR,
+                "content": "<p>Followers only</p>", "summary": "", "to": [FOLLOWERS], "cc": []}}),
+    ] {
+        // No delivery_target_account_id: exercise the shared inbox relevance decision.
+        queue.enqueue(&JobSpec::new(Lane::Ingress, ACTIVITYPUB_INBOX_JOB_KIND, json!({
+            "signature_key_id": key_id, "remote_domain": "fresh-audience.fixture.invalid", "body": body.to_string()
+        }))).await?;
+        assert!(
+            executor
+                .process_one("audience-private", &[Lane::Ingress], Duration::seconds(30))
+                .await?
+        );
+    }
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM follows WHERE account_id = $1 AND target_account_id = $2 AND uri = $3")
+        .bind(ALICE).bind(remote_id).bind(&follow_uri).fetch_one(&pool).await?, 1);
+    let stored: Option<(i64, i32)> =
+        sqlx::query_as("SELECT account_id, visibility FROM statuses WHERE uri = $1")
+            .bind(&private_note)
+            .fetch_optional(&pool)
+            .await?;
+    assert_eq!(
+        stored,
+        Some((remote_id, 2)),
+        "freshly discovered followers-only Note must survive shared-inbox ingestion"
+    );
+    let collections: (String, String) =
+        sqlx::query_as("SELECT followers_url, following_url FROM accounts WHERE id = $1")
+            .bind(remote_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(collections, (FOLLOWERS.to_owned(), FOLLOWING.to_owned()));
+    sqlx::query("DELETE FROM accounts WHERE id = $1")
+        .bind(remote_id)
+        .execute(&pool)
+        .await?;
+    sqlx::query("UPDATE account_stats SET following_count = $2 WHERE account_id = $1")
+        .bind(ALICE)
+        .bind(baseline_following)
+        .execute(&pool)
+        .await?;
+    reset().await?;
+    Ok(())
+}

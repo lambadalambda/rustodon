@@ -3171,6 +3171,8 @@ impl WriteRepository {
             "UPDATE accounts SET username = $2, domain = $3, actor_type = $4,
                 display_name = $5, note = $6, uri = $7, url = $8, inbox_url = $9,
                  shared_inbox_url = $10, protocol = 1, public_key = '',
+                followers_url = COALESCE($11, followers_url),
+                following_url = COALESCE($12, following_url),
                 last_webfingered_at = clock_timestamp(),
                 updated_at = clock_timestamp()
              WHERE id = $1",
@@ -3185,6 +3187,8 @@ impl WriteRepository {
         .bind(profile_url)
         .bind(actor.inbox.as_str())
         .bind(actor.shared_inbox.as_ref().map_or("", Url::as_str))
+        .bind(actor.followers.as_ref().map(Url::as_str))
+        .bind(actor.following.as_ref().map(Url::as_str))
         .execute(&mut *transaction)
         .await?;
         sqlx::query(

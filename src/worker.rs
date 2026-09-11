@@ -4506,6 +4506,10 @@ async fn resolve_inbox_actor(
         key_id: &signer_key_id,
         private_key_pem: private_key.as_str(),
     };
+    #[cfg(feature = "test-support")]
+    let fetcher = &fetcher
+        .clone()
+        .with_test_endpoint(config.remote_fetch_endpoint);
     let resolver = RemoteAccountResolver::new(fetcher.clone());
     let resolution = resolver
         .resolve_key(&job.signature_key_id, Some(&signer))
