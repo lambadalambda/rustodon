@@ -489,6 +489,7 @@ fn parse_private_key(pem: &str) -> Result<RsaPrivateKey, RsaKeyError> {
 }
 
 fn parse_public_key(pem: &str) -> Result<RsaPublicKey, RsaKeyError> {
+    let pem = pem.trim();
     RsaPublicKey::from_public_key_pem(pem)
         .or_else(|_| RsaPublicKey::from_pkcs1_pem(pem))
         .map_err(|_| RsaKeyError::CorruptPublicKey)
@@ -518,4 +519,30 @@ pub(crate) fn verify_rsa_sha256(
     VerifyingKey::<Sha256>::new(public_key)
         .verify(message, &signature)
         .map_err(|_| RsaKeyError::SignatureVerificationFailed)
+}
+
+#[cfg(test)]
+mod tests {
+    use rsa::pkcs1::EncodeRsaPrivateKey;
+    use rsa::pkcs8::{EncodePublicKey, LineEnding};
+
+    use super::*;
+
+    #[test]
+    fn rsa_verification_accepts_trailing_pem_whitespace() {
+        let private_key = RsaPrivateKey::new(&mut OsRng, 1024).expect("test key generation");
+        let public_key = RsaPublicKey::from(&private_key)
+            .to_public_key_pem(LineEnding::LF)
+            .expect("public key encoding");
+        let private_key = private_key
+            .to_pkcs1_pem(LineEnding::LF)
+            .expect("private key encoding");
+        let message = b"Pleroma-compatible PEM parsing";
+        let signature = sign_rsa_sha256(private_key.as_str(), message).expect("signature");
+
+        assert_eq!(
+            verify_rsa_sha256(&format!("{public_key}\n"), message, &signature),
+            Ok(())
+        );
+    }
 }
