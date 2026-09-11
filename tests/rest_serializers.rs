@@ -604,6 +604,59 @@ fn media_paths_proxy_fallbacks_and_poll_votes_match_wire_shapes() {
 }
 
 #[test]
+fn raw_gifs_use_image_rendering_without_reclassifying_transcoded_gifv() {
+    let mut media = MediaAttachmentProjection {
+        id: PUBLIC_STATUS + 1_001,
+        media_type: 1,
+        processing: Some(2),
+        remote_url: "https://media.fixture.invalid/animation.gif".to_owned(),
+        file_content_type: Some("image/gif".to_owned()),
+        file_name: Some("animation.gif".to_owned()),
+        file_storage_schema_version: Some(1),
+        thumbnail_file_name: None,
+        thumbnail_storage_schema_version: None,
+        thumbnail_remote_url: None,
+        shortcode: None,
+        meta: Some(json!({"original": {"width": 320, "height": 240}})),
+        description: Some("Animated image".to_owned()),
+        blurhash: None,
+        discarded: false,
+    };
+    let value = serde_json::to_value(serializer().media_attachment(&media)).unwrap();
+    assert_eq!(value["type"], "image");
+    assert!(
+        value["url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/original/animation.gif")
+    );
+    assert!(
+        value["preview_url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/small/animation.png")
+    );
+    assert_eq!(value["remote_url"], media.remote_url);
+    assert_eq!(value["meta"], media.meta.clone().unwrap());
+    assert_eq!(value["description"], "Animated image");
+
+    for (kind, mime, name, expected) in [
+        (1, Some("IMAGE/GIF"), "animation.gif", "image"),
+        (1, Some("video/mp4"), "animation.mp4", "gifv"),
+        (1, None, "animation.mp4", "gifv"),
+        (2, Some("video/mp4"), "movie.mp4", "video"),
+    ] {
+        media.media_type = kind;
+        media.file_content_type = mime.map(str::to_owned);
+        media.file_name = Some(name.to_owned());
+        let value = serde_json::to_value(serializer().media_attachment(&media)).unwrap();
+        assert_eq!(value["type"], expected, "{kind}: {mime:?}");
+        // The origin's .gif extension must not override the cached file format.
+        assert_eq!(value["remote_url"], media.remote_url);
+    }
+}
+
+#[test]
 fn unknown_status_visibility_fails_closed() {
     let mut status = public_status();
     status.visibility = 99;

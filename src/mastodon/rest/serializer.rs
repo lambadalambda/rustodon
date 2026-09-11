@@ -1381,6 +1381,15 @@ impl<'a> RestSerializer<'a> {
             id: DecimalId::new(media.id),
             media_type: match media.media_type {
                 0 => "image",
+                // Remote GIFs retain their original bytes; gifv requires a video
+                // representation. Use the cached MIME, not the origin URL suffix.
+                1 if media
+                    .file_content_type
+                    .as_deref()
+                    .is_some_and(|mime| mime.eq_ignore_ascii_case("image/gif")) =>
+                {
+                    "image"
+                }
                 1 => "gifv",
                 2 => "video",
                 4 => "audio",
