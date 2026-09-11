@@ -93,3 +93,11 @@ All commands below ran in the prescribed Secunda workspace with two Cargo jobs.
   retry policy. Keep concurrency stress as separate follow-up work.
 - This issue stays open for the remaining peer matrix. Parent owns issue indexes.
 
+
+## Pleroma quota decision
+
+The exact v2.10.2 source archive and guarded build helper are prepared, but the
+required release base image pull failed under Docker Hub's anonymous quota.
+The user chose to leave Pleroma blocked until that quota resets rather than
+configure registry authentication. Do not claim Pleroma coverage or retry in a
+loop. See [build evidence](../../docs/federation-pleroma-build.md).
