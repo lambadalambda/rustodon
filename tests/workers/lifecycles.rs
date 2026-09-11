@@ -473,3 +473,7 @@ async fn cancellation_keeps_undo_behind_live_earlier_like() -> TestResult {
     reset().await?;
     Ok(())
 }
+
+#[cfg(feature = "test-support")]
+#[path = "update_versions.rs"]
+mod update_versions;

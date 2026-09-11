@@ -761,7 +761,7 @@ async fn distribute_status(
                 .or(status.edited_at)
                 .unwrap_or(status.updated_at);
             object["updated"] = json!(activitypub::timestamp(edited_at));
-            let update_uri = format!("{object_uri}#updates/{}", edited_at.and_utc().timestamp());
+            let update_uri = activitypub::update_activity_id(&object_uri, edited_at);
             activitypub::update_with_uris(
                 &update_uri,
                 &activitypub::actor_url(&config.origin, &account),
@@ -1827,19 +1827,23 @@ async fn record_conversation_stream_event(
     .map_err(|_| HandlerFailure::retry("notification conversation stream write failed"))
 }
 
-fn account_update_delivery_is_current(
+fn update_delivery_is_current(
     activity_id: Option<&str>,
-    actor_uri: &str,
-    updated_at: NaiveDateTime,
-    requested_updated_at_micros: Option<i64>,
+    object_uri: &str,
+    version: NaiveDateTime,
+    requested_version_micros: Option<i64>,
 ) -> bool {
-    if requested_updated_at_micros
-        .is_some_and(|requested| requested != updated_at.and_utc().timestamp_micros())
+    if requested_version_micros
+        .is_some_and(|requested| requested != version.and_utc().timestamp_micros())
     {
         return false;
     }
-    let expected_activity_id = format!("{actor_uri}#updates/{}", updated_at.and_utc().timestamp());
+    let expected_activity_id = activitypub::update_activity_id(object_uri, version);
+    // Already-persisted deliveries keep their original body/ID across an upgrade.
+    // Their microsecond metadata still fences superseded versions.
+    let legacy_activity_id = format!("{object_uri}#updates/{}", version.and_utc().timestamp());
     activity_id == Some(expected_activity_id.as_str())
+        || activity_id == Some(legacy_activity_id.as_str())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1919,7 +1923,7 @@ async fn deliver_activity(
     }
     if body_value.get("type").and_then(Value::as_str) == Some("Update") && status_id.is_none() {
         let actor_uri = activitypub::actor_url(&config.origin, &source_account);
-        if !account_update_delivery_is_current(
+        if !update_delivery_is_current(
             body_value.get("id").and_then(Value::as_str),
             &actor_uri,
             source_account.updated_at,
@@ -1933,14 +1937,12 @@ async fn deliver_activity(
     {
         let object_uri = activitypub::status_uri(&config.origin, &source_account, status);
         let edited_at = status.edited_at.unwrap_or(status.updated_at);
-        if delivery_edited_at_micros
-            .is_some_and(|requested| requested != edited_at.and_utc().timestamp_micros())
-        {
-            return Ok(());
-        }
-        let expected_activity_id =
-            format!("{object_uri}#updates/{}", edited_at.and_utc().timestamp());
-        if body_value["id"].as_str() != Some(expected_activity_id.as_str()) {
+        if !update_delivery_is_current(
+            body_value["id"].as_str(),
+            &object_uri,
+            edited_at,
+            delivery_edited_at_micros,
+        ) {
             return Ok(());
         }
     }
@@ -5919,20 +5921,21 @@ pub fn retry_delay(job_id: i64, attempt: i32) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, Duration, Utc};
     use http::StatusCode;
     use serde_json::json;
 
     use super::{
         FailureDisposition, HandlerRegistry, RemoteAnnounceTarget, ResourceClass,
-        account_purge_cleanup_paths, account_update_delivery_is_current,
-        account_update_delivery_logical_key, delivery_failure, delivery_logical_key,
-        inbox_actor_domain, note_fetch_audience, note_resolution_logical_key,
+        account_purge_cleanup_paths, account_update_delivery_logical_key, delivery_failure,
+        delivery_logical_key, inbox_actor_domain, note_fetch_audience, note_resolution_logical_key,
         preferred_note_fetch_signer_id, remote_announce_document, remote_media_fetch_failure,
         remote_note_document, remote_note_fetch_failure, resolved_create_note, retry_delay,
-        safe_cleanup_path, update_delivery_logical_key, validate_create_binding,
+        safe_cleanup_path, update_delivery_is_current, update_delivery_logical_key,
+        validate_create_binding,
     };
     use crate::jobs::Lane;
+    use crate::mastodon::activitypub;
     use crate::remote::RemoteFetchError;
 
     #[test]
@@ -6113,14 +6116,27 @@ mod tests {
         let activity_id = format!("{actor_uri}#updates/{}", updated_at.and_utc().timestamp());
         let current_updated_at_micros = updated_at.and_utc().timestamp_micros();
 
-        assert!(!account_update_delivery_is_current(
-            Some(&activity_id),
-            actor_uri,
-            updated_at,
-            Some(current_updated_at_micros - 1),
-        ));
-        assert!(account_update_delivery_is_current(
-            Some(&activity_id),
+        for activity_id in [
+            activity_id,
+            activitypub::update_activity_id(actor_uri, updated_at),
+        ] {
+            assert!(!update_delivery_is_current(
+                Some(&activity_id),
+                actor_uri,
+                updated_at,
+                Some(current_updated_at_micros - 1),
+            ));
+            assert!(update_delivery_is_current(
+                Some(&activity_id),
+                actor_uri,
+                updated_at,
+                Some(current_updated_at_micros),
+            ));
+        }
+        let stale_id =
+            activitypub::update_activity_id(actor_uri, updated_at - Duration::microseconds(1));
+        assert!(!update_delivery_is_current(
+            Some(&stale_id),
             actor_uri,
             updated_at,
             Some(current_updated_at_micros),

@@ -1291,6 +1291,17 @@ GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_
 EOF
   run_worker_cli "$migrator_url" admin migrate-operational-schema
   prepare_differential_writer_database "$DATABASE_NAME"
+  # Clone before any test connections open: receiver lifecycles need independent
+  # actor/status identities and ingress queues, inside this same disposable container.
+  receiver_database="rustodon_worker_receiver_$$"
+  run_podman exec -i "$PG_CONTAINER" psql \
+    --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname postgres >/dev/null <<EOF
+CREATE DATABASE $receiver_database TEMPLATE $DATABASE_NAME;
+REVOKE ALL ON DATABASE $receiver_database FROM PUBLIC;
+GRANT CONNECT ON DATABASE $receiver_database TO $WORKER_RUNTIME;
+EOF
+  RUSTODON_WORKER_RECEIVER_DATABASE_URL="postgresql://$WORKER_RUNTIME:$WORKER_RUNTIME_PASSWORD@127.0.0.1:$published_port/$receiver_database" \
+  RUSTODON_WORKER_RECEIVER_OWNER_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$receiver_database" \
   RUSTODON_WORKER_DATABASE_URL="$runtime_url" \
   RUSTODON_WORKER_ADMIN_DATABASE_URL="$migrator_url" \
   RUSTODON_WORKER_WRITE_DATABASE_URL="$writer_url" \

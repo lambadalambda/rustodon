@@ -659,6 +659,15 @@ pub fn actor_with_media(
     value
 }
 
+/// Identifies a persisted Update version at `PostgreSQL` timestamp precision.
+#[must_use]
+pub fn update_activity_id(object_uri: &str, version: NaiveDateTime) -> String {
+    format!(
+        "{object_uri}#updates/{}",
+        version.and_utc().timestamp_micros()
+    )
+}
+
 #[must_use]
 pub fn update_actor(
     origin: &Url,
@@ -671,7 +680,7 @@ pub fn update_actor(
     let actor_uri = actor_url(origin, account);
     json!({
         "@context": ACTIVITY_STREAMS_CONTEXT,
-        "id": format!("{actor_uri}#updates/{}", account.updated_at.and_utc().timestamp()),
+        "id": update_activity_id(&actor_uri, account.updated_at),
         "type": "Update",
         "actor": actor_uri,
         "to": [PUBLIC_ADDRESS],
@@ -1931,7 +1940,10 @@ mod tests {
         );
 
         assert_eq!(value["type"], "Update");
-        assert_eq!(value["id"], "https://example.test/users/alice#updates/42");
+        assert_eq!(
+            value["id"],
+            "https://example.test/users/alice#updates/42000000"
+        );
         assert_eq!(value["actor"], "https://example.test/users/alice");
         assert_eq!(value["to"], json!([PUBLIC_ADDRESS]));
         assert_eq!(value["object"]["icon"]["type"], "Image");

@@ -41,6 +41,21 @@ Correct accepted-follow preference updates, delivery cancellation ordering, and 
 - Independent read-only correctness/architecture review found no blockers. Secunda Clippy passed. `cargo test --locked --all-targets --all-features` passed 406 tests with the pinned-source link temporarily absent (ignored DB/source gates are not counted as passes).
 - Deferred performance observation: the all-earlier correlated scan may merit a stream-expression partial index after backlog measurement; queue-performance work remains outside this fix.
 
-### Remaining work
+### R10 — distinct durable Update identities
 
-- R10 follows as a separate red/green commit. Regression tests live under `tests/workers/` to minimize shared-test conflicts; `tests/workers.rs` only declares the lifecycle module.
+- Status and actor Update generation share an ID constructor using the persisted microsecond version. Delivery freshness checks share the same version/ID predicate. Existing queued seconds-format IDs remain valid for their original current version; delivery sends their stored body unchanged rather than rewriting IDs on retry. Legacy jobs without microsecond metadata retain their previous ID-only freshness limitation; new producers supply metadata.
+- Added two complete sender/receiver lifecycles in `tests/workers/update_versions.rs`. The fixture harness clones an independent receiver database before test connections open, within its PID-isolated PostgreSQL container. Tests use different origins and actor rows, real signed delivery, the real inbox router, and ingress workers. Status Create first materializes a distinct receiver row. Both status/profile version A and B are exactly one microsecond apart in the same second, and A is applied before B exists.
+- After accepting A, receiver middleware returns a simulated transient 503. The sender retries the exact stored JSON bytes and ID after receiver application; the receiver accepts the duplicate without another ingress job. B must then be accepted and applied with a different activity ID, the same object ID, changed content, and no leftover delivery/ingress jobs. No captured wire payload is rewritten.
+- Secunda RED: `CARGO_BUILD_JOBS=2 LIFECYCLE_FILTER=update_versions tools/.lifecycles-fixture worker-test` failed both tests at `distinct delivered same-second versions must not conflict at the receiver` (409 instead of 202 for B), after A and its retry succeeded (`target/r10-red.log`). GREEN: the same command passed both tests (`target/r10-green.log`).
+- Independent read-only correctness/architecture review found no blockers. Small setup-review findings were addressed before RED (explicit actor ID scheme and cleanup after assertion panics). The precommit review covered the shared constructor/freshness predicate, unchanged legacy retry bodies, receiver database isolation, convergence assertions, and harness cleanup.
+
+### Final verification and scope
+
+All commands below ran only in `/home/lain/rustodon-parity/lifecycles` on `lain@secunda.local`, with `CARGO_BUILD_JOBS=2`:
+
+- `tools/mastodon-fixture worker-test`: **55 passed**, including all six new lifecycle regressions and existing retry, ordering, distribution, and ingress tests (`target/lifecycles-workers.log`).
+- `tools/mastodon-fixture schema-read-test`: **37 passed** (`target/lifecycles-schema.log`).
+- `cargo test --locked --all-targets --all-features`: **406 passed**, with source/DB-dependent ignored gates excluded from the pass count (`target/lifecycles-unit-final.log`). The pinned-source symlink was temporarily absent for this clean-source run and restored afterward.
+- `cargo fmt --all --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, and `tools/tests/mastodon-fixture-images-test`: passed. Clippy also ran with the source link absent (`target/lifecycles-clippy-final.log`).
+
+Limits: the R10 profile is image-free and the source status has a persisted HTTP URI. A generated `tag:` atomUri hit a separate existing writer relevance-parser rejection during test setup; that ingress defect was not changed here. These tests prove Rustodon receiver convergence, not a Mastodon/Pleroma peer matrix. No live instance data, environment, or credentials were accessed; the shared user checkout and pinned reference were not modified. Indexes remain untouched for the parent to manage.

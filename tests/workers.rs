@@ -8405,7 +8405,7 @@ async fn activitypub_status_update_and_delete_distribution_are_durable()
         update_body["id"],
         format!(
             "{status_activity_uri}#updates/{}",
-            edited_at.and_utc().timestamp()
+            edited_at.and_utc().timestamp_micros()
         )
     );
     assert_eq!(update_body["object"]["content"], "<p>worker updated</p>");
@@ -9050,7 +9050,7 @@ async fn activitypub_account_updates_are_fanned_out_and_stale_jobs_are_fenced()
         update_body["id"],
         format!(
             "https://fixture-v4-6-5.rustodon.invalid/ap/users/{ACCOUNT}#updates/{}",
-            updated_at.and_utc().timestamp()
+            updated_at.and_utc().timestamp_micros()
         )
     );
 
