@@ -2514,22 +2514,8 @@ mod tests {
         })
     }
 
-    #[cfg(feature = "test-support")]
     fn fixture_private_key() -> String {
-        let source =
-            include_str!("../target/mastodon-v4.6.5/spec/requests/signature_verification_spec.rb");
-        let start = source
-            .find("-----BEGIN RSA PRIVATE KEY-----")
-            .expect("Mastodon test key should have a PEM header");
-        let end = source[start..]
-            .find("-----END RSA PRIVATE KEY-----")
-            .map(|offset| start + offset + "-----END RSA PRIVATE KEY-----".len())
-            .expect("Mastodon test key should have a PEM footer");
-        source[start..end]
-            .lines()
-            .map(str::trim)
-            .collect::<Vec<_>>()
-            .join("\n")
+        include_str!("../tests/fixtures/http-signature-private.pem").to_owned()
     }
 
     #[test]
@@ -3228,20 +3214,7 @@ mod tests {
 
     #[test]
     fn signed_get_headers_bind_host_date_and_query_target() {
-        let source =
-            include_str!("../target/mastodon-v4.6.5/spec/requests/signature_verification_spec.rb");
-        let start = source
-            .find("-----BEGIN RSA PRIVATE KEY-----")
-            .expect("Mastodon test key should have a PEM header");
-        let end = source[start..]
-            .find("-----END RSA PRIVATE KEY-----")
-            .map(|offset| start + offset + "-----END RSA PRIVATE KEY-----".len())
-            .expect("Mastodon test key should have a PEM footer");
-        let private_key = source[start..end]
-            .lines()
-            .map(str::trim)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let private_key = fixture_private_key();
         let signer = HttpSignatureSigner {
             key_id: "https://local.example/actor#main-key",
             private_key_pem: &private_key,
@@ -3261,20 +3234,7 @@ mod tests {
 
     #[test]
     fn signed_post_headers_bind_host_date_digest_and_target() {
-        let source =
-            include_str!("../target/mastodon-v4.6.5/spec/requests/signature_verification_spec.rb");
-        let start = source
-            .find("-----BEGIN RSA PRIVATE KEY-----")
-            .expect("Mastodon test key should have a PEM header");
-        let end = source[start..]
-            .find("-----END RSA PRIVATE KEY-----")
-            .map(|offset| start + offset + "-----END RSA PRIVATE KEY-----".len())
-            .expect("Mastodon test key should have a PEM footer");
-        let private_key = source[start..end]
-            .lines()
-            .map(str::trim)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let private_key = fixture_private_key();
         let signer = HttpSignatureSigner {
             key_id: "https://local.example/actor#main-key",
             private_key_pem: &private_key,

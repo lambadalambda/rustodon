@@ -413,8 +413,8 @@ fn safe_open_rejects_symlinks_in_the_root_path() {
 
 #[test]
 fn account_media_processing_uses_rails_profile_geometries() {
-    let avatar_bytes = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/avatar.gif")
-        .expect("Mastodon avatar fixture exists");
+    let avatar_bytes =
+        fs::read("tests/fixtures/media/avatar.gif").expect("Mastodon avatar fixture exists");
     let avatar = prepare_account_media(
         PaperclipAttachment::AccountAvatar,
         101,
@@ -443,8 +443,8 @@ fn account_media_processing_uses_rails_profile_geometries() {
         .count();
     assert_eq!(output_frames, source_frames.min(3000));
 
-    let header_bytes = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/attachment.jpg")
-        .expect("Mastodon header fixture exists");
+    let header_bytes =
+        fs::read("tests/fixtures/media/attachment.jpg").expect("Mastodon header fixture exists");
     let header = prepare_account_media(
         PaperclipAttachment::AccountHeader,
         101,
@@ -456,8 +456,8 @@ fn account_media_processing_uses_rails_profile_geometries() {
     assert_eq!((header.width, header.height), (600, 400));
     assert!(header.static_bytes.is_none());
 
-    let png_bytes = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/emojo.png")
-        .expect("Mastodon PNG fixture exists");
+    let png_bytes =
+        fs::read("tests/fixtures/media/emojo.png").expect("Mastodon PNG fixture exists");
     let normalized = prepare_account_media(
         PaperclipAttachment::AccountAvatar,
         101,
@@ -472,8 +472,8 @@ fn account_media_processing_uses_rails_profile_geometries() {
 
 #[test]
 fn image_media_processing_builds_original_and_small_metadata() {
-    let bytes = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/attachment.jpg")
-        .expect("Mastodon media fixture exists");
+    let bytes =
+        fs::read("tests/fixtures/media/attachment.jpg").expect("Mastodon media fixture exists");
     let prepared = prepare_media_attachment(101, "attachment.jpg", "image/jpeg", &bytes)
         .expect("media fixture is valid");
 
@@ -501,8 +501,8 @@ fn image_media_processing_builds_original_and_small_metadata() {
 
 #[test]
 fn prepared_remote_media_writes_under_the_cache_prefix() {
-    let bytes = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/attachment.jpg")
-        .expect("Mastodon media fixture exists");
+    let bytes =
+        fs::read("tests/fixtures/media/attachment.jpg").expect("Mastodon media fixture exists");
     let prepared = prepare_media_attachment(101, "attachment.jpg", "image/jpeg", &bytes)
         .expect("media fixture is valid");
     let root_path = temp_root("remote-media");
@@ -543,8 +543,8 @@ fn prepared_remote_media_writes_under_the_cache_prefix() {
 
 #[test]
 fn prepared_media_write_removes_original_when_derivative_storage_fails() {
-    let bytes = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/attachment.jpg")
-        .expect("Mastodon media fixture exists");
+    let bytes =
+        fs::read("tests/fixtures/media/attachment.jpg").expect("Mastodon media fixture exists");
     let prepared = prepare_media_attachment(102, "attachment.jpg", "image/jpeg", &bytes)
         .expect("media fixture is valid");
     let root_path = temp_root("media-write-failure");
@@ -577,8 +577,8 @@ fn prepared_media_write_removes_original_when_derivative_storage_fails() {
 #[cfg(feature = "test-support")]
 #[test]
 fn prepared_media_write_recovers_after_injected_storage_full() {
-    let bytes = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/attachment.jpg")
-        .expect("Mastodon media fixture exists");
+    let bytes =
+        fs::read("tests/fixtures/media/attachment.jpg").expect("Mastodon media fixture exists");
     let prepared = prepare_media_attachment(103, "attachment.jpg", "image/jpeg", &bytes)
         .expect("media fixture is valid");
     let root_path = temp_root("media-write-storage-full");

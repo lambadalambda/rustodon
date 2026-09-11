@@ -49,3 +49,4 @@
 - [x] [Tear down follows from locally suspended remote actors](issues/prove-remote-suspension-follow-teardown.md)
 - [x] [Implement basic moderation and reconciliation](issues/implement-basic-moderation-and-reconciliation.md)
 - [x] [Review essential feature parity and federation robustness](issues/review-essential-feature-parity-and-federation-robustness.md)
+- [x] [Restore clean-checkout quality gates](issues/restore-clean-checkout-quality-gates.md)

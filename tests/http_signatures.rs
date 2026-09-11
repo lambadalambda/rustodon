@@ -1,4 +1,3 @@
-use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::{HeaderMap, HeaderValue, Method};
@@ -27,29 +26,7 @@ const POST_SIGNATURE: &str = concat!(
 );
 
 fn private_key() -> &'static str {
-    static PRIVATE_KEY: OnceLock<String> = OnceLock::new();
-    PRIVATE_KEY
-        .get_or_init(|| {
-            let source = include_str!(
-                "../target/mastodon-v4.6.5/spec/requests/signature_verification_spec.rb"
-            );
-            let start = source
-                .find("-----BEGIN RSA PRIVATE KEY-----")
-                .expect("Mastodon test key should have a PEM header");
-            let end = source[start..]
-                .find("-----END RSA PRIVATE KEY-----")
-                .map(|offset| start + offset + "-----END RSA PRIVATE KEY-----".len())
-                .expect("Mastodon test key should have a PEM footer");
-            format!(
-                "{}\n",
-                source[start..end]
-                    .lines()
-                    .map(str::trim)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        })
-        .as_str()
+    include_str!("fixtures/http-signature-private.pem")
 }
 
 fn public_key() -> String {
