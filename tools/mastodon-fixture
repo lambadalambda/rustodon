@@ -1007,10 +1007,15 @@ EOF
   owner_url="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
   writer_url="postgresql://$DIFFERENTIAL_WRITER:$DIFFERENTIAL_WRITER_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
 
+  if [ "${2:-}" = v2_account_search ]; then
+    set -- --features test-support --lib web::account_search_tests
+  else
+    set -- --test "${2:-mastodon_schema}"
+  fi
   RUSTODON_MASTODON_DATABASE_URL="$database_url" \
   RUSTODON_MASTODON_OWNER_DATABASE_URL="$owner_url" \
   RUSTODON_MASTODON_WRITER_DATABASE_URL="$writer_url" \
-    cargo test --locked --test "${2:-mastodon_schema}" -- --ignored --nocapture --test-threads=1
+    cargo test --locked "$@" -- --ignored --nocapture --test-threads=1
 
   finish_database
   printf 'read-only Rust schema integration passed for Mastodon %s\n' "$RELEASE"
@@ -2826,7 +2831,7 @@ case "$command" in
   schema-read-test)
     case "${1:-}" in
       '')
-        [ "$#" -eq 0 ] || die 'schema-read-test accepts only qualified_local_mentions, followed_hashtag_streams, public_oauth_revocation, or oauth_response_modes'
+        [ "$#" -eq 0 ] || die 'schema-read-test accepts only qualified_local_mentions, followed_hashtag_streams, public_oauth_revocation, oauth_response_modes, or v2_account_search'
         schema_read_test
         schema_read_test "$FIXTURE_DIR" saved_status_authorization
         schema_read_test "$FIXTURE_DIR" qualified_local_mentions
@@ -2834,11 +2839,11 @@ case "$command" in
         schema_read_test "$FIXTURE_DIR" public_oauth_revocation
         schema_read_test "$FIXTURE_DIR" oauth_response_modes
         ;;
-      qualified_local_mentions|followed_hashtag_streams|public_oauth_revocation|oauth_response_modes)
-        [ "$#" -eq 1 ] || die 'schema-read-test accepts only qualified_local_mentions, followed_hashtag_streams, public_oauth_revocation, or oauth_response_modes'
+      qualified_local_mentions|followed_hashtag_streams|public_oauth_revocation|oauth_response_modes|v2_account_search)
+        [ "$#" -eq 1 ] || die 'schema-read-test accepts only qualified_local_mentions, followed_hashtag_streams, public_oauth_revocation, oauth_response_modes, or v2_account_search'
         schema_read_test "$FIXTURE_DIR" "$1"
         ;;
-      *) die 'schema-read-test accepts only qualified_local_mentions, followed_hashtag_streams, public_oauth_revocation, or oauth_response_modes' ;;
+      *) die 'schema-read-test accepts only qualified_local_mentions, followed_hashtag_streams, public_oauth_revocation, oauth_response_modes, or v2_account_search' ;;
     esac
     ;;
   operational-schema-test)

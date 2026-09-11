@@ -8668,11 +8668,57 @@ async fn account_search(
     let Ok(limit) = limit_parameter(&rack, 40, 80) else {
         return framework_internal_error();
     };
-    if limit < 1 {
-        return json_response(StatusCode::OK, b"[]".to_vec());
+    match search_accounts(
+        &state,
+        &metadata,
+        Some(owner),
+        AccountSearchOptions {
+            query,
+            resolve: boolean_parameter(&rack, "resolve"),
+            following: boolean_parameter(&rack, "following"),
+            limit,
+            offset,
+        },
+    )
+    .await
+    {
+        Ok(accounts) => match serde_json::to_vec(&accounts) {
+            Ok(body) => json_response(StatusCode::OK, body),
+            Err(_) => internal_error(),
+        },
+        Err(response) => response,
     }
-    let resolve = boolean_parameter(&rack, "resolve");
-    let following = boolean_parameter(&rack, "following");
+}
+
+struct AccountSearchOptions<'a> {
+    query: Option<&'a str>,
+    resolve: bool,
+    following: bool,
+    limit: i64,
+    offset: i64,
+}
+
+// Endpoint authentication and parameter contracts stay in their handlers. Sharing the
+// resolver here keeps the domain policy, limits, signing and persistence identical.
+#[allow(clippy::too_many_lines)]
+async fn search_accounts(
+    state: &WebState,
+    metadata: &RequestMetadata,
+    owner: Option<i64>,
+    options: AccountSearchOptions<'_>,
+) -> Result<Vec<RestAccount>, Response<Body>> {
+    let AccountSearchOptions {
+        query,
+        resolve,
+        following,
+        limit,
+        offset,
+    } = options;
+    if limit < 1 || (following && owner.is_none()) {
+        return Ok(Vec::new());
+    }
+    // Optional-scope and application-only requests may read cached accounts, never resolve.
+    let resolve = resolve && owner.is_some();
     let remote_handle = resolve
         .then(|| remote_account_search_handle(query, &state.local_domain, offset))
         .flatten();
@@ -8684,25 +8730,25 @@ async fn account_search(
             .remote_domain_allowed(domain, state.instance_runtime.limited_federation)
             .await
         else {
-            return internal_error();
+            return Err(internal_error());
         };
         if !domain_allowed {
-            return json_response(
+            return Err(json_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 br#"{"error":"Remote account resolution is unavailable"}"#.to_vec(),
-            );
+            ));
         }
         let Ok(last_webfingered_at) = state
             .repository
             .rest_account_last_webfingered_at(username, domain)
             .await
         else {
-            return internal_error();
+            return Err(internal_error());
         };
         let fresh_after = Utc::now().naive_utc() - ChronoDuration::days(1);
         if last_webfingered_at.is_some_and(|value| value >= fresh_after) {
             state
-                .loader(Some(owner))
+                .loader(owner)
                 .account_search(query, false, following, limit, offset)
                 .await
         } else {
@@ -8716,20 +8762,20 @@ async fn account_search(
                 )
                 .await
             {
-                return rate_limited_response(limited);
+                return Err(rate_limited_response(limited));
             }
             let Ok(instance) = state.repository.account(-99).await else {
-                return internal_error();
+                return Err(internal_error());
             };
             let Some(instance) = instance else {
-                return internal_error();
+                return Err(internal_error());
             };
             let Some(private_key) = instance.private_key.as_ref().filter(|key| key.is_present())
             else {
-                return json_response(
+                return Err(json_response(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     br#"{"error":"Remote account resolution is unavailable"}"#.to_vec(),
-                );
+                ));
             };
             let key_id = format!(
                 "{}#main-key",
@@ -8746,17 +8792,17 @@ async fn account_search(
             {
                 Ok(actor) => actor,
                 Err(RemoteFetchError::DomainBudgetExceeded) => {
-                    return json_response(
+                    return Err(json_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         br#"{"error":"Remote account resolution is temporarily unavailable"}"#
                             .to_vec(),
-                    );
+                    ));
                 }
                 Err(_) => {
-                    return json_response(
+                    return Err(json_response(
                         StatusCode::UNPROCESSABLE_ENTITY,
                         br#"{"error":"Remote account resolution is unavailable"}"#.to_vec(),
-                    );
+                    ));
                 }
             };
             let actor_username = actor.username.clone();
@@ -8770,40 +8816,34 @@ async fn account_search(
                 .await
                 .is_err()
             {
-                return internal_error();
+                return Err(internal_error());
             }
             state
-                .loader(Some(owner))
+                .loader(owner)
                 .account_search(query, false, following, limit, offset)
                 .await
         }
     } else {
         state
-            .loader(Some(owner))
+            .loader(owner)
             .account_search(query, resolve, following, limit, offset)
             .await
     } {
         Ok(accounts) => accounts,
         Err(AccountSearchError::RemoteResolutionUnsupported) => {
-            return json_response(
+            return Err(json_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 br#"{"error":"Remote account resolution is unavailable"}"#.to_vec(),
-            );
+            ));
         }
-        Err(AccountSearchError::Database(_)) => return internal_error(),
+        Err(AccountSearchError::Database(_)) => return Err(internal_error()),
     };
     let serializer = state.serializer();
-    let values = accounts
+    accounts
         .iter()
         .map(|account| serializer.account(account))
-        .collect::<Result<Vec<_>, _>>();
-    match values
-        .ok()
-        .and_then(|values| serde_json::to_vec(&values).ok())
-    {
-        Some(body) => json_response(StatusCode::OK, body),
-        None => internal_error(),
-    }
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| internal_error())
 }
 
 async fn announcements(State(state): State<WebState>, headers: HeaderMap) -> Response<Body> {
@@ -8829,6 +8869,7 @@ async fn announcements(State(state): State<WebState>, headers: HeaderMap) -> Res
 
 async fn search_v2(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Extension(rack): Extension<RackParameters>,
     headers: HeaderMap,
 ) -> Response<Body> {
@@ -8862,6 +8903,27 @@ async fn search_v2(
     } else {
         0
     };
+    let accounts = if search_type.is_none_or(|value| value == "accounts") && limit > 0 {
+        match search_accounts(
+            &state,
+            &metadata,
+            owner,
+            AccountSearchOptions {
+                query: Some(query),
+                resolve: boolean_parameter(&rack, "resolve"),
+                following: boolean_parameter(&rack, "following"),
+                limit,
+                offset,
+            },
+        )
+        .await
+        {
+            Ok(accounts) => accounts,
+            Err(response) => return response,
+        }
+    } else {
+        Vec::new()
+    };
     let exclude_unreviewed = boolean_parameter(&rack, "exclude_unreviewed");
     let tags = if search_type.is_none_or(|value| value == "hashtags") && limit > 0 {
         match state
@@ -8883,7 +8945,7 @@ async fn search_v2(
     json_response(
         StatusCode::OK,
         serde_json::to_vec(&serde_json::json!({
-            "accounts": [],
+            "accounts": accounts,
             "statuses": [],
             "hashtags": hashtags,
             "collections": [],
@@ -18132,6 +18194,9 @@ fn framework_internal_error() -> Response<Body> {
         ))
         .expect("static framework error response is valid")
 }
+
+#[cfg(all(test, feature = "test-support"))]
+mod account_search_tests;
 
 #[cfg(test)]
 mod tests {
