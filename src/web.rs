@@ -722,6 +722,40 @@ impl BrowserLoginLimiter {
 }
 
 #[derive(Clone, Default)]
+struct BrowserReauthenticationLimiter {
+    limiter: AttemptLimiter,
+}
+
+impl BrowserReauthenticationLimiter {
+    fn keys(client_ip: IpAddr, user_id: i64) -> [(String, usize, StdDuration); 2] {
+        [
+            (
+                format!(
+                    "browser_reauthentication:ip:{}",
+                    attempt_ip_bucket(client_ip)
+                ),
+                25,
+                StdDuration::from_mins(5),
+            ),
+            (
+                format!("browser_reauthentication:user:{user_id}"),
+                10,
+                StdDuration::from_hours(1),
+            ),
+        ]
+    }
+
+    async fn check_shared(
+        &self,
+        shared: Option<&SharedRateLimiter>,
+        client_ip: IpAddr,
+        user_id: i64,
+    ) -> Result<(), RateLimitExceeded> {
+        try_rate_limit(&self.limiter, shared, Self::keys(client_ip, user_id)).await
+    }
+}
+
+#[derive(Clone, Default)]
 struct OAuthApplicationLimiter {
     limiter: AttemptLimiter,
 }
@@ -2313,6 +2347,7 @@ pub struct WebState {
     mail_config: Option<MailConfig>,
     password_reset_limiter: PasswordResetLimiter,
     browser_login_limiter: BrowserLoginLimiter,
+    browser_reauthentication_limiter: BrowserReauthenticationLimiter,
     oauth_application_limiter: OAuthApplicationLimiter,
     media_proxy_limiter: MediaProxyLimiter,
     media_upload_limiter: MediaUploadLimiter,
@@ -2385,6 +2420,7 @@ impl WebState {
             mail_config: None,
             password_reset_limiter: PasswordResetLimiter::default(),
             browser_login_limiter: BrowserLoginLimiter::default(),
+            browser_reauthentication_limiter: BrowserReauthenticationLimiter::default(),
             oauth_application_limiter: OAuthApplicationLimiter::default(),
             media_proxy_limiter: MediaProxyLimiter::default(),
             media_upload_limiter: MediaUploadLimiter::default(),
@@ -9836,8 +9872,36 @@ fn browser_two_factor_methods_form(user: &User, csrf_token: &str) -> String {
     )
 }
 
+// Reserve a shared budget before any sensitive-settings password verification. Count
+// successes too: changing route, session, or worker must not reset a guessing budget.
+async fn check_browser_reauthentication(
+    state: &WebState,
+    headers: &HeaderMap,
+    client_ip: IpAddr,
+    user_id: i64,
+) -> Result<(), Response<Body>> {
+    match state
+        .browser_reauthentication_limiter
+        .check_shared(state.shared_rate_limiter.as_ref(), client_ip, user_id)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(limited) => {
+            let mut response = browser_settings_error_response(
+                state,
+                headers,
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many password challenges. Please try again later.",
+            );
+            add_rate_limit_headers(&mut response, limited);
+            Err(response)
+        }
+    }
+}
+
 async fn browser_two_factor_disable(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Extension(parameters): Extension<RackParameters>,
     headers: HeaderMap,
 ) -> Response<Body> {
@@ -9866,6 +9930,11 @@ async fn browser_two_factor_disable(
             "Enter your current password.",
         );
     };
+    if let Err(response) =
+        check_browser_reauthentication(&state, &headers, metadata.client_ip, session.user_id).await
+    {
+        return response;
+    }
     let Some(writer) = state.write_repository.as_ref() else {
         return internal_error();
     };
@@ -9914,6 +9983,7 @@ async fn browser_otp_authentication_page(
 
 async fn browser_otp_authentication_start(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Extension(parameters): Extension<RackParameters>,
     headers: HeaderMap,
 ) -> Response<Body> {
@@ -9950,6 +10020,11 @@ async fn browser_otp_authentication_start(
     if user.otp_required_for_login {
         return browser_redirect_response("/settings/two_factor_authentication_methods");
     }
+    if let Err(response) =
+        check_browser_reauthentication(&state, &headers, metadata.client_ip, session.user_id).await
+    {
+        return response;
+    }
     if !verify_password(current_password, user.encrypted_password.as_str()) {
         return browser_otp_setup_page_response(
             &state,
@@ -9981,6 +10056,7 @@ async fn browser_otp_confirmation_redirect(
 
 async fn browser_otp_confirmation(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Extension(parameters): Extension<RackParameters>,
     headers: HeaderMap,
 ) -> Response<Body> {
@@ -10021,6 +10097,11 @@ async fn browser_otp_confirmation(
             Some("Enter your current password."),
         );
     };
+    if let Err(response) =
+        check_browser_reauthentication(&state, &headers, metadata.client_ip, session.user_id).await
+    {
+        return response;
+    }
     if !verify_password(current_password, user.encrypted_password.as_str()) {
         return browser_otp_confirmation_page_response(
             &state,
@@ -10079,6 +10160,7 @@ async fn browser_otp_confirmation(
 
 async fn browser_two_factor_recovery_codes(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Extension(parameters): Extension<RackParameters>,
     headers: HeaderMap,
 ) -> Response<Body> {
@@ -10107,6 +10189,11 @@ async fn browser_two_factor_recovery_codes(
             "Enter your current password.",
         );
     };
+    if let Err(response) =
+        check_browser_reauthentication(&state, &headers, metadata.client_ip, session.user_id).await
+    {
+        return response;
+    }
     let Some(writer) = state.write_repository.as_ref() else {
         return internal_error();
     };
@@ -10291,6 +10378,7 @@ async fn browser_security_page(
 
 async fn browser_security_update(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Extension(parameters): Extension<RackParameters>,
     headers: HeaderMap,
 ) -> Response<Body> {
@@ -10334,6 +10422,11 @@ async fn browser_security_update(
             StatusCode::UNPROCESSABLE_ENTITY,
             "The new password confirmation does not match.",
         );
+    }
+    if let Err(response) =
+        check_browser_reauthentication(&state, &headers, metadata.client_ip, session.user_id).await
+    {
+        return response;
     }
     let Some(writer) = state.write_repository.as_ref() else {
         return internal_error();
@@ -10389,6 +10482,7 @@ async fn browser_delete_page(State(state): State<WebState>, headers: HeaderMap) 
 
 async fn browser_delete(
     State(state): State<WebState>,
+    Extension(metadata): Extension<RequestMetadata>,
     Extension(parameters): Extension<RackParameters>,
     headers: HeaderMap,
 ) -> Response<Body> {
@@ -10420,6 +10514,11 @@ async fn browser_delete(
             &user,
             Some("The deletion form could not be verified. Please try again."),
         );
+    }
+    if let Err(response) =
+        check_browser_reauthentication(&state, &headers, metadata.client_ip, session.user_id).await
+    {
+        return response;
     }
     let challenge_passed = if user.encrypted_password.is_present() {
         browser_scalar(&parameters, "password")

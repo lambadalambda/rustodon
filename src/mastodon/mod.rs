@@ -52,3 +52,6 @@ pub use write_repository::{
     StatusUpdate, StatusWriteOutcome, VerifiedPassword, WriteError, WriteOptions, WriteOutcome,
     WriteRepository,
 };
+
+#[cfg(feature = "test-support")]
+pub use auth::password_verification_count;

@@ -48,3 +48,38 @@ CARGO_BUILD_JOBS=4 cargo clippy --locked --all-targets --all-features -- -D warn
 Clippy initially flagged the newly added timeout's `from_secs(120)`; changed to `from_mins(2)` and rerun. The fixture harness uses disposable PID-named containers/clones, not live data. The pinned upstream source is the existing read-only remote checkout `/home/lain/repos/rustodon/target/mastodon-v4.6.5` at `1440d55b139e39ec722c2a3db7f60b66cd889048`, symlinked in the mirror's target; absent local `/workspace/rustodon/target/mastodon-v4.6.5` was not fetched. New race assertions are Rust regression proofs, not a new Rails differential claim.
 
 Sync uses `rsync -az --exclude='/.git' --exclude='/target/' --exclude='/.local-instance/' --exclude='/.local-instance-backups/' --exclude='/.env*' ./ lain@secunda.local:/home/lain/rustodon-parity/reauth/`, without `--delete`. Only changed Rust source files formatted remotely are retrieved. No local builds/tests/format/lint, live instance/env secrets, OAuth client fixes, upstream edits, or remote user tracked-config changes. Issue indexes are intentionally untouched.
+
+## R13 implementation and evidence
+
+- Added one shared reauthentication policy: **10 attempts/user/hour** and **25 attempts/IP bucket/5 minutes**, independent keys (not a user/IP pair). Existing IP normalization, PostgreSQL rate-limit transactions, deterministic lock ordering, fail-closed errors, expiry, and response headers are reused. Successful challenges also consume budget; switching route/session/worker does not clear it. This is a separate settings budget, not a change to login policy.
+- After session/CSRF validation and before password verification, all six sensitive-settings handlers reserve that budget: security password change, 2FA disable, recovery-code regeneration, OTP setup, OTP confirmation, and account deletion. Aliases share the guarded handlers. Denials render HTTP 429 with rate-limit and Retry-After headers. No public Mastodon schema change.
+- `browser_reauthentication_limits` starts **two independent WebStates/database pools/server tasks in one process**, with one fixture CSRF signing secret. Ten incorrect guesses rotate across six routes, both servers, and IP addresses; all six subsequently reject both correct and incorrect passwords. A test-support-only atomic counter observes entry to the actual `verify_password`/bcrypt boundary: limited requests do not increment it. Three more fixture users exhaust one IP's 25-attempt budget across both servers. A fresh user/IP can legitimately reauthenticate; SQL expiry of fixture windows restores legitimate access without sleeping.
+- RED: after ten incorrect challenges, `/settings/security` still returned **422 instead of 429**; 0 passed, 1 failed. Initial test compilation required converting a harness error to the test's boxed error; corrected before the behavioral RED. GREEN: 1 passed; output confirms all six routes blocked before bcrypt, shared user/IP budgets, expiry, and legitimate reauthentication.
+- Independent read-only review found no R13 correctness/architecture blockers. The routine no-case fixture invocation now enables `test-support`, as the named invocation does, so this regression is not silently omitted. Remaining nonblocking test constraint: exhaustion assertions use the existing real fixed-window clock and can cross a five-minute/hour boundary; explicit expiry is deterministic. Bare nonproduction `WebState::new` still has the pre-existing local-limiter fallback; production queue/writer wiring installs shared enforcement and shared errors never fall back locally.
+
+Exact RED/GREEN command, both before and after the limiting fix:
+
+```sh
+ssh lain@secunda.local 'bash -lc "cd /home/lain/rustodon-parity/reauth && CARGO_BUILD_JOBS=4 tools/mastodon-fixture differential-test browser_reauthentication_limits"'
+```
+
+The named harness runs `cargo test --locked --features test-support --test differential browser_reauthentication_limits -- --ignored --exact --nocapture --test-threads=1` with its disposable fixture URLs. GREEN output:
+
+```text
+user budget: 10 challenges shared across six routes/two instances/IP changes; all six blocked before bcrypt
+IP budget: 25 challenges shared across three users/two instances; blocked before bcrypt; expiry and legitimate reauthentication work
+test result: ok. 1 passed; 0 failed
+```
+
+Final remote checks (same SSH `bash -lc` wrapper/directory as above):
+
+```sh
+cargo fmt --check
+CARGO_BUILD_JOBS=4 tools/mastodon-fixture differential-test browser_recovery_fences
+CARGO_BUILD_JOBS=4 tools/mastodon-fixture differential-test browser_two_factor_management
+CARGO_BUILD_JOBS=4 tools/mastodon-fixture differential-test account_settings
+CARGO_BUILD_JOBS=4 cargo test --locked --all-targets --all-features
+CARGO_BUILD_JOBS=4 cargo clippy --locked --all-targets --all-features -- -D warnings
+```
+
+Results: all three restored-fixture cases passed (1 each); full ordinary Cargo suite **406 passed, 0 failed, 127 ignored**; rustfmt and warnings-denied Clippy passed. Ignored integration cases are not claimed executed except the explicit fixture cases recorded here and under R03. `cargo fmt` ran remotely before verification; only changed formatted Rust files were retrieved. R03/R13 acceptance is implemented and verified, but this detail remains linked from the open index because the requested scope excludes index/archive edits. No new Rails differential behavior is claimed for the Rust-only security regressions.

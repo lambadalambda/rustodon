@@ -30,8 +30,21 @@ impl fmt::Display for AuthenticationFailure {
 
 impl std::error::Error for AuthenticationFailure {}
 
+#[cfg(feature = "test-support")]
+static PASSWORD_VERIFICATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Test-only observation of entries to the bcrypt password-verification boundary.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn password_verification_count() -> usize {
+    PASSWORD_VERIFICATIONS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 #[must_use]
 pub fn verify_password(password: &str, encrypted_password: &str) -> bool {
+    #[cfg(feature = "test-support")]
+    PASSWORD_VERIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     verify_bcrypt(password, encrypted_password).unwrap_or(false)
 }
 

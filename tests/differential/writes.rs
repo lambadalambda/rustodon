@@ -73,14 +73,14 @@ const ACTIVE_RECORD_DETERMINISTIC_KEY: &str = "11111111111111111111111111111111"
 const ACTIVE_RECORD_DERIVATION_SALT: &str = "22222222222222222222222222222222";
 
 #[derive(Clone, Debug)]
-struct BrowserFormState {
+pub(super) struct BrowserFormState {
     session_cookie: Option<String>,
     csrf_cookie: Option<String>,
     csrf_token: Option<String>,
 }
 
 impl BrowserFormState {
-    fn new(session_id: Option<&str>) -> Self {
+    pub(super) fn new(session_id: Option<&str>) -> Self {
         Self {
             session_cookie: session_id.map(|id| format!("_mastodon_session={id}")),
             csrf_cookie: None,
@@ -88,7 +88,7 @@ impl BrowserFormState {
         }
     }
 
-    fn cookie_header(&self) -> String {
+    pub(super) fn cookie_header(&self) -> String {
         [self.session_cookie.as_deref(), self.csrf_cookie.as_deref()]
             .into_iter()
             .flatten()
@@ -123,7 +123,7 @@ impl BrowserFormState {
         Ok(())
     }
 
-    fn csrf_token(&self) -> Result<&str, Box<dyn Error>> {
+    pub(super) fn csrf_token(&self) -> Result<&str, Box<dyn Error>> {
         self.csrf_token
             .as_deref()
             .ok_or_else(|| "browser flow has no rendered CSRF token".into())
@@ -5412,7 +5412,7 @@ fn browser_form_request(
     Ok(RequestSpec::new(method, path, None, headers, body)?)
 }
 
-async fn load_browser_form(
+pub(super) async fn load_browser_form(
     target: &Url,
     path: &str,
     state: &mut BrowserFormState,

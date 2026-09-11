@@ -7,6 +7,8 @@ mod differential {
     pub mod normalization;
     pub mod read_only;
     pub mod reauth;
+    #[cfg(feature = "test-support")]
+    pub mod reauth_limits;
     pub mod safety;
     pub mod writes;
 }
@@ -7065,6 +7067,19 @@ async fn browser_recovery_fences() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::timeout(
         std::time::Duration::from_mins(2),
         differential::reauth::recovery_fences(config),
+    )
+    .await?
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "requires guarded PostgreSQL clones from tools/mastodon-fixture"]
+async fn browser_reauthentication_limits() -> Result<(), Box<dyn std::error::Error>> {
+    let config =
+        DifferentialConfig::from_process_environment(&PathBuf::from(env!("CARGO_MANIFEST_DIR")))?;
+    tokio::time::timeout(
+        std::time::Duration::from_mins(3),
+        differential::reauth_limits::run(config),
     )
     .await?
 }
