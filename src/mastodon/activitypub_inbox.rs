@@ -451,6 +451,7 @@ pub(crate) fn validate_note_object(
         }
     }
     if let Some(value) = object.get("summary")
+        && !value.is_null()
         && value
             .as_str()
             .is_none_or(|summary| summary.chars().count() > 20 * 1024)
@@ -931,6 +932,34 @@ mod tests {
                 && object_uri == "https://remote.example/statuses/1"
                 && activity["type"] == "Delete"
         ));
+    }
+
+    #[test]
+    fn note_summary_rejects_non_text_and_oversized_values() {
+        for summary in [
+            json!(false),
+            json!(7),
+            json!([]),
+            json!({}),
+            json!("x".repeat(20 * 1024 + 1)),
+        ] {
+            let activity = json!({
+                "id": "https://remote.example/activities/create-1",
+                "type": "Create",
+                "actor": "https://remote.example/users/alice",
+                "object": {
+                    "id": "https://remote.example/statuses/1",
+                    "type": "Note",
+                    "attributedTo": "https://remote.example/users/alice",
+                    "content": "<p>Hello</p>",
+                    "summary": summary
+                }
+            });
+            assert_eq!(
+                parse_activity(&activity.to_string()),
+                Err(InboxParseError::Activity)
+            );
+        }
     }
 
     #[test]

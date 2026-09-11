@@ -2128,6 +2128,38 @@ mod tests {
     }
 
     #[test]
+    fn serialized_notes_round_trip_through_inbox_with_and_without_content_warnings() {
+        use crate::mastodon::activitypub_inbox::{InboxActivity, parse_activity};
+
+        let origin = url::Url::parse("https://example.test/").expect("valid origin");
+        let account = account(Some(AccountIdScheme::Username));
+        for spoiler_text in ["", "Content warning"] {
+            let mut status = status();
+            status.spoiler_text = spoiler_text.to_owned();
+            let object = basic_note(&origin, &account, &status);
+            assert_eq!(object["summary"].is_null(), spoiler_text.is_empty());
+            let create = create(&origin, &account, &status, object.clone());
+            assert!(matches!(
+                parse_activity(&create.to_string()).expect("serialized Create must parse"),
+                InboxActivity::CreateNote { object: parsed, .. } if parsed == object
+            ));
+
+            status.edited_at = Some(status.updated_at + chrono::Duration::seconds(1));
+            let object = basic_note(&origin, &account, &status);
+            let update = update_with_uris(
+                "https://example.test/users/alice/statuses/7#updates/1",
+                "https://example.test/users/alice",
+                status.edited_at.expect("edit timestamp"),
+                object.clone(),
+            );
+            assert!(matches!(
+                parse_activity(&update.to_string()).expect("serialized Update must parse"),
+                InboxActivity::UpdateNote { object: parsed, .. } if parsed == object
+            ));
+        }
+    }
+
+    #[test]
     fn create_activity_wraps_a_note_with_the_local_actor_and_activity_id() {
         let origin = url::Url::parse("https://example.test/").expect("valid origin");
         let account = account(Some(AccountIdScheme::Username));

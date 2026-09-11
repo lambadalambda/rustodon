@@ -5073,6 +5073,7 @@ async fn activitypub_note_create_update_and_delete_are_processed_idempotently()
             "published": "2026-08-25T12:00:00Z",
              "url": "https://remote.fixture.invalid/@bob/123",
              "content": "<p>Initial remote note :party_blob:</p>",
+        "summary": null,
              "likes": {"type": "Collection", "totalItems": 7},
              "shares": {"type": "Collection", "totalItems": 3},
               "to": ["https://www.w3.org/ns/activitystreams#Public"],
@@ -5107,6 +5108,7 @@ async fn activitypub_note_create_update_and_delete_are_processed_idempotently()
             "updated": "2026-08-25T12:01:00Z",
             "url": "https://remote.fixture.invalid/@bob/123",
             "content": "<p>Edited remote note :party_blob:</p>",
+        "summary": null,
              "to": ["https://remote.fixture.invalid/users/bob/followers"],
             "cc": [],
             "tag": [{
@@ -6075,6 +6077,7 @@ async fn uri_only_create_is_deduplicated_retried_materialized_and_replayed()
         "published": "2026-08-25T12:20:00Z",
         "inReplyTo": parent_uri,
         "content": "<p>Fetched durable Note</p>",
+        "summary": null,
         "to": [
             "https://fixture-v4-6-5.rustodon.invalid/users/moderator",
             "https://fixture-v4-6-5.rustodon.invalid/users/api_moderator"
@@ -14050,6 +14053,7 @@ async fn activitypub_unknown_announce_target_is_fetched_and_embedded_self_boost_
         "attributedTo": ACTOR,
         "published": "2026-08-25T12:10:00Z",
         "content": "<p>Fetched before the Announce</p>",
+        "summary": null,
         "to": ["https://www.w3.org/ns/activitystreams#Public"],
         "cc": [],
         "tag": [],
@@ -14097,6 +14101,7 @@ async fn activitypub_unknown_announce_target_is_fetched_and_embedded_self_boost_
             "attributedTo": ACTOR,
             "published": "2026-08-25T12:12:00Z",
             "content": "<p>Embedded self-boost</p>",
+        "summary": null,
             "to": ["https://www.w3.org/ns/activitystreams#Public"],
             "cc": [],
             "tag": [],
