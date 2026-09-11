@@ -131,3 +131,41 @@ No live-instance files, credentials, production roles, or sibling target were
 accessed or changed. Profile-media sibling work remains separate; this repair
 adds no account grants. Issue remains open for parent-managed deployment/replay
 verification of job 472 and the original child/parent relationship.
+
+## Parent integration checkpoint — Secunda unavailable
+
+- Main integrates emoji privileges (`0f32a3e`), raw-GIF REST rendering (`21f6b08`),
+  shaped API collection reads (`230c26d`) and profile-media discovery/cache/refresh
+  (`f1d8754`, `d3a3f85`, `2cb5659`). One module-declaration merge conflict retained
+  both new worker test modules.
+- Checksum-verified combined source was tested in `/home/lain/rustodon-parity/main`.
+  Formatting, ordinary all-target/all-feature tests and strict Clippy passed.
+  Logs: `/home/lain/rustodon-parity/combined-follow-repairs/{fmt,tests,clippy}.log`.
+- Combined workers initially passed 70/71; actor deletion's old test inspected disk
+  before draining the new durable Maintenance cleanup. Reviewed test-only correction
+  `5b1437f` asserts exact retained cleanup paths, dispatches/acknowledges both jobs,
+  and retains all physical-file assertions. Profile worktree full workers then
+  passed 70/70; its separate readiness phase cannot certify combined grants.
+- Required remaining combined gates after syncing the corrected test: formatting,
+  Clippy, full worker fixture including lifecycle readiness, startup fixture, and
+  the API HTTP fixture documented in the API issue. Ordinary tests passed before
+  this test-only correction. Do not describe the combined deployment gate as green.
+- Secunda SSH became unresponsive and `secunda.local` then failed DNS resolution;
+  parent confirmed and asked the user to restore the host. No new image, live
+  grant changes, cutover or recovery occurred for this repair set.
+- Live applications still use `f9b6af7` image
+  `da842de6c91857674c18051c2efdba8bc14297184ff324d91d9cbe1f5d99381a`.
+  Job 472 exhausted four attempts and is dead-lettered with the same persistence
+  error. Parent prepared a narrowly guarded replay, not executed.
+- Locally retained grant-aware `redeploy-application.sh` accepts optional apply/
+  inverse SQL files. Old preflight/backup precede stop; transactional grant apply
+  precedes new preflight/start. If apply completion is uncertain, it does not race
+  an inverse or restart either app: it retains the lock for manual backend/grant
+  reconciliation. Confirmed-apply failures remove candidates, revert privileges,
+  and restore original IDs before starting. Exact additive/inverse emoji scripts
+  were independently reviewed; no profile grant delta is required.
+- Eight Secunda mock safety cases passed in
+  `/home/lain/rustodon-parity/grant-deploy-check/`: success, apply failure,
+  surviving delayed apply after client failure, post-apply/pre-confirmation signal,
+  candidate preflight failure, partial creation, start failure and inverse failure.
+  These are mock evidence, not live rollback/restore tests.
