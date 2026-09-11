@@ -2819,9 +2819,19 @@ case "$command" in
     restore_verify "${1:-$FIXTURE_DIR}"
     ;;
   schema-read-test)
-    [ "$#" -eq 0 ] || die 'schema-read-test takes no arguments'
-    schema_read_test
-    schema_read_test "$FIXTURE_DIR" saved_status_authorization
+    case "${1:-}" in
+      '')
+        [ "$#" -eq 0 ] || die 'schema-read-test accepts only qualified_local_mentions'
+        schema_read_test
+        schema_read_test "$FIXTURE_DIR" saved_status_authorization
+        schema_read_test "$FIXTURE_DIR" qualified_local_mentions
+        ;;
+      qualified_local_mentions)
+        [ "$#" -eq 1 ] || die 'schema-read-test accepts only qualified_local_mentions'
+        schema_read_test "$FIXTURE_DIR" qualified_local_mentions
+        ;;
+      *) die 'schema-read-test accepts only qualified_local_mentions' ;;
+    esac
     ;;
   operational-schema-test)
     [ "$#" -eq 0 ] || die 'operational-schema-test takes no arguments'

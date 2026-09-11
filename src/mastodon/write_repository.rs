@@ -624,6 +624,7 @@ impl From<io::Error> for WriteError {
 #[derive(Clone)]
 pub struct WriteRepository {
     pool: PgPool,
+    local_domain: Option<String>,
     active_record_encryption: Option<ActiveRecordEncryptionConfig>,
     #[cfg(feature = "test-support")]
     local_media_cleanup_intent_fault: Option<Arc<AtomicBool>>,
@@ -668,6 +669,7 @@ impl WriteRepository {
             .await?;
         Ok(Self {
             pool,
+            local_domain: None,
             active_record_encryption: None,
             #[cfg(feature = "test-support")]
             local_media_cleanup_intent_fault: None,
@@ -678,10 +680,18 @@ impl WriteRepository {
     pub fn from_pool(pool: PgPool) -> Self {
         Self {
             pool,
+            local_domain: None,
             active_record_encryption: None,
             #[cfg(feature = "test-support")]
             local_media_cleanup_intent_fault: None,
         }
+    }
+
+    /// Configures the account domain used to resolve qualified local status mentions.
+    #[must_use]
+    pub fn with_local_domain(mut self, local_domain: impl Into<String>) -> Self {
+        self.local_domain = Some(local_domain.into());
+        self
     }
 
     #[must_use]
@@ -5936,8 +5946,14 @@ impl WriteRepository {
             &[],
         )
         .await?;
-        let mention_targets =
-            insert_status_mentions(&mut transaction, status_id, account_id, text).await?;
+        let mention_targets = insert_status_mentions(
+            &mut transaction,
+            status_id,
+            account_id,
+            text,
+            self.local_domain.as_deref(),
+        )
+        .await?;
         if visibility == 3
             && let Some((conversation_id, lock_version)) =
                 upsert_notification_conversation(&mut transaction, account_id, Some(status_id))
@@ -6208,7 +6224,14 @@ impl WriteRepository {
         let mention_targets = if current_text == next_text {
             Vec::new()
         } else {
-            insert_status_mentions(&mut transaction, status_id, account_id, &next_text).await?
+            insert_status_mentions(
+                &mut transaction,
+                status_id,
+                account_id,
+                &next_text,
+                self.local_domain.as_deref(),
+            )
+            .await?
         };
         let next_media_descriptions =
             media_descriptions(&mut transaction, status_id, &next_media_ids).await?;
@@ -13422,9 +13445,14 @@ async fn insert_status_mentions(
     status_id: i64,
     author_account_id: i64,
     text: &str,
+    local_domain: Option<&str>,
 ) -> Result<Vec<(i64, i64)>, WriteError> {
     let mut targets = Vec::new();
     for (username, domain) in status_mention_candidates(text) {
+        // Local accounts store NULL domains, even when the mention spells out LOCAL_DOMAIN.
+        let domain = domain
+            .as_deref()
+            .filter(|domain| !local_domain.is_some_and(|local| domain.eq_ignore_ascii_case(local)));
         let account_id = sqlx::query_scalar::<_, i64>(
             "SELECT account.id FROM accounts account \
              LEFT JOIN users account_user ON account_user.account_id = account.id \
@@ -13440,7 +13468,7 @@ async fn insert_status_mentions(
              LIMIT 1",
         )
         .bind(&username)
-        .bind(domain.as_deref())
+        .bind(domain)
         .bind(author_account_id)
         .fetch_optional(&mut **transaction)
         .await?;

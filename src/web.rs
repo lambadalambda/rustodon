@@ -2451,7 +2451,7 @@ impl WebState {
         if self.shared_rate_limiter.is_none() {
             self.shared_rate_limiter = Some(SharedRateLimiter::new(repository.pool().clone()));
         }
-        self.write_repository = Some(repository);
+        self.write_repository = Some(repository.with_local_domain(self.local_domain.clone()));
         self
     }
 
