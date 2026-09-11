@@ -33,3 +33,13 @@ Exercise the complete v1 federation profile against a pinned Mastodon 4.6.5 peer
   complete signature or secret was retained. This is the first live peer
   reproduction and the next investigation should isolate the signer-key
   resolution failure before attempting the bidirectional activity matrix.
+- A separate live mention delivery to Pleroma 2.10.2 at `lain.com` isolated a
+  concrete signer-key compatibility defect. Pleroma accepted the signed Create
+  with HTTP 200 but its valid signed actor GET received HTTP 401 because its
+  `internal.fetch` actor publishes a public-key PEM with an extra trailing LF;
+  the RSA parser classified that otherwise valid key as corrupt. Rustodon now
+  trims surrounding PEM whitespace at the centralized public-key parser, with
+  regression coverage. An idempotent replay preserving the original activity
+  ID then produced a Pleroma actor GET with HTTP 200, and `lain.com`'s public API
+  exposed the imported status under the original Rustodon object URI with the
+  intended local mention. No private key or complete signature was retained.
