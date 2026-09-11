@@ -474,6 +474,7 @@ async fn token_for(peer: &Peer, username: &str) -> Result<String> {
         .bind(username).fetch_one(&peer.pool).await?)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn private_note(
     root: &std::path::Path,
     run: &str,
@@ -981,6 +982,7 @@ fn profile_multipart(marker: &str, image: &[u8]) -> Vec<u8> {
     body
 }
 
+#[allow(clippy::too_many_lines)]
 async fn profile_update(
     smoke: &Smoke,
     sender: &Peer,
@@ -1066,10 +1068,10 @@ async fn profile_update(
         "source profile did not retain both uploads/descriptions"
     );
     for _ in 0..60 {
-        let received: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts WHERE id=$1 AND uri=$2 AND domain IS NOT NULL AND display_name=$3 AND note=$4 AND actor_type='Service' AND locked AND discoverable AND indexable AND jsonb_array_length(fields)=1 AND fields @> $5 AND avatar_remote_url=$6 AND header_remote_url=$7)")
+        let profile_applied: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts WHERE id=$1 AND uri=$2 AND domain IS NOT NULL AND display_name=$3 AND note=$4 AND actor_type='Service' AND locked AND discoverable AND indexable AND jsonb_array_length(fields)=1 AND fields @> $5 AND avatar_remote_url=$6 AND header_remote_url=$7)")
             .bind(remote_id).bind(sender.actor()).bind(&marker).bind(note).bind(&expected_fields)
             .bind(avatar).bind(header).fetch_one(&receiver.pool).await?;
-        if received
+        if profile_applied
             && has_activity_audit(
                 &smoke.root,
                 sender,

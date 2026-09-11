@@ -79,6 +79,18 @@ async fn results(
     Ok(body)
 }
 
+// Anonymous viewers cannot feature accounts; keep every other field and the
+// authenticated response comparison intact. Never normalize the actual response.
+fn expected_accounts_for_viewer(accounts: &Value, authenticated: bool) -> Value {
+    let mut expected = accounts.clone();
+    if !authenticated {
+        for account in expected.as_array_mut().expect("accounts") {
+            account["feature_approval"]["current_user"] = json!("denied");
+        }
+    }
+    expected
+}
+
 async fn remote_rows(pool: &PgPool) -> TestResult<i64> {
     Ok(
         sqlx::query_scalar("SELECT count(*) FROM accounts WHERE domain = $1")
@@ -197,10 +209,14 @@ async fn v2_accounts_reuse_search_and_authenticated_resolution() -> TestResult {
         let (code, v1) = search(&client, &base, false, query, Some(TOKEN)).await?;
         assert_eq!(code, 200);
         assert!(!v1.as_array().expect("v1 accounts").is_empty());
+        if query == "q=alice" {
+            assert_eq!(v1[0]["feature_approval"]["current_user"], "automatic");
+        }
         for token in [Some(SEARCH_TOKEN), None] {
+            let expected = expected_accounts_for_viewer(&v1, token.is_some());
             for suffix in ["", "&type=accounts"] {
                 let v2 = results(&client, &base, &format!("{query}{suffix}"), token).await?;
-                assert_eq!(v2["accounts"], v1);
+                assert_eq!(v2["accounts"], expected);
             }
         }
     }
@@ -337,9 +353,16 @@ async fn v2_accounts_reuse_search_and_authenticated_resolution() -> TestResult {
         "actor fetch stays signed"
     );
     assert_eq!(remote_rows(writer.pool()).await?, 1);
+    assert_eq!(
+        resolved["accounts"][0]["feature_approval"]["current_user"],
+        "missing"
+    );
     for token in [None, Some(SEARCH_TOKEN)] {
         let cached = results(&client, &base, &remote_query, token).await?;
-        assert_eq!(cached["accounts"], resolved["accounts"]);
+        assert_eq!(
+            cached["accounts"],
+            expected_accounts_for_viewer(&resolved["accounts"], token.is_some())
+        );
     }
     assert_eq!(
         fetches.load(Ordering::SeqCst),

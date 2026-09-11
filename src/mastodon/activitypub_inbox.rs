@@ -763,7 +763,7 @@ pub(crate) fn actor_image_uri(value: Option<&Value>) -> Result<Option<String>, I
     }
 }
 
-/// OStatus tags are opaque metadata, not proof of an ActivityPub object's identity.
+/// `OStatus` tags are opaque metadata, not proof of an `ActivityPub` object's identity.
 /// Ignore them before lookup, forwarding, media cleanup, or tombstone selection.
 /// Legacy HTTP(S) aliases retain their existing validation and writer host checks.
 pub(crate) fn optional_atom_uri(value: Option<&Value>) -> Result<Option<String>, InboxParseError> {
