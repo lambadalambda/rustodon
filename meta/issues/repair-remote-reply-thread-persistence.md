@@ -184,3 +184,56 @@ verification of job 472 and the original child/parent relationship.
   instance. Source sync excludes Git, targets, environments, instance state and
   backups. No replacement Mastodon source will be fetched; the pending worker,
   startup and API fixtures use committed fixture data and pinned container images.
+
+## Combined NAS validation and live recovery — 2026-09-11 UTC
+
+- User-authorized NAS workspace `/srv/workspaces/rustodon-follow-repairs-b2937cf`
+  validated checksum-matched source `b2937cf905c8805371651d3b06cae5f73473f21e`.
+  Native amd64 tool image `14233b9e6d8403d8d029c36f6dfd495a424b879cf44775239fedeed419566caf`
+  used Rust 1.97.1, four-CPU quota, 8 GiB memory, three Cargo jobs.
+- Formatting, all-target/all-feature tests (**430 passed, 162 ignored**), strict
+  Clippy, full workers (**71 passed**, including lifecycle readiness), startup
+  (**5 passed**) and the focused API HTTP fixture (**1 passed**) all passed.
+  Logs are retained at the workspace `logs/` and locally under
+  `.local-instance/logs/nas-b2937cf/`.
+- NAS environment corrections, not source fixes: dropped container capabilities
+  so root could not bypass the directory-permission regression; made only this
+  isolated source tree root-owned to read mode-600 synchronized inputs. Six worker
+  tests also need `attachment.gif`, `avatar.gif`, and `attachment.jpg` from the
+  pinned Mastodon media fixtures. Extracted only those three files from the exact
+  harness image `sha256:696439e1ada71d0cf3d51d4d6a4744d6e40b57aafa64980b18f4d3b78230d0cf`
+  into the task's target fixture path and recorded their hashes. No reference
+  checkout was fetched, replaced, or claimed present; pinned-source contract tests
+  were previously verified on Secunda, not rerun on the NAS.
+- Cross-built at `/src` with the AArch64 GNU toolchain, explicit Rust 1.97.1 and
+  `--locked --release --no-default-features --bin rustodon --target aarch64-unknown-linux-gnu`.
+  Runtime uses the same pinned ARM64 Debian base as the previous deployment,
+  `/src/public`, and the NAS tool image's distribution CA bundle. Independent
+  packaging review prompted fresh-only staging and explicit native loader checks.
+- Candidate image `9ffaa0dbba162e796bff5a26f39fa771f669e98de55e782217871debcd0397e8`
+  has Linux/ARM64 metadata and the full source revision label. Binary SHA-256:
+  `0c9caa5203f298921d11b2120ed9c9970cbd219654b8f02cc785a17500be298b`.
+  OCI archive SHA-256 `6427a59cd2a5b4a6625912a262fc51915cb1f1a3c71052926ef1218c2f4e602d`
+  matched after transfer. Native local loader/CLI checks and all **6062** runtime
+  input hashes passed; the new frontend subsequently loaded in the browser.
+- Reviewed grant-aware helper completed app-only cutover at `20260911T140542Z`:
+  old preflight, consistent backup, both apps stopped, exact emoji grants committed,
+  new preflight, app replacement, readiness and identity checks. Evidence:
+  `.local-instance/logs/deploy-20260911T140542Z/`. Backup:
+  `.local-instance-backups/20260911T140547Z/` (not restore-tested).
+  PostgreSQL/Redis container IDs, volumes, local actor and follow row 2 were preserved.
+  Old apps are stopped with suffix `-rollback-20260911T140542Z`.
+- **Rollback warning:** the old binary rejects the new emoji grants. Stop/remove
+  both candidate apps and apply the reviewed exact inverse before restoring old
+  apps; never start either old app alongside the current pair. An uncertain grant
+  apply must be reconciled before any inverse/restart, as enforced by the helper.
+- Paused the worker with restart protection and ran the guarded replay for job 472
+  only, preserving payload, attempts and lease generation. It completed and left
+  no job row. Child `117252276514092511` now references parent
+  `117252791715293582`, account `117252276709075059`, canonical URI
+  `https://pleroma.soykaf.com/objects/31d459c5-7d59-4ae3-a47c-e487450f9b57`.
+  Public context returns both that parent and ancestor `117252276513133141`.
+- Post-recovery worker/local/public readiness passed with **zero queued jobs and
+  zero dead letters**. No credentials, private post bodies or backup contents were
+  displayed. Thread-repair acceptance is satisfied; issue archived. Expanded
+  real-peer federation matrices remain separate and unexecuted.

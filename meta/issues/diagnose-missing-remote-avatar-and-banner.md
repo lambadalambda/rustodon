@@ -142,3 +142,23 @@ verification. No live origin, live environment or instance workload was contacte
   verification limitation, not a reported Clippy success.
 - Independent review approved the test/doc-only correction: durable paths and physical
   cleanup remain asserted; no production change or manual unlink masks lost work.
+
+## Live verification — 2026-09-11 UTC
+
+- Combined NAS gates passed, including all 71 worker tests and startup safety;
+  build/deployment evidence is in [the thread repair](repair-remote-reply-thread-persistence.md#combined-nas-validation-and-live-recovery--2026-09-11-utc).
+- Deployed source `b2937cf` / ARM64 image `9ffaa0dbba162e796bff5a26f39fa771f669e98de55e782217871debcd0397e8`
+  through the app-only helper. No profile grants or schema migration were needed.
+- Ran `admin refresh-remote-account --account-id 117250871421421944` using the
+  existing administrator runtime configuration and media volume. The signed
+  DB-canonical refresh succeeded, and both queued cache checks completed.
+- Avatar `15d534aeb23bcd01.png`: SQL MIME `image/png`, 132297 bytes, browser decoded
+  size 400×400. Header `45a67eab59c9717d.png`: SQL MIME `image/png`, 140484 bytes,
+  browser decoded size 699×233. REST avatar/header and static variants all point
+  to this instance's `/system/cache/accounts/` paths and return HTTP 200.
+- The bundled frontend at `/@lain@lain.com` rendered both locally cached images
+  successfully (`complete` and nonzero natural/rendered dimensions); no browser
+  runtime errors were reported. No remote hotlink fallback was used.
+- Account ID and accepted follow row 2 remain unchanged. Evidence:
+  `.local-instance/logs/deploy-20260911T140542Z/{profile-refresh.log,recovery-metadata.txt,public-repairs.jsonl,browser-profile.json}`.
+  Acceptance satisfied; issue archived.

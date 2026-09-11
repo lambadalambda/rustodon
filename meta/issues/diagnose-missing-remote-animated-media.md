@@ -47,3 +47,21 @@ The user reports that a remote GIF does not display. The affected post URL is no
   and all-target/all-feature Clippy with warnings denied passed on Secunda.
   Logs: `/home/lain/rustodon-parity/raw-gif-{red,green,clippy}.log`.
   Deployment and user-visible confirmation remain pending.
+
+## Live verification — 2026-09-11 UTC
+
+- Deployed source `b2937cf` after all combined NAS gates passed; see the
+  [deployment record](repair-remote-reply-thread-persistence.md#combined-nas-validation-and-live-recovery--2026-09-11-utc).
+- Attachment `117252276513140040` on status `117252276513133141` now serializes
+  as **`image`**, without modifying or redownloading its existing media.
+  Original: HTTP 200 `image/gif`, 748440 bytes, SHA-256
+  `ead48eae6af018c3d6b3cda3a5e9b06283a8bc97d6b9dcc30f2684b094dbada5`.
+  Preview: HTTP 200 `image/png`, 352688 bytes.
+- Bundled frontend `/@lain@lain.com/117252276513133141` loads the GIF original
+  in an image element (decoded 566×421, nonzero rendered dimensions), with **no
+  video element** or browser runtime errors. This establishes frontend-compatible
+  rendering; it is not a frame-by-frame animation or all-GIF compatibility test.
+- Evidence: `.local-instance/logs/deploy-20260911T140542Z/{public-repairs.jsonl,browser-gif.json,browser-errors.txt}`.
+  The diagnosed GIF is repaired. Keep this issue open only for confirmation that
+  this was the user's intended attachment; request its post URL if another GIF
+  remains broken. Static timeline-preview behavior remains deliberately unchanged.

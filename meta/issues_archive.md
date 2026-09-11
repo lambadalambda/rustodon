@@ -57,3 +57,6 @@
 - [x] [Fence browser reauthentication and recovery](issues/fence-browser-reauthentication-and-recovery.md)
 - [x] [Repair relationship and delivery lifecycles](issues/repair-relationship-and-delivery-lifecycles.md)
 - [x] [Close reviewed client workflow gaps](issues/close-reviewed-client-workflow-gaps.md)
+- [x] [Repair remote reply-thread persistence](issues/repair-remote-reply-thread-persistence.md)
+- [x] [Diagnose missing remote avatar and banner](issues/diagnose-missing-remote-avatar-and-banner.md)
+- [x] [Return empty results for unimplemented frontend API reads](issues/return-empty-unimplemented-api-reads.md)

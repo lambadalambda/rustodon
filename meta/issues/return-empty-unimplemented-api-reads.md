@@ -146,3 +146,22 @@ Final gates: `fmt.log` (`cargo fmt --all --check`) and `clippy.log`
 `pinned-source.log` records **2 passing** explicit pinned-source contract tests.
 The independent reviewer rechecked the publishing correction and approved the
 scoped commit. Live frontend/deployment acceptance remains with the parent.
+
+## Live verification — 2026-09-11 UTC
+
+- Deployed source `b2937cf` after combined NAS formatting, ordinary tests, strict
+  Clippy, workers, startup and the focused API HTTP fixture passed. See the
+  [combined deployment record](repair-remote-reply-thread-persistence.md#combined-nas-validation-and-live-recovery--2026-09-11-utc).
+- Through the permanent public origin, GET trends tags/links/statuses, directory,
+  link timeline and instance domain blocks all return **200 `[]`**.
+- Unauthenticated suggestions, familiar-followers and owner domain-block reads
+  return **401**, not placeholder 404 or fabricated authenticated success.
+  Authenticated empty shapes, scopes and actual moderation data were verified by
+  the isolated HTTP fixture; no live token was obtained for this check.
+- Unknown API route and a genuinely absent status both retain **404**. No live
+  mutation was attempted; unchanged mutation errors are fixture-covered.
+- Bundled public profile/status pages loaded without browser runtime errors.
+  Evidence: `.local-instance/logs/deploy-20260911T140542Z/public-repairs.jsonl`
+  and `browser-errors.txt`. Scoped collection-read acceptance is satisfied;
+  issue archived. The explicitly deferred noncollection/lookup routes above
+  remain unimplemented; this is not a claim that every possible API 404 is gone.

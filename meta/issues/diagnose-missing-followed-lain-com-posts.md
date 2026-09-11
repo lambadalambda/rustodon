@@ -92,3 +92,20 @@ After deploying the parity fixes, the local user reports that following `lain@la
 - Reply-thread job `472` is retrying with `remote reply thread persistence failed`;
   the post itself is stored, but its parent is unresolved. This newly exposed
   downstream issue was not repaired or bypassed as part of the nullable parser fix.
+
+## Follow-up evidence — 2026-09-11 UTC
+
+- A fresh remote top-level status `117252296570157832`, stored at
+  `2026-09-11 12:00:46.758103` after the nullable-sensitive deployment, arrived
+  without the bounded replay. The exact repository home selector put it on the
+  first page for local account `117250541985141990`; inbox acceptance also
+  continued afterward. This addresses the fresh-delivery evidence gap above.
+- Subsequent combined repair deployment `b2937cf` preserved the accepted follow
+  row 2 and recovered the reply thread through its separate reviewed permission
+  repair. Child `117252276514092511` now has its correct parent and public context;
+  see [thread recovery](repair-remote-reply-thread-persistence.md#combined-nas-validation-and-live-recovery--2026-09-11-utc).
+- Public bundled profile and status pages now render the recovered remote account
+  media and diagnosed GIF. The two earlier acknowledged Creates without rows
+  remain unexplained; do not claim historical backfill or recovery of all five.
+  Keep open for user confirmation of the original missing-post symptom; no
+  broader replay or ingestion-policy bypass was performed.

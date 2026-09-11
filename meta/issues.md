@@ -21,7 +21,4 @@
 - [ ] [Define hashtag stream history cleanup](issues/define-hashtag-stream-history-cleanup.md)
 - [ ] [Investigate reciprocal follow convergence under concurrency](issues/investigate-reciprocal-follow-convergence.md)
 - [ ] [Diagnose missing posts from followed lain.com account](issues/diagnose-missing-followed-lain-com-posts.md)
-- [ ] [Repair remote reply-thread persistence](issues/repair-remote-reply-thread-persistence.md)
-- [ ] [Diagnose missing remote avatar and banner](issues/diagnose-missing-remote-avatar-and-banner.md)
-- [ ] [Return empty results for unimplemented frontend API reads](issues/return-empty-unimplemented-api-reads.md)
 - [ ] [Diagnose missing remote animated media](issues/diagnose-missing-remote-animated-media.md)
