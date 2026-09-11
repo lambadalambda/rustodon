@@ -9150,7 +9150,7 @@ async fn oauth_metadata(State(state): State<WebState>) -> Response<Body> {
         "revocation_endpoint": revocation_endpoint,
         "scopes_supported": OAUTH_CONFIGURED_SCOPES,
         "response_types_supported": ["code"],
-        "response_modes_supported": ["query", "fragment", "form_post"],
+        "response_modes_supported": ["query"],
         "grant_types_supported": ["authorization_code", "client_credentials"],
         "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
         "code_challenge_methods_supported": ["S256"],
@@ -9204,6 +9204,13 @@ async fn oauth_authorize(
     Extension(parameters): Extension<RackParameters>,
     headers: HeaderMap,
 ) -> Response<Body> {
+    // Reject before login/consent redirects, on both entry and form submission.
+    if !matches!(
+        oauth_scalar(&parameters, "response_mode"),
+        Ok(None | Some("query"))
+    ) {
+        return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_request");
+    }
     let Some(session_id) = request_cookie(&headers, BROWSER_SESSION_COOKIE) else {
         return oauth_authorize_sign_in_redirect(&parameters);
     };
@@ -9351,6 +9358,7 @@ fn oauth_consent_response(
         fields.push_str(&hidden(name, value));
     }
     fields.push_str(&hidden("response_type", "code"));
+    fields.push_str(&hidden("response_mode", "query"));
     fields.push_str(&hidden("scope", scope));
     if let Some(state) = state {
         fields.push_str(&hidden("state", state));

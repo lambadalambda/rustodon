@@ -262,5 +262,85 @@ revision was rechecked remotely at `/home/lain/repos/rustodon/target/mastodon-v4
 Optional follow-up: explicit HTTP negatives for confidential empty-password Basic
 and public `client_credentials` requests. Source review also noted pre-existing
 handling of an anomalous confidential application with an empty stored secret in
-code exchange; that separate hardening was not included. R15 remains untouched/open,
-and no browser credential functions or issue indexes were changed.
+code exchange; that separate hardening and R15 were not included in R14.
+No browser credential functions or issue indexes were changed.
+
+## R15 — query-only OAuth response modes: implemented and verified
+
+- Discovery now advertises exactly `response_modes_supported: ["query"]`.
+  Authorization accepts an omitted mode or explicit `query`. Every other mode is
+  rejected locally with HTTP 400 `invalid_request` before session lookup, login or
+  consent redirects, and grant creation, on both GET entry and POST submission.
+- Consent forms explicitly carry hidden `response_mode=query`, canonicalizing the
+  supported default. The existing login-return helper already serializes all OAuth
+  parameters and remains unchanged. Registered redirect validation and query callback
+  generation are unchanged; no fragment or form_post implementation was added.
+- `tests/oauth_response_modes.rs` checks exact discovery modes; four default/explicit
+  query × approval/denial flows; login-return parameter preservation; submission of
+  actual rendered hidden fields without reattaching the GET query; existing callback
+  query parameters, specially encoded state, and absence of fragments. Approval
+  codes are persisted; denial returns `access_denied` without a code.
+- Eighteen unsupported-mode cases cover fragment/form_post/unknown × anonymous or
+  authenticated × GET, denial POST, approval POST. All must return local 400 with no
+  Location and no grant creation. Four additional supported-query GET/POST cases
+  reject unregistered redirect URIs on approval/denial without redirecting.
+
+### Exact remote RED/GREEN and combined-gate evidence
+
+All execution ran through `ssh lain@secunda.local bash -s`, in
+`/home/lain/rustodon-parity/clients`, with `export CARGO_BUILD_JOBS=2`.
+The new test was staged before syncing tracked changed files only, excluding `.git`,
+`target`, `.local-instance*`, `.env*`, without `--delete`. The real cache-safe harness
+used PID-isolated rootless fixture databases; no bypass, registry retry, credentials,
+tunnel, source fetch, or callback-origin network request was used.
+
+```sh
+# RED before the production discovery/authorize/form changes:
+tools/mastodon-fixture schema-read-test oauth_response_modes > /tmp/r15-red.log 2>&1
+# GREEN after the production changes:
+tools/mastodon-fixture schema-read-test oauth_response_modes > /tmp/r15-green.log 2>&1
+cargo test --locked --lib > /tmp/r15-unit.log 2>&1
+cargo clippy --locked --all-features --lib --test oauth_response_modes -- -D warnings
+# Combined client-workflow checks:
+rustfmt --edition 2024 --check src/web.rs src/mastodon/write_repository.rs \
+  tests/qualified_local_mentions.rs tests/followed_hashtag_streams.rs \
+  tests/public_oauth_revocation.rs tests/oauth_response_modes.rs
+sh -n tools/mastodon-fixture
+cargo clippy --locked --all-features --lib --test qualified_local_mentions \
+  --test followed_hashtag_streams --test public_oauth_revocation \
+  --test oauth_response_modes -- -D warnings > /tmp/r15-combined-clippy.log 2>&1
+tools/mastodon-fixture schema-read-test > /tmp/r15-schema-all.log 2>&1
+```
+
+- **RED:** exit 101, one failing test (8.57s). Discovery listed three modes; four
+  consent forms omitted mode; unsupported requests returned 200/302 rather than 400;
+  three unsupported approval submissions created grants.
+- **GREEN:** one passed test (8.25s), including all four valid flows, 18 unsupported
+  cases, no unsupported grants, and four unsafe-callback checks.
+- Library tests: **236 passed, 2 ignored** (2.56s). R15 targeted all-features Clippy
+  passed. Combined changed-source formatting, shell syntax and all-features Clippy
+  for all four client-workflow integration targets passed.
+- Full real restored-schema command: **42 passed** across six fresh databases:
+  schema **37** (18.49s), saved-status authorization **1** (8.48s), R11 **1** (9.49s),
+  R12 **1** (11.02s), R14 **1** (8.31s), R15 **1** (8.24s). The SSH call exceeded
+  its 120-second wait; the continuing remote run's completed log and harness cleanup
+  were checked before returning.
+- Independent read-only `explore` correctness and architecture/DRY review
+  approved the supplied exact production diff and inspected test/harness, finding
+  no blockers. Execution results were supplied by the implementing agent.
+
+### Limits / optional follow-up
+
+The authenticated consent session and application are seeded fixture data, not a
+password-login test. Login return-target preservation is exercised, but no browser
+credential functions were changed. Fixture owner writes do not prove production-role
+permissions. No fresh Rails differential, live browser/mobile/peer, or complete
+all-target release gate is claimed. Pinned read-only source remains
+`/home/lain/repos/rustodon/target/mastodon-v4.6.5` (canonical
+`/workspace/rustodon/target/mastodon-v4.6.5`), revision
+`1440d55b139e39ec722c2a3db7f60b66cd889048`; no source fetched or changed.
+
+Optional additional cases are empty/non-scalar modes and directly posting consent
+with the mode omitted; the current default GET flow submits the rendered canonical
+query mode. These are source-checked, not separately exercised here. No other findings
+or issue indexes were changed.
