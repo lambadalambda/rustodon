@@ -1356,10 +1356,14 @@ impl RestProjectionLoader {
             .rest_saved_status_rows(account_id, kind, options)
             .await?;
         let ids = rows.iter().map(|row| row.status_id).collect::<Vec<_>>();
+        // Saving a status does not preserve access after its audience changes.
+        // Pagination still describes the selected associations, before authorization.
         Ok(super::SavedStatusesPage {
-            statuses: self.preauthorized_statuses(&ids).await?,
+            statuses: self.authorized_statuses(&ids).await?,
             first_cursor: rows.first().map(|row| row.cursor_id),
             last_cursor: rows.last().map(|row| row.cursor_id),
+            records_continue: usize::try_from(options.limit.clamp(0, 40))
+                .is_ok_and(|limit| rows.len() == limit),
         })
     }
 

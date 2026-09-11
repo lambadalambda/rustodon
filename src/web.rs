@@ -16795,7 +16795,7 @@ async fn saved_statuses(
     };
     let mut response = statuses_response(&state, &page.statuses);
     let mut links = Vec::new();
-    if usize::try_from(options.limit).is_ok_and(|limit| page.statuses.len() == limit)
+    if page.records_continue
         && let Some(last_cursor) = page.last_cursor
         && let Some(url) = pagination_url(
             &state,

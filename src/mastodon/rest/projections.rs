@@ -322,6 +322,8 @@ pub struct SavedStatusesPage {
     pub statuses: Vec<StatusProjection>,
     pub first_cursor: Option<i64>,
     pub last_cursor: Option<i64>,
+    /// Whether the association page was full, even if authorization hid statuses.
+    pub records_continue: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

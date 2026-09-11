@@ -1002,7 +1002,7 @@ EOF
   RUSTODON_MASTODON_DATABASE_URL="$database_url" \
   RUSTODON_MASTODON_OWNER_DATABASE_URL="$owner_url" \
   RUSTODON_MASTODON_WRITER_DATABASE_URL="$writer_url" \
-    cargo test --locked --test mastodon_schema -- --ignored --nocapture --test-threads=1
+    cargo test --locked --test "${2:-mastodon_schema}" -- --ignored --nocapture --test-threads=1
 
   finish_database
   printf 'read-only Rust schema integration passed for Mastodon %s\n' "$RELEASE"
@@ -2802,6 +2802,7 @@ case "$command" in
   schema-read-test)
     [ "$#" -eq 0 ] || die 'schema-read-test takes no arguments'
     schema_read_test
+    schema_read_test "$FIXTURE_DIR" saved_status_authorization
     ;;
   operational-schema-test)
     [ "$#" -eq 0 ] || die 'operational-schema-test takes no arguments'
