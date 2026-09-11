@@ -18,3 +18,4 @@
 - [ ] [Repair relationship and delivery lifecycles](issues/repair-relationship-and-delivery-lifecycles.md)
 - [ ] [Close reviewed client workflow gaps](issues/close-reviewed-client-workflow-gaps.md)
 - [ ] [Restore clean-checkout quality gates](issues/restore-clean-checkout-quality-gates.md)
+- [ ] [Run essential parity gates and peer tests on Secunda](issues/run-essential-parity-gates-on-secunda.md)
