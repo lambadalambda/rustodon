@@ -11,7 +11,7 @@ use crate::paperclip::{PaperclipAttachment, PaperclipMetadata, rails_blank};
 
 use super::records::{Account, MediaAttachment, Mention, Status};
 use super::rest::{HtmlFormatter, MentionTarget};
-use super::types::AccountIdScheme;
+use super::types::{AccountIdScheme, StatusVisibility};
 
 pub const ACTIVITY_JSON: &str = "application/activity+json; charset=utf-8";
 pub const JRD_JSON: &str = "application/jrd+json; charset=utf-8";
@@ -1174,6 +1174,23 @@ pub fn undo_like_delivery_logical_key(like_uri: &str, inbox_url: &str) -> String
     relationship_delivery_logical_key_without_id("undo-like", like_uri, inbox_url)
 }
 
+/// Addresses a locally authored Announce using its canonical local actor URI.
+/// Local collection columns may be empty or stale; they are not authoritative.
+pub(crate) fn local_announce_audience(
+    visibility: StatusVisibility,
+    actor_uri: &str,
+) -> (Value, Value) {
+    let followers = json!([format!("{actor_uri}/followers")]);
+    match visibility {
+        StatusVisibility::Public => (json!([PUBLIC_ADDRESS]), followers),
+        StatusVisibility::Unlisted => (followers, json!([PUBLIC_ADDRESS])),
+        StatusVisibility::Private => (followers, json!([])),
+        StatusVisibility::Direct | StatusVisibility::Limited | StatusVisibility::Unknown(_) => {
+            (json!([]), json!([]))
+        }
+    }
+}
+
 #[must_use]
 pub fn announce_with_uris(
     activity_uri: &str,
@@ -1578,6 +1595,38 @@ mod tests {
     };
     use crate::mastodon::records::{Account, MediaAttachment, Mention, Status};
     use crate::mastodon::types::{AccountIdScheme, RawI32, RawString, StatusVisibility};
+
+    #[test]
+    fn local_announce_audiences_preserve_visibility() {
+        for actor_uri in [
+            "https://local.example/users/alice",
+            "https://local.example/ap/users/42",
+            "https://local.example/actor",
+        ] {
+            let followers = json!([format!("{actor_uri}/followers")]);
+            for (visibility, to, cc) in [
+                (
+                    StatusVisibility::Public,
+                    json!([PUBLIC_ADDRESS]),
+                    followers.clone(),
+                ),
+                (
+                    StatusVisibility::Unlisted,
+                    followers.clone(),
+                    json!([PUBLIC_ADDRESS]),
+                ),
+                (StatusVisibility::Private, followers, json!([])),
+                (StatusVisibility::Direct, json!([]), json!([])),
+                (StatusVisibility::Limited, json!([]), json!([])),
+                (StatusVisibility::Unknown(99), json!([]), json!([])),
+            ] {
+                assert_eq!(
+                    super::local_announce_audience(visibility, actor_uri),
+                    (to, cc)
+                );
+            }
+        }
+    }
 
     fn account(id_scheme: Option<AccountIdScheme>) -> Account {
         let timestamp = DateTime::<Utc>::UNIX_EPOCH.naive_utc();

@@ -17665,3 +17665,206 @@ async fn discovered_actor_follow_accept_allows_shared_inbox_private_note()
     reset().await?;
     Ok(())
 }
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+async fn private_announce_writer_uses_fresh_local_followers_audience()
+-> Result<(), Box<dyn std::error::Error>> {
+    private_announce_local_audience(false).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+async fn private_announce_worker_uses_fresh_local_followers_audience()
+-> Result<(), Box<dyn std::error::Error>> {
+    private_announce_local_audience(true).await
+}
+
+#[cfg(feature = "test-support")]
+#[allow(clippy::too_many_lines)]
+async fn private_announce_local_audience(worker: bool) -> Result<(), Box<dyn std::error::Error>> {
+    const ORIGIN: &str = "https://fixture-v4-6-5.rustodon.invalid/";
+    const TARGET: i64 = -331;
+    const FOLLOWER_INBOX: &str = "http://announce-follower.fixture.invalid/inbox";
+    let owner_url = std::env::var("RUSTODON_WORKER_OWNER_DATABASE_URL")?;
+    let runtime_url = std::env::var("RUSTODON_WORKER_DATABASE_URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&owner_url)
+        .await?;
+    let runtime = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&runtime_url)
+        .await?;
+    let writer = WriteRepository::connect(&owner_url).await?;
+    let repository = Repository::connect(&owner_url).await?;
+    for id_scheme in [None, Some(0_i32)] {
+        reset().await?;
+        let username = format!(
+            "announce_{}_{}",
+            if worker { "worker" } else { "writer" },
+            id_scheme.unwrap_or(1)
+        );
+        let created = writer
+            .create_local_user(
+                &format!("{username}@fixture.invalid"),
+                &username,
+                "fixture-audience-password",
+            )
+            .await?;
+        let local = repository
+            .account(created.account_id)
+            .await?
+            .ok_or("new local account missing")?;
+        assert!(
+            local.followers_url.is_empty(),
+            "ordinary local creation must exercise the empty schema default"
+        );
+        if let Some(id_scheme) = id_scheme {
+            // Restored local collection values are not authoritative either.
+            sqlx::query("UPDATE accounts SET id_scheme = $2, followers_url = 'https://stale.fixture.invalid/wrong-collection' WHERE id = $1")
+                .bind(created.account_id).bind(id_scheme).execute(&pool).await?;
+        }
+        let local = repository
+            .account(created.account_id)
+            .await?
+            .ok_or("new local account missing")?;
+        let actor_uri = activitypub::actor_url(&Url::parse(ORIGIN)?, &local);
+        let followers_uri = format!("{actor_uri}/followers");
+        let token = format!("fixture-audience-{username}");
+        sqlx::query("INSERT INTO oauth_access_tokens (resource_owner_id, token, scopes, created_at) VALUES ($1, $2, 'write:statuses', clock_timestamp())")
+            .bind(created.user_id).bind(&token).execute(&pool).await?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}"))?,
+        );
+        let authenticated = BearerAuthenticator::new(repository.clone())
+            .authenticate(&headers, WRITE_STATUSES)
+            .await?;
+        let follower: i64 = sqlx::query_scalar("INSERT INTO accounts (username, domain, uri, inbox_url, shared_inbox_url, protocol, created_at, updated_at) VALUES ($1, 'announce-follower.fixture.invalid', $2, $3, $3, 1, clock_timestamp(), clock_timestamp()) RETURNING id")
+            .bind(&username).bind(format!("http://announce-follower.fixture.invalid/users/{username}")).bind(FOLLOWER_INBOX).fetch_one(&pool).await?;
+        sqlx::query("INSERT INTO follows (account_id, target_account_id, show_reblogs, notify, created_at, updated_at) VALUES ($1, $2, true, false, clock_timestamp(), clock_timestamp())")
+            .bind(follower).bind(created.account_id).execute(&pool).await?;
+        let target_uri =
+            format!("https://remote.fixture.invalid/users/exclusive_author/statuses/{username}");
+        let target_id: i64 = sqlx::query_scalar("INSERT INTO statuses (account_id, text, spoiler_text, visibility, local, uri, sensitive, reply, created_at, updated_at) VALUES ($1, 'Audience target', '', 0, false, $2, false, false, clock_timestamp(), clock_timestamp()) RETURNING id")
+            .bind(TARGET).bind(&target_uri).fetch_one(&pool).await?;
+        sqlx::query("INSERT INTO status_stats (status_id, created_at, updated_at) VALUES ($1, clock_timestamp(), clock_timestamp())")
+            .bind(target_id).execute(&pool).await?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = listener.local_addr()?;
+        let queue = Queue::new(runtime.clone());
+        let handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
+            &queue,
+            Some(pool.clone()),
+            None,
+            Some(ActivityPubDeliveryConfig {
+                origin: Url::parse(ORIGIN)?,
+                local_domain: "fixture-v4-6-5.rustodon.invalid".to_owned(),
+                media_root_url: "/system".to_owned(),
+                media_root: None,
+                limited_federation: false,
+                remote_media_endpoint: None,
+                remote_delivery_endpoint: Some(endpoint),
+                remote_fetch_endpoint: None,
+            }),
+        )?;
+        let executor = WorkerExecutor::new(queue.clone(), handlers, 1, 1)?;
+        let boost = writer
+            .set_reblog_with_origin(
+                &authenticated,
+                target_id,
+                Some("private"),
+                true,
+                Some(ORIGIN),
+                false,
+            )
+            .await?;
+        assert!(boost.created);
+        let writer_body: Value = sqlx::query_scalar("SELECT payload -> 'arguments' -> 'body' FROM rustodon.outbox_events WHERE kind = $1 AND payload -> 'arguments' -> 'body' ->> 'type' = 'Announce'")
+            .bind(ACTIVITYPUB_DELIVERY_JOB_KIND).fetch_one(&pool).await?;
+        assert!(queue.dispatch_outbox(100).await? >= 1);
+        // Distribution is recorded before the writer's author delivery.
+        assert!(
+            executor
+                .process_one(
+                    "announce-audience-distribution",
+                    &[Lane::Push],
+                    Duration::seconds(30)
+                )
+                .await?
+        );
+        let worker_body: Value = sqlx::query_scalar("SELECT payload -> 'arguments' -> 'body' FROM rustodon.outbox_events WHERE kind = $1 AND payload -> 'arguments' ->> 'inbox_url' = $2")
+            .bind(ACTIVITYPUB_DELIVERY_JOB_KIND).bind(FOLLOWER_INBOX).fetch_one(&pool).await?;
+        let body = if worker { &worker_body } else { &writer_body };
+        assert_eq!(body["type"], "Announce");
+        assert_eq!(body["actor"], actor_uri);
+        assert_eq!(body["object"], target_uri);
+        assert_eq!(
+            body["to"],
+            json!([followers_uri]),
+            "private Announce must address the canonical LOCAL followers collection"
+        );
+        assert_eq!(
+            body["cc"],
+            json!(["https://remote.fixture.invalid/users/exclusive_author"])
+        );
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await?;
+                requests.push(fixture_delivery_request(&mut socket).await?);
+                socket
+                    .write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await?;
+            }
+            Ok::<_, std::io::Error>(requests)
+        });
+        queue.dispatch_outbox(100).await?;
+        for _ in 0..2 {
+            assert!(
+                executor
+                    .process_one(
+                        "announce-audience-delivery",
+                        &[Lane::Push],
+                        Duration::seconds(30)
+                    )
+                    .await?
+            );
+        }
+        let requests = tokio::time::timeout(std::time::Duration::from_secs(5), server).await???;
+        let follower_request = requests
+            .iter()
+            .find(|request| {
+                String::from_utf8_lossy(request)
+                    .to_ascii_lowercase()
+                    .contains("host: announce-follower.fixture.invalid")
+            })
+            .ok_or("shared-inbox delivery missing")?;
+        let body_start = follower_request
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .ok_or("missing HTTP headers")?
+            + 4;
+        let delivered: Value = serde_json::from_slice(&follower_request[body_start..])?;
+        assert_eq!(
+            delivered, worker_body,
+            "actual shared-inbox wire body must match distribution"
+        );
+        sqlx::query("DELETE FROM accounts WHERE id = ANY($1)")
+            .bind(vec![created.account_id, follower])
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM statuses WHERE id = $1")
+            .bind(target_id)
+            .execute(&pool)
+            .await?;
+        reset().await?;
+    }
+    Ok(())
+}

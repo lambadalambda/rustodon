@@ -13860,7 +13860,6 @@ struct RemoteStatusDelivery {
     target_actor_uri: String,
     inbox_url: String,
     preferred_inbox_url: String,
-    followers_url: String,
     domain: String,
 }
 
@@ -13870,18 +13869,7 @@ async fn remote_status_delivery(
     target_status_id: i64,
     origin: &str,
 ) -> Result<Option<RemoteStatusDelivery>, WriteError> {
-    let delivery = sqlx::query_as::<
-        _,
-        (
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-        ),
-    >(
+    let delivery = sqlx::query_as::<_, (String, String, String, String, String, Option<String>)>(
         "SELECT CASE
                   WHEN source.id = -99 THEN $3 || '/actor'
                   WHEN source.id_scheme = 1 THEN $3 || '/ap/users/' || source.id::text
@@ -13891,7 +13879,6 @@ async fn remote_status_delivery(
                   target.uri,
                   COALESCE(NULLIF(target.inbox_url, ''), target.shared_inbox_url),
                   COALESCE(NULLIF(target.shared_inbox_url, ''), target.inbox_url),
-                  source.followers_url,
                   target.domain
            FROM statuses status
            JOIN accounts target ON target.id = status.account_id
@@ -13911,7 +13898,6 @@ async fn remote_status_delivery(
         target_actor_uri,
         inbox_url,
         preferred_inbox_url,
-        followers_url,
         Some(domain),
     )) = delivery
     else {
@@ -13931,7 +13917,6 @@ async fn remote_status_delivery(
         target_actor_uri,
         inbox_url,
         preferred_inbox_url,
-        followers_url,
         domain,
     }))
 }
@@ -14064,20 +14049,6 @@ fn local_undo_announce_activity_uri(source_uri: &str, status_id: i64) -> String 
     format!("{source_uri}#announces/{status_id}/undo")
 }
 
-fn announce_audience(visibility: i32, followers_url: &str) -> (Value, Value) {
-    let followers = if followers_url.is_empty() {
-        json!([])
-    } else {
-        json!([followers_url])
-    };
-    match visibility {
-        0 => (json!([activitypub::PUBLIC_ADDRESS]), followers),
-        1 => (followers, json!([activitypub::PUBLIC_ADDRESS])),
-        2 => (followers, json!([])),
-        _ => (json!([]), json!([])),
-    }
-}
-
 async fn record_remote_like_delivery(
     transaction: &mut Transaction<'_, Postgres>,
     source_account_id: i64,
@@ -14147,7 +14118,8 @@ async fn record_remote_announce_delivery(
     visibility: i32,
 ) -> Result<(), WriteError> {
     let announce_uri = local_status_activity_uri(&delivery_target.source_uri, status_id);
-    let (to, mut cc) = announce_audience(visibility, &delivery_target.followers_url);
+    let (to, mut cc) =
+        activitypub::local_announce_audience(visibility.into(), &delivery_target.source_uri);
     if let Value::Array(values) = &mut cc {
         values.push(Value::String(delivery_target.target_actor_uri.clone()));
     }
@@ -14186,7 +14158,8 @@ async fn record_remote_undo_announce_delivery(
 ) -> Result<(), WriteError> {
     let announce_uri = local_status_activity_uri(&delivery_target.source_uri, status_id);
     let undo_uri = local_undo_announce_activity_uri(&delivery_target.source_uri, status_id);
-    let (to, mut cc) = announce_audience(visibility, &delivery_target.followers_url);
+    let (to, mut cc) =
+        activitypub::local_announce_audience(visibility.into(), &delivery_target.source_uri);
     if let Value::Array(values) = &mut cc {
         values.push(Value::String(delivery_target.target_actor_uri.clone()));
     }

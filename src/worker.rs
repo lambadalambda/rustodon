@@ -564,7 +564,7 @@ async fn distribute_status(
         let actor_uri = activitypub::actor_url(&config.origin, &account);
         let announce_uri = activitypub::status_uri(&config.origin, &account, &status);
         let object_uri = activitypub::status_uri(&config.origin, &target_account, &target_status);
-        let (to, mut cc) = announce_audience(status.visibility, &account.followers_url);
+        let (to, mut cc) = activitypub::local_announce_audience(status.visibility, &actor_uri);
         if let Value::Array(values) = &mut cc {
             values.push(Value::String(activitypub::actor_url(
                 &config.origin,
@@ -5103,22 +5103,6 @@ fn remote_note_write_failure(error: &WriteError, message: &str) -> HandlerFailur
         | &WriteError::Validation(_) => HandlerFailure::permanent(message),
         &WriteError::Sqlx(_) | &WriteError::Job(_) | &WriteError::Filesystem(_) => {
             HandlerFailure::retry(message)
-        }
-    }
-}
-
-fn announce_audience(visibility: StatusVisibility, followers_url: &str) -> (Value, Value) {
-    let followers = if followers_url.is_empty() {
-        json!([])
-    } else {
-        json!([followers_url])
-    };
-    match visibility {
-        StatusVisibility::Public => (json!([activitypub::PUBLIC_ADDRESS]), followers),
-        StatusVisibility::Unlisted => (followers, json!([activitypub::PUBLIC_ADDRESS])),
-        StatusVisibility::Private => (followers, json!([])),
-        StatusVisibility::Direct | StatusVisibility::Limited | StatusVisibility::Unknown(_) => {
-            (json!([]), json!([]))
         }
     }
 }
