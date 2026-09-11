@@ -11,10 +11,11 @@ REMOTE
 ```
 
 This is bounded acceptance source, not the full interoperability matrix. The
-`public` scenario has prior remote pass evidence. The new `privacy` scenario is
-**source-reviewed but unverified**: Secunda became unavailable before the fresh
-observer bootstrap could be run. Do not interpret source presence as a privacy
-pass. Pleroma and broader lifecycle coverage remain unclaimed. See
+`public` scenario has prior remote pass evidence. The new privacy/lifecycle
+scenarios are **source-reviewed but unverified**: Secunda became unavailable
+before the fresh observer bootstrap could be run. Do not interpret source
+presence as privacy/lifecycle acceptance. Pleroma and broader coverage remain
+unclaimed. See
 [the open issue](../meta/issues/add-isolated-federation-peer-tests.md) for exact
 passing, red and pending evidence.
 
@@ -25,6 +26,7 @@ CARGO_BUILD_JOBS=2 tools/federation-peer-smoke public
 CARGO_BUILD_JOBS=2 tools/federation-peer-smoke privacy
 CARGO_BUILD_JOBS=2 tools/federation-peer-smoke notes
 CARGO_BUILD_JOBS=2 tools/federation-peer-smoke profile
+CARGO_BUILD_JOBS=2 tools/federation-peer-smoke interactions
 ```
 
 `privacy` creates followers-only and direct Notes in both directions. The normal
@@ -59,10 +61,52 @@ not a claim of successful remote image download. The multipart unit regression,
 image encoding/upload and all live assertions await Secunda; no profile pass is
 claimed.
 
+`interactions` is **source-only, unexecuted**. Each direction first receives a
+new public Note through push, then Likes and un-Likes it. The receiver must
+observe the correct favourite row before its removal and a signed Undo whose
+object is the exact Like ID captured from the wire—not a guessed ID scheme.
+It then creates a followers-only **boost of that public Note**, requiring the
+exact Announce ID, actor, target and followers audience in the same signed,
+successful audit event; the original author
+is also an established follower and must receive the private wrapper. Outsider
+and anonymous REST access to the wrapper is denied on both sides. Undo must
+retire that observed wrapper while leaving the public original active.
+
+Announce envelope audiences are recorded separately from an embedded public
+Note's audience, so embedding a public original does not falsely mark a private
+boost public. A Public-addressed Announce attempt for this private boost fails
+even if a private attempt succeeds. Fully read requests are audited before backend
+forwarding with null status, then again with response status when available;
+failed or in-flight forwarding cannot hide attempts, and only 2xx completion
+events count as positive delivery evidence. Undo's outer audience is not constrained.
+Status-GET and private-attempt audits are rescanned before each scenario ends.
+The audit records IDs/audiences, never full private content or credentials;
+`signed` records Signature-header presence, with received-state checks relying
+on the application's real verification/worker path. Notification/counter parity,
+boosts of other people's private Notes and concurrent interaction stress are
+not claimed.
+
 Pending verification includes source compilation, formatting/Clippy, observer
 bootstrap, unit regressions, all commands above and repeated cleanup. TDD for
 changes after the outage is deferred rather than simulated; no local workload
 or further SSH attempt is allowed until the parent restores access.
+
+After access is restored, run these additional gates on Secunda only, with
+`CARGO_BUILD_JOBS=2` and the prescribed workspace:
+
+```sh
+cargo test --locked --features test-support --test federation_peers
+PYTHONDONTWRITEBYTECODE=1 python3 tools/peer-tests/test_tls_proxy.py
+cargo clippy --locked --features test-support --test federation_peers -- -D warnings
+cargo fmt --all --check
+bash -n tools/federation-peer-smoke
+```
+
+Then execute every selected live command above and repeat successful scenarios
+to check task-owned cleanup. The harness verifies the selected ignored test is
+listed before starting containers; a renamed/missing case fails instead of
+silently passing an empty test selection. The previous three Python audit passes
+predate the latest activity-ID/envelope fields; current regressions need reruns.
 
 ## What runs
 
@@ -121,15 +165,18 @@ both database comments before mutation, then:
    object and public audience in each TLS forwarder's identity-only audit, and
    rejects any recorded GET of either new status URL.
 
-The public/privacy/profile scenarios have a three-minute overall deadline; notes has
-six minutes. SQL statement and pool-acquisition limits are two seconds; the
+The public/privacy/profile scenarios have a three-minute overall deadline;
+notes/interactions have six minutes. SQL statement and pool-acquisition limits
+are two seconds; the
 complete harness has a ten-minute deadline
 with a final kill deadline after cleanup's grace period. This is sequential
 peer convergence, not a simultaneous reciprocal-follow stress test. A trial
 with overlapping follows hit a pinned Mastodon `account_stats` deadlock and
 left pending requests after retry; that concurrency case is not claimed.
-Rustodon's v2 search currently returns no account results, so this smoke does
-not claim v2 account-search parity either.
+The initial v2 search attempt returned no account results. Parent source repair
+`0d513f5` now exists but is unexecuted; this runner retains v1 discovery and does
+not claim v2 parity. Its separate deferred gate is
+`tools/mastodon-fixture schema-read-test v2_account_search`.
 
 HTTP 2xx is never reported as successful convergence. Workers must be ready
 before scenarios start. Unsupported ingestion fails the test; do not preseed

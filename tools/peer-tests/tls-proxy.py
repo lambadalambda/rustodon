@@ -10,6 +10,13 @@ import sys
 PUBLIC = 'https://www.w3.org/ns/activitystreams#Public'
 
 
+def recipients_for(fields):
+    return [item for key in ('to', 'cc')
+            for value in [fields.get(key)]
+            for item in (value if isinstance(value, list) else [value])
+            if isinstance(item, str)]
+
+
 def audit_event(method, path, host, status, signed, body):
     """Record only transport/ActivityPub identities, never credentials or content."""
     try:
@@ -20,17 +27,23 @@ def audit_event(method, path, host, status, signed, body):
         activity = {}
     obj = activity.get('object')
     obj_fields = obj if isinstance(obj, dict) else {}
-    audiences = [fields.get(key) for fields in (activity, obj_fields) for key in ('to', 'cc')]
-    recipients = [item for value in audiences
-                  for item in (value if isinstance(value, list) else [value])
-                  if isinstance(item, str)]
+    outer_recipients = recipients_for(activity)
+    recipients = outer_recipients + recipients_for(obj_fields)
     return dict(method=method, path=path, host=host, status=status, signed=signed,
-                activity=activity.get('type'), actor=activity.get('actor'),
+                activity=activity.get('type'), activity_id=activity.get('id'),
+                actor=activity.get('actor'),
                 object=obj_fields.get('id') if isinstance(obj, dict) else obj,
-                public=PUBLIC in recipients, recipients=recipients)
+                public=PUBLIC in recipients, recipients=recipients,
+                outer_public=PUBLIC in outer_recipients, outer_recipients=outer_recipients)
 
 
 class Proxy(http.server.BaseHTTPRequestHandler):
+    def audit_request(self, body, status):
+        event = audit_event(self.command, self.path, name, status,
+                            'Signature' in self.headers, body)
+        with pathlib.Path(root, f'{name}.jsonl').open('a') as audit:
+            audit.write(json.dumps(event) + '\n')
+
     def forward(self):
         self.connection.settimeout(15)
         if self.headers.get('Host') != name or self.headers.get('Transfer-Encoding'):
@@ -47,12 +60,11 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         conn = http.client.HTTPConnection('127.0.0.1', backend, timeout=15)
         try:
             request_body = self.rfile.read(size)
+            # Preserve attempts even if forwarding fails or response headers never arrive.
+            self.audit_request(request_body, None)
             conn.request(self.command, self.path, request_body, headers)
             response = conn.getresponse()
-            event = audit_event(self.command, self.path, name, response.status,
-                                'Signature' in self.headers, request_body)
-            with pathlib.Path(root, f'{name}.jsonl').open('a') as audit:
-                audit.write(json.dumps(event) + '\n')
+            self.audit_request(request_body, response.status)
             body = response.read(2 * 1024 * 1024 + 1)
             if len(body) > 2 * 1024 * 1024:
                 self.send_error(502)

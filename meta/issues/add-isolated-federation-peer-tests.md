@@ -83,9 +83,11 @@ All commands below ran in the prescribed Secunda workspace with two Cargo jobs.
 
 - Pleroma bootstrap and the broader lifecycle/privacy/media matrix remain open;
   this foundation does not attest any Pleroma release or image.
-- Rustodon `/api/v2/search` currently hardcodes empty account results. Both peers
-  use the actual v1 account-search resolver here; v2 parity is not repaired or
-  claimed. Evidence: `target/peer-254966/`, `src/web.rs::search_v2`.
+- The initial v2 search attempt returned empty account results. Parent source
+  repair `0d513f5` now exists but is **unexecuted**. This runner retains the v1
+  resolver and does not claim v2 parity. Historical evidence:
+  `target/peer-254966/`; deferred v2 gate:
+  `tools/mastodon-fixture schema-read-test v2_account_search`.
 - Simultaneous reciprocal follows are not claimed: `target/peer-271058/` records
   a pinned Mastodon `account_stats` PostgreSQL deadlock, retry and remaining
   pending follow requests. The bounded first smoke deliberately exercises each
@@ -146,6 +148,45 @@ All commands below ran in the prescribed Secunda workspace with two Cargo jobs.
 - Multipart source regression, compilation, format/lint, actual upload and live
   propagation have **not run**. TDD execution is deferred due the host outage;
   independent review is source-only and cannot establish profile acceptance.
+
+## Interaction extension — source only, unexecuted
+
+- `tools/federation-peer-smoke interactions` adds sequential Like/Undo and
+  followers-only Announce/Undo in both directions under a six-minute test bound.
+  Each target is a freshly push-ingested public Note; no status resolver is used.
+- Like requires the received favourite row and signed activity; Undo is correlated
+  to the actual Like ID captured on the wire and must remove the observed row.
+  Private Announce requires exact wrapper URI, actor, public-original target and
+  the boosting actor's canonical followers audience, with recipient access and
+  outsider/anonymous denial. Here the recipient is both original author and an
+  established follower. Undo retires that wrapper, not the public original.
+- Audits now retain activity IDs and separate outer audiences. A private Announce
+  may embed a public Note without becoming public itself; any Public-addressed
+  Announce attempt still fails. Undo's outer audience is unconstrained. Private
+  attempts and canonical status GETs are rescanned at scenario end, including
+  delayed events from earlier cases. The privacy suite receives the same final
+  audit rescan. Counter/notification parity and concurrency stress are unclaimed.
+- Review corrections bind Announce ID and audience to one signed successful event,
+  with regressions rejecting split evidence and accepting a later exact event.
+  The proxy records attempts before backend forwarding (null status), then response
+  status separately, so backend failures cannot hide Public-addressed attempts.
+  Mocked actual-forward failure regressions and these source fixes are unexecuted.
+- Selected ignored tests are checked in the compiled test list before resources
+  start, preventing missing/renamed scenarios from silently passing zero tests.
+- These audit/schema/helper changes, new unit cases and all interaction execution
+  remain **pending**. Earlier three passing Python audit tests predate the new
+  activity-ID/envelope fields. No compilation, formatting/lint, unit tests, live
+  scenarios or SSH retry was performed during source-only continuation.
+
+## Deferred execution checklist
+
+After the parent restores access, in `/home/lain/rustodon-parity/peer-tests` with
+`CARGO_BUILD_JOBS=2`, rerun Rust and Python unit regressions, formatting and scoped
+Clippy, observer bootstrap and all five fresh commands (`public`, `privacy`,
+`notes`, `profile`, `interactions`), then repeat successful live runs to verify
+cleanup. Commands and exact historical evidence are in the linked smoke doc and
+above. All new privacy/lifecycle acceptance stays OPEN; source review is not a
+substitute for these gates. Pleroma remains separately deferred.
 
 ## Pleroma quota decision
 
