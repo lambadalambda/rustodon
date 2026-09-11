@@ -1203,7 +1203,72 @@ macro_rules! put_route {
     };
 }
 
+const READ_FAMILIAR_FOLLOWERS: RequiredScopes = RequiredScopes::new(&["read", "read:follows"]);
+
 pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
+    route!(
+        "/api/v1/trends/tags",
+        DisabledResponse,
+        ApiAuthentication::Optional(NO_SCOPE.as_slice()),
+        None,
+        Anonymous
+    ),
+    route!(
+        "/api/v1/trends/links",
+        DisabledResponse,
+        ApiAuthentication::Optional(NO_SCOPE.as_slice()),
+        None,
+        Anonymous
+    ),
+    route!(
+        "/api/v1/trends/statuses",
+        DisabledResponse,
+        ApiAuthentication::Optional(NO_SCOPE.as_slice()),
+        None,
+        Anonymous
+    ),
+    route!(
+        "/api/v1/directory",
+        DisabledResponse,
+        ApiAuthentication::Optional(NO_SCOPE.as_slice()),
+        None,
+        Anonymous
+    ),
+    route!(
+        "/api/v1/timelines/link",
+        DisabledResponse,
+        ApiAuthentication::Optional(READ_STATUSES.as_slice()),
+        None,
+        Anonymous
+    ),
+    route!(
+        "/api/v2/suggestions",
+        DisabledResponse,
+        ApiAuthentication::Required(READ_ACCOUNTS.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v1/domain_blocks",
+        Implemented,
+        ApiAuthentication::Required(READ_BLOCKS.as_slice()),
+        AssociationId,
+        Private
+    ),
+    route!(
+        "/api/v1/instance/domain_blocks",
+        Implemented,
+        ApiAuthentication::Optional(NO_SCOPE.as_slice()),
+        None,
+        Private
+    ),
+    route!(
+        "/api/v1/accounts/familiar_followers",
+        DisabledResponse,
+        ApiAuthentication::Required(READ_FAMILIAR_FOLLOWERS.as_slice()),
+        None,
+        Private
+    ),
     route!(
         "/api/v1/instance",
         Implemented,
@@ -3534,6 +3599,36 @@ pub fn router(state: WebState) -> Router {
         .route("/api/v1/bookmarks", get(bookmarks))
         .route("/api/v1/blocks", get(blocks))
         .route("/api/v1/mutes", get(mutes))
+        .route("/api/v1/trends/tags", get(empty_discovery_read))
+        .route("/api/v1/trends/tags/", get(empty_discovery_read))
+        .route("/api/v1/trends/links", get(empty_discovery_read))
+        .route("/api/v1/trends/links/", get(empty_discovery_read))
+        .route("/api/v1/trends/statuses", get(empty_discovery_read))
+        .route("/api/v1/trends/statuses/", get(empty_discovery_read))
+        .route("/api/v1/directory", get(empty_discovery_read))
+        .route("/api/v1/directory/", get(empty_discovery_read))
+        .route("/api/v1/timelines/link", get(empty_link_timeline))
+        .route("/api/v1/timelines/link/", get(empty_link_timeline))
+        .route("/api/v2/suggestions", get(empty_suggestions))
+        .route("/api/v2/suggestions/", get(empty_suggestions))
+        .route("/api/v1/domain_blocks", get(domain_blocks))
+        .route("/api/v1/domain_blocks/", get(domain_blocks))
+        .route(
+            "/api/v1/instance/domain_blocks",
+            get(instance_domain_blocks),
+        )
+        .route(
+            "/api/v1/instance/domain_blocks/",
+            get(instance_domain_blocks),
+        )
+        .route(
+            "/api/v1/accounts/familiar_followers",
+            get(empty_familiar_followers),
+        )
+        .route(
+            "/api/v1/accounts/familiar_followers/",
+            get(empty_familiar_followers),
+        )
         .route("/api/v1/instance/", get(instance_v1))
         .route("/api/v2/instance/", get(instance_v2))
         .route("/api/v1/instance/rules/", get(instance_rules))
@@ -15220,6 +15315,238 @@ async fn relationship_response(
     }
 }
 
+// These are explicit disabled collection reads, not a catch-all API fallback.
+async fn empty_discovery_read(State(state): State<WebState>, headers: HeaderMap) -> Response<Body> {
+    if let Err(response) = optional_viewer_owner(&state, &headers, NO_SCOPE).await {
+        return response;
+    }
+    json_response(StatusCode::OK, b"[]".to_vec())
+}
+
+async fn empty_suggestions(State(state): State<WebState>, headers: HeaderMap) -> Response<Body> {
+    if let Err(response) = required_viewer(&state, &headers, READ_ACCOUNTS).await {
+        return response;
+    }
+    json_response(StatusCode::OK, b"[]".to_vec())
+}
+
+async fn empty_link_timeline(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if let Err(response) = timeline_viewer(
+        &state,
+        &headers,
+        READ_STATUSES,
+        &requested_feed_options(&rack),
+        FeedKind::Topic,
+    )
+    .await
+    {
+        return response;
+    }
+    // Link discovery is disabled: unlike a real preview-card lookup, no resource
+    // was looked up and found missing. Do not fabricate a preview card or status.
+    json_response(StatusCode::OK, b"[]".to_vec())
+}
+
+async fn empty_familiar_followers(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if let Err(response) = required_viewer(&state, &headers, READ_FAMILIAR_FOLLOWERS).await {
+        return response;
+    }
+    let Ok(ids) = relationship_ids(&rack) else {
+        return framework_internal_error();
+    };
+    // The frontend caches by requested account ID; [] alone leaves it unresolved.
+    // These are empty relationship placeholders, not proof that an account exists.
+    let mut seen = std::collections::BTreeSet::new();
+    let values = ids
+        .into_iter()
+        .filter(|id| seen.insert(*id))
+        .map(|id| serde_json::json!({"id": id.to_string(), "accounts": []}))
+        .collect::<Vec<_>>();
+    match serde_json::to_vec(&values) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(_) => internal_error(),
+    }
+}
+
+async fn domain_blocks(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let owner = match required_viewer(&state, &headers, READ_BLOCKS).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let (max_id, since_id) = match cursor_pair(&rack, "max_id", "since_id") {
+        Ok(cursors) => cursors,
+        Err(error) => return cursor_parameter_error(&headers, error),
+    };
+    let Ok(limit) =
+        limit_parameter(&rack, 100, 200).and_then(|limit| usize::try_from(limit).map_err(|_| ()))
+    else {
+        return framework_internal_error();
+    };
+    let Ok(blocks) = state.repository.account_domain_blocks(owner).await else {
+        return internal_error();
+    };
+    // The existing repository returns ascending IDs. Mastodon's max-ID pages are descending.
+    let blocks = blocks
+        .into_iter()
+        .rev()
+        .filter(|block| {
+            max_id.is_none_or(|id| block.id < id) && since_id.is_none_or(|id| block.id > id)
+        })
+        .take(limit)
+        .collect::<Vec<_>>();
+    let values = blocks.iter().map(|block| &block.domain).collect::<Vec<_>>();
+    let Ok(body) = serde_json::to_vec(&values) else {
+        return internal_error();
+    };
+    let mut response = json_response(StatusCode::OK, body);
+    let parameters = parameters(query.as_deref());
+    let mut links = Vec::new();
+    for (cursor, relation, block) in [
+        (
+            "max_id",
+            "next",
+            blocks.last().filter(|_| blocks.len() == limit),
+        ),
+        ("since_id", "prev", blocks.first()),
+    ] {
+        if let Some(block) = block
+            && let Some(url) = pagination_url(
+                &state,
+                "api/v1/domain_blocks",
+                &parameters,
+                cursor,
+                block.id,
+                &["limit"],
+            )
+        {
+            links.push(format!("<{url}>; rel=\"{relation}\""));
+        }
+    }
+    set_link_header(&mut response, &links);
+    response
+}
+
+async fn instance_domain_blocks(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let owner = match optional_viewer_owner(&state, &headers, NO_SCOPE).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let Ok(user_eligible) = instance_block_list_user_eligible(&state, &headers, owner).await else {
+        return internal_error();
+    };
+    let Ok(settings) = state.repository.settings().await else {
+        return internal_error();
+    };
+    let visible = |name| {
+        settings
+            .iter()
+            .find(|setting| setting.var == name)
+            .and_then(|setting| setting.value.as_ref())
+            .and_then(|value| yaml_scalar(value.raw()))
+            .is_some_and(|value| value == "all" || (value == "users" && user_eligible))
+    };
+    // Hidden publishing is an explicit disabled response, not an empty moderation database.
+    if !visible("show_domain_blocks") {
+        return json_response(StatusCode::OK, b"[]".to_vec());
+    }
+    let Ok(mut blocks) = state.repository.domain_blocks().await else {
+        return internal_error();
+    };
+    blocks.retain(|block| {
+        block
+            .severity
+            .is_some_and(|severity| matches!(severity.0, 0 | 1))
+    });
+    blocks.sort_by(|left, right| {
+        (left.severity.map(|v| v.0), &left.domain)
+            .cmp(&(right.severity.map(|v| v.0), &right.domain))
+    });
+    let with_comment = visible("show_domain_blocks_rationale");
+    let values = blocks
+        .iter()
+        .map(|block| public_domain_block(block, with_comment))
+        .collect::<Vec<_>>();
+    match serde_json::to_vec(&values) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(_) => internal_error(),
+    }
+}
+
+// Publishing uses User#functional_or_moved?, not the stricter require_user!.
+// Reuse the OAuth facts query, avoiding Repository::user's OTP decryption.
+async fn instance_block_list_user_eligible(
+    state: &WebState,
+    headers: &HeaderMap,
+    owner: Option<OAuthResourceOwner>,
+) -> sqlx::Result<bool> {
+    let Some(owner) = owner else {
+        return Ok(false);
+    };
+    // The optional authenticator above already validated this bearer header.
+    let Some(token) = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.get(7..))
+    else {
+        return Ok(false);
+    };
+    let Some(user) = state.repository.oauth_bearer_candidate(token).await? else {
+        return Ok(false);
+    };
+    Ok(user.user_id == Some(owner.user_id())
+        && user.account_id == Some(owner.account_id())
+        && user.confirmed_at.is_some()
+        && user.approved == Some(true)
+        && user.disabled == Some(false)
+        && user.suspended_at.is_none()
+        && user.memorial == Some(false)
+        && (user.role_requires_2fa != Some(true)
+            || user.otp_required_for_login == Some(true)
+            || user.has_webauthn_credentials))
+}
+
+fn public_domain_block(
+    block: &crate::mastodon::DomainBlock,
+    with_comment: bool,
+) -> serde_json::Value {
+    let length = block.domain.chars().count();
+    let visible = length / 4;
+    let domain = block
+        .domain
+        .chars()
+        .enumerate()
+        .map(|(index, ch)| {
+            if block.obfuscate && index > visible && index < length - visible && ch != '.' {
+                '*'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    serde_json::json!({
+        "domain": domain,
+        "digest": format!("{:x}", Sha256::digest(block.domain.as_bytes())),
+        "severity": if block.severity.is_some_and(|severity| severity.0 == 1) { "suspend" } else { "silence" },
+        "comment": if with_comment { block.public_comment.as_deref() } else { None },
+    })
+}
+
 async fn relationships(
     State(state): State<WebState>,
     Extension(rack): Extension<RackParameters>,
@@ -18199,6 +18526,9 @@ fn framework_internal_error() -> Response<Body> {
 mod account_search_tests;
 
 #[cfg(test)]
+mod api_empty_reads_tests;
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
@@ -19152,7 +19482,7 @@ mod tests {
 
     #[test]
     fn api_route_inventory_is_unique_and_declares_protocol_contracts() {
-        assert_eq!(API_ROUTE_INVENTORY.len(), 106);
+        assert_eq!(API_ROUTE_INVENTORY.len(), 115);
         assert_eq!(REST_BODY_LIMIT_BYTES, 103_809_024);
         assert_eq!(
             API_ROUTE_INVENTORY
@@ -19478,7 +19808,7 @@ mod tests {
         assert!(!response.headers().contains_key(VARY));
         assert!(cors_preflight_response("/api/v1/markers", &headers).is_some());
         assert!(cors_preflight_response("/api/v1/accounts/search", &headers).is_some());
-        assert!(cors_preflight_response("/api/v1/accounts/familiar_followers", &headers).is_none());
+        assert!(cors_preflight_response("/api/v1/accounts/familiar_followers", &headers).is_some());
         assert!(cors_preflight_response("/api/v1/accounts/search/statuses", &headers).is_some());
         headers.insert(
             ACCESS_CONTROL_REQUEST_METHOD,

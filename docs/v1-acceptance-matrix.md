@@ -56,12 +56,14 @@ surface; their help entries are checked by
 
 ## Supported API Routes
 
-`src/web.rs::API_ROUTE_INVENTORY` is the complete advertised API surface: 106
+`src/web.rs::API_ROUTE_INVENTORY` is the complete advertised API surface: 115
 canonical method/path contracts, with trailing-slash aliases registered by the
 router but not duplicated in the inventory. The inventory and route-contract
 tests check unique method/path pairs, representative authentication and
 pagination declarations, while response-finalization tests check cache
-behavior and the explicitly disabled translation response. The
+behavior and explicitly disabled collection/translation responses.
+The nine frontend read groups and their limitations are documented in
+[`return-empty-unimplemented-api-reads`](../meta/issues/return-empty-unimplemented-api-reads.md). The
 `V1_REQUIRED_API_ROUTES` test checks the required v1 subset against that same
 inventory, so adding a required route without a support declaration fails the
 test suite. The inventory also contains compatibility reads, frontend probes,
