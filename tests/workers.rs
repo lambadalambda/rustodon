@@ -14269,6 +14269,297 @@ async fn activitypub_unknown_announce_target_is_fetched_and_embedded_self_boost_
     result
 }
 
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+async fn activitypub_fetched_provenance_rejects_forged_create()
+-> Result<(), Box<dyn std::error::Error>> {
+    fetched_provenance_scenario("Create", false, false).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+async fn activitypub_fetched_provenance_dereferences_foreign_nested_note()
+-> Result<(), Box<dyn std::error::Error>> {
+    fetched_provenance_scenario("Announce", false, false).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+async fn activitypub_fetched_provenance_rejects_forged_nested_actor()
+-> Result<(), Box<dyn std::error::Error>> {
+    fetched_provenance_scenario("Announce", false, true).await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+async fn activitypub_fetched_provenance_preserves_authoritative_cross_author_boost()
+-> Result<(), Box<dyn std::error::Error>> {
+    fetched_provenance_scenario("Announce", true, false).await
+}
+
+#[cfg(feature = "test-support")]
+#[allow(clippy::too_many_lines)]
+async fn fetched_provenance_scenario(
+    wrapper_type: &str,
+    canonical_exists: bool,
+    spoof_nested_actor: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const BOB: i64 = 116_844_606_259_202_001;
+    const MODERATOR: i64 = 116_844_606_259_201_002;
+    const ATTACKER_ID: i64 = -90101;
+    const ACTOR: &str = "https://remote.fixture.invalid/users/bob";
+    const ATTACKER: &str = "http://evil.fixture.invalid/users/mallory";
+    const ORIGIN: &str = "https://fixture-v4-6-5.rustodon.invalid/";
+    const LOCAL_ACTOR: &str = "https://fixture-v4-6-5.rustodon.invalid/ap/users/116844606259201002";
+    const WRAPPER: &str = "http://evil.fixture.invalid/activities/r01-wrapper";
+    const TARGET: &str = "http://remote.fixture.invalid/users/bob/statuses/r01-target";
+    const BOOST: &str = "https://remote.fixture.invalid/activities/r01-outer";
+    let runtime_pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&std::env::var("RUSTODON_WORKER_DATABASE_URL")?)
+        .await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&std::env::var("RUSTODON_WORKER_OWNER_DATABASE_URL")?)
+        .await?;
+    reset().await?;
+    // The victim is deliberately already cached; no author discovery can authenticate this Note.
+    sqlx::query("INSERT INTO accounts SELECT (jsonb_populate_record(NULL::accounts,
+        to_jsonb(account) || jsonb_build_object('id', $1::bigint, 'uri', $2::text,
+        'username', 'r01-mallory', 'domain', 'evil.fixture.invalid'))).* FROM accounts account WHERE id = $3")
+        .bind(ATTACKER_ID).bind(ATTACKER).bind(BOB).execute(&pool).await?;
+    sqlx::query(
+        "INSERT INTO follows (id, account_id, target_account_id, created_at, updated_at)
+        VALUES ($1, $2, $1, now(), now())",
+    )
+    .bind(ATTACKER_ID)
+    .bind(MODERATOR)
+    .execute(&pool)
+    .await?;
+    let baseline_stats: Value =
+        sqlx::query_scalar("SELECT to_jsonb(stats) FROM account_stats stats WHERE account_id = $1")
+            .bind(BOB)
+            .fetch_one(&pool)
+            .await?;
+    let baseline: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM statuses), (SELECT count(*) FROM mentions), (SELECT count(*) FROM notifications)")
+        .fetch_one(&pool).await?;
+    let forged_note = json!({
+        "id": TARGET, "type": "Note", "attributedTo": ACTOR,
+        "content": "<p>Forged R01 mention</p>",
+        "to": [activitypub::PUBLIC_ADDRESS, LOCAL_ACTOR], "cc": [],
+        "tag": [{"type": "Mention", "href": LOCAL_ACTOR, "name": "@moderator"}],
+        "attachment": []
+    });
+    let document = json!({
+        "id": WRAPPER, "type": wrapper_type,
+        "actor": if wrapper_type == "Create" || spoof_nested_actor { ACTOR } else { ATTACKER },
+        "object": forged_note, "to": [activitypub::PUBLIC_ADDRESS]
+    });
+    let canonical = json!({
+        "id": TARGET, "type": "Note", "attributedTo": ACTOR,
+        "content": "<p>Authoritative original</p>",
+        "to": [activitypub::PUBLIC_ADDRESS], "cc": [], "tag": [], "attachment": []
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = listener.local_addr()?;
+    let canonical_fetches = Arc::new(AtomicUsize::new(0));
+    let fetches = canonical_fetches.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await?;
+            let request = fixture_delivery_request(&mut socket).await?;
+            let request = String::from_utf8_lossy(&request);
+            let (status, body) = if request.starts_with("GET /activities/r01-wrapper ") {
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("host: evil.fixture.invalid")
+                );
+                ("200 OK", document.to_string())
+            } else {
+                assert!(request.starts_with("GET /users/bob/statuses/r01-target "));
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("host: remote.fixture.invalid")
+                );
+                fetches.fetch_add(1, Ordering::SeqCst);
+                if canonical_exists {
+                    ("200 OK", canonical.to_string())
+                } else {
+                    ("410 Gone", String::new())
+                }
+            };
+            socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/activity+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), std::io::Error>(())
+    });
+    let queue = Queue::new(runtime_pool);
+    let handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
+        &queue,
+        Some(pool.clone()),
+        None,
+        Some(ActivityPubDeliveryConfig {
+            origin: Url::parse(ORIGIN)?,
+            local_domain: "fixture-v4-6-5.rustodon.invalid".to_owned(),
+            media_root_url: "/system".to_owned(),
+            media_root: None,
+            limited_federation: false,
+            remote_media_endpoint: None,
+            remote_delivery_endpoint: None,
+            remote_fetch_endpoint: Some(endpoint),
+        }),
+    )?;
+    let executor = WorkerExecutor::new(queue.clone(), handlers, 1, 1)?;
+    queue
+        .enqueue(
+            &JobSpec::new(
+                Lane::Ingress,
+                ACTIVITYPUB_INBOX_JOB_KIND,
+                json!({
+                    "body": json!({"id": BOOST, "type": "Announce", "actor": ACTOR,
+                        "object": WRAPPER, "to": [activitypub::PUBLIC_ADDRESS]}).to_string(),
+                    "signature_key_id": "https://remote.fixture.invalid/users/bob#secondary-key",
+                    "remote_domain": "remote.fixture.invalid"
+                }),
+            )
+            .logical_key("activitypub:r01-provenance"),
+        )
+        .await?;
+    assert!(
+        executor
+            .process_one("r01", &[Lane::Ingress], Duration::seconds(30))
+            .await?
+    );
+    assert_eq!(queue.dispatch_outbox(100).await?, 1);
+    assert!(
+        executor
+            .process_one("r01", &[Lane::Pull], Duration::seconds(30))
+            .await?
+    );
+    // Run notification/distribution work too, rather than asserting only inbox acceptance.
+    queue.dispatch_outbox(100).await?;
+    for _ in 0..20 {
+        if !executor
+            .process_one("r01", &[Lane::Core], Duration::seconds(30))
+            .await?
+        {
+            break;
+        }
+        queue.dispatch_outbox(100).await?;
+    }
+    server.abort();
+    let server_result = server.await;
+    assert!(
+        server_result
+            .as_ref()
+            .is_err_and(tokio::task::JoinError::is_cancelled),
+        "fixture server failed: {server_result:?}"
+    );
+    let after: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM statuses), (SELECT count(*) FROM mentions), (SELECT count(*) FROM notifications)")
+        .fetch_one(&pool).await?;
+    let statuses: Vec<(String, i64, String, Option<i64>)> = sqlx::query_as(
+        "SELECT uri, account_id, text, reblog_of_id FROM statuses WHERE uri = ANY($1) ORDER BY uri",
+    )
+    .bind(vec![TARGET, WRAPPER, BOOST])
+    .fetch_all(&pool)
+    .await?;
+    let target_id: Option<i64> = sqlx::query_scalar("SELECT id FROM statuses WHERE uri = $1")
+        .bind(TARGET)
+        .fetch_optional(&pool)
+        .await?;
+    let failed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM rustodon.durable_jobs WHERE kind = $1 AND dead_at IS NOT NULL",
+    )
+    .bind(ACTIVITYPUB_ANNOUNCE_RESOLVE_JOB_KIND)
+    .fetch_one(&pool)
+    .await?;
+    // Clean up even when the regression assertions below fail (the harness shares its restored DB).
+    sqlx::query("DELETE FROM notifications WHERE (activity_type = 'Mention' AND activity_id IN
+        (SELECT id FROM mentions WHERE status_id IN (SELECT id FROM statuses WHERE uri = ANY($1))))
+        OR (activity_type = 'Status' AND activity_id IN (SELECT id FROM statuses WHERE uri = ANY($1)))")
+        .bind(vec![TARGET, WRAPPER, BOOST]).execute(&pool).await?;
+    sqlx::query(
+        "DELETE FROM mentions WHERE status_id IN (SELECT id FROM statuses WHERE uri = ANY($1))",
+    )
+    .bind(vec![TARGET, WRAPPER, BOOST])
+    .execute(&pool)
+    .await?;
+    sqlx::query("DELETE FROM statuses WHERE uri = ANY($1)")
+        .bind(vec![BOOST, WRAPPER, TARGET])
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM follows WHERE id = $1")
+        .bind(ATTACKER_ID)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM account_stats WHERE account_id = ANY($1)")
+        .bind(vec![BOB, ATTACKER_ID])
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO account_stats SELECT * FROM jsonb_populate_record(NULL::account_stats, $1)",
+    )
+    .bind(baseline_stats)
+    .execute(&pool)
+    .await?;
+    sqlx::query("DELETE FROM accounts WHERE id = $1")
+        .bind(ATTACKER_ID)
+        .execute(&pool)
+        .await?;
+    assert_eq!(
+        after,
+        (
+            baseline.0 + if canonical_exists { 3 } else { 0 },
+            baseline.1,
+            baseline.2
+        ),
+        "fetched provenance must not commit forged statuses/mentions/notifications/boosts: {statuses:?}"
+    );
+    if canonical_exists {
+        assert_eq!(
+            canonical_fetches.load(Ordering::SeqCst),
+            1,
+            "foreign embedded Notes must be dereferenced"
+        );
+        assert_eq!(failed, 0);
+        assert_eq!(after.0, baseline.0 + 3);
+        assert_eq!(statuses.len(), 3);
+        let original = statuses
+            .iter()
+            .find(|status| status.0 == TARGET)
+            .expect("canonical Note");
+        assert_eq!(original.1, BOB);
+        assert_eq!(original.2, "<p>Authoritative original</p>");
+        for boost in statuses.iter().filter(|status| status.0 != TARGET) {
+            assert_eq!(
+                boost.3, target_id,
+                "both boosts must reference the original"
+            );
+            assert_eq!(boost.1, if boost.0 == WRAPPER { ATTACKER_ID } else { BOB });
+        }
+    } else {
+        assert_eq!(
+            after.0, baseline.0,
+            "forged statuses or boosts must not be committed: {statuses:?}"
+        );
+        assert!(statuses.is_empty());
+        assert_eq!(failed, 1, "the invalid target must fail permanently");
+        assert_eq!(
+            canonical_fetches.load(Ordering::SeqCst),
+            usize::from(wrapper_type == "Announce" && !spoof_nested_actor)
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
 #[allow(clippy::too_many_lines)]

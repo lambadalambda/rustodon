@@ -2760,6 +2760,24 @@ fn remote_announce_audience(arguments: &Value, field: &str) -> Result<Vec<String
         .collect()
 }
 
+// A fetched wrapper is authenticated by its transport origin, not its claimed actor.
+// Check this before allowing any embedded object to reach a writer.
+fn validate_fetched_activity_actor(
+    activity_uri: &str,
+    actor_uri: &str,
+) -> Result<(), HandlerFailure> {
+    let matches_origin = Url::parse(activity_uri)
+        .ok()
+        .zip(Url::parse(actor_uri).ok())
+        .is_some_and(|(activity, actor)| same_url_origin(&activity, &actor));
+    if !matches_origin {
+        return Err(HandlerFailure::permanent(
+            "remote fetched activity actor does not match the requested origin",
+        ));
+    }
+    Ok(())
+}
+
 fn remote_note_document(
     document: &Value,
     object_uri: &str,
@@ -2793,6 +2811,7 @@ fn remote_note_document(
             let actor_uri = remote_uri_value(document.get("actor")).ok_or_else(|| {
                 HandlerFailure::permanent("remote Announce target Create has no actor")
             })?;
+            validate_fetched_activity_actor(object_uri, actor_uri)?;
             if remote_uri_value(object.get("attributedTo")) != Some(actor_uri) {
                 return Err(HandlerFailure::permanent(
                     "remote Announce target Note author does not match Create actor",
@@ -2856,6 +2875,7 @@ fn remote_announce_document(
     }
     let actor_uri = remote_uri_value(document.get("actor"))
         .ok_or_else(|| HandlerFailure::permanent("remote nested Announce has no actor"))?;
+    validate_fetched_activity_actor(object_uri, actor_uri)?;
     let nested_object = document
         .get("object")
         .ok_or_else(|| HandlerFailure::permanent("remote nested Announce has no object"))?;
@@ -2864,7 +2884,10 @@ fn remote_announce_document(
     let embedded_note = nested_object.as_object().and_then(|object| {
         (object.get("type").and_then(Value::as_str) == Some("Note")).then(|| {
             let note_actor_uri = remote_uri_value(object.get("attributedTo"))?;
-            (remote_uri_value(object.get("id")) == Some(nested_object_uri)
+            // Only self-boosts inherit the wrapper's authority. Foreign authors must
+            // be resolved through their canonical object URI, even on the same server.
+            (note_actor_uri == actor_uri
+                && remote_uri_value(object.get("id")) == Some(nested_object_uri)
                 && validate_note_object(note_actor_uri, object).is_ok())
             .then(|| nested_object.clone())
         })?
@@ -6139,6 +6162,33 @@ mod tests {
     }
 
     #[test]
+    fn fetched_wrappers_reject_cross_origin_actor_provenance() {
+        for wrapper_type in ["Create", "Announce"] {
+            for fetched_uri in [
+                "https://evil.example/activities/1",
+                "http://remote.example/activities/1",
+                "https://remote.example:8443/activities/1",
+            ] {
+                let document = json!({
+                    "id": fetched_uri,
+                    "type": wrapper_type,
+                    "actor": "https://remote.example/users/alice",
+                    "object": {
+                        "id": "https://remote.example/users/alice/statuses/1",
+                        "type": "Note",
+                        "attributedTo": "https://remote.example/users/alice",
+                        "content": "forged"
+                    }
+                });
+                assert!(
+                    remote_announce_document(&document, fetched_uri).is_err(),
+                    "{wrapper_type} must not authenticate a different origin: {fetched_uri}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn note_resolution_keys_preserve_actor_object_and_personal_recipient() {
         let first = note_resolution_logical_key(
             1,
@@ -6279,7 +6329,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_nested_announce_document_preserves_embedded_target() {
+    fn remote_nested_announce_document_dereferences_cross_author_target() {
         let announce_uri = "https://remote.example/activities/boost";
         let note_uri = "https://remote.example/users/alice/statuses/1";
         let document = json!({
@@ -6308,7 +6358,7 @@ mod tests {
         assert_eq!(activity_uri, announce_uri);
         assert_eq!(actor_uri, "https://remote.example/users/bob");
         assert_eq!(object_uri, note_uri);
-        assert!(embedded_note.is_some());
+        assert!(embedded_note.is_none());
         assert_eq!(to, ["https://www.w3.org/ns/activitystreams#Public"]);
     }
 
