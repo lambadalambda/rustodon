@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Prepare/build the exact Pleroma release archive on Secunda, without base pulls."""
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import subprocess
+import tarfile
+
+REVISION = "cd8816eccec355b5ff1533dc75fc86e9927baf2b"
+ARCHIVE_SHA256 = "bb5c9cd6e6c6be270b119f12e5879710a496f12d1015d5448bb5c925a402046e"
+LOCK_SHA256 = "3e44cbaa4ed88ee13e1992345cba44d8bc9b9348fb43dc41036e9a8fe93ab456"
+WORKSPACE = Path("/home/lain/rustodon-parity/pleroma-peer")
+ELIXIR_REPO = "docker.io/hexpm/elixir"
+ALPINE_REPO = "docker.io/library/alpine"
+ELIXIR_TAG = ELIXIR_REPO + ":1.17.3-erlang-26.2.5.6-alpine-3.17.9"
+ALPINE_TAG = ALPINE_REPO + ":3.17.9"
+
+
+def sha256(path):
+    with path.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def verify_archive(archive):
+    if sha256(archive) != ARCHIVE_SHA256:
+        raise ValueError("archive checksum differs from the verified release export")
+
+
+def cached_digest(image, repository):
+    digests = sorted(set(
+        value for value in image.get("RepoDigests", [])
+        if re.fullmatch(re.escape(repository) + r"@sha256:[0-9a-f]{64}", value)
+    ))
+    if (len(digests) != 1 or image.get("Os") != "linux"
+            or image.get("Architecture") != "amd64"):
+        raise ValueError(f"need one cached immutable linux/amd64 digest for {repository}")
+    return digests[0]
+
+
+def pinned_recipe(original, builder, runtime):
+    build_from = "FROM ${ELIXIR_IMG}:${ELIXIR_VER}-erlang-${ERLANG_VER}-alpine-${ALPINE_VER} AS build"
+    runtime_from = "FROM alpine:${ALPINE_VER}"
+    if any(original.count(marker) != 1 for marker in [build_from, runtime_from, "USER pleroma"]):
+        raise ValueError("unexpected release Dockerfile")
+    # Preserve release install/build commands; add only immutable bases and evidence.
+    evidence = f'''RUN echo '{LOCK_SHA256}  mix.lock' | sha256sum -c - &&\\
+    mkdir -p /release/build-provenance &&\\
+    cp mix.lock /release/build-provenance/mix.lock &&\\
+    apk info -vv > /release/build-provenance/builder-packages.txt &&\\
+    elixir --version > /release/build-provenance/elixir.txt &&\\
+    mix hex.info > /release/build-provenance/hex.txt &&\\
+    find "$HOME/.mix" -type f -name rebar3 -exec {{}} version \\; > /release/build-provenance/rebar.txt &&\\
+    test -s /release/build-provenance/rebar.txt
+
+'''
+    return (original.replace(build_from, f"FROM {builder} AS build")
+            .replace(runtime_from, evidence + f"FROM {runtime}")
+            .replace("USER pleroma", "RUN apk info -vv > /usr/local/share/pleroma-runtime-packages.txt\n\nUSER pleroma"))
+
+
+def capture(*args):
+    return subprocess.check_output(args, text=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("archive", type=Path, help="exact git archive tar (see provenance doc)")
+    parser.add_argument("output", type=Path, help="new directory beneath the task workspace")
+    parser.add_argument("--build", action="store_true", help="build using exact release tags already cached; never pull")
+    args = parser.parse_args()
+    if socket.gethostname().split(".")[0] != "secunda" or os.getuid() == 0:
+        parser.error("run as an unprivileged user on Secunda")
+    output = args.output.resolve()
+    if not output.is_relative_to(WORKSPACE) or output == WORKSPACE:
+        parser.error(f"output must be beneath {WORKSPACE}")
+    verify_archive(args.archive)
+    output.mkdir(parents=True, exist_ok=False)
+    source = output / "source"
+    source.mkdir()
+    with tarfile.open(args.archive) as archive:
+        archive.extractall(source, filter="data")
+    if sha256(source / "mix.lock") != LOCK_SHA256:
+        raise ValueError("release lockfile checksum mismatch")
+    record = {
+        "source_revision": REVISION,
+        "source_archive_sha256": ARCHIVE_SHA256,
+        "mix_lock_sha256": LOCK_SHA256,
+        "release_dockerfile_sha256": sha256(source / "Dockerfile"),
+        "status": "prepared; no image built",
+    }
+    manifest = output / "provenance.json"
+
+    def save():
+        manifest.write_text(json.dumps(record, indent=2) + "\n")
+
+    save()
+    if not args.build:
+        print(manifest)
+        return
+    # Local inspection only. Missing tags/digests fail, rather than contacting a registry.
+    try:
+        info = json.loads(capture("podman", "info", "--format", "json"))
+        if not info["host"]["security"]["rootless"]:
+            raise ValueError("rootless Podman required")
+        pins = []
+        for tag, repository in [(ELIXIR_TAG, ELIXIR_REPO), (ALPINE_TAG, ALPINE_REPO)]:
+            image = json.loads(capture("podman", "image", "inspect", tag))[0]
+            (output / ("elixir-base.json" if repository == ELIXIR_REPO else "alpine-base.json")).write_text(
+                json.dumps(image, indent=2) + "\n"
+            )
+            pins.append(cached_digest(image, repository))
+        recipe = output / "Containerfile.pinned"
+        recipe.write_text(pinned_recipe((source / "Dockerfile").read_text(), *pins))
+        record.update({
+            "base_images": dict(zip([ELIXIR_TAG, ALPINE_TAG], pins)),
+            "generated_recipe_sha256": sha256(recipe),
+            "build_date": datetime.now(timezone.utc).isoformat(),
+            "podman_version": capture("podman", "--version").strip(),
+            "status": "building",
+        })
+        save()
+        command = [
+            "podman", "build", "--pull=never", "--retry=0", "--no-cache",
+            "--platform=linux/amd64", "--iidfile", str(output / "image.id"),
+            "--build-arg", "VCS_REF=" + REVISION,
+            "--build-arg", "BUILD_DATE=" + record["build_date"],
+            "-f", str(recipe), str(source),
+        ]
+        record["build_command"] = command
+        save()
+        with (output / "build.log").open("w") as log:
+            subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
+        image_id = (output / "image.id").read_text().strip()
+        record["image_id"] = image_id
+        (output / "image-inspect.json").write_text(capture("podman", "image", "inspect", image_id))
+        # No database/network/startup: collect the package/tool evidence baked into the image.
+        evidence = capture(
+            "podman", "run", "--rm", "--pull=never", "--network=none",
+            "--entrypoint", "/bin/sh", image_id, "-ec",
+            'for f in /opt/pleroma/build-provenance/* /usr/local/share/pleroma-runtime-packages.txt; '
+            'do echo "=== $f"; cat "$f"; done; '
+            f"echo '{LOCK_SHA256}  /opt/pleroma/build-provenance/mix.lock' | sha256sum -c -",
+        )
+        (output / "toolchain-packages.txt").write_text(evidence)
+        record["status"] = "built; package/lock evidence collected; bootstrap not tested"
+        save()
+        print(image_id)
+    except (ValueError, subprocess.CalledProcessError) as error:
+        record["status"] = "blocked or failed (not verified)"
+        record["error"] = str(error)
+        save()
+        raise
+
+
+if __name__ == "__main__":
+    main()
