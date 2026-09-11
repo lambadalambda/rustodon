@@ -10,10 +10,35 @@ CARGO_BUILD_JOBS=2 tools/federation-peer-smoke
 REMOTE
 ```
 
-This is a bounded first smoke, not the full interoperability matrix. Pleroma,
-private audiences, edits/deletes, media and lifecycle convergence remain future
-work. See [the open issue](../meta/issues/add-isolated-federation-peer-tests.md)
-for actual passing/blocked evidence.
+This is bounded acceptance source, not the full interoperability matrix. The
+`public` scenario has prior remote pass evidence. The new `privacy` scenario is
+**source-reviewed but unverified**: Secunda became unavailable before the fresh
+observer bootstrap could be run. Do not interpret source presence as a privacy
+pass. Pleroma and broader lifecycle coverage remain unclaimed. See
+[the open issue](../meta/issues/add-isolated-federation-peer-tests.md) for exact
+passing, red and pending evidence.
+
+After the parent restores Secunda, run each scenario in a fresh invocation:
+
+```sh
+CARGO_BUILD_JOBS=2 tools/federation-peer-smoke public
+CARGO_BUILD_JOBS=2 tools/federation-peer-smoke privacy
+```
+
+`privacy` creates followers-only and direct Notes in both directions. The normal
+peer follows the author; a separate non-following recipient receives direct
+Notes; a third account is an outsider. Assertions require received identity,
+visibility, marker and signed inbox Create with the intended audience and no
+Public address. Any observed Public-addressed Create attempt for that private
+object is rejected, even if another private delivery succeeds. Receiving REST
+checks require recipient 200, nonrecipient/outsider/anonymous 404; origin-side
+outsider/anonymous access must also be denied. These REST probes do not fetch
+the canonical ActivityPub status URL. No wire identifier is rewritten.
+
+Pending verification includes source compilation, formatting/Clippy, observer
+bootstrap, unit regressions, both commands above and repeated cleanup. TDD for
+changes after the outage is deferred rather than simulated; no local workload
+or further SSH attempt is allowed until the parent restores access.
 
 ## What runs
 
@@ -22,8 +47,9 @@ for actual passing/blocked evidence.
   existing read-only `/home/lain/repos/rustodon/target/mastodon-v4.6.5` checkout
   must match `1440d55b139e39ec722c2a3db7f60b66cd889048` (canonical reference path:
   `/workspace/rustodon/target/mastodon-v4.6.5`).
-- Two independently cloned, emptied schema databases. Rails creates a fresh
-  local user, OAuth token and signing keypair on each side; no remote actors,
+- Two independently cloned, emptied schema databases. Rails creates three fresh
+  functional local users (normal peer, recipient, outsider), OAuth tokens and
+  signing keypairs on each side; no remote actors,
   follows, statuses or signing keys are copied between peers. Separate media
   roots and origins: `mastodon.peer.invalid` and `rustodon.peer.invalid`.
 - Mastodon Puma **and Sidekiq**, Rustodon web **and durable workers**. Rustodon

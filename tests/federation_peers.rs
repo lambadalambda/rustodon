@@ -110,23 +110,27 @@ impl Peer {
         path: &str,
         form: &[(&str, &str)],
     ) -> Result<Value> {
-        let request = client
-            .request(method.clone(), self.http.join(path)?)
-            .header("Host", format!("{}.peer.invalid", self.name))
-            .header("X-Forwarded-Proto", "https")
-            .bearer_auth(&self.token);
-        let request = if method == Method::GET {
-            request.query(form)
-        } else {
-            request.form(form)
-        };
-        let response = request.send().await?;
+        let response = self.request(client, Some(&self.token), method, path, form).await?;
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
             return Err(format!("{} {path}: {status} {body}", self.name).into());
         }
         Ok(serde_json::from_str(&body)?)
+    }
+
+    async fn request(&self, client: &Client, token: Option<&str>, method: Method, path: &str, form: &[(&str, &str)]) -> Result<reqwest::Response> {
+        let request = client
+            .request(method.clone(), self.http.join(path)?)
+            .header("Host", format!("{}.peer.invalid", self.name))
+            .header("X-Forwarded-Proto", "https");
+        let request = if let Some(token) = token { request.bearer_auth(token) } else { request };
+        let request = if method == Method::GET {
+            request.query(form)
+        } else {
+            request.form(form)
+        };
+        Ok(request.send().await?)
     }
 
     async fn discover(&self, client: &Client, other: &Self) -> Result<i64> {
@@ -189,7 +193,15 @@ async fn discovery_follow_and_public_push_both_directions() -> Result<()> {
     tokio::time::timeout(Duration::from_mins(3), smoke()).await?
 }
 
-async fn smoke() -> Result<()> {
+struct Smoke {
+    root: PathBuf,
+    run: String,
+    client: Client,
+    mastodon: Peer,
+    rustodon: Peer,
+}
+
+async fn setup() -> Result<Smoke> {
     if !cfg!(all(debug_assertions, feature = "test-support")) {
         return Err("debug test-support build required".into());
     }
@@ -216,6 +228,11 @@ async fn smoke() -> Result<()> {
     // This is sequential convergence, not simultaneous reciprocal-follow stress.
     follow_and_accept(&client, &mastodon, &rustodon, rust_on_masto, masto_on_rust).await?;
     follow_and_accept(&client, &rustodon, &mastodon, masto_on_rust, rust_on_masto).await?;
+    Ok(Smoke { root, run, client, mastodon, rustodon })
+}
+
+async fn smoke() -> Result<()> {
+    let Smoke {root, run, client, mastodon, rustodon} = setup().await?;
     let mut statuses = Vec::new();
     for peer in [&mastodon, &rustodon] {
         let marker = format!("{run}-{}-public-push", peer.name);
@@ -353,11 +370,18 @@ fn parse_audit(text: &str) -> Result<Vec<Value>> {
         .collect::<std::result::Result<_, _>>()?)
 }
 
-fn has_push_audit(
+fn has_push_audit(root: &std::path::Path, sender: &Peer, receiver: &Peer, uri: &str) -> Result<bool> {
+    has_activity_audit(root, sender, receiver, uri, "Create", None, true)
+}
+
+fn has_activity_audit(
     root: &std::path::Path,
     sender: &Peer,
     receiver: &Peer,
     uri: &str,
+    kind: &str,
+    audience: Option<&str>,
+    public: bool,
 ) -> Result<bool> {
     let path = root.join(format!("{}.peer.invalid.jsonl", receiver.name));
     let audit = match std::fs::read_to_string(path) {
@@ -371,13 +395,117 @@ fn has_push_audit(
             && event["path"]
                 .as_str()
                 .is_some_and(|path| path.ends_with("/inbox"))
-            && event["activity"] == "Create"
+            && event["activity"] == kind
             && event["object"] == uri
             && event["actor"] == sender.actor()
-            && event["public"] == true
+            && event["public"] == public
+            && audience.is_none_or(|recipient| event["recipients"].as_array().is_some_and(|values| values.iter().any(|value| value == recipient)))
             && event["signed"] == true
             && event["status"]
                 .as_u64()
                 .is_some_and(|status| (200..300).contains(&status))
     }))
+}
+
+#[tokio::test]
+#[ignore = "requires task-owned live peers from tools/federation-peer-smoke privacy"]
+async fn private_notes_recipient_and_outsider_both_directions() -> Result<()> {
+    tokio::time::timeout(Duration::from_mins(3), privacy()).await?
+}
+
+async fn privacy() -> Result<()> {
+    let Smoke {root, run, client, mastodon, rustodon} = setup().await?;
+    for (sender, receiver) in [(&mastodon, &rustodon), (&rustodon, &mastodon)] {
+        for visibility in ["private", "direct"] {
+            private_note(&root, &run, &client, sender, receiver, visibility).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn token_for(peer: &Peer, username: &str) -> Result<String> {
+    Ok(sqlx::query_scalar("SELECT t.token FROM oauth_access_tokens t JOIN users u ON u.id=t.resource_owner_id JOIN accounts a ON a.id=u.account_id WHERE a.username=$1 AND a.domain IS NULL AND t.revoked_at IS NULL")
+        .bind(username).fetch_one(&peer.pool).await?)
+}
+
+async fn private_note(root: &std::path::Path, run: &str, client: &Client, sender: &Peer, receiver: &Peer, visibility: &str) -> Result<()> {
+    let recipient = format!("{}_recipient", receiver.name);
+    let outsider_token = token_for(receiver, &format!("{}_outsider", receiver.name)).await?;
+    let recipient_token = token_for(receiver, &recipient).await?;
+    let marker = format!("{run}-{}-{visibility}-push", sender.name);
+    let text = if visibility == "direct" {
+        // Resolve only the recipient ACTOR, never a status URL.
+        let acct = format!("{recipient}@{}.peer.invalid", receiver.name);
+        let resolved = sender.api(client, Method::GET, "/api/v1/accounts/search", &[("q", &acct), ("resolve", "true")]).await?;
+        assert_eq!(resolved.as_array().ok_or("recipient search missing")?.len(), 1);
+        format!("@{acct} {marker}")
+    } else { marker.clone() };
+    let created = sender.api(client, Method::POST, "/api/v1/statuses", &[("status", &text), ("visibility", visibility)]).await?;
+    let uri = created["uri"].as_str().ok_or("missing private status URI")?;
+    let origin_id = created["id"].as_str().ok_or("missing private status ID")?;
+    assert_eq!(created["visibility"], visibility);
+    let expected_visibility = if visibility == "private" {2} else {3};
+    let audience = if visibility == "private" {
+        format!("{}/followers", sender.actor())
+    } else {
+        sqlx::query_scalar::<_, String>("SELECT uri FROM accounts WHERE username=$1 AND domain=$2")
+            .bind(&recipient).bind(format!("{}.peer.invalid", receiver.name)).fetch_one(&sender.pool).await?
+    };
+    let mut received_id = None;
+    for _ in 0..60 {
+        received_id = sqlx::query_scalar::<_, i64>("SELECT s.id FROM statuses s JOIN accounts a ON a.id=s.account_id WHERE s.uri=$1 AND a.uri=$2 AND s.local=false AND s.visibility=$3 AND strpos(s.text,$4)>0 AND s.deleted_at IS NULL")
+            .bind(uri).bind(sender.actor()).bind(expected_visibility).bind(&marker).fetch_optional(&receiver.pool).await?;
+        if received_id.is_some() && has_activity_audit(root, sender, receiver, uri, "Create", Some(&audience), false)? {break;}
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let id = received_id.ok_or_else(|| format!("BLOCKED {visibility} PUSH {} -> {}: {uri} not received",sender.name,receiver.name))?;
+    assert!(has_activity_audit(root,sender,receiver,uri,"Create",Some(&audience),false)?, "missing signed private inbox Create for {uri}");
+    let allowed = if visibility == "private" {&receiver.token} else {&recipient_token};
+    let denied = if visibility == "private" {&recipient_token} else {&receiver.token};
+    let path = format!("/api/v1/statuses/{id}");
+    assert_rest_access(receiver,client,Some(allowed),&path,Some(uri)).await?;
+    for token in [Some(denied.as_str()),Some(outsider_token.as_str()),None] {
+        assert_rest_access(receiver,client,token,&path,None).await?;
+    }
+    let local_outsider = token_for(sender,&format!("{}_outsider",sender.name)).await?;
+    for token in [Some(local_outsider.as_str()),None] {
+        assert_rest_access(sender,client,token,&format!("/api/v1/statuses/{origin_id}"),None).await?;
+    }
+    let audit = std::fs::read_to_string(root.join(format!("{}.peer.invalid.jsonl",receiver.name)))?;
+    reject_public_private_deliveries(&parse_audit(&audit)?, &sender.actor(), uri)?;
+    assert_push_audit(root,sender,receiver,uri)?;
+    println!("PASS {visibility} PUSH/authorization {} -> {}: recipient allowed; nonrecipient/outsider/anonymous denied: {uri}",sender.name,receiver.name);
+    Ok(())
+}
+
+async fn assert_rest_access(peer: &Peer, client: &Client, token: Option<&str>, path: &str, expected_uri: Option<&str>) -> Result<()> {
+    let response = peer.request(client,token,Method::GET,path,&[]).await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if let Some(uri) = expected_uri {
+        assert_eq!(status,reqwest::StatusCode::OK,"{} {path}: {body}",peer.name);
+        let json: Value = serde_json::from_str(&body)?;
+        assert_eq!(json["uri"],uri);
+    } else {
+        assert_eq!(status,reqwest::StatusCode::NOT_FOUND,"{} private access unexpectedly exposed {path}: {body}",peer.name);
+    }
+    Ok(())
+}
+
+fn reject_public_private_deliveries(events: &[Value], actor: &str, uri: &str) -> Result<()> {
+    if events.iter().any(|event| event["method"] == "POST" && event["activity"] == "Create"
+        && event["actor"] == actor && event["object"] == uri && event["public"] == true) {
+        return Err(format!("private status {uri} was also addressed to Public").into());
+    }
+    Ok(())
+}
+
+#[test]
+fn privacy_audit_rejects_public_attempt_even_with_successful_private_delivery() {
+    let private = serde_json::json!({"method":"POST","activity":"Create","actor":"actor","object":"note","public":false,"status":202});
+    assert!(reject_public_private_deliveries(std::slice::from_ref(&private),"actor","note").is_ok());
+    for status in [202, 403, 500] {
+        let public = serde_json::json!({"method":"POST","activity":"Create","actor":"actor","object":"note","public":true,"status":status});
+        assert!(reject_public_private_deliveries(&[private.clone(),public],"actor","note").is_err());
+    }
 }

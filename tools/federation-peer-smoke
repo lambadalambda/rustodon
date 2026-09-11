@@ -4,9 +4,15 @@ set -euo pipefail
 [[ $(hostname) == secunda && $PWD == /home/lain/rustodon-parity/peer-tests ]] || {
   echo 'Run only on Secunda in /home/lain/rustodon-parity/peer-tests' >&2; exit 2;
 }
-[[ $# == 0 ]] || { echo 'No arguments accepted' >&2; exit 2; }
+[[ $# -le 1 ]] || { echo 'Use public or privacy' >&2; exit 2; }
+SCENARIO=${1:-public}
+case "$SCENARIO" in
+  public) TEST=discovery_follow_and_public_push_both_directions ;;
+  privacy) TEST=private_notes_recipient_and_outsider_both_directions ;;
+  *) echo 'Use public or privacy' >&2; exit 2 ;;
+esac
 if [[ ${PEER_SMOKE_DEADLINE:-0} != 1 ]]; then
-  exec timeout --signal=TERM --kill-after=60 600 env PEER_SMOKE_DEADLINE=1 "$0" </dev/null
+  exec timeout --signal=TERM --kill-after=60 600 env PEER_SMOKE_DEADLINE=1 "$0" "$SCENARIO" </dev/null
 fi
 export CARGO_BUILD_JOBS=2
 MASTODON_FIXTURE_LIBRARY=1 source tools/mastodon-fixture
@@ -221,5 +227,5 @@ env -i PATH="$PATH" HOME="$HOME" CARGO_BUILD_JOBS=2 \
   PEER_MASTODON_HTTP="http://127.0.0.1:$MASTODON_PORT" PEER_RUSTODON_HTTP="http://127.0.0.1:$RUSTODON_PORT" \
   PEER_MASTODON_DATABASE="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$DB_PORT/$MASTODON_DB" \
   PEER_RUSTODON_DATABASE="$RUST_DATABASE" \
-  cargo test --locked --features test-support --test federation_peers -- --ignored --nocapture --test-threads=1 \
+  cargo test --locked --features test-support --test federation_peers "$TEST" -- --ignored --exact --nocapture --test-threads=1 \
   2>&1 | tee "$RUN_ROOT/smoke.log"

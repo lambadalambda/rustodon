@@ -94,6 +94,28 @@ All commands below ran in the prescribed Secunda workspace with two Cargo jobs.
 - This issue stays open for the remaining peer matrix. Parent owns issue indexes.
 
 
+## Privacy extension — source implemented, verification pending
+
+- The existing runner now selects `public` (default) or `privacy`; each command
+  starts a fresh isolated run. Privacy adds distinct non-following recipient
+  and outsider accounts on each side, followers-only/direct received-row and
+  signed inbox audience checks, and recipient versus outsider/anonymous REST
+  authorization. No canonical status URL is fetched to create received state.
+- Remote TDD: `target/peer-privacy-audit-red.log` rejected missing audience audit
+  metadata; `target/peer-privacy-audit-green.log` passed all three extraction
+  tests. `target/peer-313351/smoke.log` / `target/peer-privacy-red.log` reached
+  both successful Follow/Accept directions then failed with `RowNotFound`, the
+  expected RED before observer bootstrap was added.
+- Observer bootstrap is now edited locally, but its sync/run is blocked by
+  Secunda SSH timeouts followed by `Could not resolve hostname secunda.local`.
+  No runtime assertion is disabled and no privacy pass is claimed. A review also
+  requested rejecting any Public-addressed attempt for the private object even
+  alongside a valid private delivery; that assertion and unit regression are
+  added locally but await remote execution (host outage prevented its red run).
+- Note edit/delete, profile Update, and interaction coverage are subsequent
+  bounded extensions. The parent owns ordinary `tag:` atom identifier handling;
+  the runner must not rewrite wire identifiers or repair production code.
+
 ## Pleroma quota decision
 
 The exact v2.10.2 source archive and guarded build helper are prepared, but the

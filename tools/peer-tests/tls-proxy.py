@@ -21,11 +21,13 @@ def audit_event(method, path, host, status, signed, body):
     obj = activity.get('object')
     obj_fields = obj if isinstance(obj, dict) else {}
     audiences = [fields.get(key) for fields in (activity, obj_fields) for key in ('to', 'cc')]
+    recipients = [item for value in audiences
+                  for item in (value if isinstance(value, list) else [value])
+                  if isinstance(item, str)]
     return dict(method=method, path=path, host=host, status=status, signed=signed,
                 activity=activity.get('type'), actor=activity.get('actor'),
                 object=obj_fields.get('id') if isinstance(obj, dict) else obj,
-                public=any(value == PUBLIC or isinstance(value, list) and PUBLIC in value
-                           for value in audiences))
+                public=PUBLIC in recipients, recipients=recipients)
 
 
 class Proxy(http.server.BaseHTTPRequestHandler):
