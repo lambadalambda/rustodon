@@ -1235,6 +1235,9 @@ pub struct RemoteActor {
     pub note: String,
     pub suspended: bool,
     pub profile_url: Option<Url>,
+    /// Absent field, explicit removal, or replacement URL, respectively.
+    pub avatar: Option<Option<String>>,
+    pub header: Option<Option<String>>,
     pub inbox: Url,
     pub shared_inbox: Option<Url>,
     pub followers: Option<Url>,
@@ -1985,6 +1988,8 @@ fn parse_remote_actor_document(
             note,
             suspended,
             profile_url,
+            avatar: actor_image_field(actor.get("icon"))?,
+            header: actor_image_field(actor.get("image"))?,
             inbox,
             shared_inbox,
             followers: optional_remote_url(&actor, "followers")?,
@@ -1994,6 +1999,15 @@ fn parse_remote_actor_document(
         },
         parsed_public_keys.references,
     ))
+}
+
+fn actor_image_field(value: Option<&Value>) -> Result<Option<Option<String>>, RemoteFetchError> {
+    value
+        .map(|value| {
+            crate::mastodon::activitypub_inbox::actor_image_uri(Some(value))
+                .map_err(|_| RemoteFetchError::InvalidRepresentation)
+        })
+        .transpose()
 }
 
 fn parse_account_subject(value: &str) -> Option<(&str, &str)> {
@@ -3504,6 +3518,43 @@ mod tests {
             optional_remote_url(&href, "url").unwrap().unwrap().as_str(),
             "https://remote.example/@alice"
         );
+    }
+
+    #[test]
+    fn actor_profile_images_preserve_presence_and_image_url() {
+        let url = Url::parse("https://remote.example/users/alice").unwrap();
+        let mut document = serde_json::json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "id": url.as_str(), "type": "Person", "preferredUsername": "alice",
+            "inbox": "https://remote.example/inbox"
+        });
+        let parse = |doc: &Value| {
+            parse_remote_actor(
+                &serde_json::to_vec(doc).unwrap(),
+                &url,
+                "alice",
+                "remote.example",
+            )
+        };
+        let actor = parse(&document).unwrap();
+        assert_eq!(actor.avatar, None);
+        assert_eq!(actor.header, None);
+        document["icon"] = serde_json::json!({"type": "Image", "id": "https://remote.example/image", "url": "https://cdn.example/avatar.png"});
+        document["image"] = Value::Null;
+        let actor = parse(&document).unwrap();
+        assert_eq!(
+            actor.avatar,
+            Some(Some("https://cdn.example/avatar.png".into()))
+        );
+        assert_eq!(actor.header, Some(None));
+        document["image"] =
+            serde_json::json!({"type": "Image", "url": "https://cdn.example/banner.blob"});
+        assert_eq!(
+            parse(&document).unwrap().header,
+            Some(Some("https://cdn.example/banner.blob".into()))
+        );
+        document["icon"] = serde_json::json!({"url": "file:///tmp/avatar"});
+        assert!(parse(&document).is_err());
     }
 
     #[test]
