@@ -48,3 +48,8 @@ interactions exposed [unreblog HTTP500](diagnose-private-boost-undo-http-500.md)
 The mixed-profile-media, actual delayed browser-save and failed-parent-fetch
 matrices are individually tracked under the remaining port subissue; Pleroma
 exact-image/scenario evidence and extended hosted CI execution remain unclaimed.
+
+## Approved follow-ups
+
+- [Investigate remote Update version ordering after semantic no-ops](investigate-remote-update-version-watermark.md)
+- [Assert remote semantic no-op edit-history behavior](assert-remote-noop-edit-history-stability.md)

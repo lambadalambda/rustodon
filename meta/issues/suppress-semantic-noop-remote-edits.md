@@ -110,3 +110,8 @@ cargo test --locked --features test-support --test workers semantic_updates:: \
 - Follow-ups deliberately not added: received-version watermark and explicit
   remote history assertions. No-op metadata reconciliation can still produce
   legitimate new mention notifications; only edit effects are suppressed.
+
+## Approved follow-ups
+
+- [Investigate remote Update version ordering after semantic no-ops](investigate-remote-update-version-watermark.md)
+- [Assert remote semantic no-op edit-history behavior](assert-remote-noop-edit-history-stability.md)
