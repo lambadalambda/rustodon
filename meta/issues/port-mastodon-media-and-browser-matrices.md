@@ -24,3 +24,6 @@ After foundational gates and the audited fixes, extend existing tests with indep
 ## Subissues
 
 - [Pinned media-state HTTP matrix](port-media-state-http-matrix.md)
+- [Port mixed profile-media preservation matrix](port-mixed-profile-media-matrix.md)
+- [Exercise delayed browser settings save and reload](exercise-browser-delayed-settings-save.md)
+- [Port failed parent-fetch recovery and distribution matrix](port-parent-fetch-recovery-matrix.md)
