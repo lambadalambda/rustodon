@@ -989,7 +989,9 @@ async fn profile_update(
     receiver: &Peer,
     image: &[u8],
 ) -> Result<usize> {
-    let marker = format!("{}-{}-profile", smoke.run, sender.name);
+    // Run IDs may include a timestamp; the API caps display names at 40 chars.
+    // The freshly seeded numeric account ID still distinguishes this sender.
+    let marker = format!("peer-{}-{}", sender.local_id, sender.name);
     let path = "/api/v1/accounts/update_credentials";
     let before = sender
         .api(
