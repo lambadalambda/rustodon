@@ -1,0 +1,62 @@
+#!/bin/sh
+# Offline regression coverage for real selector dispatch and Cargo selection guards.
+set -eu
+repo=$(CDPATH= cd -P -- "$(dirname -- "$0")/../.." && pwd)
+work=$(mktemp -d "${TMPDIR:-/tmp}/rustodon-selectors.XXXXXX")
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+MASTODON_FIXTURE_LIBRARY=1
+. "$repo/tools/mastodon-fixture"
+ROOT=$repo
+FIXTURE_DIR="$ROOT/fixtures/mastodon/v4.6.5"
+sed -n '/^case "$command" in$/,$p' "$repo/tools/mastodon-fixture" > "$work/dispatch.sh"
+# Real dispatch, but fixture provisioning is forbidden in this offline test.
+schema_read_test() { printf '%s\n' "${2:-mastodon_schema}" >> "$work/selected"; }
+run_podman() { echo 'unexpected container operation' >&2; exit 80; }
+dispatch() ( command=$1; shift; . "$work/dispatch.sh"; )
+dispatch schema-read-test
+cat > "$work/expected" <<'EOF'
+mastodon_schema
+saved_status_authorization
+qualified_local_mentions
+followed_hashtag_streams
+public_oauth_revocation
+oauth_response_modes
+v2_account_search
+api_empty_reads
+web_settings
+EOF
+cmp "$work/expected" "$work/selected" || die 'default schema gate omits a required HTTP regression'
+for selector in v2_account_search api_empty_reads web_settings; do
+  : > "$work/selected"
+  dispatch schema-read-test "$selector"
+  [ "$(cat "$work/selected")" = "$selector" ] || die "wrong selector: $selector"
+done
+if dispatch schema-read-test unknown > "$work/error" 2>&1; then die 'unknown selector accepted'; fi
+
+cargo_mode=present
+cargo() {
+  printf '%s\n' "$*" >> "$work/cargo"
+  case "$*" in
+    *--list*)
+      [ "$cargo_mode" != list-error ] || return 7
+      [ "$cargo_mode" != empty ] || return 0
+      printf '%s\n' 'web::example::regression: test' '1 test, 0 benchmarks'
+      ;;
+    *) [ "$cargo_mode" != run-error ] || return 9 ;;
+  esac
+}
+for pair in 'v2_account_search account_search_tests' 'api_empty_reads api_empty_reads_tests' 'web_settings web_settings_tests'; do
+  set -- $pair
+  : > "$work/cargo"
+  schema_read_rust_test "$1"
+  grep -F -- "--features test-support --lib web::$2" "$work/cargo" >/dev/null || die "incorrect library target: $1"
+  [ "$(wc -l < "$work/cargo" | tr -d ' ')" = 2 ] || die 'expected list check then test execution'
+done
+for cargo_mode in empty list-error; do
+  : > "$work/cargo"
+  if (schema_read_rust_test web_settings) > "$work/error" 2>&1; then die "invalid selection succeeded: $cargo_mode"; fi
+  [ "$(wc -l < "$work/cargo" | tr -d ' ')" = 1 ] || die 'test execution followed failed listing'
+done
+cargo_mode=run-error
+if (schema_read_rust_test web_settings) > "$work/error" 2>&1; then die 'failed test was accepted'; fi
+printf '%s\n' 'mastodon fixture selector and nonempty-selection tests passed'

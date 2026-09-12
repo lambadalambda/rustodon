@@ -62,3 +62,4 @@
 - [x] [Return empty results for unimplemented frontend API reads](issues/return-empty-unimplemented-api-reads.md)
 - [x] [Audit gated tests and upstream Mastodon coverage](issues/audit-gated-tests-and-upstream-mastodon-coverage.md)
 - [x] [Repair default and release test build profiles](issues/repair-test-build-profiles.md)
+- [x] [Wire permanent HTTP regression fixture gates](issues/wire-http-regression-gates.md)

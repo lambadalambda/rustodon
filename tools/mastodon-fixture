@@ -963,6 +963,31 @@ restore_verify() {
   printf 'restored and verified Mastodon %s fixture with Rails\n' "$RELEASE"
 }
 
+# A stale filter must not turn a missing regression into a successful zero-test run.
+require_ignored_tests() {
+  selection=$1; shift
+  case "$selection" in
+    exact) listing=$(cargo test --locked "$@" -- --ignored --list --exact) || return $? ;;
+    group) listing=$(cargo test --locked "$@" -- --ignored --list) || return $? ;;
+    *) die 'invalid ignored-test selection mode' ;;
+  esac
+  printf '%s\n' "$listing" | grep -Eq '^.+: test$' ||
+    die 'selected ignored tests are missing; refusing an empty integration pass'
+}
+
+schema_read_rust_test() {
+  case "$1" in
+    v2_account_search) set -- --features test-support --lib web::account_search_tests ;;
+    api_empty_reads) set -- --features test-support --lib web::api_empty_reads_tests ;;
+    web_settings) set -- --features test-support --lib web::web_settings_tests ;;
+    mastodon_schema|saved_status_authorization|qualified_local_mentions|followed_hashtag_streams|public_oauth_revocation|oauth_response_modes)
+      set -- --test "$1" ;;
+    *) die "unknown schema-read test: $1" ;;
+  esac
+  require_ignored_tests group "$@" || return $?
+  cargo test --locked "$@" -- --ignored --nocapture --test-threads=1
+}
+
 schema_read_test() {
   fixture=${1:-$FIXTURE_DIR}
   verify_static "$fixture"
@@ -1007,15 +1032,10 @@ EOF
   owner_url="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
   writer_url="postgresql://$DIFFERENTIAL_WRITER:$DIFFERENTIAL_WRITER_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
 
-  if [ "${2:-}" = v2_account_search ]; then
-    set -- --features test-support --lib web::account_search_tests
-  else
-    set -- --test "${2:-mastodon_schema}"
-  fi
   RUSTODON_MASTODON_DATABASE_URL="$database_url" \
   RUSTODON_MASTODON_OWNER_DATABASE_URL="$owner_url" \
   RUSTODON_MASTODON_WRITER_DATABASE_URL="$writer_url" \
-    cargo test --locked "$@" -- --ignored --nocapture --test-threads=1
+    schema_read_rust_test "${2:-mastodon_schema}"
 
   finish_database
   printf 'read-only Rust schema integration passed for Mastodon %s\n' "$RELEASE"
@@ -2600,6 +2620,7 @@ differential_test() {
   case_name=${1:-}
   if [ -n "$case_name" ]; then
     validate_differential_case "$case_name"
+    require_ignored_tests exact --features test-support --test differential "$case_name"
   fi
   media_mode=ro
   if [ -z "$case_name" ] || [ "$case_name" = 'media_writes' ]; then
@@ -2833,21 +2854,17 @@ case "$command" in
     restore_verify "${1:-$FIXTURE_DIR}"
     ;;
   schema-read-test)
+    [ "$#" -le 1 ] || die 'schema-read-test accepts at most one named case'
     case "${1:-}" in
       '')
-        [ "$#" -eq 0 ] || die 'schema-read-test accepts only qualified_local_mentions, followed_hashtag_streams, public_oauth_revocation, oauth_response_modes, or v2_account_search'
-        schema_read_test
-        schema_read_test "$FIXTURE_DIR" saved_status_authorization
-        schema_read_test "$FIXTURE_DIR" qualified_local_mentions
-        schema_read_test "$FIXTURE_DIR" followed_hashtag_streams
-        schema_read_test "$FIXTURE_DIR" public_oauth_revocation
-        schema_read_test "$FIXTURE_DIR" oauth_response_modes
+        for selector in mastodon_schema saved_status_authorization qualified_local_mentions followed_hashtag_streams public_oauth_revocation oauth_response_modes v2_account_search api_empty_reads web_settings; do
+          schema_read_test "$FIXTURE_DIR" "$selector"
+        done
         ;;
-      qualified_local_mentions|followed_hashtag_streams|public_oauth_revocation|oauth_response_modes|v2_account_search)
-        [ "$#" -eq 1 ] || die 'schema-read-test accepts only qualified_local_mentions, followed_hashtag_streams, public_oauth_revocation, oauth_response_modes, or v2_account_search'
+      mastodon_schema|saved_status_authorization|qualified_local_mentions|followed_hashtag_streams|public_oauth_revocation|oauth_response_modes|v2_account_search|api_empty_reads|web_settings)
         schema_read_test "$FIXTURE_DIR" "$1"
         ;;
-      *) die 'schema-read-test accepts only qualified_local_mentions, followed_hashtag_streams, public_oauth_revocation, oauth_response_modes, or v2_account_search' ;;
+      *) die "unknown schema-read test: $1" ;;
     esac
     ;;
   operational-schema-test)

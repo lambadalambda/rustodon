@@ -24,7 +24,6 @@
 - [ ] [Diagnose missing remote animated media](issues/diagnose-missing-remote-animated-media.md)
 - [ ] [Support frontend web settings API](issues/support-frontend-web-settings-api.md)
 - [ ] [Implement the test audit action plan](issues/implement-test-audit-plan.md)
-- [ ] [Wire permanent HTTP regression fixture gates](issues/wire-http-regression-gates.md)
 - [ ] [Provision pinned worker media fixtures explicitly](issues/provision-pinned-worker-media-fixtures.md)
 - [ ] [Expand automated integration and harness gates](issues/expand-automated-integration-gates.md)
 - [ ] [Fix remote direct-message versus limited classification](issues/fix-remote-direct-message-classification.md)

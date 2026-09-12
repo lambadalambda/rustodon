@@ -81,31 +81,17 @@ The user requests empty results instead of the current API 404 responses that re
 
 ## Reproducing the focused HTTP fixture
 
-All commands below run **on Secunda**, from the isolated workspace, after
-synchronizing tracked regular files and the three public symlinks separately.
-The existing harness restricts selectors; a task-local copy changes only the
-library test filter, reusing the pinned fixture, least-privilege reader,
-rootless PID-specific Podman resources and cleanup unchanged. This copy is not
-tracked and does not modify the shared checkout or live instance.
+The permanent harness now selects this ignored HTTP regression directly, using
+its normal pinned fixture, least-privilege roles, and task-owned cleanup:
 
 ```sh
-cd /home/lain/rustodon-parity/api-empty-reads
-export CARGO_BUILD_JOBS=2
-SOURCE=/home/lain/repos/rustodon/target/mastodon-v4.6.5
-test "$(git -C "$SOURCE" rev-parse HEAD)" = \
-  1440d55b139e39ec722c2a3db7f60b66cd889048
-# Add only when absent; remove this workspace's link before clean-source gates.
-ln -s "$SOURCE" target/mastodon-v4.6.5
-sed 's/--lib web::account_search_tests/--lib web::api_empty_reads_tests/' \
-  tools/mastodon-fixture > tools/mastodon-fixture-api-empty-reads
-chmod +x tools/mastodon-fixture-api-empty-reads
-tools/mastodon-fixture-api-empty-reads schema-read-test v2_account_search
+tools/mastodon-fixture schema-read-test api_empty_reads
 ```
 
-The selector name is inherited by the temporary harness; its actual Cargo
-filter is **`--features test-support --lib web::api_empty_reads_tests`**, not
-the account-search suite. The new HTTP test is ignored in ordinary Cargo runs
-and explicitly selected with `--ignored` by this fixture invocation.
+Run it on the authorized isolated Linux worker (currently NAS), not the local
+coding machine. No temporary harness or upstream media checkout is needed.
+The historical evidence below used the earlier temporary selector and is not
+rewritten as evidence of the new command.
 
 ## Verification evidence
 

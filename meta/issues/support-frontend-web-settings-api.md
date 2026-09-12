@@ -240,3 +240,9 @@ above passed. No new dependencies were added.
   normal signed-in frontend retry**; no access token was obtained or session
   created to manufacture positive live evidence. Direct GET remains unsupported
   by the pinned contract; the frontend uses PUT (PATCH is also supported).
+
+## Permanent regression command
+
+Use `tools/mastodon-fixture schema-read-test web_settings` on the authorized
+isolated Linux worker. It replaces the historical temporary harness below/above;
+the original execution evidence remains unchanged.
