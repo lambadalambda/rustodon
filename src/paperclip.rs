@@ -805,6 +805,24 @@ impl PaperclipMetadata {
         ))
     }
 
+    /// MIME of a media file's served style, without changing original metadata.
+    #[must_use]
+    pub(crate) fn media_file_content_type(&self, style: &str) -> Option<&str> {
+        if self.attachment != PaperclipAttachment::MediaFile {
+            return None;
+        }
+        let content_type = self.content_type.as_deref()?;
+        match style {
+            "original" => Some(content_type),
+            "small" if content_type == "image/gif" || VIDEO_MIME_TYPES.contains(&content_type) => {
+                Some("image/png")
+            }
+            "small" if CONVERTED_IMAGE_MIME_TYPES.contains(&content_type) => Some("image/jpeg"),
+            "small" if IMAGE_MIME_TYPES.contains(&content_type) => Some(content_type),
+            _ => None,
+        }
+    }
+
     fn cache_prefix(&self) -> bool {
         self.attachment.permits_cache()
             && self.remote
@@ -830,15 +848,13 @@ impl PaperclipMetadata {
                 (style == "static").then(png).flatten()
             }
             PaperclipAttachment::MediaFile if style == "small" => {
-                let content_type = self.content_type.as_deref()?;
-                if content_type == "image/gif" || VIDEO_MIME_TYPES.contains(&content_type) {
-                    png()
-                } else if CONVERTED_IMAGE_MIME_TYPES.contains(&content_type) {
-                    derivative_file_name(&self.file_name, "jpeg")
-                } else if IMAGE_MIME_TYPES.contains(&content_type) {
-                    Some(self.file_name.clone())
-                } else {
-                    None
+                match self.media_file_content_type(style)? {
+                    content_type if Some(content_type) == self.content_type.as_deref() => {
+                        Some(self.file_name.clone())
+                    }
+                    "image/png" => png(),
+                    "image/jpeg" => derivative_file_name(&self.file_name, "jpeg"),
+                    _ => None,
                 }
             }
             PaperclipAttachment::SiteUploadFile => {

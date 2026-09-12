@@ -2622,11 +2622,7 @@ fn cached_remote_media_response(
     if body.len() > MEDIA_PROXY_MAX_RESPONSE_BYTES {
         return None;
     }
-    let content_type = if small && content_type == "image/gif" {
-        "image/png"
-    } else {
-        content_type
-    };
+    let content_type = metadata.media_file_content_type(style)?;
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = StatusCode::OK;
     response
@@ -18564,6 +18560,9 @@ mod web_settings_tests;
 
 #[cfg(test)]
 mod api_empty_reads_tests;
+
+#[cfg(test)]
+mod cached_media_response_tests;
 
 #[cfg(test)]
 mod tests {

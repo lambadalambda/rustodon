@@ -980,6 +980,7 @@ schema_read_rust_test() {
     v2_account_search) set -- --features test-support --lib web::account_search_tests ;;
     api_empty_reads) set -- --features test-support --lib web::api_empty_reads_tests ;;
     web_settings) set -- --features test-support --lib web::web_settings_tests ;;
+    media_proxy) set -- --features test-support --lib web::cached_media_response_tests::cached_private_media_http_requires_status_access_even_when_files_exist ;;
     mastodon_schema|saved_status_authorization|qualified_local_mentions|followed_hashtag_streams|public_oauth_revocation|oauth_response_modes)
       set -- --test "$1" ;;
     *) die "unknown schema-read test: $1" ;;
@@ -2858,11 +2859,11 @@ case "$command" in
     [ "$#" -le 1 ] || die 'schema-read-test accepts at most one named case'
     case "${1:-}" in
       '')
-        for selector in mastodon_schema saved_status_authorization qualified_local_mentions followed_hashtag_streams public_oauth_revocation oauth_response_modes v2_account_search api_empty_reads web_settings; do
+        for selector in mastodon_schema saved_status_authorization qualified_local_mentions followed_hashtag_streams public_oauth_revocation oauth_response_modes v2_account_search api_empty_reads web_settings media_proxy; do
           schema_read_test "$FIXTURE_DIR" "$selector"
         done
         ;;
-      mastodon_schema|saved_status_authorization|qualified_local_mentions|followed_hashtag_streams|public_oauth_revocation|oauth_response_modes|v2_account_search|api_empty_reads|web_settings)
+      mastodon_schema|saved_status_authorization|qualified_local_mentions|followed_hashtag_streams|public_oauth_revocation|oauth_response_modes|v2_account_search|api_empty_reads|web_settings|media_proxy)
         schema_read_test "$FIXTURE_DIR" "$1"
         ;;
       *) die "unknown schema-read test: $1" ;;
