@@ -1259,6 +1259,7 @@ EOF
 }
 
 worker_test() {
+  "$ROOT/tools/verify-worker-media"
   fixture=$FIXTURE_DIR
   verify_static "$fixture"
   verify_images

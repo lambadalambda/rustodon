@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+ROOT=$(CDPATH= cd -P -- "$(dirname -- "$0")/../.." && pwd)
+work=$(mktemp -d "${TMPDIR:-/tmp}/rustodon-worker-media.XXXXXX")
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+# Fresh worker jobs must not rely on a separate ignored upstream checkout.
+if grep -F 'target/mastodon-v4.6.5/spec/fixtures/files/' \
+  "$ROOT/tests/workers.rs" "$ROOT/tests/workers/reply_emoji_grants.rs" > "$work/old-paths"; then
+  echo 'worker tests still require unprovisioned upstream media paths' >&2
+  exit 1
+fi
+"$ROOT/tools/verify-worker-media"
+cp "$ROOT/fixtures/worker-media/mastodon-v4.6.5/"* "$work/"
+printf 'corrupt' >> "$work/attachment.gif"
+if "$ROOT/tools/verify-worker-media" "$work" > "$work/error" 2>&1; then
+  echo 'corrupt worker fixture accepted' >&2; exit 1
+fi
+cp "$ROOT/fixtures/worker-media/mastodon-v4.6.5/attachment.gif" "$work/"
+rm "$work/avatar.gif"
+if "$ROOT/tools/verify-worker-media" "$work" > "$work/error" 2>&1; then
+  echo 'missing worker fixture accepted' >&2; exit 1
+fi
+cp "$ROOT/fixtures/worker-media/mastodon-v4.6.5/avatar.gif" "$work/"
+grep -v 'avatar.gif' "$work/SHA256SUMS" > "$work/checksums"
+mv "$work/checksums" "$work/SHA256SUMS"
+if "$ROOT/tools/verify-worker-media" "$work" > "$work/error" 2>&1; then
+  echo 'incomplete checksum inventory accepted' >&2; exit 1
+fi
+printf '%s\n' 'worker media prerequisite tests passed'

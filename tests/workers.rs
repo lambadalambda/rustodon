@@ -6820,7 +6820,7 @@ async fn activitypub_emoji_fetch_retries_and_installs_original_and_static_files(
         .with_write_fault(PaperclipWriteFault::storage_full_after(1));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = listener.local_addr()?;
-    let body = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/attachment.gif")?;
+    let body = fs::read("fixtures/worker-media/mastodon-v4.6.5/attachment.gif")?;
     let remote_url = format!("http://media.fixture.invalid:{}/emoji.gif", endpoint.port());
     let emoji_id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO custom_emojis
@@ -6917,7 +6917,7 @@ async fn activitypub_emoji_fetch_retries_and_installs_original_and_static_files(
     drop(executor);
     let replacement_listener = TcpListener::bind("127.0.0.1:0").await?;
     let replacement_endpoint = replacement_listener.local_addr()?;
-    let replacement_body = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/avatar.gif")?;
+    let replacement_body = fs::read("fixtures/worker-media/mastodon-v4.6.5/avatar.gif")?;
     let replacement_url = format!(
         "http://media.fixture.invalid:{}/replacement.gif",
         replacement_endpoint.port()
@@ -7077,7 +7077,7 @@ async fn local_media_jobs_reconcile_create_and_delete_crash_boundaries()
         http::HeaderValue::from_static("Bearer fixture-bearer-token-v4-6-5"),
     );
     let authenticated = authenticator.authenticate(&headers, WRITE_MEDIA).await?;
-    let bytes = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/attachment.jpg")?;
+    let bytes = fs::read("fixtures/worker-media/mastodon-v4.6.5/attachment.jpg")?;
     let prepared = prepare_media_attachment(ALICE, "local.jpg", "image/jpeg", &bytes)?;
     let create = MediaAttachmentCreate {
         file_name: prepared.file_name.clone(),
@@ -7494,7 +7494,7 @@ async fn activitypub_media_fetch_reclaims_after_lease_fence()
     .await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = listener.local_addr()?;
-    let body = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/attachment.gif")?;
+    let body = fs::read("fixtures/worker-media/mastodon-v4.6.5/attachment.gif")?;
     let request_started = Arc::new(Notify::new());
     let release_request = Arc::new(Notify::new());
     let remote_url = format!(
@@ -7743,7 +7743,7 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail()
     .await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = listener.local_addr()?;
-    let body = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/attachment.gif")?;
+    let body = fs::read("fixtures/worker-media/mastodon-v4.6.5/attachment.gif")?;
     let prepared = prepare_media_attachment(BOB, "remote.gif", "image/gif", &body)?;
     let remote_url = format!(
         "http://media.fixture.invalid:{}/remote.gif",
@@ -7929,7 +7929,7 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
     .await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = listener.local_addr()?;
-    let body = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/attachment.gif")?;
+    let body = fs::read("fixtures/worker-media/mastodon-v4.6.5/attachment.gif")?;
     let prepared = prepare_media_attachment(BOB, "remote.gif", "image/gif", &body)?;
     let before_url = format!(
         "http://media.fixture.invalid:{}/ambiguous-before.gif",

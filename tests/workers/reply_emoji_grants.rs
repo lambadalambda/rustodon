@@ -154,7 +154,7 @@ async fn dedicated_writer_persists_emoji_parent_and_installs_media()
             assert!(outbox.contains(&json!({"emoji_id": id, "remote_url": url,
                 "media_type": "image/gif", "domain": DOMAIN})));
         }
-        let body = fs::read("target/mastodon-v4.6.5/spec/fixtures/files/attachment.gif")?;
+        let body = fs::read("fixtures/worker-media/mastodon-v4.6.5/attachment.gif")?;
         let media_server = tokio::spawn(fixture_media_server_for_retries(media_listener, body, 2));
         queue.dispatch_outbox(100).await?;
         for _ in 0..2 {
