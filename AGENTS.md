@@ -2,13 +2,17 @@
 
 ## Build and Test Host
 
-- Run all builds, tests, formatting, lint, and container workloads on
-  `lain@secunda.local`, not on the local coding machine.
-- Use isolated workspaces beneath `/home/lain/rustodon-parity/`. Do not overwrite
-  `/home/lain/repos/rustodon` or its untracked `tracked-configs/` directory.
-- Use rootless Podman and task-specific resources. Never synchronize instance
-  environment files, credentials, backups, or unrelated untracked files.
-- See `docs/testing-on-secunda.md` for workspace and reference-source setup.
+- Run builds, tests, formatting, lint, and container workloads on the authorized
+  NAS worker `podman-worker`, not the local coding machine or unstable Secunda.
+- Parent exclusively owns sequential NAS SSH/Podman execution; editing subagents
+  must not start independent NAS workloads. Use disposable task workspaces below
+  `/srv/workspaces/` and explicit rootful socket routing; never change the user's
+  default Podman connection or prune unrelated resources.
+- Sync tracked source and explicitly selected test files only, never instance
+  environments, credentials, backups, or unrelated untracked files.
+- See `docs/testing-on-nas.md`. Secunda instructions remain historical/fallback;
+  preserve `/home/lain/repos/rustodon` and its `tracked-configs/` untouched.
+- If the SSH agent cannot sign, retry once sequentially, then request an unlock.
 
 ## Mastodon Reference Source
 

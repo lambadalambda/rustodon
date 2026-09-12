@@ -18,8 +18,24 @@ description = "Run Clippy with warnings denied"
 run = "cargo clippy --locked --all-targets --all-features -- -D warnings"
 
 [tasks.test]
-description = "Run all Rust tests"
+description = "Run ordinary feature-enabled Rust tests (fixture ignores excluded)"
 run = "cargo test --locked --all-targets --all-features"
+
+[tasks.test-default]
+description = "Run ordinary default-feature Rust tests (fixture ignores excluded)"
+run = "cargo test --locked --all-targets"
+
+[tasks.test-release]
+description = "Run ordinary release/all-feature tests, including negative capability fences"
+run = "cargo test --locked --release --all-targets --all-features"
+
+[tasks.harness-tests]
+description = "Run offline shell/Python harness regressions without fixture workloads"
+run = "tools/check-harnesses"
+
+[tasks.worker-media-verify]
+description = "Verify vendored pinned worker assets without a source checkout"
+run = "tools/verify-worker-media"
 
 [tasks.deny]
 description = "Check dependency licenses, advisories, bans, and sources"
@@ -50,7 +66,7 @@ description = "Regenerate and byte-compare the Mastodon 4.6.5 fixture"
 run = "tools/mastodon-fixture repro"
 
 [tasks.mastodon-schema-integration]
-description = "Run read-only Rust schema integration against the restored fixture"
+description = "Run restored-schema integration and the aggregate focused HTTP regressions"
 run = "tools/mastodon-fixture schema-read-test"
 
 [tasks.operational-schema-integration]
@@ -82,9 +98,34 @@ description = "Run all or one Rails-versus-Rust differential compatibility case"
 run = "tools/mastodon-fixture differential-test"
 
 [tasks.differential-ci]
-description = "Run stable high-value Rails-versus-Rust CI cases on fresh fixture clones"
+description = "Run nine high-value/security differential cases plus relative media-root mode"
 run = "tools/ci-differential"
 
+[tasks.differential-full]
+description = "Run the full differential suite plus relative media-root mode (extended lane)"
+run = "tools/ci-differential full"
+
+# Manual only: retain the peer runner's host, workspace, and cached-image guards.
+[tasks.peer-public]
+description = "Isolated real-peer public push; authorized host/workspace only"
+run = "tools/federation-peer-smoke public"
+
+[tasks.peer-privacy]
+description = "Isolated real-peer recipient/outsider privacy; authorized host/workspace only"
+run = "tools/federation-peer-smoke privacy"
+
+[tasks.peer-notes]
+description = "Isolated real-peer Note lifecycle; authorized host/workspace only"
+run = "tools/federation-peer-smoke notes"
+
+[tasks.peer-profile]
+description = "Isolated real-peer profile updates; authorized host/workspace only"
+run = "tools/federation-peer-smoke profile"
+
+[tasks.peer-interactions]
+description = "Isolated real-peer interactions and Undo; authorized host/workspace only"
+run = "tools/federation-peer-smoke interactions"
+
 [tasks.check]
-description = "Run all local and CI checks"
-depends = ["fmt", "lint", "test", "deny", "fixture-verify"]
+description = "Run bounded ordinary/profile, static fixture, and offline harness checks"
+depends = ["fmt", "lint", "test", "test-default", "test-release", "deny", "fixture-verify", "worker-media-verify", "harness-tests"]

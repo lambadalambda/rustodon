@@ -3,6 +3,18 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * 1'
+
+# Hosted disposable runners only; never attach this workflow to the live NAS.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  MISE_JOBS: '1'
 
 permissions:
   contents: read
@@ -10,7 +22,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -58,6 +70,8 @@ jobs:
         task:
           - mastodon-schema-integration
           - operational-schema-integration
+          - startup-integration
+          - preflight-integration
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -104,6 +118,9 @@ jobs:
           fi
           podman info
 
+      - name: Verify vendored pinned worker media (no source checkout)
+        run: mise run worker-media-verify
+
       - name: Run worker integration
         run: mise run worker-integration
 
@@ -132,3 +149,52 @@ jobs:
 
       - name: Run Rails-versus-Rust differential integration
         run: mise run differential-ci
+
+  extended-integration:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: [check, pinned-source-contracts, postgres-integration, worker-integration, differential]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        task:
+          - differential-full
+          - cutover-integration
+          - browser-integration
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install project tools
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: 2026.8.4
+          cache: true
+
+      - name: Install Podman
+        run: |
+          if ! command -v podman >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes podman
+          fi
+          podman info
+
+      # Full differential media writes and cutover read pinned source assets.
+      # Fresh hosted checkout only; on NAS reuse verified existing source.
+      - name: Obtain pinned extended-lane source prerequisite
+        run: mise run fixture-obtain
+
+      - name: Install pinned browser CLI and Chromium
+        if: matrix.task == 'browser-integration'
+        run: |
+          mise exec node@24.15.0 -- npm install --prefix "$RUNNER_TEMP/browser-tools" --no-audit --no-fund agent-browser@0.31.1
+          echo "$RUNNER_TEMP/browser-tools/node_modules/.bin" >> "$GITHUB_PATH"
+          echo "$(mise where node@24.15.0)/bin" >> "$GITHUB_PATH"
+          mise exec node@24.15.0 -- "$RUNNER_TEMP/browser-tools/node_modules/.bin/agent-browser" install --with-deps
+
+      - name: Run ${{ matrix.task }}
+        run: mise run ${{ matrix.task }}

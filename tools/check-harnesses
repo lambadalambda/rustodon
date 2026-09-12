@@ -1,0 +1,18 @@
+#!/bin/sh
+# Only offline regressions belong in tools/tests/*-test{,.py}.
+# Do not add real fixture/browser/peer workloads to this fast aggregate.
+set -eu
+ROOT=$(CDPATH= cd -P -- "$(dirname -- "$0")/.." && pwd)
+cd "$ROOT"
+export PYTHONDONTWRITEBYTECODE=1
+for test in tools/tests/*-test tools/tests/*-test.py \
+  tools/federation-pleroma-build-test.py tools/peer-tests/test_tls_proxy.py
+do
+  # An unmatched shell glob is not a test; explicit Python paths must exist.
+  case "$test" in *'*'*) continue ;; esac
+  printf '\n==> %s\n' "$test"
+  case "$test" in
+    *.py) python3 "$test" ;;
+    *) "$ROOT/$test" ;;
+  esac
+done

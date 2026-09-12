@@ -1,9 +1,12 @@
 # Build and test on Secunda
 
-All builds, tests, formatting, lint, and container workloads for essential-parity
-work run on **`lain@secunda.local`**, not on the local coding machine. Source
-editing and Git commits may remain local. Queue-performance review observations
-R17/R18 are deferred.
+The default build/test host for essential-parity work is
+**`lain@secunda.local`**, not the local coding machine. The user-authorized NAS
+exception and its exact peer workspace contract are documented in
+[Testing on NAS](testing-on-nas.md). During the audit implementation the parent
+alone runs all workloads sequentially on NAS; child worktrees only edit source.
+Source editing and Git commits may otherwise remain local. Queue-performance
+review observations R17/R18 are deferred.
 
 ## Host and isolation
 

@@ -67,3 +67,4 @@
 - [x] [Fix remote direct-message versus limited classification](issues/fix-remote-direct-message-classification.md)
 - [x] [Suppress semantically unchanged inbound edit effects](issues/suppress-semantic-noop-remote-edits.md)
 - [x] [Serve the correct MIME for cached media derivatives](issues/serve-cached-media-derivative-mime.md)
+- [x] [Expand automated integration and harness gates](issues/expand-automated-integration-gates.md)
