@@ -27,3 +27,4 @@
 - [ ] [Expand automated integration and harness gates](issues/expand-automated-integration-gates.md)
 - [ ] [Adapt and run the existing peer matrix on NAS](issues/adapt-and-run-peer-matrix-on-nas.md)
 - [ ] [Port selected Mastodon media and browser behavior matrices](issues/port-mastodon-media-and-browser-matrices.md)
+- [ ] [Port the pinned media-state HTTP matrix](issues/port-media-state-http-matrix.md)

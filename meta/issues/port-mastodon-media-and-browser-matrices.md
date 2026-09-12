@@ -20,3 +20,7 @@ After foundational gates and the audited fixes, extend existing tests with indep
 
 - Source: [test coverage audit](../test-coverage-audit.md).
 - User authorized this implementation plan on 2026-09-12; no live deployment is implied.
+
+## Subissues
+
+- [Pinned media-state HTTP matrix](port-media-state-http-matrix.md)
