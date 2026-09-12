@@ -209,3 +209,34 @@ above passed. No new dependencies were added.
   `.local-instance/verify-web-settings-routing.py` is prepared to verify routing,
   CSRF and authentication rejection without login or settings writes; successful
   signed-in save/reload is fixture-proven but still needs live user confirmation.
+
+## Deployed after SSH unlock — 2026-09-12 UTC
+
+- User unlocked the SSH agent. Archive transfer succeeded with the recorded
+  SHA-256; Linux/ARM64 image identity and full `a29df56` source label matched.
+  Native local loader/CLI smoke checks and all **6062** runtime-input hashes
+  passed, including bundled frontend assets and the CA certificate bundle.
+- Reviewed app-only helper completed at `20260912T063346Z`: old preflight,
+  consistent backup, both apps stopped, exact web-settings grant transaction,
+  new preflight, app replacement and identity/readiness checks. Both apps now use
+  `859b97ecc2cbd42c47553a8760dd698d7cf57f2c8d2ce3f75bb5240cbf068777`.
+  PostgreSQL/Redis containers, persistent volumes, accounts and origin were preserved.
+- Backup: `.local-instance-backups/20260912T063351Z/` (not restore-tested).
+  Evidence: `.local-instance/logs/deploy-20260912T063346Z/`.
+  Prior apps are stopped with suffix `-rollback-20260912T063346Z`, image `9ffaa0db...`.
+  Rollback to that pair requires reversing **only the new web-settings ACL delta**
+  before restart; retain existing settings rows and earlier emoji/runtime grants.
+- Live public PUT without CSRF now returns the expected 422 CSRF error, not 404.
+  PUT and PATCH with a valid anonymous CSRF pair return the expected 422
+  authenticated-user requirement. Cookies stayed in memory and were not printed.
+  `web-settings-routing.jsonl` records these negative probes; no live preferences
+  were mutated. The table still had zero settings rows at this check.
+- Local/public/worker readiness passed, zero queued jobs. Two **pre-existing**
+  media dead letters (799 and 800, failed 2026-09-11 16:44 UTC) remain untouched:
+  profile image invalid/processing bounds and unsupported remote-media response
+  content type. They predate this deployment and are not settings-save failures.
+- Authenticated save/reload is proven by the NAS HTTP/persistence fixture, not
+  by these unauthenticated live probes. **Keep issue open pending the user's
+  normal signed-in frontend retry**; no access token was obtained or session
+  created to manufacture positive live evidence. Direct GET remains unsupported
+  by the pinned contract; the frontend uses PUT (PATCH is also supported).
