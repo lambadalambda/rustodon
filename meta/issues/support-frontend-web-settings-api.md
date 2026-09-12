@@ -185,3 +185,27 @@ above passed. No new dependencies were added.
 - Deployment-only scripts: `.local-instance/apply-web-settings-writer-grants.sql`
   and `revert-web-settings-writer-grants.sql`, used with the unchanged reviewed
   transaction/uncertain-apply-safe app replacement helper.
+
+## Deployment checkpoint — SSH signing blocked
+
+- Reviewed commits: `292b874` (bounded grants/fences/fixture) and `a29df56`
+  (settings endpoint/persistence/bootstrap). Working source was checksum-matched
+  to the NAS workspace, including all three public symlink targets.
+- NAS ARM64 production build passed (`--locked --release --no-default-features`,
+  explicit Rust 1.97.1). Candidate image:
+  `859b97ecc2cbd42c47553a8760dd698d7cf57f2c8d2ce3f75bb5240cbf068777`,
+  Linux/ARM64, revision `a29df561bc28c6f90b1f1518e969b5ef94222511`.
+  NAS loader and CLI checks passed. OCI archive at
+  `/srv/workspaces/rustodon-web-settings-c81a/rustodon-a29df56-arm64.oci`, SHA-256
+  `8d24ae0482115a4babe56685aef82246db56dfd11423b314be2055130600d38a`.
+- Transfer to the local deployment host failed because the SSH agent refused
+  signing. One sequential retry failed with agent communication error; no further
+  attempts or credential workaround. Asked the user to unlock the SSH agent.
+- **Not deployed.** No new live grants, backup/cutover or settings mutation occurred.
+  Existing apps remain on `9ffaa0db...` / source `b2937cf`; a safe unauthenticated
+  PUT before cutover still returned the reported 404. Issue stays open.
+- Resume with archive transfer/checksum verification, native local loader/CLI and
+  all runtime-input hashes, then reviewed grant-aware app-only backup/cutover.
+  `.local-instance/verify-web-settings-routing.py` is prepared to verify routing,
+  CSRF and authentication rejection without login or settings writes; successful
+  signed-in save/reload is fixture-proven but still needs live user confirmation.
