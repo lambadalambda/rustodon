@@ -1,0 +1,69 @@
+#!/bin/bash
+# Supervise a task-only rootful API socket; never change the global Podman service.
+set -euo pipefail
+nas_session_profile() {
+  [[ $1 == podman-worker && $2 == 0 && $3 == "$4" ]] || return 1
+  [[ $3 =~ ^/srv/workspaces/rustodon-[a-zA-Z0-9-]+/source$ ]] || return 1
+  [[ $5 == /run/user/0 && $6 == unix:path=/run/user/0/bus ]]
+}
+nas_session_api() { exec /usr/bin/podman system service --time=0 "unix://$RUSTODON_NAS_SOCKET"; }
+nas_session_run() {
+  set -euo pipefail
+  mkdir -p "$ROOT/../ops"
+  session=$(mktemp -d "$ROOT/../ops/nas-api.XXXXXX")
+  chmod 700 "$session"
+  export RUSTODON_NAS_SOCKET="$session/podman.sock"
+  api_pid=''; command_pid=''
+  cleanup() {
+    status=$?
+    trap - EXIT INT TERM HUP
+    # The command owns a distinct process group. Let fixture cleanup use the API
+    # before stopping that API; never signal a shared engine or unrelated group.
+    if [[ -n $command_pid ]]; then
+      kill -TERM -- "-$command_pid" 2>/dev/null || true
+      for _ in {1..100}; do
+        kill -0 -- "-$command_pid" 2>/dev/null || break
+        sleep .1
+      done
+      kill -KILL -- "-$command_pid" 2>/dev/null || true
+      wait "$command_pid" 2>/dev/null || true
+    fi
+    if [[ -n $api_pid ]]; then
+      kill "$api_pid" 2>/dev/null || true
+      for _ in {1..50}; do
+        kill -0 "$api_pid" 2>/dev/null || break
+        sleep .1
+      done
+      kill -KILL "$api_pid" 2>/dev/null || true
+      wait "$api_pid" 2>/dev/null || true
+    fi
+    rm -f "$RUSTODON_NAS_SOCKET" || status=1
+    printf 'task-only Podman API stopped; evidence=%s\n' "$session" >&2
+    exit "$status"
+  }
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  nas_session_api >"$session/service.log" 2>&1 &
+  api_pid=$!
+  for _ in {1..50}; do
+    [[ ! -S $RUSTODON_NAS_SOCKET ]] || break
+    kill -0 "$api_pid" || { cat "$session/service.log" >&2; exit 1; }
+    sleep .1
+  done
+  [[ -S $RUSTODON_NAS_SOCKET ]] || { echo 'task-only Podman API did not become ready' >&2; exit 1; }
+  setsid "$@" &
+  command_pid=$!
+  wait "$command_pid"
+}
+if [[ ${RUSTODON_NAS_SESSION_LIBRARY:-0} == 1 ]]; then return 0; fi
+ROOT=$(CDPATH= cd -P -- "$(dirname -- "$0")/.." && pwd)
+if ! nas_session_profile "$(hostname)" "$(id -u)" "$(pwd -P)" "$ROOT" \
+  "${XDG_RUNTIME_DIR:-}" "${DBUS_SESSION_BUS_ADDRESS:-}" || [[ ! -S /run/user/0/bus ]]; then
+  echo 'nas-fixture-session requires root login on podman-worker, its user bus, and a physical isolated source workspace' >&2
+  exit 2
+fi
+[[ ${1:-} != -- ]] || shift
+[[ $# -gt 0 ]] || { echo 'usage: tools/nas-fixture-session -- COMMAND [ARG...]' >&2; exit 2; }
+nas_session_run "$@"

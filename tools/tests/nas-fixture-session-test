@@ -1,0 +1,15 @@
+#!/bin/bash
+set -euo pipefail
+ROOT=$(CDPATH= cd -P -- "$(dirname -- "$0")/../.." && pwd)
+RUSTODON_NAS_SESSION_LIBRARY=1 source "$ROOT/tools/nas-fixture-session"
+path=/srv/workspaces/rustodon-audit-green/source
+nas_session_profile podman-worker 0 "$path" "$path" /run/user/0 unix:path=/run/user/0/bus
+reject() { if nas_session_profile "$@"; then echo 'unsafe NAS session profile accepted' >&2; exit 1; fi; }
+reject laptop 0 "$path" "$path" /run/user/0 unix:path=/run/user/0/bus
+reject podman-worker 1000 "$path" "$path" /run/user/0 unix:path=/run/user/0/bus
+reject podman-worker 0 "$path" /other/source /run/user/0 unix:path=/run/user/0/bus
+reject podman-worker 0 /srv/workspaces/other/source /srv/workspaces/other/source /run/user/0 unix:path=/run/user/0/bus
+reject podman-worker 0 "$path/subdir" "$path/subdir" /run/user/0 unix:path=/run/user/0/bus
+reject podman-worker 0 "$path" "$path" '' ''
+reject podman-worker 0 "$path" "$path" /run/user/996 unix:path=/run/user/996/bus
+printf '%s\n' 'NAS task-session profile tests passed'

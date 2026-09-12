@@ -70,3 +70,4 @@
 - [x] [Expand automated integration and harness gates](issues/expand-automated-integration-gates.md)
 - [x] [Port the pinned media-state HTTP matrix](issues/port-media-state-http-matrix.md)
 - [x] [Adapt and run the existing peer matrix on NAS](issues/adapt-and-run-peer-matrix-on-nas.md)
+- [x] [Diagnose NAS fixture bridge DNS failures](issues/repair-nas-fixture-network-dns.md)

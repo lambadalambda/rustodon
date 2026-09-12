@@ -30,6 +30,27 @@ as a self-hosted CI runner or run the heavy lanes against production.
   `set -o pipefail`. No broad image/container/volume pruning. Clean only resources
   created by the current run. Ask for an SSH-agent unlock instead of workarounds.
 
+## Task-owned API socket for bridge-backed gates
+
+The global rootful API service's missing user-bus environment prevents its DNS
+helper from starting on this NAS. Do not restart/reconfigure that shared service.
+From an active **root SSH login**, use `tools/nas-fixture-session -- COMMAND...`
+in the physical `/srv/workspaces/rustodon-<task>/source` directory. It requires
+the existing `/run/user/0` bus and creates a private, task-owned API socket using
+the same engine. No root linger or global configuration change is needed.
+
+The command must explicitly consume `RUSTODON_NAS_SOCKET`: bind
+`"$RUSTODON_NAS_SOCKET:/run/podman/podman.sock"` into the existing tooling image,
+whose Podman executable wrapper selects that endpoint. Merely exporting this
+variable does not redirect arbitrary Podman clients. Keep the same absolute
+workspace bind, host networking, cached tool image and resource limits above.
+
+The helper supervises the command's own process group, forwards cancellation,
+allows bounded fixture cleanup with the API still available, then stops only
+its API process and removes its socket. It retains `../ops/nas-api.*/service.log`.
+Fixture containers/volumes/networks remain the fixture harness's responsibility;
+keep its wall-time bounds and cleanup verification. Do not run concurrent gates.
+
 ## Source contracts versus image-only fixtures
 
 The source-contract oracle remains the read-only Mastodon **4.6.5** checkout at
@@ -112,8 +133,8 @@ default/all-feature debug tests, release tests, formatting and strict Clippy.
 The final eleven-selector schema aggregate passed, including the 14-request
 media-state matrix. These are not evidence for
 GitHub-hosted execution, full differential, browser/cutover, source contracts,
-or real-peer convergence. Operational-schema Rust cases passed, but its later
-Rails reopen hit NAS bridge DNS resolution failure; see
+or real-peer convergence. The earlier operational-schema Rails reopen hit NAS bridge DNS resolution
+failure, now resolved by the task-owned API session above; see
 [the DNS blocker](../meta/issues/repair-nas-fixture-network-dns.md).
 
 Keep exact execution evidence and configured-only lanes separate in
