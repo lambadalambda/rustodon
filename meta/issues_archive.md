@@ -60,3 +60,4 @@
 - [x] [Repair remote reply-thread persistence](issues/repair-remote-reply-thread-persistence.md)
 - [x] [Diagnose missing remote avatar and banner](issues/diagnose-missing-remote-avatar-and-banner.md)
 - [x] [Return empty results for unimplemented frontend API reads](issues/return-empty-unimplemented-api-reads.md)
+- [x] [Audit gated tests and upstream Mastodon coverage](issues/audit-gated-tests-and-upstream-mastodon-coverage.md)
