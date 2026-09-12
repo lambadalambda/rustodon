@@ -64,3 +64,4 @@
 - [x] [Repair default and release test build profiles](issues/repair-test-build-profiles.md)
 - [x] [Wire permanent HTTP regression fixture gates](issues/wire-http-regression-gates.md)
 - [x] [Provision pinned worker media fixtures explicitly](issues/provision-pinned-worker-media-fixtures.md)
+- [x] [Fix remote direct-message versus limited classification](issues/fix-remote-direct-message-classification.md)

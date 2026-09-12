@@ -17967,3 +17967,6 @@ async fn private_announce_local_audience(worker: bool) -> Result<(), Box<dyn std
     }
     Ok(())
 }
+
+#[path = "workers/direct_visibility.rs"]
+mod direct_visibility;

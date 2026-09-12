@@ -3915,6 +3915,19 @@ impl WriteRepository {
             origin,
         )
         .await?;
+        // Classify only after resolving mentions, including an implicit inbox recipient.
+        // An explicitly mentioned Note is direct only when no silent recipient was added.
+        let visibility = if visibility == 4
+            && remote_note_has_only_explicit_recipients(&mut transaction, status_id, &note).await?
+        {
+            sqlx::query("UPDATE statuses SET visibility = 3 WHERE id = $1")
+                .bind(status_id)
+                .execute(&mut *transaction)
+                .await?;
+            3
+        } else {
+            visibility
+        };
         update_remote_note_tags(&mut transaction, status_id, &note.hashtags).await?;
         insert_remote_note_stats(&mut transaction, status_id, &note).await?;
         if visibility != 3 {
@@ -11983,6 +11996,36 @@ fn remote_note_visibility(audience: &RemoteNoteAudience, followers_url: &str) ->
         return 2;
     }
     4
+}
+
+async fn remote_note_has_only_explicit_recipients(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_id: i64,
+    note: &RemoteNoteData,
+) -> Result<bool, WriteError> {
+    // Local mentions already resolve actor aliases and include the delivery target.
+    // Known remote audience accounts also count, but unknown URIs and collections
+    // must not manufacture silent recipients or trigger remote resolution here.
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM mentions WHERE status_id = $1 AND silent IS FALSE
+            UNION ALL
+            SELECT 1 FROM accounts WHERE domain IS NOT NULL AND uri = ANY($2::text[])
+         ) AND NOT EXISTS (
+            SELECT 1 FROM mentions WHERE status_id = $1 AND silent IS TRUE
+            UNION ALL
+            SELECT 1 FROM accounts
+             WHERE domain IS NOT NULL
+               AND (uri = ANY($3::text[]) OR uri = ANY($4::text[]))
+               AND NOT (uri = ANY($2::text[]))
+         )",
+    )
+    .bind(status_id)
+    .bind(&note.mentions)
+    .bind(&note.audience.to)
+    .bind(&note.audience.cc)
+    .fetch_one(&mut **transaction)
+    .await?)
 }
 
 async fn remote_note_thread(

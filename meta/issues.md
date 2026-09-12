@@ -25,7 +25,6 @@
 - [ ] [Support frontend web settings API](issues/support-frontend-web-settings-api.md)
 - [ ] [Implement the test audit action plan](issues/implement-test-audit-plan.md)
 - [ ] [Expand automated integration and harness gates](issues/expand-automated-integration-gates.md)
-- [ ] [Fix remote direct-message versus limited classification](issues/fix-remote-direct-message-classification.md)
 - [ ] [Suppress semantically unchanged inbound edit effects](issues/suppress-semantic-noop-remote-edits.md)
 - [ ] [Serve the correct MIME for cached media derivatives](issues/serve-cached-media-derivative-mime.md)
 - [ ] [Adapt and run the existing peer matrix on NAS](issues/adapt-and-run-peer-matrix-on-nas.md)
