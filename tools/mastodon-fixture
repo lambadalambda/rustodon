@@ -2288,6 +2288,9 @@ GRANT SELECT ON TABLE
  GRANT INSERT (account_id, email, encrypted_password, approved, confirmed_at,
    confirmation_token, confirmation_sent_at, created_at, updated_at)
    ON TABLE public.users TO $DIFFERENTIAL_WRITER;
+ GRANT SELECT ON TABLE public.web_settings TO $DIFFERENTIAL_WRITER;
+ GRANT INSERT (user_id, data, created_at, updated_at) ON TABLE public.web_settings TO $DIFFERENTIAL_WRITER;
+ GRANT UPDATE (data, updated_at) ON TABLE public.web_settings TO $DIFFERENTIAL_WRITER;
  GRANT SELECT, INSERT, DELETE ON TABLE public.login_activities TO $DIFFERENTIAL_WRITER;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.session_activations TO $DIFFERENTIAL_WRITER;
  GRANT SELECT, DELETE ON TABLE public.web_push_subscriptions TO $DIFFERENTIAL_WRITER;
@@ -2361,6 +2364,7 @@ GRANT USAGE, SELECT ON SEQUENCE
 GRANT USAGE, SELECT ON SEQUENCE public.reports_id_seq, public.collection_reports_id_seq
    TO $DIFFERENTIAL_WRITER;
 GRANT USAGE, SELECT ON SEQUENCE public.admin_action_logs_id_seq TO $DIFFERENTIAL_WRITER;
+GRANT USAGE ON SEQUENCE public.web_settings_id_seq TO $DIFFERENTIAL_WRITER;
 GRANT USAGE, SELECT ON SEQUENCE
    public.bookmarks_id_seq, public.favourites_id_seq, public.status_stats_id_seq,
    public.status_pins_id_seq, public.statuses_id_seq, public.conversations_id_seq,

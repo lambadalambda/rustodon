@@ -134,7 +134,12 @@ fn every_expected_physical_catalog_entry_is_required_and_compared() {
             .iter()
             .filter(|entry| entry.kind == CatalogKind::Relation)
             .count(),
-        77
+        78
+    );
+    assert!(
+        expected
+            .iter()
+            .any(|entry| entry.kind == CatalogKind::Relation && entry.name == "web_settings")
     );
     assert_eq!(
         expected

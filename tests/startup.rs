@@ -14,6 +14,70 @@ use sqlx::{Connection, PgConnection, postgres::PgPoolOptions};
 
 const WRITER_PRIVILEGE_MUTATIONS: &[(&str, &str)] = &[
     (
+        "REVOKE SELECT ON public.web_settings FROM rustodon_differential_writer",
+        "GRANT SELECT ON public.web_settings TO rustodon_differential_writer",
+    ),
+    (
+        "REVOKE INSERT (user_id) ON public.web_settings FROM rustodon_differential_writer",
+        "GRANT INSERT (user_id) ON public.web_settings TO rustodon_differential_writer",
+    ),
+    (
+        "REVOKE INSERT (data) ON public.web_settings FROM rustodon_differential_writer",
+        "GRANT INSERT (data) ON public.web_settings TO rustodon_differential_writer",
+    ),
+    (
+        "REVOKE INSERT (created_at) ON public.web_settings FROM rustodon_differential_writer",
+        "GRANT INSERT (created_at) ON public.web_settings TO rustodon_differential_writer",
+    ),
+    (
+        "REVOKE INSERT (updated_at) ON public.web_settings FROM rustodon_differential_writer",
+        "GRANT INSERT (updated_at) ON public.web_settings TO rustodon_differential_writer",
+    ),
+    (
+        "REVOKE UPDATE (data) ON public.web_settings FROM rustodon_differential_writer",
+        "GRANT UPDATE (data) ON public.web_settings TO rustodon_differential_writer",
+    ),
+    (
+        "REVOKE UPDATE (updated_at) ON public.web_settings FROM rustodon_differential_writer",
+        "GRANT UPDATE (updated_at) ON public.web_settings TO rustodon_differential_writer",
+    ),
+    (
+        "GRANT DELETE ON public.web_settings TO rustodon_differential_writer",
+        "REVOKE DELETE ON public.web_settings FROM rustodon_differential_writer",
+    ),
+    (
+        "GRANT UPDATE (user_id) ON public.web_settings TO rustodon_differential_writer",
+        "REVOKE UPDATE (user_id) ON public.web_settings FROM rustodon_differential_writer",
+    ),
+    (
+        "GRANT UPDATE (created_at) ON public.web_settings TO rustodon_differential_writer",
+        "REVOKE UPDATE (created_at) ON public.web_settings FROM rustodon_differential_writer",
+    ),
+    (
+        "GRANT INSERT (id) ON public.web_settings TO rustodon_differential_writer",
+        "REVOKE INSERT (id) ON public.web_settings FROM rustodon_differential_writer",
+    ),
+    (
+        "GRANT INSERT ON public.web_settings TO rustodon_differential_writer",
+        "REVOKE INSERT ON public.web_settings FROM rustodon_differential_writer; GRANT INSERT (user_id, data, created_at, updated_at) ON public.web_settings TO rustodon_differential_writer",
+    ),
+    (
+        "GRANT UPDATE ON public.web_settings TO rustodon_differential_writer",
+        "REVOKE UPDATE ON public.web_settings FROM rustodon_differential_writer; GRANT UPDATE (data, updated_at) ON public.web_settings TO rustodon_differential_writer",
+    ),
+    (
+        "REVOKE USAGE ON SEQUENCE public.web_settings_id_seq FROM rustodon_differential_writer",
+        "GRANT USAGE ON SEQUENCE public.web_settings_id_seq TO rustodon_differential_writer",
+    ),
+    (
+        "GRANT SELECT ON SEQUENCE public.web_settings_id_seq TO rustodon_differential_writer",
+        "REVOKE SELECT ON SEQUENCE public.web_settings_id_seq FROM rustodon_differential_writer",
+    ),
+    (
+        "GRANT UPDATE ON SEQUENCE public.web_settings_id_seq TO rustodon_differential_writer",
+        "REVOKE UPDATE ON SEQUENCE public.web_settings_id_seq FROM rustodon_differential_writer",
+    ),
+    (
         "ALTER ROLE rustodon_differential_writer SUPERUSER",
         "ALTER ROLE rustodon_differential_writer NOSUPERUSER",
     ),

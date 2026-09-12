@@ -73,6 +73,12 @@ GRANT SELECT ON TABLE
   public.users, public.web_push_subscriptions, public.webauthn_credentials
   TO :"writer_role";
 
+-- Web-client snapshots are separate from users.settings. No identity rewrite or delete.
+GRANT SELECT ON TABLE public.web_settings TO :"writer_role";
+GRANT INSERT (user_id, data, created_at, updated_at) ON TABLE public.web_settings TO :"writer_role";
+GRANT UPDATE (data, updated_at) ON TABLE public.web_settings TO :"writer_role";
+GRANT USAGE ON SEQUENCE public.web_settings_id_seq TO :"writer_role";
+
 GRANT UPDATE (
   username, domain, display_name, note, actor_type, locked, memorial,
   discoverable, trendable, also_known_as, moved_to_account_id, reviewed_at,

@@ -107,6 +107,7 @@ pub(crate) const V1_CRITICAL_TABLES: &[&str] = &[
     "invites",
     "webauthn_credentials",
     "web_push_subscriptions",
+    "web_settings",
 ];
 
 const SNOWFLAKE_SEQUENCES: &[&str] = &[
@@ -545,6 +546,14 @@ SELECT
     AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'confirmation_sent_at', 'INSERT')
     AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'created_at', 'INSERT')
     AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'updated_at', 'INSERT')
+     AND pg_catalog.has_table_privilege(role.oid, 'public.web_settings', 'SELECT')
+     AND pg_catalog.has_sequence_privilege(role.oid, 'public.web_settings_id_seq', 'USAGE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.web_settings', 'user_id', 'INSERT')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.web_settings', 'data', 'INSERT')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.web_settings', 'created_at', 'INSERT')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.web_settings', 'updated_at', 'INSERT')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.web_settings', 'data', 'UPDATE')
+     AND pg_catalog.has_column_privilege(role.oid, 'public.web_settings', 'updated_at', 'UPDATE')
      AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'settings', 'UPDATE')
      AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'consumed_timestep', 'UPDATE')
      AND pg_catalog.has_column_privilege(role.oid, 'public.users', 'otp_backup_codes', 'UPDATE')
@@ -1136,7 +1145,7 @@ SELECT
                  'session_activations_id_seq', 'status_edits_id_seq', 'status_pins_id_seq',
                  'status_stats_id_seq', 'statuses_id_seq', 'tags_id_seq', 'tombstones_id_seq',
                  'users_id_seq'))
-               OR (namespace.nspname = 'public' AND relation.relname = 'custom_emojis_id_seq'
+               OR (namespace.nspname = 'public' AND relation.relname IN ('custom_emojis_id_seq', 'web_settings_id_seq')
                    AND acl.privilege_type = 'USAGE')
                OR (namespace.nspname = 'rustodon' AND relation.relname = 'outbox_events_id_seq')
              )
@@ -1176,7 +1185,7 @@ SELECT
                'reports', 'rules', 'scheduled_statuses', 'session_activations',
                'severed_relationships', 'status_edits', 'status_pins', 'status_stats', 'statuses',
                'statuses_tags', 'tag_follows', 'tags', 'tombstones', 'user_roles', 'users',
-               'web_push_subscriptions', 'webauthn_credentials'))
+               'web_push_subscriptions', 'webauthn_credentials', 'web_settings'))
               OR (namespace.nspname = 'rustodon' AND relation.relname IN (
                  'durable_jobs', 'idempotency_keys', 'ordering_markers', 'outbox_events',
                  'rate_limit_windows'))
@@ -1260,6 +1269,8 @@ SELECT
                 AND attribute.attname IN (
                   'shortcode', 'domain', 'uri', 'image_remote_url', 'disabled',
                   'visible_in_picker', 'created_at', 'updated_at'))
+            OR (namespace.nspname = 'public' AND relation.relname = 'web_settings'
+                AND attribute.attname IN ('user_id', 'data', 'created_at', 'updated_at'))
             OR (namespace.nspname = 'public' AND relation.relname = 'users'
                 AND attribute.attname IN (
                   'account_id', 'email', 'encrypted_password', 'approved', 'confirmed_at',
@@ -1293,6 +1304,8 @@ SELECT
                    'sign_in_token_sent_at', 'confirmed_at', 'confirmation_token',
                    'confirmation_sent_at', 'disabled',
                   'updated_at'))
+            OR (namespace.nspname = 'public' AND relation.relname = 'web_settings'
+                AND attribute.attname IN ('data', 'updated_at'))
             OR (namespace.nspname = 'public' AND relation.relname = 'mentions'
                 AND attribute.attname IN ('silent', 'updated_at'))
           ))
