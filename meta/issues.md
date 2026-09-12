@@ -32,3 +32,4 @@
 - [ ] [Diagnose private boost Undo returning HTTP 500](issues/diagnose-private-boost-undo-http-500.md)
 - [ ] [Investigate remote Update version ordering after semantic no-ops](issues/investigate-remote-update-version-watermark.md)
 - [ ] [Assert remote semantic no-op edit-history behavior](issues/assert-remote-noop-edit-history-stability.md)
+- [ ] [Align OAuth metadata with supported response modes](issues/align-oauth-metadata-response-modes.md)
