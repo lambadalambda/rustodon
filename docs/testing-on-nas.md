@@ -109,7 +109,8 @@ Phase-2 offline validation passed on NAS: all 10 automation regressions and
 `tools/check-harnesses` (shell mocks and Python units). Combined Rust validation
 also passed 85 workers, seven MIME units, one private-media HTTP regression,
 default/all-feature debug tests, release tests, formatting and strict Clippy.
-The complete ten-selector schema aggregate passed. These are not evidence for
+The final eleven-selector schema aggregate passed, including the 14-request
+media-state matrix. These are not evidence for
 GitHub-hosted execution, full differential, browser/cutover, source contracts,
 or real-peer convergence. Operational-schema Rust cases passed, but its later
 Rails reopen hit NAS bridge DNS resolution failure; see
@@ -117,3 +118,10 @@ Rails reopen hit NAS bridge DNS resolution failure; see
 
 Keep exact execution evidence and configured-only lanes separate in
 [the owning issue](../meta/issues/expand-automated-integration-gates.md).
+
+Startup (five tests) and configuration preflight also passed. Real Mastodon
+public/privacy/notes/profile peers passed; interactions reached private Announce
+then failed at Rustodon unreblog HTTP500. See the separate
+[peer outcomes](../meta/issues/adapt-and-run-peer-matrix-on-nas.md). Do not share
+compiled Cargo targets between source roots; embedded workspace paths are part
+of peer isolation. Broader browser/profile/reply ports remain open issues.

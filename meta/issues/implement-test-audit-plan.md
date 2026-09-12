@@ -33,3 +33,18 @@ Make existing test coverage dependable, fix the three audited behavior defects w
 - [Port selected Mastodon media and browser behavior matrices](port-mastodon-media-and-browser-matrices.md)
 
 Existing peer acceptance records remain [the peer test issue](add-isolated-federation-peer-tests.md) and [essential parity gates](run-essential-parity-gates-on-secunda.md); link new NAS evidence rather than overwrite historical claims.
+
+## Implementation checkpoint (2026-09-12)
+
+Completed and archived: build profiles, permanent HTTP selectors, pinned worker
+media, CI/harness lane wiring, the three initial production defects, guarded NAS
+peer execution with recorded outcomes, and the first additional media-state
+matrix/fix. Final NAS schema/worker/default/debug/release/fmt/Clippy/harness gates
+are green; startup/preflight passed independently. No live deployment occurred.
+
+This umbrella remains **open**. Required Rails operational/differential gates
+are blocked by [socket-path NAS DNS](repair-nas-fixture-network-dns.md). Peer
+interactions exposed [unreblog HTTP500](diagnose-private-boost-undo-http-500.md).
+The mixed-profile-media, actual delayed browser-save and failed-parent-fetch
+matrices are individually tracked under the remaining port subissue; Pleroma
+exact-image/scenario evidence and extended hosted CI execution remain unclaimed.

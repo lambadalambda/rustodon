@@ -39,3 +39,30 @@ Existing peer scenarios are locked to a Secunda host/path and expanded privacy/l
   scenario reruns are pending; source and mock success are not peer convergence.
 - Pleroma remains blocked on its separately tracked exact-image build history;
   no new build or scenario acceptance is claimed. No live resources changed.
+
+## Execution outcomes (2026-09-12)
+
+Final production source includes all four audited/ported fixes. Peer builds use
+a fresh dedicated target: sharing Cargo artifacts across source roots retained
+a wrong compile-time workspace marker and was rejected by the guard. No guard
+was weakened. Profile test data was shortened to a seeded account-ID marker to
+respect Mastodon's 40-character display-name limit; independent review and the
+real rerun passed.
+
+| Scenario | Result | Evidence run |
+| --- | --- | --- |
+| public | PASS, both directions, signed push and no canonical status GET | `peer-44271789209055836348330` |
+| privacy | PASS, recipient/outsider/anonymous and audience checks | `peer-54681789209110617445892` |
+| notes | PASS, Create/Update/Delete and retained private access rules | `peer-65321789209171966206942` |
+| profile | PASS, full actor Update both directions without actor refetch | `peer-81789210624970092399` |
+| interactions | FAIL after private Announce: original-ID unreblog HTTP500 | `peer-86911789209305125467036` |
+
+Logs: `/srv/workspaces/rustodon-peer-tests/logs/<scenario>.log`; detailed runs
+under `source/target/<run>/`. Each invocation cleaned its task containers,
+network and volume; keys/environment files were removed by the runner.
+
+Adapter/execution acceptance is complete with the failure explicitly retained in
+[a separate unresolved issue](diagnose-private-boost-undo-http-500.md). Broader
+[peer compatibility acceptance](add-isolated-federation-peer-tests.md) remains
+open; four Mastodon passes do not establish full federation or Pleroma parity.
+Pleroma has no new exact-image build/scenario evidence.

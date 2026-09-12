@@ -13,8 +13,8 @@ reproducibility gates remain separate.
 For NAS, use the tooling container described in [the runbook](testing-on-nas.md)
 with host networking, the rootful socket wrapper, and the workspace mounted at
 the same absolute host path. `target/` and the run media directory must be
-physical directories, not symlink aliases. Only compiled-cache subdirectories
-may be reused sequentially. The runner verifies engine identity/rootful mode,
+physical directories, not symlink aliases. Use a dedicated Cargo target per source root: shared compiled artifacts can
+retain a different compile-time workspace marker and are correctly rejected. The runner verifies engine identity/rootful mode,
 newly written host-visible files, network namespace, numeric run/database
 markers, cached digests, and absence of its intended resources. A workspace
 lock prevents concurrent peer runs. It refuses pulls/builds of container images;
