@@ -29,6 +29,4 @@
 - [ ] [Exercise delayed browser settings save and reload](issues/exercise-browser-delayed-settings-save.md)
 - [ ] [Port failed parent-fetch recovery and distribution matrix](issues/port-parent-fetch-recovery-matrix.md)
 - [ ] [Diagnose private boost Undo returning HTTP 500](issues/diagnose-private-boost-undo-http-500.md)
-- [ ] [Investigate remote Update version ordering after semantic no-ops](issues/investigate-remote-update-version-watermark.md)
-- [ ] [Assert remote semantic no-op edit-history behavior](issues/assert-remote-noop-edit-history-stability.md)
 - [ ] [Align OAuth metadata with supported response modes](issues/align-oauth-metadata-response-modes.md)

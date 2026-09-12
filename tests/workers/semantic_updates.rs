@@ -2,6 +2,9 @@ use super::*;
 use futures_util::FutureExt;
 use rustodon::mastodon::rest::HtmlFormatter;
 
+#[path = "semantic_update_history.rs"]
+mod history;
+
 // Behavioral port of the pinned 4.6.5 sanitized-HTML update contract, confirmed
 // by the parent from the exact image. Reference checkout (read-only):
 // /workspace/rustodon/target/mastodon-v4.6.5, or on Secunda
@@ -34,6 +37,7 @@ enum Scenario {
     Media,
     Sensitivity,
     TimestampFences,
+    NoopVersionOrdering,
     Counts,
 }
 
@@ -113,6 +117,12 @@ async fn unchanged_render_reconciles_interaction_counts_without_edit_effects() -
     run(Scenario::Counts).await
 }
 
+#[tokio::test]
+#[ignore = "requires the disposable worker PostgreSQL fixture and restricted writer"]
+async fn newer_noop_does_not_fence_an_intermediate_meaningful_edit() -> TestResult {
+    run(Scenario::NoopVersionOrdering).await
+}
+
 async fn run(scenario: Scenario) -> TestResult {
     let fixture = Fixture::new().await?;
     // Red assertions must not leave rows behind for the next serialized case.
@@ -126,6 +136,7 @@ async fn run(scenario: Scenario) -> TestResult {
             Scenario::Media => media(&fixture).await,
             Scenario::Sensitivity => sensitivity(&fixture).await,
             Scenario::TimestampFences => timestamp_fences(&fixture).await,
+            Scenario::NoopVersionOrdering => noop_version_ordering(&fixture).await,
             Scenario::Counts => counts(&fixture).await,
         }
     })
@@ -296,6 +307,53 @@ async fn timestamp_fences(fixture: &Fixture) -> TestResult {
     Ok(())
 }
 
+async fn noop_version_ordering(fixture: &Fixture) -> TestResult {
+    // Pinned 4.6.5 ProcessStatusUpdateService: only significant changes advance
+    // edited_at (174-184); ordering checks that timestamp (26-35, 435-436).
+    // Source: read-only audit-reference/remaining, detailed in the owned issue.
+    const T3: &str = "2026-08-25T12:03:00Z";
+    assert!(timestamp(FIRST_EDIT) < timestamp(NEWER));
+    assert!(timestamp(NEWER) < timestamp(T3));
+    let mut t1 = note(Some(FIRST_EDIT));
+    t1["summary"] = json!("T1 warning");
+    fixture.send(&t1, "ordering-t1").await?;
+    fixture.assert_edit(FIRST_EDIT, 1).await?;
+    let mut expected = fixture.state().await?;
+
+    let mut t3 = t1.clone();
+    t3["updated"] = json!(T3);
+    t3["content"] = json!(EQUIVALENT);
+    t3["sensitive"] = json!(true);
+    assert_ne!(t3["content"], t1["content"]);
+    assert_eq!(render(EQUIVALENT), CONTENT);
+    expected.sensitive = true;
+    for suffix in ["ordering-t3-noop", "ordering-t3-noop-replay"] {
+        fixture.send(&t3, suffix).await?;
+        assert_eq!(fixture.state().await?, expected, "T3 is not an edit fence");
+        fixture.assert_edit(FIRST_EDIT, 1).await?;
+    }
+
+    let mut t2 = t1;
+    t2["updated"] = json!(NEWER);
+    t2["content"] = json!("<p>T2 meaningful content</p>");
+    fixture.send(&t2, "ordering-t2-meaningful").await?;
+    fixture.assert_edit(NEWER, 2).await?;
+    let accepted = fixture.state().await?;
+    assert_eq!(accepted.rendered, "<p>T2 meaningful content</p>");
+    assert_eq!(accepted.warning, "T1 warning");
+    assert!(!accepted.sensitive, "T2 metadata also reconciles");
+    fixture.send(&t2, "ordering-t2-replay").await?;
+    assert_eq!(fixture.state().await?, accepted);
+    for (suffix, version) in [("ordering-older", FIRST_EDIT), ("ordering-equal", NEWER)] {
+        let mut rejected = note(Some(version));
+        rejected["content"] = json!("<p>Must not replace T2</p>");
+        rejected["sensitive"] = json!(true);
+        fixture.send(&rejected, suffix).await?;
+        assert_eq!(fixture.state().await?, accepted, "{suffix}");
+    }
+    Ok(())
+}
+
 async fn counts(fixture: &Fixture) -> TestResult {
     let before = fixture.state().await?;
     let trusted: (i64, i64) = sqlx::query_as(
@@ -376,6 +434,7 @@ struct EditState {
     // Durable update intents plus both home and notification status streams.
     effects: Vec<Value>,
     notifications: Vec<Value>,
+    history_rows: Vec<Value>,
 }
 
 struct Fixture {
@@ -607,7 +666,17 @@ impl Fixture {
             media,
             effects,
             notifications,
+            history_rows: self.history_rows().await?,
         })
+    }
+
+    async fn history_rows(&self) -> TestResult<Vec<Value>> {
+        Ok(sqlx::query_scalar(
+            "SELECT to_jsonb(edit) FROM status_edits edit WHERE status_id = $1 ORDER BY id",
+        )
+        .bind(self.status_id)
+        .fetch_all(&self.owner)
+        .await?)
     }
 
     async fn assert_edit(&self, version: &str, expected_versions: i64) -> TestResult {
@@ -668,6 +737,10 @@ impl Fixture {
         .bind(self.mention_id)
         .execute(&self.owner)
         .await?;
+        sqlx::query("DELETE FROM status_edits WHERE status_id = $1")
+            .bind(self.status_id)
+            .execute(&self.owner)
+            .await?;
         // The media FK uses ON DELETE SET NULL, not CASCADE.
         sqlx::query("DELETE FROM media_attachments WHERE status_id = $1")
             .bind(self.status_id)
