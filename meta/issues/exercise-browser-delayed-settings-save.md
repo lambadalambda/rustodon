@@ -13,3 +13,12 @@ Use agent-browser on an isolated Linux fixture only. Confirm pinned 4.6.5 fronte
 - Subissue of [selected matrix ports](port-mastodon-media-and-browser-matrices.md).
 - Tests first; separate topical implementation and independent review.
 - Pending; no implementation or execution evidence claimed.
+
+## Shared fixture prerequisite
+
+Parent replaced the cutover/differential JPEG-only upstream-path dependency with
+the existing exact vendored corpus and early verifier. NAS prerequisite red
+detected the old path; green verified corpus and corruption/missing checks.
+Logs: `rustodon-audit-green/logs/extended-media-prereq-{red,green}.log`.
+Independent static review passed. Full browser execution remains pending; no
+full-source oracle guard was weakened.

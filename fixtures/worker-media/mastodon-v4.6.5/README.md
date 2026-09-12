@@ -17,3 +17,7 @@ small test inputs, not generated application artifacts or schema fixtures.
 
 This directory is **not** an upstream Git checkout. Source-contract and
 reference-oracle gates retain their separate full-source verification.
+
+The differential media-write and cutover/browser gates also reuse
+`attachment.jpg` and run this verifier before provisioning. They do not need a
+full upstream checkout merely to supply this image.

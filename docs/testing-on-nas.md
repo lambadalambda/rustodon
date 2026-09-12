@@ -63,10 +63,10 @@ checkout exists; do not alter it or substitute a different version.
 and expose the authorized read-only checkout at the task's
 `target/mastodon-v4.6.5` only for source-dependent commands. If it is not available
 on NAS, report the lane blocked; image-only success is not source-contract proof.
-Full differential media writes and cutover/browser currently also read
-`attachment.jpg` under that source path. Fresh disposable hosted CI
-obtains/verifies the pin for all extended lanes; this is not an instruction to
-fetch another NAS reference checkout.
+Differential media writes and cutover/browser now reuse the verified vendored
+JPEG instead of depending on an ignored source checkout merely for an image.
+Fresh hosted CI may still obtain the pinned source for its separate oracle lane;
+this is not an instruction to fetch another NAS reference checkout.
 
 Workers use the parent's vendored `fixtures/worker-media/mastodon-v4.6.5` corpus
 and `tools/verify-worker-media`; a whole source checkout is not their prerequisite.
@@ -85,8 +85,8 @@ fallback. Keep the source-dependent lane separate rather than disabling its guar
 | Operational/startup/preflight | `mise run operational-schema-integration`, `mise run startup-integration`, `mise run preflight-integration` | Separate required matrix entries; run sequentially on NAS. |
 | Workers | `mise run worker-media-verify`, then `mise run worker-integration` | Verified vendored media; parent fixture runner serializes worker tests. |
 | Required differential | `mise run differential-ci` | Nine distinct cases, ten invocations; fresh fixture clones per invocation. Bearer/status authorization, signed fetch, browser recovery fences and reauthentication limits, REST serializers/protocol, federation discovery, and both actor-media-root modes. |
-| Broader differential | `mise run differential-full` | Full fixture suite plus relative actor-media-root mode; pinned source media asset prerequisite. Weekly/manual hosted CI after required gates, never a `check` dependency. |
-| Cutover/browser | `mise run cutover-integration`, `mise run browser-integration` | Weekly/manual hosted CI, sequential matrix, 180-minute job deadlines. Disposable fixtures only; cutover source asset prerequisite. Browser CLI `agent-browser` 0.31.1, Node 24.15.0 and installed Chromium/system dependencies; no automatic NAS installation. |
+| Broader differential | `mise run differential-full` | Full fixture suite plus relative actor-media-root mode; verified vendored media prerequisite. Weekly/manual hosted CI after required gates, never a `check` dependency. |
+| Cutover/browser | `mise run cutover-integration`, `mise run browser-integration` | Weekly/manual hosted CI, sequential matrix, 180-minute job deadlines. Disposable fixtures only; verified vendored media prerequisite. Browser CLI `agent-browser` 0.31.1, Node 24.15.0 and installed Chromium/system dependencies; no automatic NAS installation. |
 | Pinned source | `mise run pinned-source-contracts` | Required separate hosted job; verified read-only checkout on authorized hosts. |
 | Real peers | `mise run peer-public`, `peer-privacy`, `peer-notes`, `peer-profile`, `peer-interactions` | Manual authorized-host commands only; see exact NAS contract below. No workflow job. |
 

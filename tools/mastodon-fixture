@@ -1891,6 +1891,7 @@ cutover_preflight() {
 }
 
 cutover_test() {
+  "$ROOT/tools/verify-worker-media"
   fixture=$FIXTURE_DIR
   umask 077
   verify_static "$fixture"
@@ -2099,7 +2100,7 @@ EOF
   curl --silent --show-error --fail --max-time 30 \
     --header "Host: $LOCAL_DOMAIN" \
     --header 'Authorization: Bearer fixture-bearer-token-v4-6-5' \
-    --form "file=@$SOURCE_DIR/spec/fixtures/files/attachment.jpg;type=image/jpeg" \
+    --form "file=@$ROOT/fixtures/worker-media/mastodon-v4.6.5/attachment.jpg;type=image/jpeg" \
     --form "description=$cutover_media_description" \
     "http://127.0.0.1:$cutover_web_port/api/v1/media" >/dev/null
   cutover_media_id=$(run_podman exec "$PG_CONTAINER" psql \
@@ -2619,6 +2620,7 @@ finish_differential() {
 }
 
 differential_test() {
+  "$ROOT/tools/verify-worker-media"
   case_name=${1:-}
   if [ -n "$case_name" ]; then
     validate_differential_case "$case_name"

@@ -5,9 +5,12 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/rustodon-worker-media.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 # Fresh worker jobs must not rely on a separate ignored upstream checkout.
 if grep -F 'target/mastodon-v4.6.5/spec/fixtures/files/' \
-  "$ROOT/tests/workers.rs" "$ROOT/tests/workers/reply_emoji_grants.rs" > "$work/old-paths"; then
-  echo 'worker tests still require unprovisioned upstream media paths' >&2
+  "$ROOT/tests/workers.rs" "$ROOT/tests/workers/reply_emoji_grants.rs" "$ROOT/tests/differential/writes.rs" > "$work/old-paths"; then
+  echo 'fixture tests still require unprovisioned upstream media paths' >&2
   exit 1
+fi
+if grep -F 'file=@$SOURCE_DIR/spec/fixtures/files/attachment.jpg' "$ROOT/tools/mastodon-fixture" > "$work/cutover-path"; then
+  echo 'cutover still requires an unprovisioned upstream media path' >&2; exit 1
 fi
 "$ROOT/tools/verify-worker-media"
 cp "$ROOT/fixtures/worker-media/mastodon-v4.6.5/"* "$work/"
