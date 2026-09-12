@@ -1,0 +1,77 @@
+#!/bin/bash
+# Offline control-flow checks; never talks to a container engine.
+set -euo pipefail
+ROOT=$(CDPATH= cd -P -- "$(dirname -- "$0")/../.." && pwd)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+source "$ROOT/tools/peer-tests/preflight.sh"
+die() { echo "$*" >&2; exit 1; }
+expect_fail() { if ( "$@" ) >"$work/error" 2>&1; then die "unexpected success: $*"; fi; }
+NAS=/srv/workspaces/rustodon-peer-tests/source
+SECUNDA=/home/lain/rustodon-parity/peer-tests
+peer_profile podman-worker "$NAS" "$NAS"
+[[ $PEER_PROFILE == nas-cached-image ]]
+peer_profile secunda "$SECUNDA" "$SECUNDA"
+[[ $PEER_PROFILE == secunda-source ]]
+expect_fail peer_profile laptop "$NAS" "$NAS"
+expect_fail peer_profile podman-worker "$SECUNDA" "$SECUNDA"
+expect_fail peer_profile secunda "$NAS" "$NAS"
+expect_fail peer_profile podman-worker "$NAS/child" "$NAS/child"
+expect_fail peer_profile podman-worker "$NAS-sibling" "$NAS-sibling"
+expect_fail peer_profile podman-worker "$NAS" /different/source
+
+REVISION=pinned
+PLATFORM=linux/amd64
+MASTODON_IMAGE=mastodon@sha256:m
+POSTGRES_IMAGE=postgres@sha256:p
+REDIS_IMAGE=redis@sha256:r
+FIXTURE_DIR=fixture
+mode=good
+: >"$work/calls"
+git() { echo git >>"$work/calls"; [[ $mode != git-error ]] || return 128; echo "${revision:-pinned}"; }
+verify_static() { [[ $mode != bad-fixture ]]; }
+run_podman() {
+  echo "$*" >>"$work/calls"
+  case "$1 $2" in
+    'info --format') echo "${engine:-podman-worker|false}" ;;
+    'image exists') [[ $mode != "missing-$3" ]] ;;
+    'image inspect')
+      [[ $mode != inspect-error ]] || return 125
+      if [[ $mode == "wrong-$3" ]]; then echo 'linux/arm64|sha256:wrong'; else echo "$PLATFORM|${3##*@}"; fi ;;
+    'container exists'|'network exists'|'volume exists') return "${exists_status:-1}" ;;
+    *) die "unexpected engine operation: $*" ;;
+  esac
+}
+PEER_PROFILE=nas-cached-image
+peer_prerequisites
+! grep -q git "$work/calls"
+for mode in bad-fixture inspect-error; do expect_fail peer_prerequisites; done
+for image in "$MASTODON_IMAGE" "$POSTGRES_IMAGE" "$REDIS_IMAGE"; do
+  for mode in "missing-$image" "wrong-$image"; do expect_fail peer_prerequisites; done
+done
+mode=good
+for engine in 'wrong|false' 'podman-worker|true'; do expect_fail peer_prerequisites; done
+engine='podman-worker|false'
+PEER_PROFILE=secunda-source
+peer_prerequisites
+revision=wrong; expect_fail peer_prerequisites
+revision=pinned; mode=git-error; expect_fail peer_prerequisites
+mode=good
+for kind in container network volume; do
+  exists_status=1; peer_require_absent "$kind" owned
+  exists_status=0; expect_fail peer_require_absent "$kind" occupied
+  exists_status=125; expect_fail peer_require_absent "$kind" uncertain
+done
+# The peer wrapper applies cache-only policy to every run, including shared helpers.
+peer_engine() { printf '%s\n' "$*"; }
+[[ $(peer_podman run --name owned image) == 'run --pull=never --name owned image' ]]
+[[ $(peer_podman image inspect image) == 'image inspect image' ]]
+expect_fail peer_podman pull image
+expect_fail peer_podman build .
+# Sanitized final Cargo invocation must retain toolchain/cache locations, not
+# database credentials inherited from the outer environment.
+grep -F 'RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"' "$ROOT/tools/federation-peer-smoke" >/dev/null
+grep -F 'CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"' "$ROOT/tools/federation-peer-smoke" >/dev/null
+first=$(peer_run_id); second=$(peer_run_id)
+[[ $first != "$second" && $first != *[!0-9]* && $second != *[!0-9]* ]]
+echo 'peer profile and cache-only prerequisite tests passed' 

@@ -20,3 +20,22 @@ Existing peer scenarios are locked to a Secunda host/path and expanded privacy/l
 
 - Source: [test coverage audit](../test-coverage-audit.md).
 - User authorized this implementation plan on 2026-09-12; no live deployment is implied.
+
+## Guarded adapter implementation (2026-09-12)
+
+- Added exact NAS host/physical-workspace profile with rootful-engine identity,
+  cache-only three-image verification, host-network/mount probes and resource
+  absence checks before ownership/cleanup. Secunda source HEAD check preserved.
+- Offline prerequisites first failed, then passed source/profile, cache integrity,
+  absence-error, no-pull and numeric unique-run checks. Logs under
+  `/srv/workspaces/rustodon-audit-{main,green}/logs/peer-*.log`.
+- Initial NAS attempts honestly stopped on missing pinned Redis, a task target
+  symlink, then sanitized Cargo's missing rustup home. Normal verified fixture
+  tooling supplied the Redis pin; physical target preserved the application
+  preflight. Final Cargo explicitly retains only toolchain/cache locations.
+- Repeated tooling PID7 now uses a numeric timestamp/PID run ID, preserving Rust
+  endpoint/database/comment guards while avoiding retained-evidence collisions.
+- Independent initial and incremental reviews found no blockers. All five actual
+  scenario reruns are pending; source and mock success are not peer convergence.
+- Pleroma remains blocked on its separately tracked exact-image build history;
+  no new build or scenario acceptance is claimed. No live resources changed.

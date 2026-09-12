@@ -1,6 +1,30 @@
 # Isolated Mastodon peer smoke
 
-Run **only on Secunda**, from the task workspace:
+The runner accepts two exact host/physical-workspace pairs:
+
+- NAS: `podman-worker`, `/srv/workspaces/rustodon-peer-tests/source`.
+- Historical Secunda: `secunda`, `/home/lain/rustodon-parity/peer-tests`.
+
+NAS uses the committed schema fixture and **all three cached pinned images**;
+it neither fetches nor certifies a Mastodon source checkout. Secunda retains
+its existing canonical source HEAD check. Dedicated source-contract and fixture
+reproducibility gates remain separate.
+
+For NAS, use the tooling container described in [the runbook](testing-on-nas.md)
+with host networking, the rootful socket wrapper, and the workspace mounted at
+the same absolute host path. `target/` and the run media directory must be
+physical directories, not symlink aliases. Only compiled-cache subdirectories
+may be reused sequentially. The runner verifies engine identity/rootful mode,
+newly written host-visible files, network namespace, numeric run/database
+markers, cached digests, and absence of its intended resources. A workspace
+lock prevents concurrent peer runs. It refuses pulls/builds of container images;
+provision missing exact pins separately through normal verified fixture tooling.
+
+All five scenario commands below work in either authorized workspace. Actual
+NAS results live in [the owning issue](../meta/issues/adapt-and-run-peer-matrix-on-nas.md),
+not in the historical scope notes below. Pleroma is separate and remains unclaimed.
+
+Historical Secunda invocation:
 
 ```sh
 ssh lain@secunda.local bash -s <<'REMOTE'
@@ -9,6 +33,8 @@ cd /home/lain/rustodon-parity/peer-tests
 CARGO_BUILD_JOBS=2 tools/federation-peer-smoke
 REMOTE
 ```
+
+## Historical scenario scope and pre-NAS evidence
 
 This is bounded acceptance source, not the full interoperability matrix. The
 `public` scenario has prior remote pass evidence. The new privacy/lifecycle
@@ -19,7 +45,7 @@ unclaimed. See
 [the open issue](../meta/issues/add-isolated-federation-peer-tests.md) for exact
 passing, red and pending evidence.
 
-After the parent restores Secunda, run each scenario in a fresh invocation:
+Run each scenario in a fresh invocation on its authorized workspace:
 
 ```sh
 CARGO_BUILD_JOBS=2 tools/federation-peer-smoke public

@@ -1,9 +1,10 @@
 #!/bin/bash
-# Real Mastodon <-> Rustodon smoke; Secunda only, no production environment.
+# Real Mastodon <-> Rustodon smoke; exact disposable workspaces only.
 set -euo pipefail
-[[ $(hostname) == secunda && $PWD == /home/lain/rustodon-parity/peer-tests ]] || {
-  echo 'Run only on Secunda in /home/lain/rustodon-parity/peer-tests' >&2; exit 2;
-}
+PEER_ROOT=$(CDPATH= cd -P -- "$(dirname -- "$0")/.." && pwd)
+source "$PEER_ROOT/tools/peer-tests/preflight.sh"
+die() { echo "peer smoke: $*" >&2; exit 2; }
+peer_profile "$(hostname)" "$(pwd -P)" "$PEER_ROOT"
 [[ $# -le 1 ]] || { echo 'Use public, privacy, notes, profile or interactions' >&2; exit 2; }
 SCENARIO=${1:-public}
 case "$SCENARIO" in
@@ -19,22 +20,44 @@ if [[ ${PEER_SMOKE_DEADLINE:-0} != 1 ]]; then
 fi
 export CARGO_BUILD_JOBS=2
 MASTODON_FIXTURE_LIBRARY=1 source tools/mastodon-fixture
-SOURCE_DIR=/home/lain/repos/rustodon/target/mastodon-v4.6.5
-[[ $(git -C "$SOURCE_DIR" rev-parse HEAD) == "$REVISION" ]] || die 'pinned source mismatch'
-verify_static "$FIXTURE_DIR"
-# Reuse cached pinned images; never pull or rebuild upstream for this smoke.
-for image in "$MASTODON_IMAGE" "$POSTGRES_IMAGE" "$REDIS_IMAGE"; do
-  run_podman image exists "$image" || die "missing pinned image: $image"
-  [[ $(run_podman image inspect "$image" --format '{{.Os}}/{{.Architecture}}|{{.Digest}}') == "$PLATFORM|${image##*@}" ]] || die "cached image platform/digest mismatch: $image"
+[[ $ROOT == "$PEER_ROOT" ]] || die 'fixture library root differs from peer workspace'
+# Apply cache-only semantics to shared database/Redis helpers too.
+run_podman() { peer_podman "$@"; }
+peer_prerequisites
+mkdir -p "$ROOT/target"
+[[ $(cd -P "$ROOT/target" && pwd) == "$ROOT/target" ]] || die 'peer target must be a physical directory'
+PEER_ID=$(peer_run_id)
+RUN="peer-$PEER_ID"
+exec 9>"$ROOT/target/.peer-smoke.lock"
+flock -n 9 || die 'another peer smoke owns this workspace'
+# Check before shared setup installs cleanup traps or assigns resource ownership.
+peer_require_absent network "rustodon-fixture-v4-6-5-network-$$"
+peer_require_absent volume "rustodon-fixture-v4-6-5-postgres-$$"
+for name in "rustodon-fixture-v4-6-5-postgres-$$" "rustodon-differential-v4-6-5-redis-$$" \
+  "$RUN-seed-mastodon" "$RUN-seed-rustodon" "$RUN-web" "$RUN-sidekiq"; do
+  peer_require_absent container "$name"
 done
 cargo build --locked --features test-support --bin rustodon
 cargo test --locked --features test-support --test federation_peers --no-run
 # A renamed/non-ignored test must fail here, not report an empty smoke as success.
 cargo test --locked --features test-support --test federation_peers -- --list --ignored |
   grep -Fx "$TEST: test" >/dev/null || die 'selected ignored peer scenario is missing'
-RUN="peer-$$"
 RUN_ROOT="$ROOT/target/$RUN"
 mkdir -m 700 "$RUN_ROOT"
+if [[ $PEER_PROFILE == nas-cached-image ]]; then
+  # Sibling mounts resolve on the engine host; loopback must be shared as well.
+  # The unique marker proves new host-visible writes, not just a stale source copy.
+  printf '%s\n' "$RUN" > "$RUN_ROOT/.mount-probe"
+  if ! probe=$(run_podman run --rm --network host --cap-drop=ALL \
+    --volume "$RUN_ROOT:$RUN_ROOT:ro" --entrypoint /bin/sh "$POSTGRES_IMAGE" \
+    -c 'cat "$1/.mount-probe"; readlink /proc/self/ns/net' sh "$RUN_ROOT"); then
+    rm -f "$RUN_ROOT/.mount-probe"
+    die 'NAS peer host mount/network probe failed'
+  fi
+  rm -f "$RUN_ROOT/.mount-probe"
+  [[ $probe == "$(printf '%s\n%s' "$RUN" "$(readlink /proc/self/ns/net)")" ]] ||
+    die 'NAS peer runner requires same absolute host mounts and host networking'
+fi
 printf '%s\n' "$RUN" > "$RUN_ROOT/.peer-run"
 PIDS=()
 EXTRA_CONTAINERS=()
@@ -44,8 +67,8 @@ cleanup() {
   if [[ -n ${RUSTODON_DB:-} ]]; then
     psql_peer "$RUSTODON_DB" -c 'SELECT id, kind, attempts, last_error, dead_at FROM rustodon.durable_jobs ORDER BY id LIMIT 30' >"$RUN_ROOT/rustodon-jobs.log" 2>&1 || true
     for side in mastodon rustodon; do
-      psql_peer "rustodon_peer_$$_$side" -c 'SELECT a.id, a.username, a.domain, a.uri, u.approved, u.confirmed_at FROM accounts a LEFT JOIN users u ON u.account_id=a.id ORDER BY a.id' >"$RUN_ROOT/$side-accounts.log" 2>&1 || true
-      psql_peer "rustodon_peer_$$_$side" -c 'SELECT account_id, target_account_id FROM follows' -c 'SELECT account_id, target_account_id FROM follow_requests' >"$RUN_ROOT/$side-follows.log" 2>&1 || true
+      psql_peer "rustodon_peer_${PEER_ID}_$side" -c 'SELECT a.id, a.username, a.domain, a.uri, u.approved, u.confirmed_at FROM accounts a LEFT JOIN users u ON u.account_id=a.id ORDER BY a.id' >"$RUN_ROOT/$side-accounts.log" 2>&1 || true
+      psql_peer "rustodon_peer_${PEER_ID}_$side" -c 'SELECT account_id, target_account_id FROM follows' -c 'SELECT account_id, target_account_id FROM follow_requests' >"$RUN_ROOT/$side-follows.log" 2>&1 || true
     done
   fi
   for name in "${EXTRA_CONTAINERS[@]}"; do
@@ -90,13 +113,13 @@ SELECT 'TRUNCATE ' || string_agg(format('%I.%I', schemaname, tablename), ', ') |
 FROM pg_tables WHERE schemaname = 'public' AND tablename NOT IN ('schema_migrations', 'ar_internal_metadata') \gexec
 SQL
 for side in mastodon rustodon; do
-  db="rustodon_peer_$$_$side"
+  db="rustodon_peer_${PEER_ID}_$side"
   psql_peer postgres -c "CREATE DATABASE $db TEMPLATE $DATABASE_NAME" >/dev/null
   psql_peer "$db" -c "COMMENT ON DATABASE $db IS '$RUN/$side'" >/dev/null
   mkdir -m 777 "$RUN_ROOT/$side-media"
 done
-MASTODON_DB="rustodon_peer_$$_mastodon"
-RUSTODON_DB="rustodon_peer_$$_rustodon"
+MASTODON_DB="rustodon_peer_${PEER_ID}_mastodon"
+RUSTODON_DB="rustodon_peer_${PEER_ID}_rustodon"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=Disposable peer CA' \
   -keyout "$RUN_ROOT/ca.key" -out "$RUN_ROOT/ca.crt" >"$RUN_ROOT/tls.log" 2>&1
 openssl req -newkey rsa:2048 -nodes -subj '/CN=mastodon.peer.invalid' \
@@ -139,7 +162,7 @@ mastodon() {
     --volume "$ROOT/tools/peer-tests/mastodon-transport.rb:/opt/mastodon/config/initializers/peer_transport.rb:ro" \
     --volume "$RUN_ROOT/$side-media:/opt/mastodon/public/system:rw" \
     "${args[@]}" --env RAILS_ENV=production --env NODE_ENV=production \
-    --env DB_HOST=127.0.0.1 --env "DB_PORT=$DB_PORT" --env "DB_NAME=rustodon_peer_$$_$side" \
+    --env DB_HOST=127.0.0.1 --env "DB_PORT=$DB_PORT" --env "DB_NAME=rustodon_peer_${PEER_ID}_$side" \
     --env "DB_USER=$MASTODON_DB_USER" --env "DB_PASS=$MASTODON_DB_PASSWORD" --env DB_SSLMODE=disable \
     --env REDIS_HOST=127.0.0.1 --env "REDIS_PORT=$REDIS_PORT" --env "REDIS_DB=$redis_db" \
     --env "LOCAL_DOMAIN=$side.peer.invalid" --env "WEB_DOMAIN=$side.peer.invalid" \
@@ -229,6 +252,7 @@ done
 [[ $ready == 1 ]] || die 'federation workers did not become ready'
 # The ignored test validates the run marker and DB comments before API mutations.
 env -i PATH="$PATH" HOME="$HOME" CARGO_BUILD_JOBS=2 \
+  RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
   PEER_RUN="$RUN" PEER_ROOT="$RUN_ROOT" \
   PEER_MASTODON_HTTP="http://127.0.0.1:$MASTODON_PORT" PEER_RUSTODON_HTTP="http://127.0.0.1:$RUSTODON_PORT" \
   PEER_MASTODON_DATABASE="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$DB_PORT/$MASTODON_DB" \
