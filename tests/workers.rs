@@ -474,6 +474,7 @@ async fn worker_reclaims_job_after_database_failure_before_acknowledgement()
     Ok(())
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 #[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
 #[allow(clippy::too_many_lines)]

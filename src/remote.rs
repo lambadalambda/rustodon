@@ -2648,19 +2648,19 @@ fn prefix_matches(value: u128, prefix: u128, bits: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "test-support")]
+    #[cfg(all(debug_assertions, feature = "test-support"))]
     use std::io::{Read, Write};
     use std::net::{IpAddr, SocketAddr};
-    #[cfg(feature = "test-support")]
+    #[cfg(all(debug_assertions, feature = "test-support"))]
     use std::thread::JoinHandle;
-    #[cfg(feature = "test-support")]
+    #[cfg(all(debug_assertions, feature = "test-support"))]
     use std::time::Duration as StdDuration;
 
     use url::Url;
 
     use super::*;
 
-    #[cfg(feature = "test-support")]
+    #[cfg(all(debug_assertions, feature = "test-support"))]
     fn local_http_response(
         response: Option<Vec<u8>>,
         delay: StdDuration,
@@ -2684,7 +2684,7 @@ mod tests {
         (address, handle)
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(all(debug_assertions, feature = "test-support"))]
     fn local_http_responses(responses: Vec<Vec<u8>>) -> (SocketAddr, JoinHandle<()>) {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
@@ -2715,7 +2715,7 @@ mod tests {
         (address, handle)
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(all(debug_assertions, feature = "test-support"))]
     fn local_http_responses_with_requests(
         responses: Vec<Vec<u8>>,
     ) -> (SocketAddr, JoinHandle<Vec<Vec<u8>>>) {
@@ -2790,7 +2790,7 @@ mod tests {
         (address, handle)
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(all(debug_assertions, feature = "test-support"))]
     fn request_header_value(request: &[u8], name: &str) -> Option<String> {
         String::from_utf8_lossy(request).lines().find_map(|line| {
             let (header_name, value) = line.split_once(':')?;
@@ -3141,7 +3141,20 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(all(not(debug_assertions), feature = "test-support"))]
+    #[tokio::test]
+    async fn test_endpoint_transport_is_unavailable_without_debug_assertions() {
+        let result = RemoteFetcher::default()
+            .get_for_test_endpoint(
+                Url::parse("https://remote.example/object").unwrap(),
+                &["application/json"],
+                "127.0.0.1:9".parse().unwrap(),
+            )
+            .await;
+        assert!(matches!(result, Err(RemoteFetchError::Client)));
+    }
+
+    #[cfg(all(debug_assertions, feature = "test-support"))]
     #[tokio::test]
     async fn bounded_transport_fixtures_fail_closed() {
         let oversized_response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678"
@@ -3188,7 +3201,7 @@ mod tests {
         handle.join().unwrap();
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(all(debug_assertions, feature = "test-support"))]
     #[tokio::test]
     async fn signed_post_transport_fixtures_enforce_dns_and_redirect_policy() {
         let private_key = fixture_private_key();
@@ -3288,7 +3301,7 @@ mod tests {
         handle.join().unwrap();
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(all(debug_assertions, feature = "test-support"))]
     #[tokio::test]
     async fn signed_post_transport_fixtures_enforce_timeout_and_response_limits() {
         let private_key = fixture_private_key();
@@ -3335,7 +3348,7 @@ mod tests {
         handle.join().unwrap();
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(all(debug_assertions, feature = "test-support"))]
     #[tokio::test]
     async fn transport_fixture_rejects_mixed_resolved_addresses_before_connecting() {
         let result = RemoteFetcher::default()
@@ -3356,7 +3369,7 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(all(debug_assertions, feature = "test-support"))]
     #[tokio::test]
     async fn transport_fixture_rechecks_resolved_addresses_after_redirects() {
         let redirect = b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
@@ -3593,7 +3606,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(all(debug_assertions, feature = "test-support"))]
     #[tokio::test]
     async fn profile_fetch_checks_every_redirect_before_contact_and_retains_history() {
         let redirect = b"HTTP/1.1 302 Found\r\nLocation: http://cdn.fixture.invalid/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
