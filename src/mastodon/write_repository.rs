@@ -913,6 +913,39 @@ impl WriteRepository {
         remote_media_allowed_in_transaction(transaction, domain, limited_federation).await
     }
 
+    /// Replace one user's complete web-client snapshot, never their posting defaults.
+    /// The unique user index makes concurrent first saves atomic; the last writer wins.
+    pub async fn update_web_settings(
+        &self,
+        user_id: i64,
+        account_id: i64,
+        data: &Value,
+    ) -> Result<(), WriteError> {
+        if !data.is_object() {
+            return Err(WriteError::InvalidInput("data must be an object"));
+        }
+        let mut transaction = self.pool.begin().await?;
+        lock_account_scope(&mut transaction, account_id).await?;
+        ensure_account_write_allowed_in(&mut transaction, account_id).await?;
+        let result = sqlx::query(
+            "INSERT INTO web_settings (user_id, data, created_at, updated_at) \
+             SELECT id, $3, clock_timestamp(), clock_timestamp() FROM users \
+             WHERE id = $1 AND account_id = $2 \
+             ON CONFLICT (user_id) DO UPDATE \
+             SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(user_id)
+        .bind(account_id)
+        .bind(data)
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(WriteError::NotFound);
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// Creates one user report and queues the first staff notification atomically.
     ///
     /// # Errors

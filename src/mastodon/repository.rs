@@ -427,6 +427,24 @@ impl Repository {
         Ok(Some(user))
     }
 
+    /// The web client saves full snapshots separately from posting defaults.
+    pub async fn web_settings(
+        &self,
+        user_id: i64,
+        account_id: i64,
+    ) -> sqlx::Result<serde_json::Value> {
+        let data = sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            "SELECT setting.data FROM web_settings setting \
+             JOIN users owner ON owner.id = setting.user_id \
+             WHERE owner.id = $1 AND owner.account_id = $2",
+        )
+        .bind(user_id)
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(data.flatten().unwrap_or_else(|| serde_json::json!({})))
+    }
+
     pub async fn browser_session(&self, session_id: &str) -> sqlx::Result<Option<BrowserSession>> {
         sqlx::query_as::<_, BrowserSession>(
             "SELECT session.user_id, user_record.account_id, access_token.token AS access_token, session.updated_at, \

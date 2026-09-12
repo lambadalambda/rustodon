@@ -172,6 +172,7 @@ struct FrontendAuthenticatedState {
     access_token: String,
     account_id: i64,
     preferences: RestPreferences,
+    settings: serde_json::Value,
     role: RestRole,
 }
 
@@ -1206,6 +1207,20 @@ macro_rules! put_route {
 const READ_FAMILIAR_FOLLOWERS: RequiredScopes = RequiredScopes::new(&["read", "read:follows"]);
 
 pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
+    put_route!(
+        "/api/web/settings",
+        Implemented,
+        ApiAuthentication::Optional(NO_SCOPE.as_slice()),
+        None,
+        Private
+    ),
+    patch_route!(
+        "/api/web/settings",
+        Implemented,
+        ApiAuthentication::Optional(NO_SCOPE.as_slice()),
+        None,
+        Private
+    ),
     route!(
         "/api/v1/trends/tags",
         DisabledResponse,
@@ -2816,11 +2831,19 @@ async fn frontend_html_response(
         let Ok(serialized) = state.serializer().credential_account(&credential) else {
             return internal_error();
         };
+        let Ok(settings) = state
+            .repository
+            .web_settings(session.user_id, session.account_id)
+            .await
+        else {
+            return internal_error();
+        };
         Some(FrontendAuthenticatedState {
             account: serialized.account,
             access_token: session.access_token.as_str().to_owned(),
             account_id: session.account_id,
             preferences: state.serializer().preferences(&preferences),
+            settings,
             role: serialized.role,
         })
     } else {
@@ -3151,6 +3174,7 @@ fn frontend_initial_state(
         initial_state["meta"]["access_token"] = serde_json::json!(&authenticated.access_token);
         initial_state["meta"]["me"] = serde_json::json!(account_id);
         initial_state["role"] = role;
+        initial_state["settings"] = authenticated.settings.clone();
     }
     Some(initial_state)
 }
@@ -3306,6 +3330,14 @@ pub fn router(state: WebState) -> Router {
             get(federation_following_id),
         );
     let api = Router::new()
+        .route(
+            "/api/web/settings",
+            axum::routing::put(web_settings::update).patch(web_settings::update),
+        )
+        .route(
+            "/api/web/settings/",
+            axum::routing::put(web_settings::update).patch(web_settings::update),
+        )
         .route(
             "/auth/sign_in",
             get(browser_sign_in_page).post(browser_sign_in),
@@ -18525,6 +18557,11 @@ fn framework_internal_error() -> Response<Body> {
 #[cfg(all(test, feature = "test-support"))]
 mod account_search_tests;
 
+mod web_settings;
+
+#[cfg(test)]
+mod web_settings_tests;
+
 #[cfg(test)]
 mod api_empty_reads_tests;
 
@@ -19482,7 +19519,7 @@ mod tests {
 
     #[test]
     fn api_route_inventory_is_unique_and_declares_protocol_contracts() {
-        assert_eq!(API_ROUTE_INVENTORY.len(), 115);
+        assert_eq!(API_ROUTE_INVENTORY.len(), 117);
         assert_eq!(REST_BODY_LIMIT_BYTES, 103_809_024);
         assert_eq!(
             API_ROUTE_INVENTORY
@@ -19562,7 +19599,7 @@ mod tests {
                 .iter()
                 .filter(|route| route.method == ApiMethod::Put)
                 .count(),
-            4
+            5
         );
         assert_eq!(
             API_ROUTE_INVENTORY
