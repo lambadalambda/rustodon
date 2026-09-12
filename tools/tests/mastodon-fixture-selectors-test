@@ -25,9 +25,10 @@ v2_account_search
 api_empty_reads
 web_settings
 media_proxy
+media_state
 EOF
 cmp "$work/expected" "$work/selected" || die 'default schema gate omits a required HTTP regression'
-for selector in v2_account_search api_empty_reads web_settings media_proxy; do
+for selector in v2_account_search api_empty_reads web_settings media_proxy media_state; do
   : > "$work/selected"
   dispatch schema-read-test "$selector"
   [ "$(cat "$work/selected")" = "$selector" ] || die "wrong selector: $selector"
@@ -53,6 +54,9 @@ for pair in 'v2_account_search account_search_tests' 'api_empty_reads api_empty_
   grep -F -- "--features test-support --lib web::$2" "$work/cargo" >/dev/null || die "incorrect library target: $1"
   [ "$(wc -l < "$work/cargo" | tr -d ' ')" = 2 ] || die 'expected list check then test execution'
 done
+: > "$work/cargo"
+schema_read_rust_test media_state
+grep -F -- '--test media_state' "$work/cargo" >/dev/null || die 'incorrect media-state target'
 for cargo_mode in empty list-error; do
   : > "$work/cargo"
   if (schema_read_rust_test web_settings) > "$work/error" 2>&1; then die "invalid selection succeeded: $cargo_mode"; fi

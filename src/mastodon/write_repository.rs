@@ -5146,9 +5146,12 @@ impl WriteRepository {
         let (account_id, mut transaction) =
             self.begin_account_write(authenticated, WRITE_MEDIA).await?;
         validate_media_attachment_update(update)?;
+        // Mastodon 4.6.5 MediaController#update permits pending/in-progress metadata
+        // updates. Keep unpublished Rust staging rows and failed processing excluded.
         let current_meta = sqlx::query_scalar::<_, Option<Value>>(
             "SELECT file_meta FROM media_attachments
-             WHERE id = $1 AND account_id = $2 AND status_id IS NULL AND processing = 2
+             WHERE id = $1 AND account_id = $2 AND status_id IS NULL
+               AND processing IN (0, 1, 2) AND file_file_name IS NOT NULL
              FOR UPDATE",
         )
         .bind(id)

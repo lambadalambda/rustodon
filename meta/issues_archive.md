@@ -68,3 +68,4 @@
 - [x] [Suppress semantically unchanged inbound edit effects](issues/suppress-semantic-noop-remote-edits.md)
 - [x] [Serve the correct MIME for cached media derivatives](issues/serve-cached-media-derivative-mime.md)
 - [x] [Expand automated integration and harness gates](issues/expand-automated-integration-gates.md)
+- [x] [Port the pinned media-state HTTP matrix](issues/port-media-state-http-matrix.md)
