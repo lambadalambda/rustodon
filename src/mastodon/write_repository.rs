@@ -43,6 +43,7 @@ use super::policy::{
     status_reblog_access,
 };
 use super::records::{BrowserLoginUser, DomainBlock, Marker, MediaAttachment, NotificationPolicy};
+use super::rest::{HtmlFormatter, RenderedHtml};
 use super::types::{AccountIdScheme, SecretText, StatusVisibility};
 use crate::crypto::ActiveRecordEncryptionConfig;
 use crate::jobs::{
@@ -4324,6 +4325,11 @@ impl WriteRepository {
             transaction.commit().await?;
             return Ok(None);
         }
+        let html_origin =
+            Url::parse(origin).map_err(|_| WriteError::InvalidInput("local origin is invalid"))?;
+        let formatter =
+            HtmlFormatter::new(&html_origin, html_origin.host_str().unwrap_or_default());
+        let before = remote_note_edit_projection(&mut transaction, status_id, &formatter).await?;
         upsert_remote_emojis(
             &mut transaction,
             domain.as_deref().expect("remote accounts have a domain"),
@@ -4333,7 +4339,7 @@ impl WriteRepository {
         .await?;
         sqlx::query(
             "UPDATE statuses SET text = $2, spoiler_text = $3, sensitive = $4,
-                language = $5, edited_at = $6, updated_at = clock_timestamp()
+                language = $5, updated_at = clock_timestamp()
               WHERE id = $1",
         )
         .bind(status_id)
@@ -4341,7 +4347,6 @@ impl WriteRepository {
         .bind(&note.summary)
         .bind(note.sensitive)
         .bind(&note.language)
-        .bind(note.updated_at)
         .execute(&mut *transaction)
         .await?;
         remove_remote_note_media_not_in(&mut transaction, status_id, &note.attachments).await?;
@@ -4391,6 +4396,18 @@ impl WriteRepository {
             )
             .await?;
         }
+        // Reconcile metadata (including mentions and their notifications) even
+        // when rendered content is unchanged. Only meaningful edits advance the
+        // edit version and broadcast update effects.
+        if remote_note_edit_projection(&mut transaction, status_id, &formatter).await? == before {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        sqlx::query("UPDATE statuses SET edited_at = $2 WHERE id = $1")
+            .bind(status_id)
+            .bind(note.updated_at)
+            .execute(&mut *transaction)
+            .await?;
         record_status_update_notifications(
             &mut transaction,
             status_id,
@@ -11419,6 +11436,50 @@ async fn record_login_activity(
     .execute(&mut **transaction)
     .await?;
     Ok(())
+}
+
+// The inbound 4.6.5 edit contract concerns rendered text, CW, and ordered
+// media identity/descriptions. Sensitivity, language, tags, counts, and media
+// cache metadata still reconcile, but are not standalone edit signals. Poll
+// editing is not supported here; do not infer it from ignored Question fields.
+#[derive(Eq, PartialEq)]
+struct RemoteNoteEditProjection {
+    content: RenderedHtml,
+    spoiler_text: String,
+    media: Vec<(i64, Option<String>)>,
+}
+
+async fn remote_note_edit_projection(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_id: i64,
+    formatter: &HtmlFormatter<'_>,
+) -> Result<RemoteNoteEditProjection, WriteError> {
+    let (text, spoiler_text) = sqlx::query_as::<_, (String, String)>(
+        "SELECT text, spoiler_text FROM statuses WHERE id = $1",
+    )
+    .bind(status_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    // Match the visible-media projection: explicit ordering when present,
+    // otherwise attachment ID order. Cache installation is not an edit.
+    let media = sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT media.id, media.description FROM statuses status
+         CROSS JOIN LATERAL unnest(COALESCE(status.ordered_media_attachment_ids,
+             ARRAY(SELECT fallback.id FROM media_attachments fallback
+                   WHERE fallback.status_id = status.id ORDER BY fallback.id)))
+             WITH ORDINALITY ordering(media_id, position)
+         JOIN media_attachments media ON media.id = ordering.media_id
+             AND media.status_id = status.id
+         WHERE status.id = $1 ORDER BY ordering.position LIMIT 4",
+    )
+    .bind(status_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    Ok(RemoteNoteEditProjection {
+        content: formatter.remote_fragment(&text),
+        spoiler_text,
+        media,
+    })
 }
 
 struct RemoteNoteData {

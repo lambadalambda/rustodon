@@ -65,3 +65,4 @@
 - [x] [Wire permanent HTTP regression fixture gates](issues/wire-http-regression-gates.md)
 - [x] [Provision pinned worker media fixtures explicitly](issues/provision-pinned-worker-media-fixtures.md)
 - [x] [Fix remote direct-message versus limited classification](issues/fix-remote-direct-message-classification.md)
+- [x] [Suppress semantically unchanged inbound edit effects](issues/suppress-semantic-noop-remote-edits.md)
