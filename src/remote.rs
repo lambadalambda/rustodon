@@ -273,6 +273,8 @@ struct RemoteDomainLease {
     pool: sqlx::PgPool,
     host: String,
     lease_id: String,
+    #[cfg(test)]
+    release_completed: Option<tokio::sync::oneshot::Sender<Result<(), sqlx::Error>>>,
 }
 
 impl RemoteDomainBudget {
@@ -411,6 +413,8 @@ impl RemoteDomainBudget {
                 pool,
                 host,
                 lease_id,
+                #[cfg(test)]
+                release_completed: None,
             }),
         })
     }
@@ -435,7 +439,13 @@ impl Drop for RemoteDomainPermit {
             return;
         };
         handle.spawn(async move {
-            let _ = release_remote_domain_lease(&lease).await;
+            let result = release_remote_domain_lease(&lease).await;
+            #[cfg(test)]
+            if let Some(completed) = lease.release_completed {
+                let _ = completed.send(result);
+            }
+            #[cfg(not(test))]
+            let _ = result;
         });
     }
 }
@@ -3025,7 +3035,10 @@ mod tests {
     async fn remote_domain_budget_coordinates_independent_pools_and_reclaims_expired_leases()
     -> Result<(), Box<dyn std::error::Error>> {
         let url = std::env::var("RUSTODON_OPERATIONAL_DATABASE_URL")?;
-        let first_pool = sqlx::PgPool::connect(&url).await?;
+        let first_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await?;
         let second_pool = sqlx::PgPool::connect(&url).await?;
         let target = Url::parse("https://remote-fetch-lease-test.example/actor")?;
         let host = canonical_remote_host_from_origin(&target)?;
@@ -3050,25 +3063,46 @@ mod tests {
         second_lease.release().await;
         replacement.release().await;
 
-        let cancelled = first_budget.acquire(&target).await?;
+        let mut cancelled = first_budget.acquire(&target).await?;
+        let (release_completed, mut released) = tokio::sync::oneshot::channel();
+        cancelled
+            .shared
+            .as_mut()
+            .expect("operational budget must issue a shared lease")
+            .release_completed = Some(release_completed);
+        // Hold the only connection so Drop cannot finish cleanup yet. The old
+        // one-second polling deadline conflated database/scheduler latency with
+        // correctness; observe this permit's actual DELETE completion instead.
+        let cleanup_connection = first_pool.acquire().await?;
         drop(cancelled);
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if sqlx::query_scalar::<_, i64>(
-                    "SELECT count(*) FROM rustodon.remote_fetch_leases WHERE host = $1",
-                )
-                .bind(host)
-                .fetch_one(&first_pool)
-                .await?
-                    == 0
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            Ok::<(), sqlx::Error>(())
-        })
-        .await??;
+        assert!(matches!(
+            released.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM rustodon.remote_fetch_leases WHERE host = $1",
+            )
+            .bind(host)
+            .fetch_one(&second_pool)
+            .await?,
+            1
+        );
+        drop(cleanup_connection);
+        // A deadlock watchdog only: successful synchronization is the DELETE
+        // result, not elapsed time or a polling cadence.
+        tokio::time::timeout(Duration::from_secs(30), released)
+            .await
+            .expect("dropped shared lease cleanup did not complete")??;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM rustodon.remote_fetch_leases WHERE host = $1",
+            )
+            .bind(host)
+            .fetch_one(&second_pool)
+            .await?,
+            0
+        );
 
         sqlx::query(
             "INSERT INTO rustodon.remote_fetch_leases (host, lease_id, expires_at) \
