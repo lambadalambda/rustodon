@@ -27,3 +27,12 @@ After foundational gates and the audited fixes, extend existing tests with indep
 - [Port mixed profile-media preservation matrix](port-mixed-profile-media-matrix.md)
 - [Exercise delayed browser settings save and reload](exercise-browser-delayed-settings-save.md)
 - [Port failed parent-fetch recovery and distribution matrix](port-parent-fetch-recovery-matrix.md)
+
+## Completion evidence
+
+All four selected subissues are satisfied and archived: media-state HTTP,
+mixed-profile media, parent-fetch recovery/distribution, and actual browser
+settings-save/reload. Each retained pinned expectations, meaningful rejection or
+durable-state assertions, and permanent gate wiring. Exact topical evidence is
+in the linked subissues; `final19-browser.log` also passes the enclosing full
+cutover/rollback. Broader frontend/federation coverage is not inferred.

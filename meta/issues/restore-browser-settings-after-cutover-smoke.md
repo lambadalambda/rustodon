@@ -22,7 +22,8 @@ NAS `browser-settings-rollback-red.log`:6 tests/8 failures before implementation
 `final18-rollback-offline.log` and the complete harness pass after implementation,
 including preexisting/absent/NULL/quoted settings, unrelated-user preservation,
 sequence failures and owned-file cleanup. Independent review approved.
-The final real browser-plus-rollback gate is pending: final18 stopped because its
+At this intermediate checkpoint the real browser-plus-rollback gate was pending:
+final18 stopped because its
 leading PUT was still pending at the unchanged deadline, not a CSRF422.
 
 Final acceptance: `final19-browser.log` passes the actual HTTPS browser **and**

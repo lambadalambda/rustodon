@@ -48,7 +48,8 @@ The exact422 branch is being classified without logging tokens.
   actual extracted JS and shell adapter tests afterward.
 - `browser-https-first.log`: actual browser smoke passes authenticated settings
   leading/trailing PUT, reload persistence, API audits and logout. The enclosing
-  cutover later failed Mastodon Puma readiness; that separate gate remains pending.
+  cutover later failed Mastodon Puma readiness; that separate gate was pending at
+  this intermediate checkpoint (see final acceptance below).
 - Separate component reviews and merged security/correctness/compactness review
   approved. Tests are permanently discovered by `tools/check-harnesses`.
 

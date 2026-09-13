@@ -24,4 +24,4 @@
 - [ ] [Diagnose missing remote animated media](issues/diagnose-missing-remote-animated-media.md)
 - [ ] [Support frontend web settings API](issues/support-frontend-web-settings-api.md)
 - [ ] [Implement the test audit action plan](issues/implement-test-audit-plan.md)
-- [ ] [Port selected Mastodon media and browser behavior matrices](issues/port-mastodon-media-and-browser-matrices.md)
+- [ ] [Stabilize worker executor coordination regressions](issues/stabilize-worker-executor-coordination-tests.md)

@@ -66,3 +66,25 @@ Adapter/execution acceptance is complete with the failure explicitly retained in
 [peer compatibility acceptance](add-isolated-federation-peer-tests.md) remains
 open; four Mastodon passes do not establish full federation or Pleroma parity.
 Pleroma has no new exact-image build/scenario evidence.
+
+
+## Remaining-audit peer rerun (2026-09-13)
+
+All five actual scenarios passed with the missing-account-stats boost correction
+(now committed in `db8b540`) and reviewed OAuth modes. The peer workspace retained
+its own physical Cargo target and verified cached images; no source-contract or
+Pleroma result is inferred.
+
+| Scenario | Result | Evidence run |
+| --- | --- | --- |
+| interactions | PASS, private Announce and Undo included | `peer-71789273216189507306` |
+| public | PASS | `peer-19751789273511768764386` |
+| privacy | PASS | `peer-31221789273724030004092` |
+| notes | PASS | `peer-42931789273971807200191` |
+| profile | PASS | `peer-54271789274212335948275` |
+
+Logs: `/srv/workspaces/rustodon-peer-tests/logs/<scenario>-remaining.log`.
+A preliminary attempt stopped before compilation because source transfer retained
+mode600 files with the Mac owner. Ownership was corrected only on task source
+files; capability-drop and peer guards stayed intact. Each real scenario cleaned
+its own resources, and the task-owned API session stopped afterward.

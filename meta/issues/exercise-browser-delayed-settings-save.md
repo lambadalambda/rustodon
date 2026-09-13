@@ -68,7 +68,7 @@ Use agent-browser on an isolated Linux fixture only. Confirm pinned 4.6.5 fronte
 - Tests cover object-like output rejection, classification, stop-at-gate behavior, diagnostic URL/query omission and value sanitization, and observed/missing timing stage bookkeeping. Independent read-only review found no blocking issues. These changes are prepared for parent NAS testing, not locally executed.
 - Parent next: rerun the isolated gate and capture its safe classification/summary. On the same verified CLI, compare known-value `eval 'true'`, `eval 'false'`, and `eval 'Promise.resolve(true)'` outputs using the existing session/args invocation. Those synthetic results can establish formatting without inspecting any page/session/private state. Do not change the API allowlist or relax literal-boolean acceptance until the result representation and actual failed branch are known. Issue remains open; no workloads, NAS/SSH execution, or commits performed here.
 
-## Current parent checkpoint
+## Historical checkpoint — before HTTPS correction
 
 Real anonymous/authenticated startup audits now pass after the separately
 committed extended-description and batch-account endpoints. Verified CLI init

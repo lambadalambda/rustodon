@@ -90,11 +90,28 @@ fallback. Keep the source-dependent lane separate rather than disabling its guar
 | Pinned source | `mise run pinned-source-contracts` | Required separate hosted job; verified read-only checkout on authorized hosts. |
 | Real peers | `mise run peer-public`, `peer-privacy`, `peer-notes`, `peer-profile`, `peer-interactions` | Manual authorized-host commands only; see exact NAS contract below. No workflow job. |
 
-The browser lane exercises the existing fixture-authenticated shell/settings/logout
-smoke. Wiring it does not claim coverage of every browser form or the debounced
-settings-save action. The broader lanes are bounded separately and are not called
-“all tests.” Do not use blanket `cargo test -- --ignored` or concurrent fixture
-runs to replace the named gates.
+The mixed-profile selector uses test-profile opt-level3 for both discovery and
+execution, preserving debug assertions and the exact animated fixture's2s connect,
+10s total and5s read budgets. The full differential lane skips that case in its
+ordinary batch and runs it once afterward with the scoped optimization. Other
+selectors and CLI builds keep their caller profile.
+
+The browser lane exercises fixture-authenticated shell/settings/logout plus real
+Home boost/reply actions: leading and trailing settings PUTs, omission of the
+client-only `saved` field, and bootstrap/rendered persistence after reload. HTTP
+observation starts before navigation and rejects unexpected API failures; deliberate
+marked auth/missing-resource probes remain exact. This is not coverage of every
+browser form, WebSocket, or EventSource behavior. Do not use blanket
+`cargo test -- --ignored` or concurrent fixtures to replace named gates.
+
+Browser cutover uses `tools/browser-fixture-tls`: a task-owned loopback TLS relay
+with an ephemeral exact-domain certificate. It passes `RUSTODON_BROWSER_CA_FILE`
+and `RUSTODON_BROWSER_SPKI` only to the smoke invocation. Curl validates that CA
+and hostname; Chromium trusts only the fixture leaf SPKI, not arbitrary invalid
+certificates. No global trust installation or production CSRF/cookie changes.
+TLS certificates are removed even when other cutover artifacts are retained.
+The offline harness now requires OpenSSL as well as Python for real loopback TLS
+transport, negative trust/hostname, streaming, and bounded-cleanup tests.
 
 ## Exact NAS peer execution contract
 
@@ -140,9 +157,59 @@ failure, now resolved by the task-owned API session above; see
 Keep exact execution evidence and configured-only lanes separate in
 [the owning issue](../meta/issues/expand-automated-integration-gates.md).
 
-Startup (five tests) and configuration preflight also passed. Real Mastodon
-public/privacy/notes/profile peers passed; interactions reached private Announce
-then failed at Rustodon unreblog HTTP500. See the separate
-[peer outcomes](../meta/issues/adapt-and-run-peer-matrix-on-nas.md). Do not share
-compiled Cargo targets between source roots; embedded workspace paths are part
-of peer isolation. Broader browser/profile/reply ports remain open issues.
+Startup (five tests) and configuration preflight passed. All five actual Mastodon
+peers subsequently passed after the private-unboost correction; see the exact
+[peer outcomes](../meta/issues/adapt-and-run-peer-matrix-on-nas.md). These peer runs
+precede the final browser API additions, rather than certify the final tree. Do not
+share compiled Cargo targets between source roots; embedded workspace paths are
+part of peer isolation.
+
+Use a workload-side watchdog for long fixture commands, for example
+`timeout --signal=TERM --kill-after=60s 1200s tools/mastodon-fixture worker-test`
+**inside** the NAS tooling container. An SSH-client timeout alone can leave the
+remote process alive. On timeout, inspect only that task's process/container IDs
+and let fixture cleanup run while its task-owned API socket is still available;
+do not prune the engine or terminate unrelated workloads. The1200-second example
+is a test-workload bound, not a production queue/HTTP/SMTP timeout.
+For schema coverage, bound each of the12 named selectors separately; the final16
+aggregate cutoff after six successes was not an assertion failure. Preflight has
+many canonical/drift checks and needs an aggregate budget appropriate to that work;
+600/1200-second aggregate cutoffs did not establish a failing individual check.
+The final18 diagnostic run printed fixed case labels only and passed all checks
+under a3600-second workload bound, with unchanged production/check deadlines.
+
+### Remaining-audit final evidence
+
+Logs below are beneath `/srv/workspaces/rustodon-audit-green/logs/`:
+
+- `final17-schema-*.log`: all12 independent selectors pass (including batch
+  accounts); these precede the final test-only budget-clock/cleanup seams.
+- `final18-{default,feature,release,clippy,harnesses}.log`: combined-tree ordinary
+  default/debug-all-feature/release-all-feature tests, strict lint, offline checks.
+  `final19` additionally checks formatting. Ignored tests are not inferred.
+- `final18-operational.log`: complete operational/Rails gate, including actual
+  asynchronous domain-lease cleanup and the fixed-clock regression.
+- `startup-retry.log`: all5 startup cases pass. `final18-preflight.log`: canonical
+  and all configuration-drift cases pass with sanitized stage-only diagnostics.
+- Required differential: seven invocations in `final17-diff-*.log` pass;
+  `final18-{oauth-diff,core-diff,reauth}.log` supplies the remaining three greens.
+  The reauthentication case includes the deterministic per-instance fixture clock;
+  earlier `required-remaining-complete.log` is separate, earlier-source evidence.
+- `final19-browser.log`: authenticated actual leading/trailing PUT and reload
+  persistence **plus full cutover/rollback** pass. `final19-cutover.log`: ordinary
+  cutover independently passes. Intermediate HTTP CSRF422, Puma readiness, exact
+  settings rollback and pending-leading-response failures remain recorded; no
+  blanket TLS bypass, removed equality guard, or widened browser deadline.
+- The latest worker rerun exposed fixture coordination failures after the earlier
+  100/100 pass; [the focused follow-up](../meta/issues/stabilize-worker-executor-coordination-tests.md)
+  remains open pending a restored combined worker result.
+
+This is not a full `mise run check`, full differential, hosted-CI, Pleroma, or
+read-only source-contract execution claim. Earlier five-peer results retain their
+source/evidence boundary above.
+
+Dependency-policy execution note: the currently provisioned NAS browser/tooling
+image does not include `cargo-deny`. The new Markdown dependency resolves under
+the committed lockfile and compiles/tests on NAS, but a fresh dependency-policy
+run is not claimed from those checks. The configured CI policy lane remains
+separate; no host-wide tool installation or policy bypass was performed.
