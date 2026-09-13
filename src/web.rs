@@ -1299,6 +1299,13 @@ pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
         Public
     ),
     route!(
+        "/api/v1/instance/extended_description",
+        Implemented,
+        ApiAuthentication::Public,
+        None,
+        Public
+    ),
+    route!(
         "/api/v1/instance/rules",
         Implemented,
         ApiAuthentication::Public,
@@ -2040,6 +2047,11 @@ pub const V1_REQUIRED_API_ROUTES: &[(&str, ApiMethod, ApiRouteSupport)] = &[
     ),
     (
         "/api/v2/instance",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/instance/extended_description",
         ApiMethod::Get,
         ApiRouteSupport::Implemented,
     ),
@@ -3442,6 +3454,10 @@ pub fn router(state: WebState) -> Router {
         .route("/api/v1/streaming/direct", get(streaming))
         .route("/api/v1/instance", get(instance_v1))
         .route("/api/v2/instance", get(instance_v2))
+        .route(
+            "/api/v1/instance/extended_description",
+            get(extended_description::show),
+        )
         .route("/api/v1/instance/rules", get(instance_rules))
         .route(
             "/api/v1/instance/translation_languages",
@@ -3659,6 +3675,10 @@ pub fn router(state: WebState) -> Router {
         )
         .route("/api/v1/instance/", get(instance_v1))
         .route("/api/v2/instance/", get(instance_v2))
+        .route(
+            "/api/v1/instance/extended_description/",
+            get(extended_description::show),
+        )
         .route("/api/v1/instance/rules/", get(instance_rules))
         .route(
             "/api/v1/instance/translation_languages/",
@@ -18680,6 +18700,11 @@ fn framework_internal_error() -> Response<Body> {
 #[cfg(all(test, feature = "test-support"))]
 mod account_search_tests;
 
+mod extended_description;
+
+#[cfg(test)]
+mod extended_description_tests;
+
 mod web_settings;
 
 #[cfg(test)]
@@ -19645,7 +19670,7 @@ mod tests {
 
     #[test]
     fn api_route_inventory_is_unique_and_declares_protocol_contracts() {
-        assert_eq!(API_ROUTE_INVENTORY.len(), 117);
+        assert_eq!(API_ROUTE_INVENTORY.len(), 118);
         assert_eq!(REST_BODY_LIMIT_BYTES, 103_809_024);
         assert_eq!(
             API_ROUTE_INVENTORY

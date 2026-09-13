@@ -2,6 +2,7 @@ mod differential {
     pub mod artifacts;
     pub mod comparison;
     pub mod database;
+    pub mod extended_description;
     pub mod federation;
     pub mod harness;
     pub mod mixed_profile_media;
@@ -7134,4 +7135,16 @@ async fn browser_reauthentication_limits() -> Result<(), Box<dyn std::error::Err
         differential::reauth_limits::run(config),
     )
     .await?
+}
+
+#[tokio::test]
+#[ignore = "requires guarded disposable fixture databases and owner URL"]
+async fn extended_description() -> Result<(), Box<dyn std::error::Error>> {
+    differential::extended_description::extended_description_http_contract().await
+}
+
+#[tokio::test]
+#[ignore = "requires guarded disposable fixture databases and owner URL"]
+async fn extended_description_limited_mode() -> Result<(), Box<dyn std::error::Error>> {
+    differential::extended_description::extended_description_limited_mode_contract().await
 }

@@ -3747,6 +3747,17 @@ impl Repository {
         .await
     }
 
+    pub(crate) async fn extended_description_setting(
+        &self,
+    ) -> sqlx::Result<Option<super::records::ExtendedDescriptionSetting>> {
+        sqlx::query_as(
+            "SELECT value, updated_at FROM settings \
+             WHERE var = 'site_extended_description' ORDER BY id LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     pub async fn settings(&self) -> sqlx::Result<Vec<Setting>> {
         sqlx::query_as::<_, Setting>("SELECT id, var, value FROM settings ORDER BY id")
             .fetch_all(&self.pool)

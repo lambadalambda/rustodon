@@ -612,6 +612,12 @@ pub struct DomainBlock {
     pub obfuscate: bool,
 }
 
+#[derive(sqlx::FromRow)]
+pub(crate) struct ExtendedDescriptionSetting {
+    pub value: Option<RawYamlText>,
+    pub updated_at: Option<NaiveDateTime>,
+}
+
 #[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
 pub struct Setting {
     pub id: i64,

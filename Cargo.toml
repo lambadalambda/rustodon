@@ -31,6 +31,8 @@ lettre = { version = "0.11.23", default-features = false, features = ["builder",
 linkify = "0.10"
 pbkdf2 = "0.12.2"
 percent-encoding = "2.3"
+# Library-only CommonMark parser/HTML renderer; no CLI or default feature bundle.
+pulldown-cmark = { version = "0.13.0", default-features = false, features = ["html"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "stream"] }
 rsa = { version = "0.9.10", features = ["pem", "sha2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

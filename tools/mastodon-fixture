@@ -2198,7 +2198,7 @@ validate_differential_case() {
       ;;
   esac
   case "$case_name" in
-    account_settings|actor_media_root_url|admin_create_user|authorized_fetch_read_routes_require_signatures|browser_authentication|browser_recovery_fences|browser_reauthentication_limits|browser_two_factor_management|core_rest_serializers|federation_discovery|instance_v2|local_paperclip_media|local_paperclip_deleted_media|local_web_client_shell|media_writes|mixed_profile_media|notification_writes|oauth_authorization_code|oauth_bearer_authentication|password_recovery|report_writes|rest_protocol_contracts|status_authorization_matrix|write_transactions) ;;
+    account_settings|actor_media_root_url|admin_create_user|authorized_fetch_read_routes_require_signatures|browser_authentication|browser_recovery_fences|browser_reauthentication_limits|browser_two_factor_management|core_rest_serializers|extended_description|extended_description_limited_mode|federation_discovery|instance_v2|local_paperclip_media|local_paperclip_deleted_media|local_web_client_shell|media_writes|mixed_profile_media|notification_writes|oauth_authorization_code|oauth_bearer_authentication|password_recovery|report_writes|rest_protocol_contracts|status_authorization_matrix|write_transactions) ;;
     *) die "unknown differential case: $case_name" ;;
   esac
 }
