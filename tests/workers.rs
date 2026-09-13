@@ -17987,3 +17987,7 @@ mod semantic_updates;
 #[cfg(feature = "test-support")]
 #[path = "workers/parent_fetch_recovery.rs"]
 mod parent_fetch_recovery;
+
+#[cfg(feature = "test-support")]
+#[path = "workers/private_unreblog.rs"]
+mod private_unreblog;

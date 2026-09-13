@@ -5683,12 +5683,8 @@ impl WriteRepository {
                 account_statuses_count_before_removal: None,
             });
         };
-        let account_statuses_count_before_removal = sqlx::query_scalar::<_, i64>(
-            "SELECT statuses_count FROM account_stats WHERE account_id = $1 FOR UPDATE",
-        )
-        .bind(account_id)
-        .fetch_one(&mut *transaction)
-        .await?;
+        let account_statuses_count_before_removal =
+            lock_account_statuses_count(&mut transaction, account_id).await?;
         let remote_delivery = match origin {
             Some(origin) => {
                 remote_status_delivery(&mut transaction, account_id, requested_status_id, origin)
@@ -5842,6 +5838,9 @@ impl WriteRepository {
         if !matches!(visibility, 0..=2) {
             return Err(WriteError::InvalidInput("invalid reblog visibility"));
         }
+        // Initialize an imported/fresh account's missing stats before inserting
+        // the wrapper, so the normal increment counts it exactly once.
+        lock_account_statuses_count(&mut transaction, account_id).await?;
         let (status_id, created_at) = sqlx::query_as::<_, (i64, NaiveDateTime)>(
             "INSERT INTO statuses ( \
                account_id, text, spoiler_text, visibility, local, uri, url, language, \
@@ -16201,6 +16200,44 @@ async fn increment_reblog_count(
     .execute(&mut **transaction)
     .await?;
     Ok(())
+}
+
+// Callers must already hold the local account row lock acquired by
+// ensure_account_write_allowed_in. This serializes initialization with other
+// local writes, including boosts of different targets. Keep existing counters
+// authoritative; only an absent stats row is seeded from live non-direct posts.
+async fn lock_account_statuses_count(
+    transaction: &mut Transaction<'_, Postgres>,
+    account_id: i64,
+) -> Result<i64, WriteError> {
+    const LOCK_COUNT: &str =
+        "SELECT statuses_count FROM account_stats WHERE account_id = $1 FOR UPDATE";
+    if let Some(count) = sqlx::query_scalar::<_, i64>(LOCK_COUNT)
+        .bind(account_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+    {
+        return Ok(count);
+    }
+    sqlx::query(
+        "INSERT INTO account_stats (account_id, statuses_count, last_status_at, \
+                                   following_count, followers_count, created_at, updated_at) \
+         SELECT $1, count(*), max(LEAST(created_at, clock_timestamp())), \
+                (SELECT count(*) FROM follows WHERE account_id = $1), \
+                (SELECT count(*) FROM follows WHERE target_account_id = $1), \
+                clock_timestamp(), clock_timestamp() \
+           FROM statuses WHERE account_id = $1 AND deleted_at IS NULL AND visibility <> 3 \
+         ON CONFLICT (account_id) DO NOTHING",
+    )
+    .bind(account_id)
+    .execute(&mut **transaction)
+    .await?;
+    // A concurrent initializer may have won the unique-key conflict. Read and
+    // lock its actual row in a new statement; never reset it or hide SQL errors.
+    Ok(sqlx::query_scalar::<_, i64>(LOCK_COUNT)
+        .bind(account_id)
+        .fetch_one(&mut **transaction)
+        .await?)
 }
 
 async fn increment_account_status_count(
