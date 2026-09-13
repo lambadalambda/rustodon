@@ -63,7 +63,7 @@ use serde_json::{Value, json};
 use sqlx::{Connection, PgConnection, Row, postgres::PgPoolOptions};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Barrier, Notify, oneshot};
 use url::Url;
 
 #[tokio::test]
@@ -7631,7 +7631,7 @@ async fn activitypub_media_fetch_reclaims_after_lease_fence()
         Some(config),
     )?;
     let executor = WorkerExecutor::new(queue.clone(), handlers, 1, 1)?;
-    queue
+    let job_id = queue
         .enqueue(
             &JobSpec::new(
                 Lane::Pull,
@@ -7655,24 +7655,47 @@ async fn activitypub_media_fetch_reclaims_after_lease_fence()
                 .process_one(
                     "fenced-media-worker",
                     &[Lane::Pull],
-                    Duration::milliseconds(150),
+                    // A fixture lease, not a shortened production HTTP deadline.
+                    // Renew every five seconds, before the HTTP client times out.
+                    Duration::seconds(15),
                 )
                 .await
         }));
     let operation = async {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            request_started.notified(),
+        tokio::time::timeout(WORKER_FIXTURE_WATCHDOG, async {
+            tokio::select! {
+                () = request_started.notified() => Ok::<_, Box<dyn std::error::Error>>(()),
+                result = first.as_mut().expect("the first worker task is present") => {
+                    first.take();
+                    Err(std::io::Error::other(format!(
+                        "media worker stopped before the first request: {result:?}"
+                    )).into())
+                }
+            }
+        })
+        .await??;
+        let generation = sqlx::query_scalar::<_, i64>(
+            "SELECT lease_generation FROM rustodon.durable_jobs
+              WHERE id = $1 AND lease_owner = 'fenced-media-worker'
+                AND dead_at IS NULL AND lease_expires_at > clock_timestamp()",
         )
-        .await
-        .map_err(|_| std::io::Error::other("media fixture did not receive the first request"))?;
+        .bind(job_id)
+        .fetch_one(&runtime_pool)
+        .await?;
+        assert_eq!(
+            generation, 1,
+            "the initial media claim must not be a recovery"
+        );
         assert_eq!(
             sqlx::query(
                 "UPDATE rustodon.durable_jobs
                     SET lease_expires_at = clock_timestamp() - interval '1 second'
-                  WHERE logical_key = $1 AND dead_at IS NULL",
+                  WHERE id = $1 AND lease_owner = 'fenced-media-worker'
+                    AND lease_generation = $2 AND dead_at IS NULL
+                    AND lease_expires_at > clock_timestamp()",
             )
-            .bind(LOGICAL_KEY)
+            .bind(job_id)
+            .bind(generation)
             .execute(&runtime_pool)
             .await?
             .rows_affected(),
@@ -7680,7 +7703,7 @@ async fn activitypub_media_fetch_reclaims_after_lease_fence()
             "the live media job must be fenced before recovery"
         );
         let first_processed = match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            WORKER_FIXTURE_WATCHDOG,
             first.as_mut().expect("the first worker task is present"),
         )
         .await
@@ -7727,8 +7750,8 @@ async fn activitypub_media_fetch_reclaims_after_lease_fence()
 
         release_request.notify_one();
         let recovered = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            executor.process_one("recovery-media-worker", &[Lane::Pull], Duration::seconds(5)),
+            WORKER_FIXTURE_WATCHDOG,
+            executor.process_one("recovery-media-worker", &[Lane::Pull], WORKER_FIXTURE_LEASE),
         )
         .await??;
         assert!(recovered);
@@ -7774,7 +7797,7 @@ async fn activitypub_media_fetch_reclaims_after_lease_fence()
     }
     release_request.notify_one();
     let server_result: Result<(), Box<dyn std::error::Error>> = if operation.is_ok() {
-        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut server).await {
+        match tokio::time::timeout(WORKER_FIXTURE_WATCHDOG, &mut server).await {
             Ok(Ok(result)) => result.map_err(|error| Box::new(error) as _),
             Ok(Err(error)) => Err(Box::new(error)),
             Err(error) => {
@@ -16663,8 +16686,62 @@ async fn activitypub_delivery_outbox_serializes_same_inbox_across_workers()
     Ok(())
 }
 
+// Deadlock watchdogs are not synchronization. Production lease/deadline code is unchanged.
+const WORKER_FIXTURE_WATCHDOG: std::time::Duration = std::time::Duration::from_mins(2);
+const WORKER_FIXTURE_LEASE: Duration = Duration::seconds(60);
+
+// These counters describe live handler futures, including cancellation on lease loss.
+struct ActiveWorker {
+    active: Arc<AtomicUsize>,
+}
+
+impl ActiveWorker {
+    fn enter(active: &Arc<AtomicUsize>, maximum: &AtomicUsize) -> Self {
+        let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+        maximum.fetch_max(now_active, Ordering::SeqCst);
+        Self {
+            active: Arc::clone(active),
+        }
+    }
+}
+
+impl Drop for ActiveWorker {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn worker_fixture_active_count_is_released_on_cancellation_and_error() {
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = AtomicUsize::new(0);
+    let mut handler = Box::pin(async {
+        let _active = ActiveWorker::enter(&active, &maximum);
+        std::future::pending::<()>().await;
+    });
+    let polled = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(handler.as_mut(), cx))
+    })
+    .await;
+    assert!(polled.is_pending());
+    assert_eq!(active.load(Ordering::SeqCst), 1);
+    drop(handler);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+
+    let result: Result<(), ()> = async {
+        let _active = ActiveWorker::enter(&active, &maximum);
+        std::future::ready(Err(())).await?;
+        Ok(())
+    }
+    .await;
+    assert!(result.is_err());
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert_eq!(maximum.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 #[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+#[allow(clippy::too_many_lines)]
 async fn executor_bounds_resources_and_duplicate_execution_keeps_one_effect()
 -> Result<(), Box<dyn std::error::Error>> {
     let url = std::env::var("RUSTODON_WORKER_DATABASE_URL")?;
@@ -16677,19 +16754,22 @@ async fn executor_bounds_resources_and_duplicate_execution_keeps_one_effect()
 
     let active = Arc::new(AtomicUsize::new(0));
     let maximum = Arc::new(AtomicUsize::new(0));
+    // Every group must overlap at the resource limit; elapsed sleeps prove nothing.
+    let overlap = Arc::new(Barrier::new(4));
     let registry = HandlerRegistry::new();
     registry.register("fixture.http", Lane::Pull, ResourceClass::RemoteHttp, {
         let pool = pool.clone();
         let active = Arc::clone(&active);
         let maximum = Arc::clone(&maximum);
+        let overlap = Arc::clone(&overlap);
         move |job| {
             let pool = pool.clone();
             let active = Arc::clone(&active);
             let maximum = Arc::clone(&maximum);
+            let overlap = Arc::clone(&overlap);
             Box::pin(async move {
-                let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
-                maximum.fetch_max(now_active, Ordering::SeqCst);
-                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                let _active = ActiveWorker::enter(&active, &maximum);
+                overlap.wait().await;
                 sqlx::query(
                     "INSERT INTO rustodon.idempotency_keys \
                            (scope, key, fingerprint, result, expires_at) \
@@ -16702,7 +16782,6 @@ async fn executor_bounds_resources_and_duplicate_execution_keeps_one_effect()
                 .execute(&pool)
                 .await
                 .map_err(|_| HandlerFailure::retry("effect write failed"))?;
-                active.fetch_sub(1, Ordering::SeqCst);
                 if job.attempt == 1 {
                     Err(HandlerFailure::retry("retry after committed effect"))
                 } else {
@@ -16730,15 +16809,21 @@ async fn executor_bounds_resources_and_duplicate_execution_keeps_one_effect()
                         .process_one(
                             &format!("runtime-{round}-{slot}"),
                             &[Lane::Pull],
-                            Duration::seconds(1),
+                            WORKER_FIXTURE_LEASE,
                         )
                         .await
                 }
             })
             .collect::<Vec<_>>();
-        for result in futures_util::future::join_all(attempts).await {
+        for result in tokio::time::timeout(
+            WORKER_FIXTURE_WATCHDOG,
+            futures_util::future::join_all(attempts),
+        )
+        .await?
+        {
             assert!(result?);
         }
+        assert_eq!(active.load(Ordering::SeqCst), 0);
         if round == 0 {
             sqlx::query(
                 "UPDATE rustodon.durable_jobs SET run_at = clock_timestamp() \
@@ -16748,7 +16833,9 @@ async fn executor_bounds_resources_and_duplicate_execution_keeps_one_effect()
             .await?;
         }
     }
-    assert!(maximum.load(Ordering::SeqCst) <= 4);
+    assert_eq!(maximum.load(Ordering::SeqCst), 4);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert!(queue.dead_letters(10).await?.is_empty());
     assert_eq!(queue.queued_count().await?, 0);
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -16780,6 +16867,8 @@ async fn executor_processes_twenty_user_waves_without_duplicate_effects()
 
     let active = Arc::new(AtomicUsize::new(0));
     let maximum = Arc::new(AtomicUsize::new(0));
+    // Every group must overlap at the resource limit; elapsed sleeps prove nothing.
+    let overlap = Arc::new(Barrier::new(PERMITS));
     let registry = HandlerRegistry::new();
     registry.register(
         "fixture.sustained",
@@ -16789,14 +16878,15 @@ async fn executor_processes_twenty_user_waves_without_duplicate_effects()
             let pool = pool.clone();
             let active = Arc::clone(&active);
             let maximum = Arc::clone(&maximum);
+            let overlap = Arc::clone(&overlap);
             move |job| {
                 let pool = pool.clone();
                 let active = Arc::clone(&active);
                 let maximum = Arc::clone(&maximum);
+                let overlap = Arc::clone(&overlap);
                 Box::pin(async move {
-                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    maximum.fetch_max(now_active, Ordering::SeqCst);
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    let _active = ActiveWorker::enter(&active, &maximum);
+                    overlap.wait().await;
                     sqlx::query(
                         "INSERT INTO rustodon.idempotency_keys
                            (scope, key, fingerprint, result, expires_at)
@@ -16809,7 +16899,6 @@ async fn executor_processes_twenty_user_waves_without_duplicate_effects()
                     .execute(&pool)
                     .await
                     .map_err(|_| HandlerFailure::retry("sustained effect write failed"))?;
-                    active.fetch_sub(1, Ordering::SeqCst);
                     if job.attempt == 1 {
                         Err(HandlerFailure::retry("retry after sustained effect commit"))
                     } else {
@@ -16844,15 +16933,21 @@ async fn executor_processes_twenty_user_waves_without_duplicate_effects()
                         .process_one(
                             &format!("sustained-{wave}-first-{slot}"),
                             &[Lane::Pull],
-                            Duration::seconds(1),
+                            WORKER_FIXTURE_LEASE,
                         )
                         .await
                 }
             })
             .collect::<Vec<_>>();
-        for result in futures_util::future::join_all(first_attempts).await {
+        for result in tokio::time::timeout(
+            WORKER_FIXTURE_WATCHDOG,
+            futures_util::future::join_all(first_attempts),
+        )
+        .await?
+        {
             assert!(result?);
         }
+        assert_eq!(active.load(Ordering::SeqCst), 0);
 
         sqlx::query(
             "UPDATE rustodon.durable_jobs
@@ -16870,18 +16965,25 @@ async fn executor_processes_twenty_user_waves_without_duplicate_effects()
                         .process_one(
                             &format!("sustained-{wave}-retry-{slot}"),
                             &[Lane::Pull],
-                            Duration::seconds(1),
+                            WORKER_FIXTURE_LEASE,
                         )
                         .await
                 }
             })
             .collect::<Vec<_>>();
-        for result in futures_util::future::join_all(retry_attempts).await {
+        for result in tokio::time::timeout(
+            WORKER_FIXTURE_WATCHDOG,
+            futures_util::future::join_all(retry_attempts),
+        )
+        .await?
+        {
             assert!(result?);
         }
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
     assert_eq!(maximum.load(Ordering::SeqCst), PERMITS);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
     assert_eq!(queue.queued_count().await?, 0);
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -16918,6 +17020,7 @@ async fn executor_processes_twenty_user_waves_without_duplicate_effects()
 
 #[tokio::test]
 #[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+#[allow(clippy::too_many_lines)]
 async fn executor_renews_a_lease_while_waiting_for_a_resource_permit()
 -> Result<(), Box<dyn std::error::Error>> {
     let url = std::env::var("RUSTODON_WORKER_DATABASE_URL")?;
@@ -16970,38 +17073,86 @@ async fn executor_renews_a_lease_while_waiting_for_a_resource_permit()
         ))
         .await?;
     let executor = WorkerExecutor::new(queue.clone(), registry, 1, 1)?;
-    let first_executor = executor.clone();
-    let first = tokio::spawn(async move {
-        first_executor
-            .process_one("permit-first", &[Lane::Pull], Duration::milliseconds(300))
-            .await
-    });
-    first_started.notified().await;
-    let second_executor = executor.clone();
-    let second = tokio::spawn(async move {
-        second_executor
-            .process_one("permit-second", &[Lane::Pull], Duration::milliseconds(300))
-            .await
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-    assert!(
-        queue
-            .claim("lease-thief", &[Lane::Pull], Duration::seconds(1))
-            .await?
-            .is_none(),
-        "a permit waiter must renew its already-claimed lease"
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM rustodon.durable_jobs WHERE lease_owner = 'permit-second'",
+    // Keep these futures owned by the test: a watchdog/error drops all handlers,
+    // rather than detaching spawned workers holding permits or leases.
+    let first = async {
+        Ok::<_, Box<dyn std::error::Error>>(
+            executor
+                .process_one("permit-first", &[Lane::Pull], WORKER_FIXTURE_LEASE)
+                .await?,
         )
-        .fetch_one(queue.pool())
-        .await?,
-        second_id
-    );
-    release_first.notify_one();
-    assert!(first.await??);
-    assert!(second.await??);
+    };
+    let second = async {
+        first_started.notified().await;
+        Ok::<_, Box<dyn std::error::Error>>(
+            executor
+                .process_one("permit-second", &[Lane::Pull], WORKER_FIXTURE_LEASE)
+                .await?,
+        )
+    };
+    let observe_renewal = async {
+        // The handler cannot signal arrival while waiting on its resource permit.
+        // Observe its actual committed claim, not a delay measured from spawn.
+        let (generation, original_expiry) = loop {
+            if let Some(claim) = sqlx::query_as::<_, (i64, DateTime<Utc>)>(
+                "SELECT lease_generation, lease_expires_at FROM rustodon.durable_jobs
+                  WHERE id = $1 AND lease_owner = 'permit-second'
+                    AND dead_at IS NULL AND lease_expires_at > clock_timestamp()",
+            )
+            .bind(second_id)
+            .fetch_optional(queue.pool())
+            .await?
+            {
+                break claim;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        };
+        assert_eq!(generation, 1, "the waiter must not be a reclaimed job");
+        loop {
+            let (live, past_original_expiry, extended) = sqlx::query_as::<_, (bool, bool, bool)>(
+                "SELECT COALESCE(lease_owner = 'permit-second' AND lease_generation = $2
+                           AND dead_at IS NULL AND lease_expires_at > clock_timestamp(), false),
+                        clock_timestamp() >= $3,
+                        COALESCE(lease_expires_at > $3, false)
+                   FROM rustodon.durable_jobs WHERE id = $1",
+            )
+            .bind(second_id)
+            .bind(generation)
+            .bind(original_expiry)
+            .fetch_one(queue.pool())
+            .await?;
+            assert!(live, "the selected permit waiter lost its live lease");
+            assert_eq!(
+                executions.load(Ordering::SeqCst),
+                1,
+                "the second handler must remain blocked behind the first permit"
+            );
+            if past_original_expiry {
+                assert!(
+                    extended,
+                    "a permit waiter must renew its already-claimed lease"
+                );
+                break;
+            }
+            // Backoff only: success requires database evidence beyond the observed expiry.
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        assert!(
+            queue
+                .claim("lease-thief", &[Lane::Pull], WORKER_FIXTURE_LEASE)
+                .await?
+                .is_none(),
+            "neither the running handler nor its permit waiter may be reclaimed"
+        );
+        release_first.notify_one();
+        Ok::<_, Box<dyn std::error::Error>>(())
+    };
+    let (first, second, ()) = tokio::time::timeout(WORKER_FIXTURE_WATCHDOG, async {
+        tokio::try_join!(first, second, observe_renewal)
+    })
+    .await??;
+    assert!(first);
+    assert!(second);
     assert_eq!(executions.load(Ordering::SeqCst), 2);
     assert_eq!(queue.queued_count().await?, 0);
     Ok(())

@@ -88,3 +88,4 @@
 - [x] [Exercise delayed browser settings save and reload](issues/exercise-browser-delayed-settings-save.md)
 - [x] [Restore browser settings after cutover smoke](issues/restore-browser-settings-after-cutover-smoke.md)
 - [x] [Port selected Mastodon media and browser behavior matrices](issues/port-mastodon-media-and-browser-matrices.md)
+- [x] [Stabilize worker executor coordination regressions](issues/stabilize-worker-executor-coordination-tests.md)
