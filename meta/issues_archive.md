@@ -76,3 +76,4 @@
 - [x] [Separate worker live-lease assertions from forced expiry](issues/stabilize-worker-live-lease-tests.md)
 - [x] [Port failed parent-fetch recovery and distribution matrix](issues/port-parent-fetch-recovery-matrix.md)
 - [x] [Align OAuth metadata with supported response modes](issues/align-oauth-metadata-response-modes.md)
+- [x] [Refresh familiar followers preflight classification](issues/refresh-familiar-followers-preflight-regression.md)

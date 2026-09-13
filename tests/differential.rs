@@ -5827,37 +5827,44 @@ async fn run_rest_protocol_contracts_case(
         ],
     )
     .map_err(|error| format!("CORS preflight: {error}"))?;
-    let mut search_preflight_headers = stable_request_headers();
-    search_preflight_headers.insert(ORIGIN, HeaderValue::from_static("https://client.example"));
-    search_preflight_headers.insert(
-        ACCESS_CONTROL_REQUEST_METHOD,
-        HeaderValue::from_static("GET"),
-    );
-    search_preflight_headers.insert(
-        ACCESS_CONTROL_REQUEST_HEADERS,
-        HeaderValue::from_static("authorization"),
-    );
-    let request = RequestSpec::new(
-        Method::OPTIONS,
+    for path in [
         "/api/v1/accounts/search",
-        None,
-        search_preflight_headers,
-        Vec::new(),
-    )?;
-    let responses = guard.send(&request).await?;
-    compare_status_headers_and_body(
-        &responses.mastodon,
-        &responses.rust,
-        &[
-            VARY,
-            ACCESS_CONTROL_ALLOW_ORIGIN,
-            ACCESS_CONTROL_ALLOW_METHODS,
-            ACCESS_CONTROL_ALLOW_HEADERS,
-            ACCESS_CONTROL_EXPOSE_HEADERS,
-            ACCESS_CONTROL_MAX_AGE,
-        ],
-    )
-    .map_err(|error| format!("account search CORS preflight: {error}"))?;
+        "/api/v1/accounts/familiar_followers",
+        "/api/v1/accounts/familiar_followers/",
+    ] {
+        let mut account_preflight_headers = stable_request_headers();
+        account_preflight_headers
+            .insert(ORIGIN, HeaderValue::from_static("https://client.example"));
+        account_preflight_headers.insert(
+            ACCESS_CONTROL_REQUEST_METHOD,
+            HeaderValue::from_static("GET"),
+        );
+        account_preflight_headers.insert(
+            ACCESS_CONTROL_REQUEST_HEADERS,
+            HeaderValue::from_static("authorization"),
+        );
+        let request = RequestSpec::new(
+            Method::OPTIONS,
+            path,
+            None,
+            account_preflight_headers,
+            Vec::new(),
+        )?;
+        let responses = guard.send(&request).await?;
+        compare_status_headers_and_body(
+            &responses.mastodon,
+            &responses.rust,
+            &[
+                VARY,
+                ACCESS_CONTROL_ALLOW_ORIGIN,
+                ACCESS_CONTROL_ALLOW_METHODS,
+                ACCESS_CONTROL_ALLOW_HEADERS,
+                ACCESS_CONTROL_EXPOSE_HEADERS,
+                ACCESS_CONTROL_MAX_AGE,
+            ],
+        )
+        .map_err(|error| format!("account CORS preflight {path}: {error}"))?;
+    }
     let mut oversized_preflight_headers = stable_request_headers();
     oversized_preflight_headers.insert(ORIGIN, HeaderValue::from_static("https://client.example"));
     oversized_preflight_headers.insert(
@@ -5963,7 +5970,7 @@ async fn run_rest_protocol_contracts_case(
         &[CONTENT_TYPE, VARY, ACCESS_CONTROL_ALLOW_ORIGIN],
     )
     .map_err(|error| format!("malformed-path CORS preflight: {error}"))?;
-    for path in ["/api/v1/accounts/familiar_followers"] {
+    for path in ["/api/v1/unknown"] {
         let mut unsupported_preflight = stable_request_headers();
         unsupported_preflight.insert(ORIGIN, HeaderValue::from_static("https://client.example"));
         unsupported_preflight.insert(
