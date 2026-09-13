@@ -46,3 +46,11 @@ being run before the production overlay and NAS-only lockfile resolution.
   [batch reads](serve-batch-account-reads.md); no404 allowlist was added.
 - Security/correctness/DRY and final integrated reviews found no blockers. Full
   browser/cutover acceptance remains pending, so this issue stays open for now.
+
+## Completion
+
+After the separately committed batch-account endpoint, both anonymous and
+authenticated startup API audits pass in `browser-init-green.log`. The browser
+now reaches the actual Home settings actions; its remaining first-save predicate
+failure is not a startup404. Endpoint diagnosis and correction are complete;
+full browser delayed-save acceptance remains tracked in its own issue.

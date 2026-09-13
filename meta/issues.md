@@ -26,4 +26,3 @@
 - [ ] [Implement the test audit action plan](issues/implement-test-audit-plan.md)
 - [ ] [Port selected Mastodon media and browser behavior matrices](issues/port-mastodon-media-and-browser-matrices.md)
 - [ ] [Exercise delayed browser settings save and reload](issues/exercise-browser-delayed-settings-save.md)
-- [ ] [Diagnose unexpected browser startup API 404](issues/diagnose-browser-startup-api-404.md)

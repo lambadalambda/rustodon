@@ -81,3 +81,4 @@
 - [x] [Diagnose private boost Undo returning HTTP 500](issues/diagnose-private-boost-undo-http-500.md)
 - [x] [Bound and stabilize SMTP crash-before-ack replay coverage](issues/stabilize-smtp-crash-replay-test.md)
 - [x] [Serve batch account reads used by the web client](issues/serve-batch-account-reads.md)
+- [x] [Diagnose unexpected browser startup API 404](issues/diagnose-browser-startup-api-404.md)
