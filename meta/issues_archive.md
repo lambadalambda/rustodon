@@ -84,3 +84,6 @@
 - [x] [Diagnose unexpected browser startup API 404](issues/diagnose-browser-startup-api-404.md)
 - [x] [Stabilize operational domain budget regression](issues/stabilize-operational-domain-budget-test.md)
 - [x] [Stabilize browser reauthentication budget regression](issues/stabilize-browser-reauth-budget-test.md)
+- [x] [Use HTTPS for browser cutover fixtures](issues/use-https-for-browser-cutover-fixtures.md)
+- [x] [Exercise delayed browser settings save and reload](issues/exercise-browser-delayed-settings-save.md)
+- [x] [Restore browser settings after cutover smoke](issues/restore-browser-settings-after-cutover-smoke.md)

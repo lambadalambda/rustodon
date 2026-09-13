@@ -4,23 +4,173 @@ set -eu
 ROOT=$(CDPATH= cd -P -- "$(dirname -- "$0")/../.." && pwd)
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/rustodon-browser-smoke-test.XXXXXX")
 trap 'rm -rf "$test_root"' EXIT HUP INT TERM
-mkdir -p "$test_root/bin"
+mkdir -p "$test_root/bin" "$test_root/js"
+
+# Validate deadline wiring without waiting for real timeouts in offline tests.
+cat > "$test_root/bin/timeout" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$#" -ge 4 ] && [ "$1" = --kill-after=5 ] && [ "$2" = 20 ] && [ "$3" = agent-browser ] || exit 76
+shift 2
+export BROWSER_TEST_BOUNDED=true
+exec "$@"
+EOF
 
 cat > "$test_root/bin/agent-browser" <<'EOF'
 #!/bin/sh
+set -eu
+[ "${BROWSER_TEST_BOUNDED:-false}" = true ] || exit 76
+# Semantic eval checkpoints keep this offline test independent of the installed
+# CLI's network envelope. They test shell sequencing/fail-closed handling, NOT
+# the JavaScript predicates, real debounce timing, or response allowlisting.
+# Parent must verify those on NAS with the installed CLI skill and real fixture.
+printf '%s\n' "$*" >> "$BROWSER_TEST_COMMANDS"
+# Model the verified 0.31.1 invocation, rather than silently accepting arbitrary
+# global flags. Every browser operation, including cleanup, owns one run session.
 case "$*" in
+  'session id --scope worktree --prefix rustodon-browser') ;;
+  *)
+    [ "$#" -ge 5 ] && [ "$1" = --session ] && [ "$3" = --args ] &&
+      [ "$4" = "$BROWSER_TEST_EXPECTED_ARGS" ] || {
+        printf '%s\n' 'unsupported or missing browser isolation arguments' >&2
+        exit 73
+      }
+    case "$5" in
+      open|pushstate)
+        if [ "${6:-}" != --init-script ]; then
+          case "${6:-}" in
+            "$BROWSER_TEST_BASE_URL"|"$BROWSER_TEST_BASE_URL/"*) ;;
+            *) printf '%s\n' 'navigation must retain the fixture origin and protocol' >&2; exit 90 ;;
+          esac
+        fi
+        ;;
+      cookies)
+        if [ "${6:-}" = set ]; then
+          [ "$#" -eq 12 ] && [ "$9" = --url ] && [ "${10}" = "$BROWSER_TEST_BASE_URL/" ] &&
+            [ "${11}" = --path ] && [ "${12}" = / ] || exit 91
+        fi
+        ;;
+    esac
+    case "$2" in
+      test-session-*)
+        run_id=${2#test-session-}
+        case "$run_id" in ''|*[!0-9]*) exit 74 ;; esac
+        ;;
+      *) printf '%s\n' 'expected a run-specific session' >&2; exit 74 ;;
+    esac
+    if [ -f "$BROWSER_TEST_SESSION" ]; then
+      [ "$(cat "$BROWSER_TEST_SESSION")" = "$2" ] || exit 75
+    else
+      printf '%s\n' "$2" > "$BROWSER_TEST_SESSION"
+    fi
+    if [ "$5" = open ] && [ "${6:-}" = --init-script ]; then
+      [ "$#" -eq 7 ] && [ ! -e "$BROWSER_TEST_SESSION.init" ] || exit 77
+      [ -f "$7" ] && [ "$(stat -c '%a' "$7")" = 600 ] || exit 78
+      printf '%s\n' "$7" > "$BROWSER_TEST_SESSION.init"
+      if [ "${BROWSER_TEST_CAPTURE_JS:-false}" = true ]; then
+        cp "$7" "$BROWSER_TEST_JS/api-init.js"
+      fi
+    elif [ "$5" != close ]; then
+      # The init script must be staged once, before any operation can navigate.
+      [ -s "$BROWSER_TEST_SESSION.init" ] || exit 79
+    fi
+    ;;
+esac
+case "$*" in
+  *' wait --load '*) printf '%s\n' 'load-state waiting is not DOM readiness' >&2; exit 80 ;;
+esac
+# Inject CLI failures without launching or sleeping. The parent runs this mock
+# on NAS; 124 models timeout's result, not a real timed browser process.
+case "${BROWSER_TEST_FAIL_AT:-}:$*" in
+  command-session-id:'session id --scope worktree --prefix rustodon-browser'|\
+  command-network:*' network requests --clear'|\
+  command-open:*' open '*|\
+  command-navigation:*' open http://fixture.invalid:18080/'|\
+  command-wait:*' wait '*|\
+  command-close:*' close'|\
+  command-network-close:*' network requests --clear') exit 124 ;;
+  command-network-close:*' close') exit 72 ;;
+esac
+# Capture expanded eval payloads from the happy path for Node syntax checks.
+# Do not execute browser JavaScript here or retain any non-fixture data.
+if [ "${BROWSER_TEST_CAPTURE_JS:-false}" = true ]; then
+  case "$*" in
+    *' eval '*)
+      (
+        while [ "$1" != eval ]; do shift; done
+        shift
+        js_file=$(mktemp "$BROWSER_TEST_JS/eval.XXXXXX")
+        printf '%s\n' "$1" > "$js_file"
+      )
+      ;;
+    *' wait --fn '*)
+      (
+        while [ "$1" != --fn ]; do shift; done
+        shift
+        js_file=$(mktemp "$BROWSER_TEST_JS/ready.XXXXXX")
+        printf '%s\n' "$1" > "$js_file"
+      )
+      ;;
+  esac
+fi
+case "$*" in
+  *' eval '*rustodon-smoke:*)
+    checkpoint=$(printf '%s\n' "$*" | sed -n 's/.*\/\* rustodon-smoke: \([a-z-]*\) \*\/.*/\1/p')
+    case "$checkpoint" in
+      api-observer-ready|settings-ui-ready|settings-leading-observed|settings-trailing-observed|settings-reload-persisted|api-responses-acceptable) ;;
+      *) printf 'unknown smoke checkpoint: %s\n' "$checkpoint" >&2; exit 71 ;;
+    esac
+    printf '%s\n' "$checkpoint" >> "$BROWSER_TEST_EVENTS"
+    if [ "$checkpoint" = "${BROWSER_TEST_FAIL_AT:-}" ]; then
+      case "${BROWSER_TEST_RESULT:-false}" in
+        empty) ;;
+        command-error) exit 72 ;;
+        *) printf '%s\n' "$BROWSER_TEST_RESULT" ;;
+      esac
+    else
+      printf '%s\n' true
+    fi
+    ;;
+  *' eval '*settingsResourceCount*)
+    if [ "${BROWSER_TEST_RESULT:-}" = diagnostic-error ]; then exit 73; fi
+    printf '%s\n' '{"statePresent":true,"changeCount":1,"requestCount":0,"settingsResourceCount":0}'
+    ;;
+  *' eval '*distinctFailedRoutes*)
+    if [ "${BROWSER_TEST_FAIL_AT:-}" = authenticated-api ] && [ "${BROWSER_TEST_RESULT:-}" = diagnostic-error ]; then exit 73; fi
+    printf '%s\n' '{"failedRoutes":[{"route":"/api/:unclassified","status":403,"crossOrigin":false,"count":1}]}'
+    ;;
+  *' eval '*'const watch = window.__rustodonApiSmoke;'*)
+    if [ "${BROWSER_TEST_FAIL_AT:-}" = authenticated-api ] && [ -f "$BROWSER_TEST_SESSION.auth" ]; then
+      if [ "${BROWSER_TEST_RESULT:-}" = command-error ]; then exit 72; fi
+      printf '%s\n' false
+    else
+      printf '%s\n' true
+    fi
+    ;;
+  *' click label[for="setting-toggle-home_timeline-shows-reblog"]')
+    printf '%s\n' toggle-boosts >> "$BROWSER_TEST_EVENTS" ;;
+  *' click label[for="setting-toggle-home_timeline-shows-reply"]')
+    printf '%s\n' toggle-replies >> "$BROWSER_TEST_EVENTS" ;;
+  *' reload') printf '%s\n' reload >> "$BROWSER_TEST_EVENTS" ;;
+  *' click '*) ;;
   'session id --scope worktree --prefix rustodon-browser') printf '%s\n' test-session ;;
   *' get count #mastodon') printf '%s\n' 1 ;;
   *' eval document.body.className') printf '%s\n' app-body ;;
+  *' eval '*initial-state*'116844606259201001'*)
+    : > "$BROWSER_TEST_SESSION.auth"
+    printf '%s\n' true
+    ;;
   *' eval '*initial-state*) printf '%s\n' true ;;
   *' eval '*) printf '%s\n' true ;;
   *' get text '*) printf '%s\n' 'Profile details Save changes' ;;
-  *' get url') printf '%s\n' 'http://fixture.invalid:18080/about' ;;
+  *' get url') printf '%s/about\n' "$BROWSER_TEST_BASE_URL" ;;
   *' errors'*) printf '%s\n' 'No page errors' ;;
   *' network requests'*) ;;
+  *' open http://fixture.invalid:18080/settings/profile'|*' open https://fixture.invalid:18443/settings/profile')
+    printf '%s\n' profile-settings >> "$BROWSER_TEST_EVENTS" ;;
   *' open '*) ;;
   *' wait '*) ;;
-  *' fill '*) ;;
+  *' fill '*) printf '%s\n' fixture-password ;;
   *' cookies '*) ;;
   *' pushstate '*) ;;
   *' close') ;;
@@ -30,6 +180,19 @@ EOF
 
 cat > "$test_root/bin/curl" <<'EOF'
 #!/bin/sh
+set -eu
+# Verify trust argument wiring, not TLS itself. Parent's real HTTPS fixture must
+# separately prove CA/hostname verification and the exact installed CLI parser.
+printf '%s\n' called >> "$BROWSER_TEST_CURL_CALLS"
+case "$BROWSER_TEST_BASE_URL" in
+  https://*)
+    # Suppress ambient .curlrc: it could otherwise enable insecure verification.
+    [ "${1:-}" = --disable ] || [ "${1:-}" = -q ] || exit 86
+    ;;
+esac
+ca_count=0
+url_count=0
+ca_file=''
 dump_header=''
 output=''
 cookie=''
@@ -44,32 +207,48 @@ while [ "$#" -gt 0 ]; do
       case "$2" in csrf_token=*) data=$2 ;; esac
       shift 2
       ;;
-    http://*) url=$1; shift ;;
+    http://*|https://*) url_count=$((url_count + 1)); url=$1; shift ;;
+    --cacert) ca_count=$((ca_count + 1)); ca_file=$2; shift 2 ;;
     --resolve|--header|--cookie-jar|--write-out|--max-time) shift 2 ;;
-    *) shift ;;
+    --disable|-q|--silent|--show-error|--fail) shift ;;
+    *) printf '%s\n' 'unexpected curl option (TLS bypass is forbidden)' >&2; exit 87 ;;
   esac
 done
+[ "$url_count" -eq 1 ] || exit 89
+case "$url" in "$BROWSER_TEST_BASE_URL/"*) ;; *) exit 89 ;; esac
+case "$BROWSER_TEST_BASE_URL" in
+  https://*)
+    [ "$ca_count" -eq 1 ] && [ "$ca_file" = "$BROWSER_TEST_EXPECTED_CA" ] || exit 88
+    if [ "${BROWSER_TEST_FAIL_AT:-}" = curl-tls ]; then exit 60; fi
+    ;;
+  *) [ "$ca_count" -eq 0 ] || exit 88 ;;
+esac
 
 case "$url:$dump_header:$data" in
   */auth/sign_in:?*:)
+    printf '%s\n' csrf-sign-in >> "$BROWSER_TEST_EVENTS"
     printf '%s\n' 'Set-Cookie: __Host-csrf_token=sign-in-cookie; Path=/; Secure; HttpOnly' > "$dump_header"
     printf '%s\n' '<input type="hidden" name="csrf_token" value="sign-in-rendered">' > "$output"
     ;;
   */auth/sign_in:?*:csrf_token=sign-in-rendered)
+    printf '%s\n' sign-in >> "$BROWSER_TEST_EVENTS"
     [ "$cookie" = '__Host-csrf_token=sign-in-cookie' ] || exit 81
     printf '%s\n' 'Set-Cookie: _mastodon_session=browser-session; Path=/; HttpOnly' > "$dump_header"
     printf '%s\n' '302|https://fixture.invalid/'
     ;;
   */settings/profile:?*:)
+    printf '%s\n' csrf-logout >> "$BROWSER_TEST_EVENTS"
     [ "$cookie" = '_mastodon_session=browser-session' ] || exit 82
     printf '%s\n' 'Set-Cookie: __Host-csrf_token=logout-cookie; Path=/; Secure; HttpOnly' > "$dump_header"
     printf '%s\n' '<input type="hidden" name="csrf_token" value="logout-rendered">' > "$output"
     ;;
   */auth/sign_out::csrf_token=logout-rendered)
+    printf '%s\n' sign-out >> "$BROWSER_TEST_EVENTS"
     [ "$cookie" = '__Host-csrf_token=logout-cookie; _mastodon_session=browser-session' ] || exit 83
     printf '%s\n' 302
     ;;
   */settings/profile::)
+    printf '%s\n' logout-probe >> "$BROWSER_TEST_EVENTS"
     [ "$cookie" = '_mastodon_session=browser-session' ] || exit 84
     printf '%s\n' '302|https://fixture.invalid/auth/sign_in'
     ;;
@@ -77,21 +256,973 @@ case "$url:$dump_header:$data" in
 esac
 EOF
 
-chmod +x "$test_root/bin/agent-browser" "$test_root/bin/curl"
-output=$(PATH="$test_root/bin:$PATH" \
-  RUSTODON_BROWSER_AUTH=true \
-  RUSTODON_BROWSER_EMAIL=alice@fixture.invalid \
-  RUSTODON_BROWSER_PASSWORD=fixture-password \
-  RUSTODON_BROWSER_OTP=fixture-otp \
-  "$ROOT/tools/rustodon-browser-smoke" \
-  http://fixture.invalid:18080 fixture.invalid)
+chmod +x "$test_root/bin/agent-browser" "$test_root/bin/curl" "$test_root/bin/timeout"
+failures=0
 
-case "$output" in
-  *'browser web-client smoke passed'*) ;;
-  *)
-    printf 'unexpected browser smoke output: %s\n' "$output" >&2
-    exit 1
-    ;;
-esac
+fail_test() {
+  printf 'FAIL: %s\n' "$1" >&2
+  failures=$((failures + 1))
+}
 
+run_smoke() {
+  case_name=$1
+  fail_at=$2
+  result=$3
+  auth=$4
+  test_base_url=${5:-http://fixture.invalid:18080}
+  test_host=${6:-fixture.invalid}
+  test_ca=${7:-}
+  test_spki=${8:-}
+  expected_browser_args='--host-resolver-rules=MAP fixture.invalid 127.0.0.1'
+  case "$test_base_url" in
+    https://*) expected_browser_args="$expected_browser_args,--ignore-certificate-errors-spki-list=$test_spki" ;;
+  esac
+  email=''
+  password=''
+  otp=''
+  if [ "$auth" = true ]; then
+    email=alice@fixture.invalid
+    password=fixture-password
+    otp=fixture-otp
+  fi
+  events="$test_root/$case_name.events"
+  commands="$test_root/$case_name.commands"
+  output="$test_root/$case_name.output"
+  curl_calls="$test_root/$case_name.curl-calls"
+  : > "$events"
+  : > "$commands"
+  : > "$curl_calls"
+  status=0
+  capture_js=false
+  [ "$case_name" != authenticated ] || capture_js=true
+  PATH="$test_root/bin:$PATH" \
+    BROWSER_TEST_BOUNDED=false \
+    BROWSER_TEST_CAPTURE_JS="$capture_js" \
+    BROWSER_TEST_JS="$test_root/js" \
+    BROWSER_TEST_EVENTS="$events" \
+    BROWSER_TEST_COMMANDS="$commands" \
+    BROWSER_TEST_SESSION="$test_root/$case_name.session" \
+    BROWSER_TEST_FAIL_AT="$fail_at" \
+    BROWSER_TEST_RESULT="$result" \
+    BROWSER_TEST_BASE_URL="$test_base_url" \
+    BROWSER_TEST_EXPECTED_ARGS="$expected_browser_args" \
+    BROWSER_TEST_EXPECTED_CA="$test_ca" \
+    BROWSER_TEST_CURL_CALLS="$curl_calls" \
+    RUSTODON_BROWSER_CA_FILE="$test_ca" \
+    RUSTODON_BROWSER_SPKI="$test_spki" \
+    RUSTODON_BROWSER_AUTH="$auth" \
+    RUSTODON_BROWSER_EMAIL="$email" \
+    RUSTODON_BROWSER_PASSWORD="$password" \
+    RUSTODON_BROWSER_OTP="$otp" \
+    RUSTODON_BROWSER_DEBUG=false \
+    RUSTODON_BROWSER_RECORD='' \
+    RUSTODON_BROWSER_SCREENSHOT='' \
+    "$ROOT/tools/rustodon-browser-smoke" \
+    "$test_base_url" "$test_host" > "$output" 2>&1 || status=$?
+}
+
+assert_cleanup() {
+  session_file="$test_root/$case_name.session"
+  if [ ! -s "$session_file" ]; then
+    fail_test "$case_name: no valid run-specific browser session"
+    return
+  fi
+  expected_close="--session $(cat "$session_file") --args $expected_browser_args close"
+  grep -Fxq -- "$expected_close" "$commands" || fail_test "$case_name: owned browser session was not closed"
+  if [ ! -s "$session_file.init" ]; then
+    fail_test "$case_name: no staged init script"
+  elif [ -e "$(cat "$session_file.init")" ]; then
+    fail_test "$case_name: init script was not removed during cleanup"
+  fi
+}
+
+# Keep the original CSRF/login/profile/logout curl contract above. No direct
+# HTTP settings mutation is accepted by that mock; saving must be a UI action.
+# api-responses-acceptable=true stands for successful API responses AND narrowly
+# expected auth/missing-resource outcomes, not blanket acceptance of 4xx errors.
+run_smoke authenticated '' true true
+[ "$status" -eq 0 ] || fail_test 'authenticated fixture flow failed'
+grep -q 'browser web-client smoke passed' "$output" || fail_test 'success output missing'
+cat > "$test_root/expected.events" <<'EOF'
+api-observer-ready
+csrf-sign-in
+sign-in
+settings-ui-ready
+toggle-boosts
+settings-leading-observed
+toggle-replies
+settings-trailing-observed
+reload
+settings-reload-persisted
+profile-settings
+csrf-logout
+sign-out
+logout-probe
+api-responses-acceptable
+EOF
+if ! cmp -s "$test_root/expected.events" "$events"; then
+  fail_test 'missing/incorrect ordered UI action, leading/trailing PUT, reload, or API observation flow'
+  printf '%s\n' 'Expected checkpoints/actions:' >&2
+  cat "$test_root/expected.events" >&2
+  printf '%s\n' 'Actual checkpoints/actions:' >&2
+  cat "$events" >&2
+fi
+assert_cleanup
+for step in session-id network open wait-predicate eval fill cookies close; do
+  grep -Fq "browser step: begin $step (limit 20s)" "$output" || fail_test "missing safe start diagnostic: $step"
+  grep -Fq "browser step: end $step (exit 0)" "$output" || fail_test "missing safe completion diagnostic: $step"
+done
+if grep -Eq 'alice@fixture.invalid|fixture-password|fixture-otp|browser-session|sign-in-cookie|logout-cookie|sign-in-rendered|logout-rendered|__rustodonSettingsSmoke|host-resolver-rules' "$output"; then
+  fail_test 'browser progress exposed credentials, cookies, form values, eval source, or launch arguments'
+fi
+
+# TLS adapter contract: parent confirmed this suite RED before implementation.
+# CA bytes here are an opaque mock fixture, not a real certificate. Real trust,
+# wrong-host rejection and Chromium SPKI behavior require parent NAS integration.
+tls_url=https://fixture.invalid:18443
+tls_ca="$test_root/fixture CA.pem"
+printf '%s\n' 'opaque fixture CA for argument checks' > "$tls_ca"
+tls_pin=$(printf '%043d=' 0 | tr '0' A)
+tls_plus_pin=$(printf '%042d8=' 0 | tr '0' '+')
+tls_slash_pin=$(printf '%042d8=' 0 | tr '0' '/')
+for pin_case in standard plus slash; do
+  case "$pin_case" in standard) pin=$tls_pin ;; plus) pin=$tls_plus_pin ;; slash) pin=$tls_slash_pin ;; esac
+  run_smoke "tls-authenticated-$pin_case" '' true true "$tls_url" fixture.invalid "$tls_ca" "$pin"
+  [ "$status" -eq 0 ] || fail_test "$case_name: valid scoped TLS adapter failed"
+  cmp -s "$test_root/expected.events" "$events" || fail_test "$case_name: HTTPS lost the authenticated settings/logout flow"
+  [ "$(wc -l < "$curl_calls" | tr -d ' ')" -eq 5 ] || fail_test "$case_name: must verify CA on all five curl calls"
+  if grep -Fq "$pin" "$output" || grep -Fq "$tls_ca" "$output"; then
+    fail_test "$case_name: TLS diagnostics exposed pin or CA path"
+  fi
+  assert_cleanup
+done
+run_smoke tls-anonymous '' true false "$tls_url" fixture.invalid "$tls_ca" "$tls_pin"
+[ "$status" -eq 0 ] || fail_test "$case_name: anonymous scoped TLS adapter failed"
+[ ! -s "$curl_calls" ] || fail_test "$case_name: anonymous flow unexpectedly used curl"
+assert_cleanup
+
+# A CA/hostname failure must stop before login POST; no insecure or HTTP retry.
+run_smoke tls-curl-failure curl-tls true true "$tls_url" fixture.invalid "$tls_ca" "$tls_pin"
+[ "$status" -ne 0 ] || fail_test "$case_name: certificate verification failure ignored"
+[ "$(wc -l < "$curl_calls" | tr -d ' ')" -eq 1 ] || fail_test "$case_name: curl trust failure retried or was not reached"
+if grep -Eq '^(sign-in|settings-ui-ready)$' "$events" || grep -q 'browser web-client smoke passed' "$output"; then
+  fail_test "$case_name: continued after certificate verification failure"
+fi
+assert_cleanup
+
+reject_tls() {
+  run_smoke "tls-reject-$1" '' true false "$2" "$3" "$4" "$5"
+  [ "$status" -eq 1 ] || fail_test "$case_name: invalid TLS configuration must fail closed"
+  [ ! -s "$commands" ] || fail_test "$case_name: rejected configuration reached browser discovery/launch"
+  [ ! -s "$curl_calls" ] || fail_test "$case_name: rejected configuration reached curl"
+  if [ -n "$4" ] && grep -Fq -- "$4" "$output"; then fail_test "$case_name: raw CA path in validation output"; fi
+  if [ -n "$5" ] && grep -Fq -- "$5" "$output"; then fail_test "$case_name: raw pin in validation output"; fi
+}
+reject_tls missing-both "$tls_url" fixture.invalid '' ''
+reject_tls missing-ca "$tls_url" fixture.invalid '' "$tls_pin"
+reject_tls missing-pin "$tls_url" fixture.invalid "$tls_ca" ''
+reject_tls absent-ca "$tls_url" fixture.invalid "$test_root/no-CA.pem" "$tls_pin"
+: > "$test_root/empty-CA.pem"
+reject_tls empty-ca "$tls_url" fixture.invalid "$test_root/empty-CA.pem" "$tls_pin"
+reject_tls directory-ca "$tls_url" fixture.invalid "$test_root" "$tls_pin"
+printf '%s\n' 'opaque fixture CA' > "$test_root/unreadable-CA.pem"
+chmod 000 "$test_root/unreadable-CA.pem"
+if [ ! -r "$test_root/unreadable-CA.pem" ]; then
+  reject_tls unreadable-ca "$tls_url" fixture.invalid "$test_root/unreadable-CA.pem" "$tls_pin"
+else
+  printf '%s\n' 'SKIP: unreadable CA permission check (test user can still read mode 000)'
+fi
+chmod 600 "$test_root/unreadable-CA.pem"
+for http_case in both ca pin; do
+  ca=$tls_ca; pin=$tls_pin
+  case "$http_case" in ca) pin='' ;; pin) ca='' ;; esac
+  reject_tls "http-$http_case" http://fixture.invalid:18080 fixture.invalid "$ca" "$pin"
+done
+pin_index=0
+for pin in 'synthetic-private-pin' "sha256/$tls_pin" "${tls_pin%=}" "$tls_pin=" \
+  "${tls_pin%=}B=" "${tls_pin%=}?" "${tls_pin%??}B=" "$tls_pin,$tls_pin" \
+  "$tls_pin,--ignore-certificate-errors" "$tls_pin --ignore-certificate-errors" \
+  "$(printf '%s\r' "$tls_pin")" "$(printf '%s\t' "$tls_pin")" "$(printf '%s\nsynthetic-private-pin-tail' "$tls_pin")"; do
+  pin_index=$((pin_index + 1))
+  reject_tls "pin-$pin_index" "$tls_url" fixture.invalid "$tls_ca" "$pin"
+done
+# --args is comma-delimited: reject resolver-host injection before discovery too.
+for host_case in comma space newline; do
+  case "$host_case" in
+    comma) bad_host='fixture.invalid,--ignore-certificate-errors' ;;
+    space) bad_host='fixture.invalid --ignore-certificate-errors' ;;
+    newline) bad_host=$(printf 'fixture.invalid\nx') ;;
+  esac
+  reject_tls "host-$host_case" "$tls_url" "$bad_host" "$tls_ca" "$tls_pin"
+done
+
+# A first-command launch failure must identify its boundary without relying on
+# page output. Cleanup remains visible/bounded and must not mask the main error.
+for step in session-id network open navigation wait close; do
+  run_smoke "trace-$step" "command-$step" true true
+  label=$step
+  [ "$step" != navigation ] || label=open
+  [ "$step" != wait ] || label=wait-predicate
+  grep -Fq "browser step: begin $label (limit 20s)" "$output" || fail_test "$case_name: missing boundary start"
+  grep -Fq "browser step: end $label (exit 124)" "$output" || fail_test "$case_name: missing timeout exit diagnostic"
+  if [ "$step" = close ]; then
+    [ "$status" -eq 0 ] || fail_test "$case_name: cleanup masked successful main result"
+  else
+    expected_status=124
+    if [ "$step" = wait ]; then
+      expected_status=1
+      grep -Fq 'initial-app readiness failed' "$output" || fail_test "$case_name: missing readiness failure"
+      grep -Fq 'browser API diagnostic:' "$output" || fail_test "$case_name: missing safe readiness diagnostic"
+    fi
+    [ "$status" -eq "$expected_status" ] || fail_test "$case_name: unexpected failure exit"
+    if grep -q 'browser web-client smoke passed' "$output"; then
+      fail_test "$case_name: launch/wait failure printed success"
+    fi
+  fi
+  if [ "$step" != session-id ]; then assert_cleanup; fi
+done
+
+run_smoke trace-main-and-cleanup command-network-close true true
+[ "$status" -eq 124 ] || fail_test 'cleanup failure replaced the main timeout status'
+grep -Fq 'browser step: end network (exit 124)' "$output" || fail_test 'main failure diagnostic missing'
+grep -Fq 'browser step: end close (exit 72)' "$output" || fail_test 'cleanup failure diagnostic missing'
+assert_cleanup
+
+# All observation gates must fail closed. A missing PUT, unsuccessful trailing
+# save, stale reload, or unexpected API response must never print success.
+# This deliberately remains a shell-level contract: the mock does not execute
+# eval JavaScript or claim that true means any real response was inspected.
+for checkpoint in api-observer-ready settings-ui-ready settings-leading-observed \
+  settings-trailing-observed settings-reload-persisted api-responses-acceptable; do
+  for result in false empty '"true"' malformed '{"success":true,"data":{"result":true}}' command-error; do
+    run_smoke "$checkpoint-$result" "$checkpoint" "$result" true
+    [ "$status" -ne 0 ] || fail_test "$case_name: rejected observation was ignored"
+    if [ "$result" != command-error ]; then
+      case "$result" in
+        false) shape=boolean-false ;;
+        empty) shape=empty ;;
+        '"true"') shape=quoted-boolean ;;
+        '{'*) shape=object-like ;;
+        *) shape=other ;;
+      esac
+      grep -Fq "result=$shape" "$output" || fail_test "$case_name: missing safe result classification"
+      case "$checkpoint" in
+        api-observer-ready|api-responses-acceptable)
+          grep -Fq 'browser API diagnostic:' "$output" || fail_test "$case_name: missing API diagnostic"
+          ;;
+      esac
+      if grep -Fq "$result" "$output" && [ "$shape" = object-like ]; then
+        fail_test "$case_name: raw eval envelope was dumped"
+      fi
+    else
+      [ "$status" -eq 1 ] || fail_test "$case_name: evaluation failure exit changed"
+      grep -Fq 'result=eval-error' "$output" || fail_test "$case_name: missing eval-error classification"
+      case "$checkpoint" in
+        api-observer-ready|api-responses-acceptable)
+          grep -Fq "browser smoke failed: $checkpoint evaluation failed" "$output" || fail_test "$case_name: lost evaluation failure"
+          grep -Fq 'browser API diagnostic:' "$output" || fail_test "$case_name: missing diagnostic after evaluation error"
+          ;;
+      esac
+    fi
+    case "$checkpoint" in
+      settings-*)
+        grep -Fq 'browser settings diagnostic: {"statePresent":' "$output" || fail_test "$case_name: missing sanitized settings diagnostic"
+        ;;
+    esac
+    if grep -q 'browser web-client smoke passed' "$output"; then
+      fail_test "$case_name: printed success after rejected observation"
+    fi
+    # The failing checkpoint must have been reached, and nothing after it may
+    # run (in particular no second toggle/reload/logout success path).
+    sed "/^$checkpoint\$/q" "$test_root/expected.events" > "$test_root/prefix.events"
+    cmp -s "$test_root/prefix.events" "$events" ||
+      fail_test "$case_name: missing gate or continued after failure"
+    assert_cleanup
+  done
+done
+
+# Diagnostic failure must preserve the settings failure and stop before another
+# click, even when the bounded follow-up eval itself cannot return a summary.
+run_smoke settings-diagnostic-error settings-leading-observed diagnostic-error true
+[ "$status" -eq 1 ] || fail_test "$case_name: diagnostic failure replaced the predicate failure"
+grep -Fxq 'browser settings diagnostic: unavailable' "$output" || fail_test "$case_name: missing unavailable diagnostic"
+grep -Fxq 'browser smoke failed: settings-leading-observed (missing PUT or slow leading response)' "$output" || fail_test "$case_name: lost original failure"
+sed '/^settings-leading-observed$/q' "$test_root/expected.events" > "$test_root/prefix.events"
+cmp -s "$test_root/prefix.events" "$events" || fail_test "$case_name: continued after failure"
+assert_cleanup
+
+# Generic audits after authenticated bootstrap must diagnose and stop before
+# Home controls, even if the eval or the follow-up diagnostic command fails.
+for result in false command-error diagnostic-error; do
+  run_smoke "authenticated-audit-$result" authenticated-api "$result" true
+  [ "$status" -eq 1 ] || fail_test "$case_name: authenticated API failure exit changed"
+  if [ "$result" = command-error ]; then
+    grep -Fq 'result=eval-error' "$output" || fail_test "$case_name: missing eval-error classification"
+    grep -Fxq 'browser smoke failed: unexpected or unobservable API response evaluation failed' "$output" || fail_test "$case_name: lost evaluation failure"
+  fi
+  [ -f "$test_root/$case_name.session.auth" ] || fail_test "$case_name: did not reach authenticated bootstrap"
+  grep -Fq 'browser smoke failed: unexpected or unobservable API response' "$output" || fail_test "$case_name: lost original audit failure"
+  if [ "$result" = diagnostic-error ]; then
+    grep -Fq 'browser API diagnostic: unavailable' "$output" || fail_test "$case_name: diagnostic failure was not reported"
+  else
+    grep -Fq 'browser API diagnostic: {"failedRoutes":' "$output" || fail_test "$case_name: missing sanitized route diagnostic"
+  fi
+  printf '%s\n' api-observer-ready csrf-sign-in sign-in > "$test_root/authenticated-audit.events"
+  cmp -s "$test_root/authenticated-audit.events" "$events" || fail_test "$case_name: continued into settings after audit failure"
+  if grep -q 'browser web-client smoke passed' "$output"; then fail_test "$case_name: printed success"; fi
+  assert_cleanup
+done
+
+# The anonymous gate must still inspect API responses, but must not mutate
+# settings or require fixture credentials. API observation is not auth-only.
+for result in true false; do
+  run_smoke "anonymous-$result" api-responses-acceptable "$result" false
+  if [ "$result" = true ]; then
+    [ "$status" -eq 0 ] || fail_test "$case_name: anonymous shell failed"
+    grep -q 'browser web-client smoke passed' "$output" || fail_test "$case_name: success output missing"
+  else
+    [ "$status" -ne 0 ] || fail_test "$case_name: unexpected API response was ignored"
+    if grep -q 'browser web-client smoke passed' "$output"; then
+      fail_test "$case_name: printed success after rejected observation"
+    fi
+  fi
+  printf '%s\n' api-observer-ready api-responses-acceptable > "$test_root/anonymous.events"
+  cmp -s "$test_root/anonymous.events" "$events" || fail_test "$case_name: incorrect anonymous observation flow"
+  if grep -Eq ' (click|reload|fill|cookies)( |$)' "$commands"; then
+    fail_test "$case_name: anonymous flow performed authenticated actions"
+  fi
+  assert_cleanup
+done
+
+# Independent smoke invocations must not reuse the worktree's active tab/session.
+if [ -f "$test_root/authenticated.session" ] && [ -f "$test_root/anonymous-true.session" ] &&
+  cmp -s "$test_root/authenticated.session" "$test_root/anonymous-true.session"; then
+  fail_test 'separate smoke runs reused one browser session'
+fi
+
+# Test the actual production JS predicates, not a copied implementation or an
+# invented agent-browser response envelope. The parent runs Node on NAS only.
+if ! command -v node >/dev/null 2>&1; then
+  fail_test 'node is required for offline browser predicate checks'
+else
+  node - "$ROOT/tools/rustodon-browser-smoke" "$test_root/js" <<'JS' || fail_test 'browser JavaScript regressions failed'
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const source = fs.readFileSync(process.argv[2], 'utf8');
+const block = name => {
+  const start = `${name}=$(cat <<'JS'\n`;
+  const position = source.indexOf(start);
+  assert.notEqual(position, -1, `missing production block ${name}`);
+  const end = source.indexOf('\nJS\n)', position);
+  assert.notEqual(end, -1, `unterminated production block ${name}`);
+  return source.slice(position + start.length, end);
+};
+const files = fs.readdirSync(process.argv[3]);
+assert.ok(files.length >= 6, 'missing expanded eval scripts');
+const initSource = fs.readFileSync(`${process.argv[3]}/api-init.js`, 'utf8');
+assert.equal(initSource.trim(), `(() => {\n${block('api_watch_js')}\n})();`, 'stage the actual observer, not a placeholder');
+const expanded = new Map();
+const readiness = new Map();
+for (const file of files) {
+  const script = fs.readFileSync(`${process.argv[3]}/${file}`, 'utf8');
+  new vm.Script(script, { filename: file });
+  const marker = script.match(/\/\* rustodon-smoke: ([a-z-]+) \*\//);
+  if (marker) expanded.set(marker[1], script);
+  const ready = script.match(/\/\* rustodon-ready: ([a-z-]+) \*\//);
+  if (ready) readiness.set(ready[1], script);
+}
+assert.deepEqual([...readiness.keys()].sort(), [
+  'initial-app', 'authenticated-app', 'reloaded-app', 'post-logout-app',
+  'home-controls', 'sign-in-form', 'profile-form', 'about-app',
+].sort(), 'every navigation uses explicit readiness');
+const ready = (label, overrides = {}) => {
+  const fixture = { installed: true, state: 'interactive', present: true, disabled: false,
+    path: label === 'about-app' ? '/about' : '/home', ...overrides };
+  return vm.runInNewContext(readiness.get(label), {
+    window: { __rustodonApiSmoke: fixture.installed ? {} : undefined },
+    location: { pathname: fixture.path },
+    document: { readyState: fixture.state, querySelector: selector =>
+      fixture.present && (!fixture.selectors || fixture.selectors.includes(selector)) ? { disabled: fixture.disabled } : null },
+  });
+};
+for (const label of readiness.keys()) {
+  assert.equal(ready(label), true, label);
+  assert.equal(ready(label, { installed: false }), false, `${label}: no late observer fallback`);
+  assert.equal(ready(label, { state: 'loading' }), false, `${label}: DOM still loading`);
+  assert.equal(ready(label, { present: false }), false, `${label}: missing expected control/mount`);
+}
+assert.equal(ready('sign-in-form', { disabled: true }), false);
+for (const [label, selectors] of [
+  ['sign-in-form', ['#email', '#password', '#otp_attempt']],
+  ['profile-form', ['form[action="/settings/profile"] #display_name', 'form[action="/settings/profile"] button[type="submit"]']],
+]) {
+  assert.equal(ready(label, { selectors }), true);
+  for (const missing of selectors) {
+    assert.equal(ready(label, { selectors: selectors.filter(selector => selector !== missing) }), false, `${label}: requires ${missing}`);
+  }
+}
+assert.equal(ready('home-controls', { path: '/about' }), false);
+assert.equal(ready('about-app', { path: '/home' }), false);
+assert.equal(ready('about-app', { selectors: ['#mastodon > :not(noscript)'] }), false, 'stale React shell is not rendered About');
+assert.equal(expanded.size, 6, 'all six browser checkpoint scripts must parse');
+const audit = (entries, supported = true) => vm.runInNewContext(block('api_audit_js'), {
+  performance: { getEntriesByType: () => entries },
+  PerformanceResourceTiming: { prototype: supported ? { responseStatus: 0 } : {} },
+  location: { href: 'http://fixture.invalid:18080/', origin: 'http://fixture.invalid:18080' },
+  URL,
+});
+const entry = (path, status, initiatorType = 'xmlhttprequest') => ({
+  name: `http://fixture.invalid:18080${path}`, responseStatus: status, initiatorType,
+});
+assert.equal(audit([entry('/api/v1/timelines/home', 200)]), true);
+assert.equal(audit([entry('/api/v1/markers', 204)]), true);
+for (const status of [0, 302, 401, 403, 404, 422, 500, undefined, '200']) {
+  assert.equal(audit([entry('/api/v1/timelines/home', status)]), false, `unexpected ${status}`);
+}
+for (const [path, status] of [
+  ['/api/v1/accounts/verify_credentials?rustodon_smoke=auth', 401],
+  ['/api/v1/statuses/999999999999999999?rustodon_smoke=missing', 404],
+]) {
+  assert.equal(audit([entry(path, status, 'fetch')]), true, 'deliberate failure');
+  assert.equal(audit([entry(path, 500, 'fetch')]), false);
+  assert.equal(audit([entry(path, status)]), false, 'not a deliberate fetch');
+  assert.equal(audit([entry(path.split('?')[0], status, 'fetch')]), false, 'no blanket path exemption');
+  assert.equal(audit([entry(path + '&extra=1', status, 'fetch')]), false);
+}
+assert.equal(audit([{ name: 'https://other.invalid/api/v1/instance', responseStatus: 200 }]), false);
+assert.equal(audit([], false), false, 'unsupported responseStatus must fail closed');
+assert.equal(audit(Array.from({ length: 250 }, () => entry('/packs/file.js', 200))), false, 'possibly truncated buffer');
+
+const diagnose = (entries, probe = {}, supported = true) => JSON.parse(vm.runInNewContext(block('api_diagnostic_js'), {
+  performance: { getEntriesByType: () => entries },
+  PerformanceResourceTiming: { prototype: supported ? { responseStatus: 0 } : {} },
+  location: { href: 'http://fixture.invalid:18080/', origin: 'http://fixture.invalid:18080' },
+  window: { __rustodonApiProbe: probe }, URL,
+  document: { readyState: 'interactive', querySelector: () => null },
+}));
+const diagnostic = diagnose([
+  entry('/api/v1/statuses/synthetic-private-id?token=synthetic-private-token', 401),
+  entry('/api/v1/instance', 200), entry('/packs/example.js', 200),
+], { stage: 'auth-probe', statuses: [401] });
+assert.equal(diagnostic.stage, 'auth-probe');
+assert.equal(diagnostic.readyState, 'interactive');
+assert.equal(diagnostic.mountPresent, false);
+assert.equal(diagnostic.reactPresent, false);
+assert.equal(diagnostic.observerInstalled, false);
+assert.equal(diagnostic.pending, null);
+assert.equal(diagnostic.transportFailed, false);
+assert.equal(diagnostic.resources, 3);
+assert.equal(diagnostic.api, 2);
+assert.deepEqual(diagnostic.statuses, [[200, 1], [401, 1]]);
+assert.equal(JSON.stringify(diagnostic).includes('synthetic-private'), false, 'never emit resource names or queries');
+const scrubbed = diagnose([], { stage: 'synthetic-private', statuses: ['synthetic-private', 9999, 200] }, false);
+assert.equal(scrubbed.stage, 'unavailable');
+assert.deepEqual(scrubbed.probeStatuses, [-1, -1]);
+assert.equal(scrubbed.responseStatusSupported, false);
+assert.equal(JSON.stringify(scrubbed).includes('synthetic-private'), false);
+assert.equal(diagnose(Array.from({ length: 250 }, () => entry('/packs/file.js', 200))).bufferMayBeFull, true);
+
+// Report only fixed route labels, never arbitrary URL/path/query segments.
+for (const path of [
+  '/api/v2/instance', '/api/v1/instance/extended_description', '/api/v1/trends/tags', '/api/v1/custom_emojis',
+  '/api/v1/accounts/verify_credentials', '/api/web/settings',
+  '/api/v1/markers', '/api/v1/timelines/home', '/api/v2/notifications',
+  '/api/v1/instance/translation_languages', '/api/v1/follow_requests',
+  '/api/v1/lists', '/api/v1/followed_tags', '/api/v1/announcements',
+  '/api/v2/suggestions', '/api/v1/accounts/relationships', '/api/v1/accounts',
+  '/api/v2/notifications/policy', '/api/web/push_subscriptions',
+  '/api/v1/streaming/', '/api/v1/streaming/user',
+]) {
+  const failed = diagnose([entry(path + '?token=synthetic-private', 404)]);
+  assert.deepEqual(failed.failedRoutes, [{ route: path, status: 404, crossOrigin: false, count: 1 }]);
+  assert.equal(audit([entry(path, 404)]), false, 'diagnostic recognition is not an API exception');
+}
+for (const [path, route] of [
+  ['/api/v1/annual_reports/synthetic-private-year/state', '/api/v1/annual_reports/:year/state'],
+  ['/api/v1/announcements/synthetic-private-id/dismiss', '/api/v1/announcements/:id/dismiss'],
+  ['/api/web/push_subscriptions/synthetic-private-id', '/api/web/push_subscriptions/:id'],
+]) {
+  for (const suffix of ['', '/']) {
+    const failure = diagnose([entry(path + suffix + '?token=synthetic-private', 404)]);
+    assert.deepEqual(failure.failedRoutes, [{ route, status: 404, crossOrigin: false, count: 1 }]);
+    assert.equal(JSON.stringify(failure).includes('synthetic-private'), false);
+    assert.equal(audit([entry(path + suffix, 404)]), false, 'templated failures stay rejected');
+  }
+  assert.equal(diagnose([entry(path + '/synthetic-private-extra', 404)]).failedRoutes[0].route, '/api/:unclassified');
+}
+assert.deepEqual(diagnose([entry('/api/v2/instance', 200)]).failedRoutes, []);
+const routeFailures = diagnose([
+  { name: 'http://synthetic-private-user:synthetic-private-password@fixture.invalid:18080/api/v1/instance/extended_description?token=synthetic-private#synthetic-private', responseStatus: 404 },
+  entry('/api/v1/statuses/synthetic-private-id?token=synthetic-private', 404),
+  entry('/api/v1/statuses/another-private-id', 404),
+  entry('/api/v1/accounts/synthetic-private-id', 404),
+  entry('/api/synthetic-private-prefix/synthetic-private-id', 500),
+]);
+assert.deepEqual(routeFailures.failedRoutes, [
+  { route: '/api/v1/instance/extended_description', status: 404, crossOrigin: false, count: 1 },
+  { route: '/api/v1/statuses/:id', status: 404, crossOrigin: false, count: 2 },
+  { route: '/api/v1/accounts/:id', status: 404, crossOrigin: false, count: 1 },
+  { route: '/api/:unclassified', status: 500, crossOrigin: false, count: 1 },
+]);
+assert.equal(JSON.stringify(routeFailures).includes('private'), false, 'redact credentials, IDs, queries, fragments and unknown path components');
+assert.deepEqual(diagnose([{ name: 'https://synthetic-private.invalid/api/v2/instance', responseStatus: 200 }]).failedRoutes,
+  [{ route: '/api/v2/instance', status: 200, crossOrigin: true, count: 1 }]);
+const cappedRoutes = diagnose(Array.from({ length: 20 }, (_, index) => entry('/api/v2/instance', 400 + index)));
+assert.equal(cappedRoutes.failedRoutes.length, 12);
+assert.equal(cappedRoutes.distinctFailedRoutes, 20);
+
+const { validLeading, validTrailing, validSave } = vm.runInNewContext(
+  `${block('settings_contract_js')}\n({ validLeading, validTrailing, validSave })`,
+);
+const save = (values, at, doneAt) => ({
+  method: 'PUT', status: 200, done: true, at, doneAt,
+  body: { data: { home: { shows: { reblog: values[0], reply: values[1] } } } },
+});
+const leading = () => ({
+  initial: [true, true], target: [false, false],
+  changes: [{ index: 0, checked: false, at: 100 }],
+  requests: [save([false, true], 101, 150)],
+});
+const trailing = () => {
+  const state = leading();
+  state.changes.push({ index: 1, checked: false, at: 200 });
+  state.requests.push(save([false, false], 2200, 2300));
+  return state;
+};
+const diagnoseSettings = (state, resources = [], checked = [false, true], protocol = 'http:') => JSON.parse(vm.runInNewContext(block('settings_diagnostic_js'), {
+  window: { __rustodonSettingsSmoke: state, __rustodonApiSmoke: { pending: 0 } },
+  performance: { now: () => 4000, getEntriesByType: () => resources },
+  location: { href: `${protocol}//fixture.invalid:18080/`, origin: `${protocol}//fixture.invalid:18080` }, URL,
+  document: { querySelectorAll: selector => [{ checked: checked[selector.endsWith('reblog') ? 0 : 1] }] },
+}));
+const settingsState = () => ({
+  initial: [true, true], target: [false, false], setupStartedAt: 100, armedAt: 2200, leadingDeadline: 3600,
+  changes: [{ index: 0, checked: false, at: 2300 }], requests: [save([false, true], 2301, 2400)],
+});
+const settingsSummary = diagnoseSettings(settingsState(), [
+  { ...entry('/api/web/settings?token=synthetic-private', 200), startTime: 1500, duration: 50 },
+  { ...entry('/api/web/settings', 200), startTime: 2301, duration: 99 },
+  entry('/api/v1/timelines/home', 200),
+]);
+assert.equal(settingsSummary.browserHttps, false);
+assert.equal(diagnoseSettings(settingsState(), [], [false, true], 'https:').browserHttps, true);
+assert.equal(settingsSummary.settlingMs, 2100);
+assert.equal(settingsSummary.firstClickAgeMs, 1700);
+assert.equal(settingsSummary.leadingDeadlineAfterClickMs, 1300);
+assert.equal(settingsSummary.changeCount, 1);
+assert.equal(settingsSummary.requestCount, 1);
+assert.equal(settingsSummary.settingsResourceCount, 2);
+assert.equal(settingsSummary.beforeArmingCount, 1);
+assert.equal(settingsSummary.duringSettlingCount, 1);
+assert.equal(settingsSummary.beforeFirstClickCount, 1);
+assert.deepEqual(settingsSummary.checkbox, [{ count: 1, checked: false }, { count: 1, checked: true }]);
+assert.deepEqual(settingsSummary.requests[0], {
+  isPut: true, status: 200, done: true, errorClass: null, csrfHeaderPresent: null, csrfMetaTokenPresent: null,
+  afterFirstClickMs: 1, ageMs: 1699, completionMs: 99,
+  completionAfterLeadingDeadlineMs: -1200, dataObject: true, savedPresent: false,
+  reblogMatchesTarget: true, replyMatchesLeading: true, replyMatchesTrailing: false,
+});
+assert.equal(settingsSummary.settingsResources[0].afterArmingMs, -700);
+const noPut = diagnoseSettings({ ...settingsState(), requests: [] });
+assert.equal(noPut.requestCount, 0);
+assert.deepEqual(noPut.requests, []);
+const pendingState = settingsState();
+pendingState.requests[0].done = false;
+delete pendingState.requests[0].doneAt;
+delete pendingState.requests[0].status;
+const pendingSummary = diagnoseSettings(pendingState).requests[0];
+assert.equal(pendingSummary.done, false);
+assert.equal(pendingSummary.status, null);
+assert.equal(pendingSummary.completionMs, null);
+const lateState = settingsState();
+lateState.requests[0].doneAt = 3900;
+assert.equal(diagnoseSettings(lateState).requests[0].completionAfterLeadingDeadlineMs, 300);
+const badState = settingsState();
+badState.requests[0].body.data.saved = 'synthetic-private';
+badState.requests[0].body.data.home.shows.reply = 'synthetic-private';
+badState.requests[0].body.data.unrelated = { token: 'synthetic-private', account_id: 'synthetic-private' };
+badState.requests[0].method = 'synthetic-private';
+badState.requests[0].errorClass = 'synthetic-private';
+badState.requests[0].csrfHeaderPresent = 'synthetic-private';
+badState.requests[0].csrfMetaTokenPresent = 'synthetic-private';
+const badSummary = diagnoseSettings(badState);
+assert.equal(badSummary.requests[0].errorClass, null);
+assert.equal(badSummary.requests[0].csrfHeaderPresent, null);
+assert.equal(badSummary.requests[0].csrfMetaTokenPresent, null);
+for (const errorClass of ['csrf', 'user', 'data', 'other']) {
+  const state = settingsState();
+  Object.assign(state.requests[0], { errorClass, csrfHeaderPresent: true, csrfMetaTokenPresent: false });
+  const summary = diagnoseSettings(state).requests[0];
+  assert.equal(summary.errorClass, errorClass);
+  assert.equal(summary.csrfHeaderPresent, true);
+  assert.equal(summary.csrfMetaTokenPresent, false);
+}
+assert.equal(badSummary.requests[0].savedPresent, true);
+assert.equal(badSummary.requests[0].replyMatchesLeading, false);
+assert.equal(badSummary.requests[0].isPut, false);
+assert.equal(JSON.stringify(badSummary).includes('synthetic-private'), false);
+assert.equal(JSON.stringify(settingsSummary).includes('synthetic-private'), false);
+const projected = (value, key) => {
+  if (value !== null && typeof value === 'object') Object.entries(value).forEach(([key, value]) => projected(value, key));
+  else if (key === 'errorClass') assert.ok(value === null || ['csrf', 'user', 'data', 'other'].includes(value));
+  else assert.ok(value === null || typeof value === 'number' || typeof value === 'boolean', 'diagnostic values must be numeric/boolean/null except fixed error classes');
+};
+projected(badSummary);
+assert.equal(diagnoseSettings(undefined).statePresent, false);
+const many = diagnoseSettings({ ...settingsState(), changes: Array(20).fill(settingsState().changes[0]), requests: Array(20).fill(settingsState().requests[0]) },
+  Array(20).fill({ ...entry('/api/web/settings', 200), startTime: 1, duration: 1 }));
+assert.equal(many.changeCount, 20);
+assert.equal(many.requestCount, 20);
+assert.equal(many.settingsResourceCount, 20);
+assert.equal(many.changes.length, 4);
+assert.equal(many.requests.length, 8);
+assert.equal(many.settingsResources.length, 8);
+const crowdedState = settingsState();
+crowdedState.requests.push(...Array.from({ length: 12 }, () => save([true, false], 3000, 3100)));
+const crowdedSummary = diagnoseSettings(crowdedState);
+assert.equal(crowdedSummary.requestCount, 13);
+assert.equal(crowdedSummary.requests[0].afterFirstClickMs, 1, 'always retain the leading candidate when capped');
+assert.equal(crowdedSummary.requests[0].replyMatchesLeading, true);
+const preClick = diagnoseSettings({ ...settingsState(), requests: [] }, [
+  { ...entry('/api/web/settings', 200), startTime: 50, duration: 10 },
+  { ...entry('/api/web/settings', 200), startTime: 1500, duration: 10 },
+  { ...entry('/api/web/settings', 200), startTime: 2250, duration: 10 },
+]);
+assert.equal(preClick.beforeArmingCount, 2);
+assert.equal(preClick.duringSettlingCount, 1);
+assert.equal(preClick.beforeFirstClickCount, 3);
+assert.equal(preClick.requestCount, 0, 'buffered earlier activity is not an observed test PUT');
+projected(preClick);
+
+assert.equal(validLeading(leading()), true);
+assert.equal(validTrailing(trailing()), true);
+assert.equal(validLeading({ ...leading(), requests: [] }), false);
+assert.equal(validTrailing(leading()), false, 'one leading save is not a trailing save');
+for (const mutate of [
+  state => { state.requests[1].method = 'PATCH'; },
+  state => { state.requests[1].status = 500; },
+  state => { state.requests[1].done = false; },
+  state => { state.requests[1].body.data.saved = true; },
+  state => { state.requests[1].body.data.home.shows.reply = 'false'; },
+  state => { state.requests[1].body.data.home.shows.reply = true; },
+  state => { state.requests[1].body = null; },
+  state => { state.requests[1].at = 300; }, // immediate, not debounced
+  state => { state.requests[1].at = 7000; }, // not bounded
+  state => { state.changes[1].at = 2200; state.requests[1].at = 4200; }, // second leading
+  state => { state.requests[0].doneAt = 250; }, // SETTING_SAVE races second mutation
+  state => { state.requests.push(save([false, false], 2400, 2500)); },
+  state => { state.changes[1].checked = true; },
+]) {
+  const state = trailing();
+  mutate(state);
+  assert.equal(validTrailing(state), false, String(mutate));
+}
+for (const body of [undefined, null, {}, { data: null }, { data: [] }]) {
+  assert.equal(validSave({ ...save([false, false], 1, 2), body }, [false, false]), false);
+}
+const reload = (overrides = {}) => {
+  const fixture = {
+    expected: { target: [false, false], document: 1 }, document: 2,
+    shows: { reblog: false, reply: false }, checked: [false, false], window: {},
+    ...overrides,
+  };
+  return vm.runInNewContext(expanded.get('settings-reload-persisted'), {
+    sessionStorage: { getItem: () => JSON.stringify(fixture.expected), removeItem() {} },
+    performance: { timeOrigin: fixture.document }, window: fixture.window,
+    document: {
+      getElementById: () => ({ textContent: JSON.stringify({ settings: { home: { shows: fixture.shows } } }) }),
+      querySelectorAll: selector => [{ checked: fixture.checked[selector.endsWith('reblog') ? 0 : 1] }],
+    },
+  });
+};
+assert.equal(reload(), true);
+for (const fixture of [
+  { expected: null }, { document: 1 }, { window: { __rustodonSettingsSmoke: {} } },
+  { shows: {} }, { shows: { reblog: 'false', reply: false } },
+  { checked: [true, false] }, { shows: { reblog: true, reply: false } },
+]) assert.equal(reload(fixture), false, JSON.stringify(fixture));
+
+(async () => {
+  // Execute the real XHR instrumentation against a tiny browser-free fixture.
+  // A capture click must be recorded before the simulated React leading send.
+  const controls = [{ checked: true }, { checked: true }];
+  const listeners = new Map();
+  const storage = new Map();
+  let clock = 100;
+  class XHR {
+    open(method, url) { this.opened = [method, url]; }
+    setRequestHeader(name, value) {
+      if (value === 'reject-header') throw new Error('fixture rejected header');
+      this.header = [name, value];
+      return 17;
+    }
+    send(body) { this.sent = body; }
+    addEventListener(name, callback) { this[name] = callback; }
+  }
+  let metaToken = 'synthetic-private-meta';
+  const window = {};
+  const timers = [];
+  const setup = vm.runInNewContext(block('settings_setup_js'), {
+    window, XMLHttpRequest: XHR, URL,
+    location: { href: 'http://fixture.invalid:18080/', origin: 'http://fixture.invalid:18080' },
+    performance: { timeOrigin: 1, now: () => clock },
+    setTimeout: callback => timers.push(callback),
+    sessionStorage: { setItem: (key, value) => storage.set(key, value) },
+    document: {
+      querySelector: selector => {
+        assert.equal(selector, 'meta[name="csrf-token"]');
+        return metaToken === null ? null : { content: metaToken };
+      },
+      querySelectorAll: selector => [controls[selector.endsWith('reblog') ? 0 : 1]],
+      addEventListener: (name, callback, capture) => { assert.equal(capture, true); listeners.set(name, callback); },
+    },
+  });
+  timers.shift()(); // release the explicit bootstrap quiet period
+  assert.equal(await setup, true);
+  assert.equal(listeners.has('click'), true);
+  listeners.get('click')({ target: {} }); // associated label is not the input
+  assert.equal(window.__rustodonSettingsSmoke.changes.length, 0);
+  controls[0].checked = false;
+  listeners.get('click')({ target: controls[0] });
+  clock = 101;
+  const xhr = new XHR();
+  xhr.open('put', '/api/web/settings');
+  assert.equal(xhr.setRequestHeader('x-CsRf-ToKeN', 'synthetic-private-header'), 17);
+  assert.deepEqual(xhr.header, ['x-CsRf-ToKeN', 'synthetic-private-header'], 'header forwarded unchanged');
+  const body = JSON.stringify(save([false, true], 101, 150).body);
+  xhr.send(body);
+  assert.equal(xhr.sent, body, 'observer must not replace the real frontend request');
+  assert.equal(xhr.opened[0], 'put');
+  clock = 140;
+  xhr.status = 200;
+  xhr.loadend();
+  assert.notEqual(window.__rustodonSettingsSmoke.requests[0].done, true, 'must yield past Axios completion microtasks');
+  clock = 150;
+  timers.shift()();
+  assert.equal(window.__rustodonSettingsSmoke.requests[0].doneAt, 150);
+  assert.equal(validLeading(window.__rustodonSettingsSmoke), true);
+  const unrelated = new XHR();
+  unrelated.open('GET', '/api/v1/timelines/home');
+  unrelated.send(null);
+  assert.equal(window.__rustodonSettingsSmoke.requests.length, 1);
+  assert.deepEqual(JSON.parse(storage.get('rustodon-smoke-settings')), { target: [false, false], document: 1 });
+  assert.equal(window.__rustodonSettingsSmoke.requests[0].csrfHeaderPresent, true);
+  assert.equal(window.__rustodonSettingsSmoke.requests[0].csrfMetaTokenPresent, true);
+  assert.equal(window.__rustodonSettingsSmoke.requests[0].errorClass, 'other');
+
+  // Exact public error strings only; never retain raw response/header/meta data.
+  for (const [response, expected] of [
+    [{ error: "Can't verify CSRF token authenticity." }, 'csrf'],
+    [{ error: 'This method requires an authenticated user' }, 'user'],
+    [{ error: 'data must be an object' }, 'data'],
+    [{ error: "Can't verify CSRF token authenticity. synthetic-private" }, 'other'],
+    [{ error: 'synthetic-private' }, 'other'], [{ error: { token: 'synthetic-private' } }, 'other'],
+    [{ nested: { error: 'data must be an object' } }, 'other'], [null, 'other'],
+  ]) {
+    for (const responseType of ['', 'text', 'json']) {
+      const rejected = new XHR();
+      rejected.open('PUT', '/api/web/settings');
+      assert.throws(() => rejected.setRequestHeader('X-CSRF-Token', 'reject-header'), /fixture rejected header/);
+      rejected.setRequestHeader('X-Unrelated', 'synthetic-private');
+      metaToken = null;
+      rejected.send(body);
+      rejected.status = 422;
+      rejected.responseType = responseType;
+      if (responseType === 'json') rejected.response = response;
+      else rejected.responseText = JSON.stringify(response);
+      rejected.loadend();
+      timers.shift()();
+      const request = window.__rustodonSettingsSmoke.requests.at(-1);
+      assert.equal(request.errorClass, expected);
+      assert.equal(request.csrfHeaderPresent, false, 'failed/unrelated header does not count');
+      assert.equal(request.csrfMetaTokenPresent, false);
+      assert.equal(request.status, 422);
+      assert.equal(request.done, true);
+      assert.equal(JSON.stringify(request).includes('synthetic-private'), false);
+    }
+  }
+  for (const responseText of ['synthetic-private', 'x'.repeat(4097), '']) {
+    const malformed = new XHR();
+    malformed.open('PUT', '/api/web/settings');
+    metaToken = '';
+    malformed.send(body);
+    malformed.status = 422;
+    malformed.responseText = responseText;
+    malformed.loadend();
+    timers.shift()();
+    assert.equal(window.__rustodonSettingsSmoke.requests.at(-1).errorClass, 'other');
+    assert.equal(window.__rustodonSettingsSmoke.requests.at(-1).csrfMetaTokenPresent, false);
+  }
+  for (const [size, expected] of [[4096, 'csrf'], [4097, 'other']]) {
+    const bounded = new XHR();
+    bounded.open('PUT', '/api/web/settings');
+    bounded.send(body);
+    bounded.status = 422;
+    bounded.responseText = JSON.stringify({ error: "Can't verify CSRF token authenticity." }).padEnd(size, ' ');
+    bounded.loadend();
+    timers.shift()();
+    assert.equal(window.__rustodonSettingsSmoke.requests.at(-1).errorClass, expected, 'valid JSON respects the parse size bound');
+  }
+  const unreadable = new XHR();
+  unreadable.open('PUT', '/api/web/settings');
+  unreadable.send(body);
+  Object.defineProperty(unreadable, 'responseText', { get() { throw new Error('synthetic-private'); } });
+  unreadable.status = 422;
+  unreadable.loadend();
+  timers.shift()();
+  assert.equal(window.__rustodonSettingsSmoke.requests.at(-1).errorClass, 'other');
+  assert.equal(window.__rustodonSettingsSmoke.requests.at(-1).done, true, 'diagnostic read failure cannot interrupt completion');
+  assert.equal(JSON.stringify(window.__rustodonSettingsSmoke).includes('synthetic-private'), false);
+  projected(diagnoseSettings(window.__rustodonSettingsSmoke));
+
+  // A successful direct probe is insufficient: the Resource Timing observer
+  // must also see its exact response. Virtual time keeps these checks offline.
+  for (const observed of [true, false]) {
+    let now = 0;
+    const probes = [
+      entry('/api/v1/accounts/verify_credentials?rustodon_smoke=auth', 401, 'fetch'),
+      entry('/api/v1/statuses/999999999999999999?rustodon_smoke=missing', 404, 'fetch'),
+    ];
+    const entries = [];
+    const calls = [];
+    const probeWindow = { __rustodonApiSmoke: { pending: 0, failed: false, changed: 0 } };
+    const ready = await vm.runInNewContext(expanded.get('api-observer-ready'), {
+      window: probeWindow,
+      performance: { getEntriesByType: () => entries, now: () => now += 25 },
+      PerformanceResourceTiming: { prototype: { responseStatus: 0 } },
+      location: { href: 'http://fixture.invalid:18080/', origin: 'http://fixture.invalid:18080' },
+      URL, AbortSignal: { timeout: ms => { assert.equal(ms, 5000); return 'abort-signal'; } },
+      setTimeout: callback => callback(),
+      fetch: async (path, options) => {
+        calls.push(path);
+        assert.equal(options.credentials, 'omit');
+        assert.equal(options.cache, 'no-store');
+        assert.equal(options.signal, 'abort-signal');
+        const probe = probes.find(probe => probe.name.endsWith(path));
+        assert.ok(probe, `unexpected probe ${path}`);
+        return {
+          status: probe.responseStatus,
+          arrayBuffer: async () => { if (observed) entries.push(probe); return new ArrayBuffer(0); },
+        };
+      },
+    });
+    assert.deepEqual(calls, probes.map(probe => new URL(probe.name).pathname + new URL(probe.name).search));
+    assert.equal(ready, observed, 'readiness requires observed probe responses');
+    assert.equal(probeWindow.__rustodonApiProbe.stage, observed ? 'complete' : 'timing-entries');
+    assert.deepEqual(Array.from(probeWindow.__rustodonApiProbe.statuses), [401, 404]);
+  }
+  // Missing pre-navigation instrumentation must fail rather than install late
+  // and silently lose requests started during document loading.
+  for (const checkpoint of ['api-observer-ready', 'api-responses-acceptable']) {
+    const uninstrumented = {};
+    assert.equal(await vm.runInNewContext(expanded.get(checkpoint), { window: uninstrumented }), false);
+    assert.equal(uninstrumented.__rustodonApiSmoke, undefined);
+  }
+  // Fresh pending accounting must not confuse a previously reached load-state
+  // with current idleness. Virtual time bounds the never-finishing case.
+  for (const [pending, failed, expected] of [[0, false, true], [1, false, false], [0, true, false]]) {
+    let now = 0;
+    const drained = await vm.runInNewContext(`(async () => { ${block('api_drain_js')} })()`, {
+      window: { __rustodonApiSmoke: { pending, failed, changed: 0 } },
+      performance: { now: () => now += 25, getEntriesByType: () => [] },
+      setTimeout: callback => callback(),
+    });
+    assert.equal(drained, expected);
+    if (expected) assert.ok(now >= 500, 'success requires a quiet observation interval');
+    if (pending) assert.ok(now >= 8000, 'pending requests time out rather than disappear');
+  }
+  for (const activity of ['request', 'resource']) {
+    let now = 0;
+    let resetAt = 0;
+    const watch = { pending: 0, failed: false, changed: 0 };
+    const drained = await vm.runInNewContext(`(async () => { ${block('api_drain_js')} })()`, {
+      window: { __rustodonApiSmoke: watch },
+      performance: {
+        now: () => {
+          now += 25;
+          if (!resetAt && now >= 300) {
+            resetAt = now;
+            if (activity === 'request') watch.changed = now;
+          }
+          return now;
+        },
+        getEntriesByType: () => activity === 'resource' && resetAt ? [{}] : [],
+      },
+      setTimeout: callback => callback(),
+    });
+    assert.equal(drained, true);
+    assert.ok(resetAt > 0 && now >= resetAt + 500, `${activity} activity must restart the quiet interval`);
+  }
+  let consumeBody;
+  const response = { redirected: false, clone: () => ({ arrayBuffer: () => new Promise(resolve => { consumeBody = resolve; }) }) };
+  const apiWindow = { fetch: async () => response };
+  class ApiXHR {
+    open() {}
+    send() {}
+    addEventListener(name, callback) { this[name] = callback; }
+  }
+  const apiContext = {
+    window: apiWindow, XMLHttpRequest: ApiXHR, URL,
+    location: { href: 'http://fixture.invalid:18080/' }, performance: { now: () => 100 },
+  };
+  vm.runInNewContext(initSource, apiContext);
+  assert.equal(await apiWindow.fetch('/api/v1/instance'), response, 'retain original fetch response');
+  assert.equal(apiWindow.__rustodonApiSmoke.pending, 1, 'headers alone do not drain fetch');
+  const originalWatch = apiWindow.__rustodonApiSmoke;
+  const originalFetchHook = apiWindow.fetch;
+  const originalXhrHook = ApiXHR.prototype.send;
+  vm.runInNewContext(initSource, apiContext);
+  assert.equal(apiWindow.__rustodonApiSmoke, originalWatch, 'idempotent initialization retains counters');
+  assert.equal(apiWindow.__rustodonApiSmoke.pending, 1, 'reinitialization must not erase inflight startup requests');
+  assert.equal(apiWindow.fetch, originalFetchHook, 'do not double-wrap fetch');
+  assert.equal(ApiXHR.prototype.send, originalXhrHook, 'do not double-wrap XHR');
+  consumeBody();
+  await Promise.resolve();
+  assert.equal(apiWindow.__rustodonApiSmoke.pending, 0);
+  const apiXhr = new ApiXHR();
+  apiXhr.open('GET', '/api/v1/timelines/home');
+  apiXhr.send();
+  assert.equal(apiWindow.__rustodonApiSmoke.pending, 1);
+  apiXhr.status = 200;
+  apiXhr.loadend();
+  assert.equal(apiWindow.__rustodonApiSmoke.pending, 0);
+  apiXhr.loadend();
+  assert.equal(apiWindow.__rustodonApiSmoke.pending, 0, 'count a completion only once');
+  apiXhr.open('GET', '/api/v1/timelines/home');
+  apiXhr.send();
+  apiXhr.status = 0;
+  apiXhr.loadend();
+  assert.equal(apiWindow.__rustodonApiSmoke.failed, true, 'transport failures are not HTTP success');
+  // A fresh navigation gets its own observer before application startup sends.
+  const nextWindow = { fetch: async () => response };
+  class NextXHR {
+    open() {}
+    send() {}
+    addEventListener(name, callback) { this[name] = callback; }
+  }
+  vm.runInNewContext(initSource, {
+    window: nextWindow, XMLHttpRequest: NextXHR, URL,
+    location: { href: 'http://fixture.invalid:18080/' }, performance: { now: () => 0 },
+  });
+  assert.notEqual(nextWindow.__rustodonApiSmoke, originalWatch);
+  const startup = new NextXHR();
+  startup.open('GET', '/api/v1/timelines/home');
+  startup.send();
+  assert.equal(nextWindow.__rustodonApiSmoke.pending, 1, 'initial document request tracked before readiness');
+  assert.equal(nextWindow.__rustodonApiSmoke.failed, false);
+  assert.equal(originalWatch.pending, 0);
+  assert.equal(originalWatch.failed, true, 'new document must not reset old evidence');
+  startup.status = 200;
+  startup.loadend();
+  assert.equal(nextWindow.__rustodonApiSmoke.pending, 0);
+  console.log('rustodon-browser-smoke JavaScript predicate checks passed');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+JS
+fi
+
+[ "$failures" -eq 0 ] || {
+  printf '%s\n' "$failures rustodon-browser-smoke shell regression(s) failed" >&2
+  exit 1
+}
 printf '%s\n' 'rustodon-browser-smoke shell tests passed'

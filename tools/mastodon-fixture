@@ -1794,7 +1794,54 @@ SQL
   mv "${prefix}-data.raw" "${prefix}-data"
 }
 
+cutover_start_browser_tls() {
+  command -v python3 >/dev/null 2>&1 || die 'browser fixture TLS requires python3'
+  command -v openssl >/dev/null 2>&1 || die 'browser fixture TLS requires openssl'
+  cutover_tls_dir=$(mktemp -d "$ROOT/target/cutover-browser-tls.XXXXXX")
+  chmod 700 "$cutover_tls_dir"
+  python3 "$ROOT/tools/browser-fixture-tls" --directory "$cutover_tls_dir" \
+    --domain "$LOCAL_DOMAIN" --backend-port "$cutover_web_port" &
+  cutover_tls_pid=$!
+  cutover_tls_attempts=0
+  until [ -f "$cutover_tls_dir/port" ]; do
+    kill -0 "$cutover_tls_pid" 2>/dev/null || die 'browser fixture TLS exited before readiness'
+    cutover_tls_attempts=$((cutover_tls_attempts + 1))
+    [ "$cutover_tls_attempts" -lt 200 ] || die 'browser fixture TLS startup timed out'
+    sleep 0.1
+  done
+  cutover_tls_port=$(cat "$cutover_tls_dir/port")
+  case "$cutover_tls_port" in
+    ''|*[!0-9]*) die 'invalid browser fixture TLS port' ;;
+  esac
+  [ "$cutover_tls_port" -ge 1 ] && [ "$cutover_tls_port" -le 65535 ] ||
+    die 'invalid browser fixture TLS port'
+  cutover_tls_spki=$(cat "$cutover_tls_dir/spki")
+}
+
+cutover_stop_browser_tls() {
+  if [ -n "${cutover_tls_pid:-}" ]; then
+    kill -TERM "$cutover_tls_pid" >/dev/null 2>&1 || true
+    cutover_tls_attempts=0
+    while kill -0 "$cutover_tls_pid" 2>/dev/null; do
+      cutover_tls_attempts=$((cutover_tls_attempts + 1))
+      [ "$cutover_tls_attempts" -lt 50 ] || break
+      sleep 0.1
+    done
+    kill -KILL "$cutover_tls_pid" >/dev/null 2>&1 || true
+    wait "$cutover_tls_pid" >/dev/null 2>&1 || true
+    cutover_tls_pid=''
+  fi
+  # Certificates are never retained, even with CUTOVER_KEEP_ARTIFACTS=true.
+  if [ -n "${cutover_tls_dir:-}" ]; then
+    rm -rf -- "$cutover_tls_dir"
+    cutover_tls_dir=''
+  fi
+  cutover_tls_port=''
+  cutover_tls_spki=''
+}
+
 cutover_stop_processes() {
+  cutover_stop_browser_tls
   if [ -n "${cutover_web_pid:-}" ]; then
     kill -TERM "$cutover_web_pid" >/dev/null 2>&1 || true
     wait "$cutover_web_pid" >/dev/null 2>&1 || true
@@ -1906,6 +1953,8 @@ cutover_test() {
   start_database publish
   cutover_worker_pid=''
   cutover_web_pid=''
+  cutover_tls_pid=''
+  cutover_tls_dir=''
   cutover_worker_log="$ROOT/target/cutover-worker-$$.log"
   cutover_web_log="$ROOT/target/cutover-web-$$.log"
   cutover_before_prefix="$ROOT/target/cutover-before-$$"
@@ -2052,20 +2101,37 @@ EOF
         --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
         --command "SELECT format('SELECT setval(''public.login_activities_id_seq'', %s, %L);', last_value, is_called) FROM public.login_activities_id_seq UNION ALL SELECT format('SELECT setval(''public.oauth_access_tokens_id_seq'', %s, %L);', last_value, is_called) FROM public.oauth_access_tokens_id_seq UNION ALL SELECT format('SELECT setval(''public.session_activations_id_seq'', %s, %L);', last_value, is_called) FROM public.session_activations_id_seq" \
         >> "$cutover_browser_user_restore"
+      # Browser persistence is asserted before replay. Restore only this user's
+      # exact prior row (or absence), leaving the full public-data guard intact.
+      run_podman exec "$PG_CONTAINER" psql \
+        --set ON_ERROR_STOP=1 --tuples-only --no-align \
+        --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+        --command "SELECT sql FROM (
+  SELECT 0 AS step, 'DELETE FROM public.web_settings WHERE user_id = 101;' AS sql
+  UNION ALL
+  SELECT 1, format('INSERT INTO public.web_settings (id, created_at, data, updated_at, user_id) VALUES (%s, %L, %L, %L, 101);', id, created_at, data, updated_at) FROM public.web_settings WHERE user_id = 101
+  UNION ALL
+  SELECT 2, format('SELECT setval(''public.web_settings_id_seq'', %s, %L);', last_value, is_called) FROM public.web_settings_id_seq
+) AS restore_statements ORDER BY step;" \
+        >> "$cutover_browser_user_restore"
       ;;
     false) ;;
     *) die 'RUSTODON_BROWSER_AUTH must be true or false' ;;
   esac
   case "${RUSTODON_BROWSER_SMOKE:-false}" in
     true)
+      cutover_start_browser_tls
       RUSTODON_BROWSER_RECORD="${RUSTODON_BROWSER_RECORD:-}" \
+        RUSTODON_BROWSER_CA_FILE="$cutover_tls_dir/ca.pem" \
+        RUSTODON_BROWSER_SPKI="$cutover_tls_spki" \
         RUSTODON_BROWSER_SCREENSHOT="${RUSTODON_BROWSER_SCREENSHOT:-}" \
         RUSTODON_BROWSER_AUTH="${RUSTODON_BROWSER_AUTH:-false}" \
         RUSTODON_BROWSER_EMAIL="${RUSTODON_BROWSER_EMAIL:-}" \
         RUSTODON_BROWSER_PASSWORD="${RUSTODON_BROWSER_PASSWORD:-}" \
         RUSTODON_BROWSER_OTP="${RUSTODON_BROWSER_OTP:-}" \
         "$ROOT/tools/rustodon-browser-smoke" \
-        "http://$LOCAL_DOMAIN:$cutover_web_port" "$LOCAL_DOMAIN"
+        "https://$LOCAL_DOMAIN:$cutover_tls_port" "$LOCAL_DOMAIN"
+      cutover_stop_browser_tls
       ;;
     false) ;;
     *) die 'RUSTODON_BROWSER_SMOKE must be true or false' ;;

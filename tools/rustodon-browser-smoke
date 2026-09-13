@@ -7,6 +7,9 @@ usage() {
         '' \
         'BASE_URL must be the local Rustodon web origin.' \
         'HOST is the configured Rustodon LOCAL_DOMAIN.' \
+        'HTTPS requires RUSTODON_BROWSER_CA_FILE (readable nonempty CA PEM file)' \
+        'and RUSTODON_BROWSER_SPKI (one bare canonical base64 SHA-256 SPKI pin).' \
+        'HTTP requires both trust variables to be absent or empty.' \
         'RUSTODON_BROWSER_AUTH=true enables the fixture server-authenticated browser-shell flow.' \
         'RUSTODON_BROWSER_EMAIL, _PASSWORD, and _OTP provide its test credentials.' \
         'RUSTODON_BROWSER_RECORD may name a WebM recording path.' \
@@ -34,6 +37,7 @@ auth=${RUSTODON_BROWSER_AUTH:-false}
 cookie_jar=''
 header_file=''
 csrf_body=''
+init_script=''
 case "$base_url" in
     http://*|https://*) ;;
     *) fail 'BASE_URL must use http or https' ;;
@@ -45,8 +49,32 @@ case "$base_authority" in
         ;;
 esac
 case "$host" in
-    ''|*'/'*|*'?'*|*'#'*|*'@'*|*'"'*)
-        fail 'HOST must be an authority without a path, query, fragment, user info, or quotes'
+    ''|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.:-]*)
+        fail 'HOST must be a DNS authority without whitespace or argument delimiters'
+        ;;
+esac
+
+browser_ca=${RUSTODON_BROWSER_CA_FILE:-}
+browser_spki=${RUSTODON_BROWSER_SPKI:-}
+case "$base_url" in
+    https://*)
+        [ -n "$browser_ca" ] && [ -f "$browser_ca" ] && [ -r "$browser_ca" ] && [ -s "$browser_ca" ] ||
+            fail 'HTTPS requires RUSTODON_BROWSER_CA_FILE to be a readable nonempty regular CA PEM file'
+        # SHA-256 is 32 bytes: 43 base64 symbols plus one padding character.
+        # The final symbol has two zero pad bits; reject lists and CLI injection.
+        [ "${#browser_spki}" -eq 44 ] || fail 'RUSTODON_BROWSER_SPKI must be one canonical SHA-256 base64 pin'
+        case "$browser_spki" in
+            *[AEIMQUYcgkosw048]=) ;;
+            *) fail 'RUSTODON_BROWSER_SPKI must be one canonical SHA-256 base64 pin' ;;
+        esac
+        case "${browser_spki%=}" in
+            *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/]*)
+                fail 'RUSTODON_BROWSER_SPKI must be one canonical SHA-256 base64 pin' ;;
+        esac
+        ;;
+    http://*)
+        [ -z "$browser_ca" ] && [ -z "$browser_spki" ] ||
+            fail 'browser trust variables require an HTTPS BASE_URL'
         ;;
 esac
 case "$auth" in
@@ -62,25 +90,57 @@ case "$auth" in
     *) fail 'RUSTODON_BROWSER_AUTH must be true or false' ;;
 esac
 command -v agent-browser >/dev/null 2>&1 || fail 'agent-browser is required'
+command -v timeout >/dev/null 2>&1 || fail 'timeout is required for bounded browser observations'
 
-session=$(agent-browser session id --scope worktree --prefix rustodon-browser)
+# Fixed labels only: never trace argv, eval source, form values, or cookies.
+# Include discovery/launch and cleanup, not just waits; force a stuck child to
+# stop five seconds after TERM. A 124 result identifies a bound, not its cause.
+cli_step() (
+    step_label=$1
+    shift
+    printf 'browser step: begin %s (limit 20s)\n' "$step_label" >&2
+    step_status=0
+    timeout --kill-after=5 20 agent-browser "$@" || step_status=$?
+    printf 'browser step: end %s (exit %s)\n' "$step_label" "$step_status" >&2
+    exit "$step_status"
+)
+
+session=$(cli_step session-id session id --scope worktree --prefix rustodon-browser)
+# 0.31.1 has no --pin-tab. This single-tab flow exclusively owns a per-run
+# session instead of sharing the worktree session's active tab. Cleanup closes
+# only this run; concurrent processes in the same worker get distinct names.
+session="$session-$$"
 browser_args="--host-resolver-rules=MAP $host 127.0.0.1"
+if [ -n "$browser_spki" ]; then
+    browser_args="$browser_args,--ignore-certificate-errors-spki-list=$browser_spki"
+fi
 record_path=${RUSTODON_BROWSER_RECORD:-}
 recording=false
 
 browser() {
-    agent-browser \
+    case "$1" in
+        wait)
+            case "${2:-}" in
+                --load) browser_step=wait-load ;;
+                --fn) browser_step=wait-predicate ;;
+                *) browser_step=wait ;;
+            esac
+            ;;
+        network|open|eval|get|fill|cookies|pushstate|reload|click|record|screenshot|errors|console|close)
+            browser_step=$1 ;;
+        *) browser_step=other ;;
+    esac
+    cli_step "$browser_step" \
         --session "$session" \
-        --pin-tab \
         --args "$browser_args" \
         "$@"
 }
 
 cleanup() {
     if [ "$recording" = true ]; then
-        browser record stop >/dev/null 2>&1 || true
+        browser record stop >/dev/null || true
     fi
-    browser close >/dev/null 2>&1 || true
+    browser close >/dev/null || true
     if [ -n "$cookie_jar" ]; then
         rm -f "$cookie_jar"
     fi
@@ -90,23 +150,274 @@ cleanup() {
     if [ -n "$csrf_body" ]; then
         rm -f "$csrf_body"
     fi
+    if [ -n "$init_script" ]; then
+        rm -f "$init_script"
+    fi
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+dump_api_diagnostic() {
+    if api_diagnostic=$(browser eval "$api_diagnostic_js"); then
+        printf 'browser API diagnostic: %s\n' "$api_diagnostic" >&2
+    else
+        printf '%s\n' 'browser API diagnostic: unavailable' >&2
+    fi
+}
+
+# Keep every eval gate fail-closed, including malformed CLI output.
+assert_js() {
+    js_status=0
+    js_result=$(browser eval "$2") || js_status=$?
+    if [ "$js_status" -eq 0 ] && [ "$js_result" = true ]; then return 0; fi
+    # Distinguish a rejected predicate from CLI representation without dumping
+    # arbitrary eval output or accepting an unverified JSON envelope.
+    case "$js_result" in
+        false) result_shape=boolean-false ;;
+        '') result_shape=empty ;;
+        '"true"'|'"false"') result_shape=quoted-boolean ;;
+        '{'*) result_shape=object-like ;;
+        *) result_shape=other ;;
+    esac
+    if [ "$js_status" -ne 0 ]; then result_shape=eval-error; fi
+    printf 'browser predicate: %s result=%s\n' "$1" "$result_shape" >&2
+    if [ "$1" = api-observer-ready ] || [ "${3:-}" = api ]; then
+        dump_api_diagnostic
+    elif [ "${3:-}" = settings ]; then
+        if settings_diagnostic=$(browser eval "$settings_diagnostic_js"); then
+            printf 'browser settings diagnostic: %s\n' "$settings_diagnostic" >&2
+        else
+            printf '%s\n' 'browser settings diagnostic: unavailable' >&2
+        fi
+    fi
+    [ "$js_status" -eq 0 ] || fail "$1 evaluation failed"
+    fail "$1"
+}
+
+# Only fixed stages/route labels, flags, counts, and numeric HTTP statuses leave
+# the page here. Never return arbitrary paths, queries, IDs, credentials or bodies.
+api_diagnostic_js=$(cat <<'JS'
+(() => {
+  const entries = performance.getEntriesByType('resource');
+  const statuses = new Map();
+  const failures = new Map();
+  // Proven calls from bundled About/UI startup, NavigationPanel, Home, emoji,
+  // account-batching, annual-report, push and streaming sources. Include
+  // conditional calls too; this vocabulary never permits their HTTP errors.
+  const knownPaths = new Set([
+    '/api/v2/instance', '/api/v1/instance/extended_description',
+    '/api/v1/trends/tags', '/api/v1/custom_emojis',
+    '/api/v1/accounts/verify_credentials', '/api/web/settings',
+    '/api/v1/markers', '/api/v1/timelines/home', '/api/v2/notifications',
+    '/api/v1/instance/translation_languages', '/api/v1/follow_requests',
+    '/api/v1/lists', '/api/v1/followed_tags', '/api/v1/announcements',
+    '/api/v2/suggestions', '/api/v1/accounts/relationships', '/api/v1/accounts',
+    '/api/v2/notifications/policy', '/api/web/push_subscriptions',
+    '/api/v1/streaming/', '/api/v1/streaming/user',
+  ]);
+  const routeLabel = path => {
+    if (knownPaths.has(path)) return path;
+    if (/^\/api\/v1\/statuses\/[^/]+\/?$/.test(path)) return '/api/v1/statuses/:id';
+    if (/^\/api\/v1\/accounts\/[^/]+\/?$/.test(path)) return '/api/v1/accounts/:id';
+    if (/^\/api\/v1\/annual_reports\/[^/]+\/state\/?$/.test(path)) return '/api/v1/annual_reports/:year/state';
+    if (/^\/api\/v1\/announcements\/[^/]+\/dismiss\/?$/.test(path)) return '/api/v1/announcements/:id/dismiss';
+    if (/^\/api\/web\/push_subscriptions\/[^/]+\/?$/.test(path)) return '/api/web/push_subscriptions/:id';
+    return '/api/:unclassified';
+  };
+  let api = 0, crossOrigin = 0;
+  const statusCode = value => Number.isInteger(value) && value >= 0 && value <= 599 ? value : -1;
+  for (const entry of entries) {
+    const url = new URL(entry.name, location.href);
+    if (!url.pathname.startsWith('/api/')) continue;
+    api++;
+    const foreign = url.origin !== location.origin;
+    if (foreign) crossOrigin++;
+    const status = statusCode(entry.responseStatus);
+    statuses.set(status, (statuses.get(status) || 0) + 1);
+    if (foreign || status < 200 || status >= 300) {
+      const route = routeLabel(url.pathname);
+      const key = JSON.stringify([route, status, foreign]);
+      const failure = failures.get(key) || { route, status, crossOrigin: foreign, count: 0 };
+      failure.count++;
+      failures.set(key, failure);
+    }
+  }
+  const probe = window.__rustodonApiProbe || {};
+  const watch = window.__rustodonApiSmoke;
+  const stages = ['startup-audit', 'auth-probe', 'missing-probe', 'timing-entries', 'complete'];
+  return JSON.stringify({
+    stage: stages.includes(probe.stage) ? probe.stage : 'unavailable',
+    readyState: ['loading', 'interactive', 'complete'].includes(document.readyState) ? document.readyState : 'unknown',
+    mountPresent: Boolean(document.querySelector('#mastodon')),
+    reactPresent: Boolean(document.querySelector('#mastodon > :not(noscript)')),
+    observerInstalled: Boolean(watch),
+    pending: Number.isInteger(watch?.pending) && watch.pending >= 0 ? watch.pending : null,
+    transportFailed: watch?.failed === true,
+    probeStatuses: Array.isArray(probe.statuses) ? probe.statuses.slice(0, 2).map(statusCode) : [],
+    responseStatusSupported: 'responseStatus' in PerformanceResourceTiming.prototype,
+    resources: entries.length, bufferMayBeFull: entries.length >= 250, api, crossOrigin,
+    statuses: [...statuses].sort((a, b) => a[0] - b[0]).slice(0, 12), distinctStatuses: statuses.size,
+    failedRoutes: [...failures.values()].slice(0, 12), distinctFailedRoutes: failures.size,
+  });
+})()
+JS
+)
+
+# Resource Timing is buffered from document start, unlike an XHR hook installed
+# after React mounts. Audit recorded completed responses before each full
+# navigation. No CLI network-response schema is assumed.
+api_audit_js=$(cat <<'JS'
+(() => {
+  const entries = performance.getEntriesByType('resource');
+  if (!('responseStatus' in PerformanceResourceTiming.prototype) || entries.length >= 250) return false;
+  const expected = new Map([
+    ['/api/v1/accounts/verify_credentials?rustodon_smoke=auth', 401],
+    ['/api/v1/statuses/999999999999999999?rustodon_smoke=missing', 404],
+  ]);
+  return entries.every(entry => {
+    const url = new URL(entry.name, location.href);
+    if (!url.pathname.startsWith('/api/')) return true;
+    if (url.origin !== location.origin) return false;
+    const deliberate = expected.get(url.pathname + url.search);
+    return deliberate !== undefined
+      ? entry.initiatorType === 'fetch' && entry.responseStatus === deliberate
+      : Number.isInteger(entry.responseStatus) && entry.responseStatus >= 200 && entry.responseStatus < 300;
+  });
+})()
+JS
+)
+
+# Register once before navigation using the verified 0.31.1 --init-script flag.
+# The per-document guard also prevents accidental re-execution from resetting
+# in-flight counters. Audits only read this observer; they never install it late.
+# Tracks fetch/XHR bodies, not WebSocket/EventSource health; a streaming fetch
+# that never completes will fail the bounded drain rather than be exempted.
+api_watch_js=$(cat <<'JS'
+if (!window.__rustodonApiSmoke) {
+  const watch = window.__rustodonApiSmoke = { pending: 0, failed: false, changed: performance.now() };
+  const isApi = url => new URL(url, location.href).pathname.startsWith('/api/');
+  const begin = () => { watch.pending++; watch.changed = performance.now(); };
+  const end = failed => { watch.pending--; watch.failed ||= failed; watch.changed = performance.now(); };
+  const originalFetch = window.fetch;
+  window.fetch = function(input, ...args) {
+    if (!isApi(typeof input === 'string' || input instanceof URL ? input : input.url)) {
+      return originalFetch.call(this, input, ...args);
+    }
+    begin();
+    try {
+      return originalFetch.call(this, input, ...args).then(response => {
+        response.clone().arrayBuffer().then(() => end(response.redirected), () => end(true));
+        return response;
+      }, error => { end(true); throw error; });
+    } catch (error) { end(true); throw error; }
+  };
+  const originalOpen = XMLHttpRequest.prototype.open;
+  const originalSend = XMLHttpRequest.prototype.send;
+  const tracked = new WeakSet();
+  XMLHttpRequest.prototype.open = function(method, url, ...args) {
+    if (isApi(url)) tracked.add(this); else tracked.delete(this);
+    return originalOpen.call(this, method, url, ...args);
+  };
+  XMLHttpRequest.prototype.send = function(...args) {
+    if (!tracked.has(this)) return originalSend.apply(this, args);
+    begin();
+    let ended = false;
+    const finish = failed => { if (!ended) { ended = true; end(failed); } };
+    this.addEventListener('loadend', () => finish(this.status === 0), { once: true });
+    try { return originalSend.apply(this, args); }
+    catch (error) { finish(true); throw error; }
+  };
+}
+JS
+)
+
+api_drain_js=$(cat <<'JS'
+const watch = window.__rustodonApiSmoke;
+if (!watch) return false;
+const deadline = performance.now() + 8000;
+let count = performance.getEntriesByType('resource').length;
+let quiet = performance.now();
+while (performance.now() < deadline) {
+  if (watch.failed) return false;
+  const current = performance.getEntriesByType('resource').length;
+  if (current !== count) { count = current; quiet = performance.now(); }
+  if (watch.pending === 0 && performance.now() - Math.max(quiet, watch.changed) >= 500) return true;
+  await new Promise(resolve => setTimeout(resolve, 25));
+}
+return false;
+JS
+)
+
+audit_api() {
+    assert_js "${1:-unexpected or unobservable API response}" "${2:-}
+(async () => {
+  if (!(await (async () => { $api_drain_js })())) return false;
+  return $api_audit_js;
+})()" api
+}
+
+# Installed core documents --fn and --init-script, but not networkidle's
+# internal algorithm. Use application readiness, not a claimed timeout cause.
+app_ready_js="Boolean(document.querySelector('#mastodon > :not(noscript)'))"
+wait_ready() {
+    printf 'browser readiness: %s\n' "$1" >&2
+    if browser wait --fn "/* rustodon-ready: $1 */ Boolean(window.__rustodonApiSmoke && document.readyState !== 'loading' && ($2))" >/dev/null; then
+        return 0
+    fi
+    dump_api_diagnostic
+    fail "$1 readiness failed"
+}
+
+# mktemp creates an exclusive file; restrictive creation applies even with a
+# permissive caller umask. No credentials or instance data go into this file.
+init_script=$(umask 077; mktemp "${TMPDIR:-/tmp}/rustodon-browser-init.XXXXXX")
+printf '(() => {\n%s\n})();\n' "$api_watch_js" > "$init_script"
+# This is the only registration. No URL: remain on about:blank while staging.
+# Closing the owned session discards the registration, even on early failure.
+browser open --init-script "$init_script" >/dev/null
 if [ -n "$record_path" ]; then
     command -v ffmpeg >/dev/null 2>&1 || fail 'ffmpeg is required when RUSTODON_BROWSER_RECORD is set'
     mkdir -p "$(dirname "$record_path")"
     browser record start "$record_path" >/dev/null
     recording=true
 fi
-
 browser network requests --clear >/dev/null
 browser open "$base_url/" >/dev/null
-browser wait --load networkidle >/dev/null
-browser wait --fn "Boolean(document.querySelector('#mastodon'))" >/dev/null
+wait_ready initial-app "$app_ready_js"
+# These are deliberate read-only failures with unique URLs, not exemptions for
+# frontend failures on the same paths. Abort each probe after five seconds.
+assert_js 'api-observer-ready' "/* rustodon-smoke: api-observer-ready */
+(async () => {
+  const progress = window.__rustodonApiProbe = { stage: 'startup-audit', statuses: [] };
+  if (!(await (async () => { $api_drain_js })())) return false;
+  if (!($api_audit_js)) return false;
+  const probes = [
+    ['/api/v1/accounts/verify_credentials?rustodon_smoke=auth', 401],
+    ['/api/v1/statuses/999999999999999999?rustodon_smoke=missing', 404],
+  ];
+  for (const [index, [path, status]] of probes.entries()) {
+    progress.stage = index === 0 ? 'auth-probe' : 'missing-probe';
+    const response = await fetch(path, { credentials: 'omit', cache: 'no-store', signal: AbortSignal.timeout(5000) });
+    await response.arrayBuffer();
+    progress.statuses.push(response.status);
+    if (response.status !== status) return false;
+  }
+  progress.stage = 'timing-entries';
+  const deadline = performance.now() + 1000;
+  while (performance.now() < deadline) {
+    const entries = performance.getEntriesByType('resource');
+    if (probes.every(([path, status]) => entries.some(entry =>
+      entry.name === new URL(path, location.href).href && entry.initiatorType === 'fetch' && entry.responseStatus === status))) {
+      progress.stage = 'complete';
+      return true;
+    }
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  return false;
+})()"
+audit_api
 
 debug_dump() {
     if [ "${RUSTODON_BROWSER_DEBUG:-false}" = true ]; then
@@ -138,11 +449,22 @@ assert_mount() {
     esac
 }
 
+# Keep hostname verification enabled and ignore ambient .curlrc options. The
+# fixture CA is scoped to these calls, never installed into a shared trust store.
+# Invalid PEM/trust/hostname errors propagate; there is no insecure fallback.
+fixture_curl() {
+    if [ -n "$browser_ca" ]; then
+        curl --disable --cacert "$browser_ca" "$@"
+    else
+        curl --disable "$@"
+    fi
+}
+
 bootstrap_csrf() {
     csrf_path=$1
     bootstrap_cookie=$2
     csrf_label=$3
-    curl --silent --show-error --fail --max-time 30 \
+    fixture_curl --silent --show-error --fail --max-time 30 \
         --resolve "$base_host:$base_port:127.0.0.1" \
         --header "Host: $host" \
         --header 'X-Forwarded-Proto: https' \
@@ -154,6 +476,251 @@ bootstrap_csrf() {
     csrf_cookie=$(awk 'tolower($0) ~ /^set-cookie:[[:space:]]*__host-csrf_token=/ { line = $0; sub(/^[^:]+:[[:space:]]*/, "", line); sub(/^[^=]+=/, "", line); sub(/;.*/, "", line); print line; exit }' "$header_file")
     [ -n "$csrf_token" ] || fail "$csrf_label page did not expose a CSRF token"
     [ -n "$csrf_cookie" ] || fail "$csrf_label did not return an __Host-csrf_token cookie"
+}
+
+# Only the disposable fixture's Home controls are changed. These helpers never
+# import Redux internals, dispatch fabricated actions, or write settings via HTTP.
+open_home_settings() {
+    browser pushstate "$base_url/home" >/dev/null
+    wait_ready home-controls "location.pathname === '/home' && Boolean(document.querySelector('button.column-header__button[aria-label=\"Show settings\"]'))"
+    browser click 'button.column-header__button[aria-label="Show settings"]' >/dev/null
+}
+
+# Diagnostic projection only: never serialize request bodies, bootstrap, Redux
+# state, resource URLs, IDs, or arbitrary field values. Earlier HTTP activity is
+# evidence of earlier requests, not proof of the shared debounce's internal state.
+settings_diagnostic_js=$(cat <<'JS'
+(() => {
+  const state = window.__rustodonSettingsSmoke;
+  const list = value => Array.isArray(value) ? value : [];
+  const boolean = value => typeof value === 'boolean' ? value : null;
+  const delta = (end, start) => Number.isFinite(end) && Number.isFinite(start) ? Math.round(end - start) : null;
+  const status = value => Number.isInteger(value) && value >= 0 && value <= 599 ? value : null;
+  const initial = [0, 1].map(index => boolean(state?.initial?.[index]));
+  const target = [0, 1].map(index => boolean(state?.target?.[index]));
+  const changes = list(state?.changes);
+  const requests = list(state?.requests);
+  const firstClick = changes[0]?.at;
+  const now = performance.now();
+  const resources = performance.getEntriesByType('resource').filter(entry =>
+    new URL(entry.name, location.href).pathname === '/api/web/settings');
+  return JSON.stringify({
+    statePresent: Boolean(state), initial, target,
+    browserHttps: new URL(location.href).protocol === 'https:',
+    pendingApi: Number.isInteger(window.__rustodonApiSmoke?.pending) && window.__rustodonApiSmoke.pending >= 0 ? window.__rustodonApiSmoke.pending : null,
+    checkbox: ['reblog', 'reply'].map(key => {
+      const controls = document.querySelectorAll('#setting-toggle-home_timeline-shows-' + key);
+      return { count: controls.length, checked: controls.length === 1 ? boolean(controls[0].checked) : null };
+    }),
+    settlingMs: delta(state?.armedAt, state?.setupStartedAt),
+    firstClickAgeMs: delta(now, firstClick),
+    leadingDeadlineAfterClickMs: delta(state?.leadingDeadline, firstClick),
+    trailingDeadlineAfterClickMs: delta(state?.trailingDeadline, firstClick),
+    changeCount: changes.length,
+    changes: changes.slice(0, 4).map(change => ({
+      index: change.index === 0 || change.index === 1 ? change.index : -1,
+      checked: boolean(change.checked), afterArmingMs: delta(change.at, state?.armedAt),
+    })),
+    requestCount: requests.length,
+    // Preserve the first/leading candidate even if unrelated activity overflows
+    // the bounded projection. requestCount still exposes the full count.
+    requests: requests.slice(0, 8).map(request => {
+      const data = request.body?.data;
+      const dataObject = data !== null && typeof data === 'object' && !Array.isArray(data);
+      return {
+        isPut: request.method === 'PUT', status: status(request.status), done: request.done === true,
+        errorClass: ['csrf', 'user', 'data', 'other'].includes(request.errorClass) ? request.errorClass : null,
+        csrfHeaderPresent: boolean(request.csrfHeaderPresent), csrfMetaTokenPresent: boolean(request.csrfMetaTokenPresent),
+        afterFirstClickMs: delta(request.at, firstClick), ageMs: delta(now, request.at), completionMs: delta(request.doneAt, request.at),
+        completionAfterLeadingDeadlineMs: delta(request.doneAt, state?.leadingDeadline),
+        dataObject, savedPresent: dataObject && Object.hasOwn(data, 'saved'),
+        reblogMatchesTarget: target[0] !== null && data?.home?.shows?.reblog === target[0],
+        replyMatchesLeading: initial[1] !== null && data?.home?.shows?.reply === initial[1],
+        replyMatchesTrailing: target[1] !== null && data?.home?.shows?.reply === target[1],
+      };
+    }),
+    settingsResourceCount: resources.length,
+    beforeArmingCount: resources.filter(entry => Number.isFinite(state?.armedAt) && entry.startTime < state.armedAt).length,
+    duringSettlingCount: resources.filter(entry => Number.isFinite(state?.setupStartedAt) && Number.isFinite(state?.armedAt) &&
+      entry.startTime >= state.setupStartedAt && entry.startTime < state.armedAt).length,
+    beforeFirstClickCount: resources.filter(entry => Number.isFinite(firstClick) && entry.startTime < firstClick).length,
+    settingsResources: resources.slice(-8).map(entry => ({
+      status: status(entry.responseStatus), sameOrigin: new URL(entry.name, location.href).origin === location.origin,
+      isXhr: entry.initiatorType === 'xmlhttprequest', isFetch: entry.initiatorType === 'fetch',
+      afterArmingMs: delta(entry.startTime, state?.armedAt), afterFirstClickMs: delta(entry.startTime, firstClick),
+      durationMs: Number.isFinite(entry.duration) ? Math.round(entry.duration) : null,
+    })),
+  });
+})()
+JS
+)
+
+settings_setup_js=$(cat <<'JS'
+/* rustodon-smoke: settings-ui-ready */
+(async () => {
+  // A settling allowance, not proof of an idle debounce: its saved/me guard
+  // runs inside the callback, so even a no-PUT save invocation can arm it.
+  const setupStartedAt = performance.now();
+  await new Promise(resolve => setTimeout(resolve, 2100));
+  const controls = ['reblog', 'reply'].map(key =>
+    document.querySelectorAll('#setting-toggle-home_timeline-shows-' + key));
+  if (controls.some(nodes => nodes.length !== 1 || nodes[0].disabled)) return false;
+  const initial = controls.map(nodes => nodes[0].checked);
+  const state = window.__rustodonSettingsSmoke = {
+    initial, target: initial.map(value => !value), changes: [], requests: [],
+    setupStartedAt, armedAt: performance.now(),
+  };
+  sessionStorage.setItem('rustodon-smoke-settings', JSON.stringify({
+    target: state.target, document: performance.timeOrigin,
+  }));
+  // React derives checkbox onChange from click, before native change fires.
+  // Capture the input's click (not the label's) before React can start the PUT.
+  document.addEventListener('click', event => {
+    const index = controls.findIndex(nodes => nodes[0] === event.target);
+    if (index !== -1) state.changes.push({ index, at: performance.now(), checked: event.target.checked });
+  }, true);
+  const originalOpen = XMLHttpRequest.prototype.open;
+  const originalSend = XMLHttpRequest.prototype.send;
+  const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+  const tracked = new WeakMap();
+  XMLHttpRequest.prototype.open = function(method, url, ...args) {
+    const parsed = new URL(url, location.href);
+    if (parsed.origin === location.origin && parsed.pathname === '/api/web/settings') {
+      tracked.set(this, { method: method.toUpperCase(), csrfHeaderPresent: false });
+    } else {
+      tracked.delete(this);
+    }
+    return originalOpen.call(this, method, url, ...args);
+  };
+  XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+    // Observe only a successful setter; never retain, inject or replace values.
+    const result = originalSetRequestHeader.call(this, name, value);
+    const request = tracked.get(this);
+    if (request && typeof name === 'string' && name.toLowerCase() === 'x-csrf-token') request.csrfHeaderPresent = true;
+    return result;
+  };
+  XMLHttpRequest.prototype.send = function(body) {
+    const request = tracked.get(this);
+    if (request) {
+      request.at = performance.now();
+      request.csrfMetaTokenPresent = Boolean(document.querySelector('meta[name="csrf-token"]')?.content);
+      try { request.body = JSON.parse(body); } catch { request.body = null; }
+      state.requests.push(request);
+      this.addEventListener('loadend', () => {
+        request.status = this.status;
+        // Exact public errors from src/web/web_settings.rs only. Unknown,
+        // oversized or unreadable responses collapse to other; no raw retention.
+        request.errorClass = 'other';
+        try {
+          let response;
+          if (this.responseType === 'json') response = this.response;
+          else if (!this.responseType || this.responseType === 'text') {
+            const text = this.responseText;
+            if (typeof text === 'string' && text.length <= 4096) response = JSON.parse(text);
+          }
+          switch (response?.error) {
+            case "Can't verify CSRF token authenticity.": request.errorClass = 'csrf'; break;
+            case 'This method requires an authenticated user': request.errorClass = 'user'; break;
+            case 'data must be an object': request.errorClass = 'data'; break;
+          }
+        } catch { /* Diagnostic parsing must not interrupt completion tracking. */ }
+        // Yield a task after Axios's completion microtasks/SETTING_SAVE dispatch.
+        setTimeout(() => { request.doneAt = performance.now(); request.done = true; }, 0);
+      }, { once: true });
+    }
+    return originalSend.call(this, body);
+  };
+  return true;
+})()
+JS
+)
+
+# Pure predicates are also exercised by the offline JS regressions. Requests
+# must be distinct, successful PUTs of the selected booleans without `saved`.
+settings_contract_js=$(cat <<'JS'
+const validSave = (request, values) => {
+  const data = request?.body?.data;
+  return request?.done === true && request.method === 'PUT' && request.status === 200 &&
+    data !== null && typeof data === 'object' && !Object.hasOwn(data, 'saved') &&
+    data.home?.shows?.reblog === values[0] && data.home?.shows?.reply === values[1];
+};
+const validLeading = state => {
+  const change = state.changes[0];
+  const request = state.requests[0];
+  return state.changes.length === 1 && state.requests.length === 1 &&
+    change.index === 0 && change.checked === state.target[0] &&
+    request.at >= change.at && request.at - change.at < 500 &&
+    validSave(request, [state.target[0], state.initial[1]]);
+};
+const validTrailing = state => {
+  const [first, second] = state.changes;
+  const [leading, trailing] = state.requests;
+  return state.changes.length === 2 && state.requests.length === 2 &&
+    first.index === 0 && first.checked === state.target[0] &&
+    second.index === 1 && second.checked === state.target[1] &&
+    second.at > first.at && second.at > leading.doneAt && second.at - first.at < 1800 &&
+    leading.at >= first.at && leading.at - first.at < 500 &&
+    trailing.at - second.at >= 1900 && trailing.at - second.at < 6000 &&
+    validSave(leading, [state.target[0], state.initial[1]]) && validSave(trailing, state.target);
+};
+JS
+)
+
+exercise_settings_save() {
+    printf '%s\n' 'browser auth: exercising leading/trailing frontend settings PUT and reload' >&2
+    open_home_settings
+    assert_js 'settings-ui-ready' "$settings_setup_js" settings
+    browser click 'label[for="setting-toggle-home_timeline-shows-reblog"]' >/dev/null
+    assert_js 'settings-leading-observed (missing PUT or slow leading response)' "/* rustodon-smoke: settings-leading-observed */
+(async () => {
+  $settings_contract_js
+  const state = window.__rustodonSettingsSmoke;
+  const deadline = performance.now() + 1200;
+  state.leadingDeadline = deadline;
+  while (performance.now() < deadline) {
+    if (validLeading(state)) return performance.now() - state.changes[0].at < 1500;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  return false;
+})()" settings
+    browser click 'label[for="setting-toggle-home_timeline-shows-reply"]' >/dev/null
+    assert_js 'settings-trailing-observed (missing/incorrect delayed PUT)' "/* rustodon-smoke: settings-trailing-observed */
+(async () => {
+  $settings_contract_js
+  const state = window.__rustodonSettingsSmoke;
+  const deadline = performance.now() + 6500;
+  state.trailingDeadline = deadline;
+  while (performance.now() < deadline) {
+    if (validTrailing(state)) return true;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  return false;
+})()" settings
+    audit_api
+    assert_js 'settings save contract changed while draining API requests' "(() => {
+      $settings_contract_js
+      return validTrailing(window.__rustodonSettingsSmoke);
+    })()" settings
+    browser reload >/dev/null
+    wait_ready reloaded-app "$app_ready_js"
+    audit_api
+    open_home_settings
+    assert_js 'settings-reload-persisted' "/* rustodon-smoke: settings-reload-persisted */
+(() => {
+  const expected = JSON.parse(sessionStorage.getItem('rustodon-smoke-settings') || 'null');
+  if (!expected || expected.document === performance.timeOrigin || window.__rustodonSettingsSmoke) return false;
+  const bootstrap = JSON.parse(document.getElementById('initial-state').textContent);
+  const shows = bootstrap.settings?.home?.shows;
+  const keys = ['reblog', 'reply'];
+  const persisted = keys.every((key, index) => {
+    const controls = document.querySelectorAll('#setting-toggle-home_timeline-shows-' + key);
+    return typeof expected.target[index] === 'boolean' && shows?.[key] === expected.target[index] &&
+      controls.length === 1 && controls[0].checked === expected.target[index];
+  });
+  sessionStorage.removeItem('rustodon-smoke-settings');
+  return persisted;
+})()" settings
+    audit_api
 }
 
 assert_mount
@@ -170,15 +737,14 @@ fi
 
 if [ "$auth" = true ]; then
     printf '%s\n' 'browser auth: opening sign-in page' >&2
+    audit_api
     browser open "$base_url/auth/sign_in" >/dev/null
-    if ! browser wait --load networkidle >/dev/null; then
-        debug_dump
-        fail 'sign-in page did not become idle'
-    fi
+    wait_ready sign-in-form "['#email', '#password', '#otp_attempt'].every(selector => { const control = document.querySelector(selector); return control && !control.disabled; })"
+    audit_api
     printf '%s\n' 'browser auth: submitting fixture credentials' >&2
-    browser fill '#email' "$browser_email"
-    browser fill '#password' "$browser_password"
-    browser fill '#otp_attempt' "$browser_otp"
+    browser fill '#email' "$browser_email" >/dev/null
+    browser fill '#password' "$browser_password" >/dev/null
+    browser fill '#otp_attempt' "$browser_otp" >/dev/null
     case "$base_authority" in
         *:*)
             base_host=${base_authority%:*}
@@ -193,11 +759,12 @@ if [ "$auth" = true ]; then
     cookie_jar=$(mktemp "${TMPDIR:-/tmp}/rustodon-browser-cookies.XXXXXX")
     header_file=$(mktemp "${TMPDIR:-/tmp}/rustodon-browser-headers.XXXXXX")
     csrf_body=$(mktemp "${TMPDIR:-/tmp}/rustodon-browser-csrf.XXXXXX")
-    # Chromium cannot retain the canonical origin's Secure __Host- cookie over
-    # the fixture's loopback HTTP transport, so curl must bootstrap each form.
+    # Keep each curl form's rendered token paired with its own CSRF cookie on
+    # both transports. Legacy HTTP cannot retain Chromium's Secure __Host- cookie;
+    # HTTPS lets the subsequent browser shell establish its own matching pair.
     bootstrap_csrf '/auth/sign_in' '' 'browser sign-in'
     printf '%s\n' 'browser auth: submitting fixture credentials through the local form endpoint' >&2
-    login_result=$(curl --silent --show-error --max-time 30 \
+    login_result=$(fixture_curl --silent --show-error --max-time 30 \
         --resolve "$base_host:$base_port:127.0.0.1" \
         --header "Host: $host" \
         --header 'X-Forwarded-Proto: https' \
@@ -225,25 +792,22 @@ if [ "$auth" = true ]; then
     fi
     browser cookies set _mastodon_session "$browser_session" --url "$base_url/" --path / >/dev/null
     printf '%s\n' 'browser auth: waiting for authenticated shell' >&2
+    audit_api
     browser open "$base_url/" >/dev/null
-    if ! browser wait --load networkidle >/dev/null; then
-        debug_dump
-        fail 'authenticated page did not become idle'
-    fi
-    browser wait --fn "Boolean(document.querySelector('#mastodon'))" >/dev/null
+    wait_ready authenticated-app "$app_ready_js"
     authenticated_me=$(browser eval "document.getElementById('initial-state')?.textContent.includes('116844606259201001')")
     case "$authenticated_me" in
         true) ;;
         *) fail 'authenticated shell did not contain the fixture account' ;;
     esac
     assert_mount
+    audit_api
+    exercise_settings_save
 
     printf '%s\n' 'browser auth: checking profile settings' >&2
     browser open "$base_url/settings/profile" >/dev/null
-    if ! browser wait --load networkidle >/dev/null; then
-        debug_dump
-        fail 'profile settings page did not become idle'
-    fi
+    wait_ready profile-form "Boolean(document.querySelector('form[action=\"/settings/profile\"] #display_name') && document.querySelector('form[action=\"/settings/profile\"] button[type=\"submit\"]'))"
+    audit_api
     settings_text=$(browser get text body)
     case "$settings_text" in
         *'Profile details'*'Save changes'*) ;;
@@ -251,7 +815,7 @@ if [ "$auth" = true ]; then
     esac
     printf '%s\n' 'browser auth: submitting logout' >&2
     bootstrap_csrf '/settings/profile' "_mastodon_session=$browser_session" 'browser logout'
-    logout_status=$(curl --silent --show-error --fail --max-time 30 \
+    logout_status=$(fixture_curl --silent --show-error --fail --max-time 30 \
         --resolve "$base_host:$base_port:127.0.0.1" \
         --header "Host: $host" \
         --header 'X-Forwarded-Proto: https' \
@@ -262,7 +826,7 @@ if [ "$auth" = true ]; then
         --output /dev/null \
         "$base_url/auth/sign_out")
     [ "$logout_status" = 302 ] || fail "browser logout returned HTTP $logout_status"
-    logout_probe=$(curl --silent --show-error --max-time 30 \
+    logout_probe=$(fixture_curl --silent --show-error --max-time 30 \
         --resolve "$base_host:$base_port:127.0.0.1" \
         --header "Host: $host" \
         --header 'X-Forwarded-Proto: https' \
@@ -279,23 +843,23 @@ if [ "$auth" = true ]; then
         *) fail "server-side logout probe did not redirect to sign-in: $logout_probe_redirect" ;;
     esac
     printf '%s\n' 'browser auth: clearing browser session' >&2
+    audit_api
     browser cookies clear >/dev/null
     browser open "$base_url/" >/dev/null
-    if ! browser wait --load networkidle >/dev/null; then
-        debug_dump
-        fail 'anonymous post-logout shell did not become idle'
-    fi
+    wait_ready post-logout-app "$app_ready_js"
+    audit_api
 fi
 
 browser pushstate "$base_url/about" >/dev/null
-browser wait --load networkidle >/dev/null
+wait_ready about-app "location.pathname === '/about' && Boolean(document.querySelector('#mastodon .scrollable.about > .about__header'))"
 current_url=$(browser get url)
 case "$current_url" in
     "$base_url/about"|"$base_url/about/"*) ;;
     *) fail "SPA deep-link navigation ended at $current_url" ;;
 esac
-browser wait --fn "Boolean(document.querySelector('#mastodon'))" >/dev/null
 assert_mount
+
+audit_api 'api-responses-acceptable' '/* rustodon-smoke: api-responses-acceptable */'
 
 page_errors=$(browser errors --clear)
 case "$page_errors" in
@@ -309,7 +873,7 @@ if [ "$recording" = true ]; then
 fi
 
 if [ "$auth" = true ]; then
-    printf 'browser web-client smoke passed: mount, server-authenticated shell/settings/logout, SPA deep link, and page errors\n'
+    printf 'browser web-client smoke passed: mount, server-authenticated shell/settings/logout, frontend debounced PUT/reload, SPA deep link, API responses, and page errors\n'
 else
-    printf 'browser web-client smoke passed: mount, app body, SPA deep link, and page errors\n'
+    printf 'browser web-client smoke passed: mount, app body, SPA deep link, API responses, and page errors\n'
 fi
