@@ -16360,11 +16360,26 @@ async fn retries_cancellation_outbox_dead_letters_and_readiness_are_operational(
     );
 
     let abandoned_id = queue.enqueue(&duplicate).await?;
-    queue
-        .claim("push-crashed", &[Lane::Push], Duration::milliseconds(25))
+    let abandoned = queue
+        .claim("push-crashed", &[Lane::Push], Duration::seconds(30))
         .await?
         .expect("the cancellable delivery is claimed before its worker crashes");
-    tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+    assert_eq!(abandoned.id, abandoned_id);
+    assert_eq!(
+        sqlx::query(
+            "UPDATE rustodon.durable_jobs
+                SET lease_expires_at = clock_timestamp() - interval '1 second'
+              WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3
+                AND dead_at IS NULL AND lease_expires_at > clock_timestamp()",
+        )
+        .bind(abandoned.id)
+        .bind(&abandoned.lease_owner)
+        .bind(abandoned.generation)
+        .execute(&pool)
+        .await?
+        .rows_affected(),
+        1
+    );
     assert_eq!(
         queue
             .cancel("deliver", "https://remote.invalid/inbox")
@@ -16387,12 +16402,28 @@ async fn retries_cancellation_outbox_dead_letters_and_readiness_are_operational(
         .claim("pull-1", &[Lane::Pull], Duration::seconds(30))
         .await?
         .unwrap();
-    let retry_at = Utc::now() + Duration::milliseconds(50);
+    assert_eq!(first_claim.id, dead_id);
+    // Exercise the not-due/due boundary explicitly, not SQL latency within 50ms.
+    // Read the timestamp from PostgreSQL so the stored precision is exact.
+    let retry_at =
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT clock_timestamp() + interval '1 hour'")
+            .fetch_one(&pool)
+            .await?;
     assert_eq!(
         queue
             .retry(&first_claim, retry_at, "temporary remote failure",)
             .await?,
         RetryResult::Scheduled
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, DateTime<Utc>>(
+            "SELECT run_at FROM rustodon.durable_jobs WHERE id = $1",
+        )
+        .bind(dead_id)
+        .fetch_one(&pool)
+        .await?,
+        retry_at,
+        "retry must preserve the requested schedule"
     );
     assert!(
         queue
@@ -16400,7 +16431,21 @@ async fn retries_cancellation_outbox_dead_letters_and_readiness_are_operational(
             .await?
             .is_none()
     );
-    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    assert_eq!(
+        sqlx::query(
+            "UPDATE rustodon.durable_jobs SET run_at = clock_timestamp() - interval '1 second'
+              WHERE id = $1 AND run_at = $2 AND lease_generation = $3
+                AND attempts = 1 AND lease_owner IS NULL AND dead_at IS NULL",
+        )
+        .bind(dead_id)
+        .bind(retry_at)
+        .bind(first_claim.generation)
+        .execute(&pool)
+        .await?
+        .rows_affected(),
+        1,
+        "only the scheduled retry becomes due"
+    );
     let final_claim = queue
         .claim("pull-2", &[Lane::Pull], Duration::seconds(30))
         .await?
@@ -17230,6 +17275,9 @@ async fn runtime_publishes_readiness_and_removes_it_on_graceful_shutdown()
         heartbeat_seconds: 3600,
         shutdown_seconds: 5,
     };
+    // The hourly heartbeat deliberately keeps this test dependent on outbox polling,
+    // not a heartbeat tick. Its readiness query must use the same freshness scale.
+    let freshness = Duration::seconds(i64::from(config.heartbeat_seconds));
     let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
     let runtime_queue = queue.clone();
     let runtime = tokio::spawn(async move {
@@ -17244,123 +17292,155 @@ async fn runtime_publishes_readiness_and_removes_it_on_graceful_shutdown()
         )
         .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let mut phase = "initial readiness";
+    let mut outbox_state = Vec::new();
+    let mut cleanup_state = (false, false, false);
+    // One deadlock watchdog covers observation, not a 500ms performance assertion
+    // per effect. Retain the last state for useful diagnostics without extra SQL.
+    let observation = tokio::time::timeout(WORKER_FIXTURE_WATCHDOG, async {
         loop {
-            let readiness = queue
-                .readiness(
-                    &[Lane::Maintenance].into_iter().collect(),
-                    Duration::seconds(3),
-                )
-                .await
-                .expect("readiness query succeeds");
-            if readiness.ready() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    })
-    .await?;
-    let advertised_lanes = sqlx::query_scalar::<_, Vec<String>>(
-        "SELECT lanes FROM rustodon.heartbeats WHERE process_id = 'runtime-test:worker'",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(advertised_lanes, vec!["maintenance"]);
-    assert!(
-        !queue
-            .readiness(&Lane::ALL.into_iter().collect(), Duration::seconds(3))
-            .await?
-            .ready(),
-        "readiness must not claim lanes without registered handlers"
-    );
-    let mut transaction = pool.begin().await?;
-    let outbox_id = record_outbox_in(
-        &mut transaction,
-        &JobSpec::new(
-            Lane::Maintenance,
-            "rustodon.maintenance.prune",
-            json!({"source": "outbox-poll"}),
-        )
-        .logical_key("outbox-poll"),
-    )
-    .await?;
-    let _mute_outbox_id = record_outbox_in(
-        &mut transaction,
-        &JobSpec::new(
-            Lane::Maintenance,
-            "rustodon.mastodon.delete_mute",
-            json!({"mute_id": expired_mute_id}),
-        )
-        .logical_key("expired-mute-test"),
-    )
-    .await?;
-    transaction.commit().await?;
-    tokio::time::timeout(std::time::Duration::from_millis(500), async {
-        loop {
-            if sqlx::query_scalar::<_, bool>(
-                "SELECT dispatched_at IS NOT NULL FROM rustodon.outbox_events WHERE id = $1",
-            )
-            .bind(outbox_id)
-            .fetch_one(&pool)
-            .await
-            .expect("outbox inspection succeeds")
+            if queue
+                .readiness(&[Lane::Maintenance].into_iter().collect(), freshness)
+                .await?
+                .ready()
             {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
-    })
-    .await?;
-    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        phase = "lane advertisement";
+        let advertised_lanes = sqlx::query_scalar::<_, Vec<String>>(
+            "SELECT lanes FROM rustodon.heartbeats WHERE process_id = 'runtime-test:worker'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        if advertised_lanes != vec!["maintenance"] {
+            return Err(std::io::Error::other(format!(
+                "runtime advertised unexpected lanes: {advertised_lanes:?}"
+            ))
+            .into());
+        }
+        if queue
+            .readiness(&Lane::ALL.into_iter().collect(), freshness)
+            .await?
+            .ready()
+        {
+            return Err(std::io::Error::other(
+                "readiness must not claim lanes without registered handlers",
+            )
+            .into());
+        }
+        phase = "outbox enqueue";
+        let mut transaction = pool.begin().await?;
+        let outbox_id = record_outbox_in(
+            &mut transaction,
+            &JobSpec::new(
+                Lane::Maintenance,
+                "rustodon.maintenance.prune",
+                json!({"source": "outbox-poll"}),
+            )
+            .logical_key("outbox-poll"),
+        )
+        .await?;
+        let mute_outbox_id = record_outbox_in(
+            &mut transaction,
+            &JobSpec::new(
+                Lane::Maintenance,
+                "rustodon.mastodon.delete_mute",
+                json!({"mute_id": expired_mute_id}),
+            )
+            .logical_key("expired-mute-test"),
+        )
+        .await?;
+        transaction.commit().await?;
+        phase = "selected outbox completion and maintenance effects";
         loop {
-            if !sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS (SELECT 1 FROM rustodon.remote_fetch_leases WHERE host = $1)",
+            // Observe dispatch and acknowledgement in one snapshot. Periodic prune
+            // can remove the fixture data independently; its effects alone do not
+            // prove either selected outbox job completed. Include dead jobs here.
+            outbox_state = sqlx::query_as::<_, (i64, bool, bool)>(
+                "SELECT event.id, event.dispatched_at IS NOT NULL,
+                        NOT EXISTS (
+                            SELECT 1 FROM rustodon.durable_jobs job
+                             WHERE job.kind = event.kind AND job.logical_key = event.logical_key)
+                   FROM rustodon.outbox_events event WHERE event.id = ANY($1)
+                  ORDER BY event.id",
+            )
+            .bind([outbox_id, mute_outbox_id].as_slice())
+            .fetch_all(&pool)
+            .await?;
+            let (remote_removed, rate_limit_removed) = sqlx::query_as::<_, (bool, bool)>(
+                "SELECT NOT EXISTS (
+                            SELECT 1 FROM rustodon.remote_fetch_leases WHERE host = $1),
+                        NOT EXISTS (
+                            SELECT 1 FROM rustodon.rate_limit_windows WHERE window_key = $2)",
             )
             .bind(&expired_remote_fetch_host)
-            .fetch_one(&pool)
-            .await
-            .expect("remote-fetch lease cleanup inspection succeeds")
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await?;
-    tokio::time::timeout(std::time::Duration::from_millis(500), async {
-        loop {
-            if !sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS (SELECT 1 FROM rustodon.rate_limit_windows WHERE window_key = $1)",
-            )
             .bind(&expired_rate_limit_key)
             .fetch_one(&pool)
-            .await
-            .expect("rate-limit cleanup inspection succeeds")
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await?;
-    tokio::time::timeout(std::time::Duration::from_millis(500), async {
-        loop {
-            if sqlx::query_scalar::<_, bool>(
+            .await?;
+            let mute_removed = sqlx::query_scalar::<_, bool>(
                 "SELECT NOT EXISTS (SELECT 1 FROM public.mutes WHERE id = $1)",
             )
             .bind(expired_mute_id)
             .fetch_one(&owner)
-            .await
-            .expect("mute expiry inspection succeeds")
+            .await?;
+            cleanup_state = (remote_removed, rate_limit_removed, mute_removed);
+            if outbox_state.len() == 2
+                && outbox_state
+                    .iter()
+                    .all(|(_, dispatched, completed)| *dispatched && *completed)
+                && cleanup_state == (true, true, true)
             {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
+        Ok::<(), Box<dyn std::error::Error>>(())
     })
-    .await?;
-    shutdown_sender.send(()).expect("runtime is listening");
-    runtime.await??;
+    .await;
+    let observation = observation.unwrap_or_else(|_| {
+        Err(std::io::Error::other(format!(
+            "runtime fixture timed out during {phase}; \
+             outbox (id, dispatched, completed): {outbox_state:?}; \
+             cleanup (remote, rate-limit, mute): {cleanup_state:?}"
+        ))
+        .into())
+    });
+    // Always signal, join and restore the mute before propagating an observation
+    // error. A detached runtime could otherwise overlap the next test's reset.
+    let shutdown_sent = shutdown_sender.send(()).is_ok();
+    let runtime_result = runtime.await;
+    let cleanup_result = async {
+        sqlx::query("DELETE FROM public.mutes WHERE id = $1")
+            .bind(expired_mute_id)
+            .execute(&owner)
+            .await?;
+        if let Some(previous_mute) = previous_mute {
+            sqlx::query(
+                "INSERT INTO public.mutes \
+                 SELECT * FROM jsonb_populate_record(NULL::public.mutes, $1)",
+            )
+            .bind(previous_mute)
+            .execute(&owner)
+            .await?;
+        }
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    if !matches!(&runtime_result, Ok(Ok(()))) {
+        return Err(std::io::Error::other(format!(
+            "runtime failed: {runtime_result:?}; observation: {observation:?}; \
+             mute restoration: {cleanup_result:?}"
+        ))
+        .into());
+    }
+    cleanup_result?;
+    observation?;
+    assert!(
+        shutdown_sent,
+        "runtime must remain listening until shutdown"
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM rustodon.heartbeats WHERE process_id LIKE 'runtime-test:%'",
@@ -17369,19 +17449,6 @@ async fn runtime_publishes_readiness_and_removes_it_on_graceful_shutdown()
         .await?,
         0
     );
-    sqlx::query("DELETE FROM public.mutes WHERE id = $1")
-        .bind(expired_mute_id)
-        .execute(&owner)
-        .await?;
-    if let Some(previous_mute) = previous_mute {
-        sqlx::query(
-            "INSERT INTO public.mutes \
-             SELECT * FROM jsonb_populate_record(NULL::public.mutes, $1)",
-        )
-        .bind(previous_mute)
-        .execute(&owner)
-        .await?;
-    }
     Ok(())
 }
 
