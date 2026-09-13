@@ -25,6 +25,5 @@
 - [ ] [Support frontend web settings API](issues/support-frontend-web-settings-api.md)
 - [ ] [Implement the test audit action plan](issues/implement-test-audit-plan.md)
 - [ ] [Port selected Mastodon media and browser behavior matrices](issues/port-mastodon-media-and-browser-matrices.md)
-- [ ] [Port mixed profile-media preservation matrix](issues/port-mixed-profile-media-matrix.md)
 - [ ] [Exercise delayed browser settings save and reload](issues/exercise-browser-delayed-settings-save.md)
 - [ ] [Diagnose private boost Undo returning HTTP 500](issues/diagnose-private-boost-undo-http-500.md)

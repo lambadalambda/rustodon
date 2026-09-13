@@ -4,6 +4,7 @@ mod differential {
     pub mod database;
     pub mod federation;
     pub mod harness;
+    pub mod mixed_profile_media;
     pub mod normalization;
     pub mod read_only;
     pub mod reauth;
@@ -541,6 +542,50 @@ async fn media_writes() -> Result<(), Box<dyn std::error::Error>> {
             .await
     });
     let result = run_media_writes_case(config, &rust_url).await;
+    let _ = shutdown_tx.send(());
+    server.await??;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires guarded Mastodon/PostgreSQL/media clones from tools/mastodon-fixture"]
+async fn mixed_profile_media() -> Result<(), Box<dyn std::error::Error>> {
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let config = DifferentialConfig::from_process_environment(&repository_root)?;
+    config.validate_database_comments().await?;
+    let writer_url = config
+        .rust_write_database
+        .as_ref()
+        .expect("media writer differential configuration must include a Rust writer URL")
+        .url()
+        .to_owned();
+    let repository = Repository::connect(config.rust_database.url()).await?;
+    let writer = rustodon::mastodon::WriteRepository::connect(&writer_url).await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let rust_url = Url::parse(&format!("http://{}", listener.local_addr()?))?;
+    let app = web_router(
+        WebState::new(
+            repository,
+            Url::parse("https://fixture-v4-6-5.rustodon.invalid/")?,
+            "fixture-v4-6-5.rustodon.invalid",
+            "/system",
+            config.rust_media.clone(),
+            fixture_instance_runtime(),
+            Vec::new(),
+            vec!["fixture-v4-6-5.rustodon.invalid".to_owned()],
+        )?
+        .with_write_repository(writer),
+    );
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    let result =
+        differential::mixed_profile_media::run_mixed_profile_media_case(config, &rust_url).await;
     let _ = shutdown_tx.send(());
     server.await??;
     result

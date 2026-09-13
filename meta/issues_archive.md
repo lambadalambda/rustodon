@@ -77,3 +77,4 @@
 - [x] [Port failed parent-fetch recovery and distribution matrix](issues/port-parent-fetch-recovery-matrix.md)
 - [x] [Align OAuth metadata with supported response modes](issues/align-oauth-metadata-response-modes.md)
 - [x] [Refresh familiar followers preflight classification](issues/refresh-familiar-followers-preflight-regression.md)
+- [x] [Port mixed profile-media preservation matrix](issues/port-mixed-profile-media-matrix.md)

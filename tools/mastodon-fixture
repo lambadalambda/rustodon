@@ -2198,7 +2198,7 @@ validate_differential_case() {
       ;;
   esac
   case "$case_name" in
-    account_settings|actor_media_root_url|admin_create_user|authorized_fetch_read_routes_require_signatures|browser_authentication|browser_recovery_fences|browser_reauthentication_limits|browser_two_factor_management|core_rest_serializers|federation_discovery|instance_v2|local_paperclip_media|local_paperclip_deleted_media|local_web_client_shell|media_writes|notification_writes|oauth_authorization_code|oauth_bearer_authentication|password_recovery|report_writes|rest_protocol_contracts|status_authorization_matrix|write_transactions) ;;
+    account_settings|actor_media_root_url|admin_create_user|authorized_fetch_read_routes_require_signatures|browser_authentication|browser_recovery_fences|browser_reauthentication_limits|browser_two_factor_management|core_rest_serializers|federation_discovery|instance_v2|local_paperclip_media|local_paperclip_deleted_media|local_web_client_shell|media_writes|mixed_profile_media|notification_writes|oauth_authorization_code|oauth_bearer_authentication|password_recovery|report_writes|rest_protocol_contracts|status_authorization_matrix|write_transactions) ;;
     *) die "unknown differential case: $case_name" ;;
   esac
 }
@@ -2619,15 +2619,29 @@ finish_differential() {
   trap - EXIT HUP INT TERM
 }
 
+# The pinned animated profile fixture exceeds HTTP deadlines without optimization.
+# Keep discovery/execution consistent without changing other tests or CLI builds.
+with_differential_test_profile() (
+  case "$1" in
+    mixed_profile_media) export CARGO_PROFILE_TEST_OPT_LEVEL=3 ;;
+  esac
+  shift
+  "$@"
+)
+
 differential_test() {
   "$ROOT/tools/verify-worker-media"
   case_name=${1:-}
   if [ -n "$case_name" ]; then
     validate_differential_case "$case_name"
-    require_ignored_tests exact --features test-support --test differential "$case_name"
+    with_differential_test_profile "$case_name" \
+      require_ignored_tests exact --features test-support --test differential "$case_name"
+  else
+    with_differential_test_profile mixed_profile_media \
+      require_ignored_tests exact --features test-support --test differential mixed_profile_media
   fi
   media_mode=ro
-  if [ -z "$case_name" ] || [ "$case_name" = 'media_writes' ]; then
+  if [ -z "$case_name" ] || [ "$case_name" = 'media_writes' ] || [ "$case_name" = 'mixed_profile_media' ]; then
     media_mode=rw
   fi
   verify_static "$FIXTURE_DIR"
@@ -2727,7 +2741,8 @@ EOF
        RUSTODON_DIFFERENTIAL_RUST_DATABASE_URL="$rust_database_url" \
        RUSTODON_DIFFERENTIAL_RUST_OWNER_DATABASE_URL="$rust_owner_url" \
        RUSTODON_DIFFERENTIAL_RUST_WRITE_DATABASE_URL="$rust_write_database_url" \
-      cargo test --locked --features test-support --test differential "$case_name" -- --ignored --exact --nocapture --test-threads=1
+      with_differential_test_profile "$case_name" \
+        cargo test --locked --features test-support --test differential "$case_name" -- --ignored --exact --nocapture --test-threads=1
   else
     RUSTODON_DIFFERENTIAL_RUN_ID="$DIFFERENTIAL_RUN_ID" \
       RUSTODON_DIFFERENTIAL_PAPERCLIP_ROOT_URL='/system' \
@@ -2738,7 +2753,7 @@ EOF
       RUSTODON_DIFFERENTIAL_RUST_OWNER_DATABASE_URL="$rust_owner_url" \
       RUSTODON_DIFFERENTIAL_RUST_WRITE_DATABASE_URL="$rust_write_database_url" \
       cargo test --locked --features test-support --test differential -- --ignored --nocapture --test-threads=1 \
-        --skip notification_writes --skip status_authorization_matrix
+        --skip notification_writes --skip status_authorization_matrix --skip mixed_profile_media
 
     reset_differential_feeds "$mastodon_database" "$mastodon_media" "$media_mode"
     published_web=$(run_podman port "$WEB_CONTAINER" 3000/tcp)
@@ -2780,6 +2795,19 @@ EOF
       RUSTODON_DIFFERENTIAL_RUST_WRITE_DATABASE_URL="$rust_write_database_url" \
       cargo test --locked --test differential actor_media_root_url \
         -- --ignored --exact --nocapture --test-threads=1
+
+    # Run once after comparisons on shared seeded accounts, not in the debug batch.
+    RUSTODON_DIFFERENTIAL_RUN_ID="$DIFFERENTIAL_RUN_ID" \
+      RUSTODON_DIFFERENTIAL_PAPERCLIP_ROOT_URL='/system' \
+      RUSTODON_DIFFERENTIAL_MASTODON_HTTP_URL="http://127.0.0.1:$web_port" \
+      RUSTODON_DIFFERENTIAL_MASTODON_DATABASE_URL="$mastodon_database_url" \
+      RUSTODON_DIFFERENTIAL_MASTODON_OWNER_DATABASE_URL="$mastodon_owner_database_url" \
+      RUSTODON_DIFFERENTIAL_RUST_DATABASE_URL="$rust_database_url" \
+      RUSTODON_DIFFERENTIAL_RUST_OWNER_DATABASE_URL="$rust_owner_url" \
+      RUSTODON_DIFFERENTIAL_RUST_WRITE_DATABASE_URL="$rust_write_database_url" \
+      with_differential_test_profile mixed_profile_media \
+        cargo test --locked --features test-support --test differential mixed_profile_media \
+          -- --ignored --exact --nocapture --test-threads=1
   fi
 
   finish_differential
