@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Task-only browser TLS: loopback TLS socket -> fixed loopback TCP backend.
+
+No HTTP parsing, header changes, trust installation, or traffic logging. The
+caller supplies a fresh, empty mode-700 directory and owns emergency cleanup.
+Readiness is published atomically as `port`, after ca.pem and leaf-SPKI `spki`.
+"""
+import argparse
+import asyncio
+import base64
+import hashlib
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import ssl
+import subprocess
+import sys
+
+
+CHUNK = 65536
+IDLE_SECONDS = 60
+
+
+def arguments():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--directory", type=Path, required=True)
+    parser.add_argument("--domain", required=True)
+    parser.add_argument("--backend-port", type=int, required=True)
+    args = parser.parse_args()
+    label = r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+    if len(args.domain) > 253 or not all(re.fullmatch(label, part) for part in args.domain.split(".")):
+        parser.error("domain must be an exact ASCII DNS name, without wildcards")
+    if not 1 <= args.backend_port <= 65535:
+        parser.error("backend port must be between 1 and 65535")
+    directory = args.directory
+    if (directory.is_symlink() or not directory.is_dir()
+            or directory.stat().st_uid != os.getuid()
+            or directory.stat().st_mode & 0o777 != 0o700
+            or any(directory.iterdir())):
+        parser.error("directory must be a fresh, empty, owned mode-700 directory")
+    return args
+
+
+def certificates(directory, domain, stop):
+    def openssl(*args, data=None):
+        if stop.is_set():
+            raise InterruptedError
+        result = subprocess.run(["openssl", *args], cwd=directory, input=data,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                check=True, timeout=3)
+        if stop.is_set():
+            raise InterruptedError
+        return result.stdout
+
+    # Explicit config avoids inheriting host openssl request extensions.
+    (directory / "ca.cnf").write_text(
+        "[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=ca\n"
+        "[dn]\nCN=Rustodon browser fixture CA\n"
+        "[ca]\nbasicConstraints=critical,CA:TRUE,pathlen:0\n"
+        "keyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n"
+    )
+    (directory / "leaf.cnf").write_text(
+        "[leaf]\nbasicConstraints=critical,CA:FALSE\n"
+        "keyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n"
+        f"subjectAltName=DNS:{domain}\n"
+    )
+    key = ("-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes")
+    openssl("req", "-x509", *key, "-config", "ca.cnf", "-days", "1", "-sha256",
+            "-keyout", "ca.key", "-out", "ca.pem")
+    openssl("req", "-new", *key, "-config", "ca.cnf", "-subj", f"/CN={domain}",
+            "-keyout", "leaf.key", "-out", "leaf.csr")
+    openssl("x509", "-req", "-in", "leaf.csr", "-CA", "ca.pem", "-CAkey", "ca.key",
+            "-set_serial", "1", "-days", "1", "-sha256", "-extfile", "leaf.cnf",
+            "-extensions", "leaf", "-out", "leaf.pem")
+    public = openssl("x509", "-in", "leaf.pem", "-pubkey", "-noout")
+    der = openssl("pkey", "-pubin", "-outform", "DER", data=public)
+    (directory / "spki").write_text(base64.b64encode(hashlib.sha256(der).digest()).decode() + "\n")
+    for name in ("ca.key", "ca.cnf", "leaf.csr", "leaf.cnf"):
+        (directory / name).unlink()
+
+
+async def copy_stream(reader, writer):
+    while True:
+        # A quiet direction is normal during uploads, downloads, and SSE. Only
+        # stalled writes time out; fixture teardown cancels idle readers.
+        data = await reader.read(CHUNK)
+        if not data:
+            return
+        writer.write(data)
+        await asyncio.wait_for(writer.drain(), IDLE_SECONDS)
+
+
+async def bridge(client_reader, client_writer, backend_port):
+    backend_writer = None
+    pumps = []
+    try:
+        backend_reader, backend_writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", backend_port, limit=CHUNK), 3)
+        pumps = [asyncio.create_task(copy_stream(client_reader, backend_writer)),
+                 asyncio.create_task(copy_stream(backend_reader, client_writer))]
+        done, _ = await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+        # TLS has no usable write half after asyncio receives close_notify.
+        # Either EOF ends this connection. Backend output already queued is
+        # flushed by StreamWriter.close, not dropped with transport.abort.
+    except (OSError, TimeoutError):
+        pass  # No request bytes, headers, or TLS diagnostics in fixture logs.
+    finally:
+        for task in pumps:
+            task.cancel()
+        await asyncio.gather(*pumps, return_exceptions=True)
+        writers = [writer for writer in (backend_writer, client_writer) if writer is not None]
+        for writer in writers:
+            writer.close()
+        for writer in writers:
+            try:
+                await asyncio.wait_for(writer.wait_closed(), 1)
+            except (OSError, TimeoutError):
+                writer.transport.abort()
+
+
+async def serve(args, stop):
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        loop.add_signal_handler(sig, stop.set)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(args.directory / "leaf.pem", args.directory / "leaf.key")
+    connections = set()
+
+    def accepted(reader, writer):
+        if stop.is_set() or len(connections) >= 64:
+            writer.close()
+            return
+        task = asyncio.create_task(bridge(reader, writer, args.backend_port))
+        connections.add(task)
+        task.add_done_callback(connections.discard)
+
+    server = await asyncio.start_server(accepted, "127.0.0.1", 0, ssl=context,
+                                        ssl_handshake_timeout=3, limit=CHUNK)
+    try:
+        (args.directory / "port.tmp").write_text(str(server.sockets[0].getsockname()[1]) + "\n")
+        (args.directory / "port.tmp").replace(args.directory / "port")
+        await stop.wait()
+    finally:
+        server.close()
+        for task in list(connections):
+            task.cancel()
+        await asyncio.gather(*list(connections), return_exceptions=True)
+        # Newer Python also waits for accepted transports here, including an
+        # incomplete TLS handshake. Never let those peers hold fixture teardown.
+        try:
+            await asyncio.wait_for(server.wait_closed(), 1)
+        except TimeoutError:
+            pass
+
+
+def main():
+    os.umask(0o077)
+    args = arguments()
+    stop = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda _sig, _frame: stop.set())
+    try:
+        certificates(args.directory, args.domain, stop)
+        if not stop.is_set():
+            asyncio.run(serve(args, stop))
+        return 0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        if stop.is_set():
+            return 0
+        print("browser fixture TLS startup failed", file=sys.stderr)
+        return 1
+    finally:
+        shutil.rmtree(args.directory)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
