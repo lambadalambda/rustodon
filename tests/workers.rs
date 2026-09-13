@@ -12845,20 +12845,31 @@ async fn activitypub_delivery_replays_after_worker_crash_before_ack()
     let first_executor = executor.clone();
     let first_worker = tokio::spawn(async move {
         first_executor
-            .process_one(
-                "crashed-delivery",
-                &[Lane::Push],
-                Duration::milliseconds(100),
-            )
+            .process_one("crashed-delivery", &[Lane::Push], Duration::seconds(30))
             .await
     });
     accepted.notified().await;
     assert_eq!(queue.dispatch_outbox(10).await?, 1);
     assert_eq!(queue.queued_count().await?, 2);
     first_worker.abort();
-    assert!(first_worker.await.is_err());
+    let cancelled = first_worker.await;
+    assert!(
+        matches!(&cancelled, Err(error) if error.is_cancelled()),
+        "delivery must be cancelled while awaiting the response body: {cancelled:?}"
+    );
+    // Separate a live-worker crash from reclaiming its abandoned lease. Database
+    // round trips must not race a sub-second lease while arranging the crash.
+    assert_eq!(
+        sqlx::query(
+            "UPDATE rustodon.durable_jobs SET lease_expires_at = clock_timestamp() - interval '1 second' \
+             WHERE lease_owner = 'crashed-delivery' AND lease_expires_at IS NOT NULL",
+        )
+        .execute(&runtime_pool)
+        .await?
+        .rows_affected(),
+        1
+    );
     release.notify_one();
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
     assert!(
         executor
@@ -16269,7 +16280,7 @@ async fn retries_cancellation_outbox_dead_letters_and_readiness_are_operational(
     );
     tokio::time::sleep(std::time::Duration::from_millis(75)).await;
     let final_claim = queue
-        .claim("pull-2", &[Lane::Pull], Duration::milliseconds(25))
+        .claim("pull-2", &[Lane::Pull], Duration::seconds(30))
         .await?
         .unwrap();
     assert_eq!(final_claim.id, dead_id);

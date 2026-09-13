@@ -73,3 +73,4 @@
 - [x] [Diagnose NAS fixture bridge DNS failures](issues/repair-nas-fixture-network-dns.md)
 - [x] [Investigate remote Update version ordering after semantic no-ops](issues/investigate-remote-update-version-watermark.md)
 - [x] [Assert remote semantic no-op edit-history behavior](issues/assert-remote-noop-edit-history-stability.md)
+- [x] [Separate worker live-lease assertions from forced expiry](issues/stabilize-worker-live-lease-tests.md)
