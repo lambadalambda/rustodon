@@ -83,3 +83,4 @@
 - [x] [Serve batch account reads used by the web client](issues/serve-batch-account-reads.md)
 - [x] [Diagnose unexpected browser startup API 404](issues/diagnose-browser-startup-api-404.md)
 - [x] [Stabilize operational domain budget regression](issues/stabilize-operational-domain-budget-test.md)
+- [x] [Stabilize browser reauthentication budget regression](issues/stabilize-browser-reauth-budget-test.md)

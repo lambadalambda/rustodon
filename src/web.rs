@@ -420,6 +420,8 @@ fn rate_limit_bucket(now: u64, period: StdDuration) -> u64 {
 #[derive(Clone)]
 struct SharedRateLimiter {
     pool: PgPool,
+    #[cfg(feature = "test-support")]
+    fixed_time: Option<i64>,
 }
 
 struct SharedRateLimitKey {
@@ -432,7 +434,17 @@ struct SharedRateLimitKey {
 
 impl SharedRateLimiter {
     const fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            #[cfg(feature = "test-support")]
+            fixed_time: None,
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn with_fixed_time(mut self, unix_seconds: i64) -> Self {
+        self.fixed_time = Some(unix_seconds);
+        self
     }
 
     #[allow(clippy::too_many_lines)]
@@ -458,6 +470,11 @@ impl SharedRateLimiter {
             return Err(fallback);
         }
         let now = unix_timestamp_seconds();
+        #[cfg(feature = "test-support")]
+        let now = match self.fixed_time {
+            Some(now) => u64::try_from(now).map_err(|_| fallback)?,
+            None => now,
+        };
         let mut shared_keys = Vec::with_capacity(keys.len());
         for (window_key, limit, period) in keys {
             let Ok(period_seconds) = i64::try_from(period.as_secs()) else {
@@ -506,15 +523,22 @@ impl SharedRateLimiter {
             }
         }
         for key in &shared_keys {
-            if sqlx::query(
+            let delete_expired = sqlx::query(
                 "DELETE FROM rustodon.rate_limit_windows \
                  WHERE window_key = $1 AND expires_at <= clock_timestamp()",
             )
-            .bind(&key.window_key)
-            .execute(&mut *transaction)
-            .await
-            .is_err()
-            {
+            .bind(&key.window_key);
+            #[cfg(feature = "test-support")]
+            let delete_expired = match self.fixed_time {
+                Some(now) => sqlx::query(
+                    "DELETE FROM rustodon.rate_limit_windows \
+                     WHERE window_key = $1 AND expires_at <= to_timestamp($2::double precision)",
+                )
+                .bind(&key.window_key)
+                .bind(now),
+                None => delete_expired,
+            };
+            if delete_expired.execute(&mut *transaction).await.is_err() {
                 return Err(fallback);
             }
         }
@@ -725,6 +749,8 @@ impl BrowserLoginLimiter {
 #[derive(Clone, Default)]
 struct BrowserReauthenticationLimiter {
     limiter: AttemptLimiter,
+    #[cfg(feature = "test-support")]
+    fixed_time: Option<i64>,
 }
 
 impl BrowserReauthenticationLimiter {
@@ -752,6 +778,16 @@ impl BrowserReauthenticationLimiter {
         client_ip: IpAddr,
         user_id: i64,
     ) -> Result<(), RateLimitExceeded> {
+        #[cfg(feature = "test-support")]
+        if let (Some(now), Some(shared)) = (self.fixed_time, shared) {
+            // Freeze only this reauthentication call, not the state's shared
+            // limiter used by login, password reset, media, and other routes.
+            return shared
+                .clone()
+                .with_fixed_time(now)
+                .try_allow(Self::keys(client_ip, user_id))
+                .await;
+        }
         try_rate_limit(&self.limiter, shared, Self::keys(client_ip, user_id)).await
     }
 }
@@ -2542,6 +2578,15 @@ impl WebState {
     #[must_use]
     pub fn with_csrf_signing_secret(mut self, secret: &SecretString) -> Self {
         self.csrf_signing_key = derive_browser_csrf_signing_key(secret.expose_secret());
+        self
+    }
+
+    /// Fixes the database-backed browser reauthentication budget clock for this
+    /// test instance only. Other rate limits and browser/session clocks are unchanged.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_browser_reauthentication_test_time(mut self, unix_seconds: i64) -> Self {
+        self.browser_reauthentication_limiter.fixed_time = Some(unix_seconds);
         self
     }
 
@@ -20601,6 +20646,70 @@ mod tests {
             .expect_err("the 31st media upload request must be limited");
         assert_eq!(rate_limited.limit, 30);
         assert_eq!(rate_limited.period, StdDuration::from_mins(30));
+    }
+
+    #[test]
+    fn browser_reauthentication_budgets_roll_over_at_epoch_boundaries() {
+        let keys = BrowserReauthenticationLimiter::keys("192.0.2.91".parse().unwrap(), 91);
+        assert_eq!((keys[0].1, keys[0].2), (25, StdDuration::from_mins(5)));
+        assert_eq!((keys[1].1, keys[1].2), (10, StdDuration::from_hours(1)));
+        for key in keys {
+            let limiter = AttemptLimiter::default();
+            // 2000-01-01 00:00:00 UTC is aligned to both production periods.
+            let boundary = 946_684_800 + key.2.as_secs();
+            for _ in 0..key.1 {
+                assert!(limiter.allow_at([key.clone()], boundary - 1));
+            }
+            assert!(!limiter.allow_at([key.clone()], boundary - 1));
+            assert!(
+                limiter.allow_at([key], boundary),
+                "crossing the epoch boundary replenishes a budget even after only one second"
+            );
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    #[ignore = "requires a disposable RUSTODON_OPERATIONAL_DATABASE_URL"]
+    async fn shared_rate_limiter_fixed_clock_preserves_epoch_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let url = std::env::var("RUSTODON_OPERATIONAL_DATABASE_URL")?;
+        let first = SharedRateLimiter::new(PgPool::connect(&url).await?);
+        let second = SharedRateLimiter::new(PgPool::connect(&url).await?);
+        let keys = BrowserReauthenticationLimiter::keys("192.0.2.92".parse()?, 92);
+        for (key, limit, period) in keys {
+            let key = (format!("test:reauth-clock:{key}"), limit, period);
+            let boundary = 946_684_800 + i64::try_from(period.as_secs())?;
+            assert!(unix_timestamp_seconds() > u64::try_from(boundary)?);
+            sqlx::query("DELETE FROM rustodon.rate_limit_windows WHERE window_key = $1")
+                .bind(&key.0)
+                .execute(&first.pool)
+                .await?;
+            let frozen_first = first.clone().with_fixed_time(boundary - 1);
+            let frozen_second = second.clone().with_fixed_time(boundary - 1);
+            for _ in 0..limit {
+                assert!(frozen_first.try_allow([key.clone()]).await.is_ok());
+            }
+            assert!(
+                frozen_second.try_allow([key.clone()]).await.is_err(),
+                "both pools must retain a full historical bucket despite real wall time"
+            );
+            let advanced = second.clone().with_fixed_time(boundary);
+            for _ in 0..limit {
+                assert!(advanced.try_allow([key.clone()]).await.is_ok());
+            }
+            assert!(advanced.try_allow([key.clone()]).await.is_err());
+            // Unconfigured instances still use real time and therefore see a
+            // different bucket, even after configured clones exhaust theirs.
+            assert!(first.try_allow([key.clone()]).await.is_ok());
+            assert!(first.fixed_time.is_none());
+            assert!(second.fixed_time.is_none());
+            sqlx::query("DELETE FROM rustodon.rate_limit_windows WHERE window_key = $1")
+                .bind(&key.0)
+                .execute(&first.pool)
+                .await?;
+        }
+        Ok(())
     }
 
     #[tokio::test]

@@ -17,6 +17,12 @@ use super::reauth::fixture_browser_session;
 use super::safety::DifferentialConfig;
 use super::writes::{BrowserFormState, load_browser_form};
 
+// 2000-01-01 00:04:59 UTC: immediately before an IP epoch boundary and
+// deliberately behind wall time, so a missing SQL clock override cannot pass.
+const FIXTURE_REAUTH_TIME: i64 = 946_685_099;
+const CLOCK_CONTROL_IP: &str = "203.0.113.201";
+const IP_BUDGET_KEY: &str = "browser_reauthentication:ip:203.0.113.200";
+
 const ROUTES: [&str; 6] = [
     "/settings/security",
     "/settings/two_factor_authentication_methods/disable",
@@ -44,6 +50,7 @@ pub async fn run(config: DifferentialConfig) -> Result<(), Box<dyn Error>> {
             vec!["fixture-v4-6-5.rustodon.invalid".to_owned()],
         )?
         .with_write_repository(writer)
+        .with_browser_reauthentication_test_time(FIXTURE_REAUTH_TIME)
         .with_csrf_signing_secret(&SecretString::new("fixture-reauth-csrf-secret".to_owned()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         targets.push(Url::parse(&format!("http://{}", listener.local_addr()?))?);
@@ -137,9 +144,60 @@ async fn challenge(
     .await?)
 }
 
+// These seeded controls test the fixture clock only. The budget tests below
+// still accumulate every attempt through HTTP and real bcrypt verification.
+async fn check_fixture_clock(
+    connection: &mut PgConnection,
+    targets: &[Url],
+    account: &BrowserFormState,
+) -> Result<(), Box<dyn Error>> {
+    let key = format!("browser_reauthentication:ip:{CLOCK_CONTROL_IP}");
+    for infinite_expiry in [true, false] {
+        sqlx::query("DELETE FROM rustodon.rate_limit_windows WHERE window_key = $1")
+            .bind(&key)
+            .execute(&mut *connection)
+            .await?;
+        sqlx::query(
+            "INSERT INTO rustodon.rate_limit_windows (window_key, bucket, attempts, expires_at) \
+             VALUES ($1, $2::bigint / 300, 25, CASE WHEN $3 THEN 'infinity'::timestamptz \
+             ELSE to_timestamp(($2::bigint + 1)::double precision) END)",
+        )
+        .bind(&key)
+        .bind(FIXTURE_REAUTH_TIME)
+        .bind(infinite_expiry)
+        .execute(&mut *connection)
+        .await?;
+        for target in targets {
+            let before = password_verification_count();
+            let response = challenge(
+                target,
+                account,
+                ROUTES[3],
+                CLOCK_CONTROL_IP,
+                "wrong-fixture-password",
+            )
+            .await?;
+            assert_eq!(
+                response.status,
+                StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                "fixture clock must retain the exhausted historical bucket; infinite expiry: {infinite_expiry}"
+            );
+            assert_eq!(password_verification_count(), before);
+        }
+    }
+    sqlx::query("DELETE FROM rustodon.rate_limit_windows WHERE window_key = $1")
+        .bind(&key)
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn check_limits(config: &DifferentialConfig, targets: &[Url]) -> Result<(), Box<dyn Error>> {
+    let mut connection =
+        PgConnection::connect(config.rust_write_database.as_ref().unwrap().url()).await?;
     let account = browser(config, &targets[0], "limitaccount").await?;
+    check_fixture_clock(&mut connection, targets, &account).await?;
     // Switching endpoints, processes/pools, and IP addresses must not replenish the user budget.
     for attempt in 0..10 {
         let before = password_verification_count();
@@ -198,6 +256,7 @@ async fn check_limits(config: &DifferentialConfig, targets: &[Url]) -> Result<()
     for (index, count) in [10, 10, 5].into_iter().enumerate() {
         let account = browser(config, &targets[0], &format!("limitip{index}")).await?;
         for attempt in 0..count {
+            let before = password_verification_count();
             let response = challenge(
                 &targets[attempt % 2],
                 &account,
@@ -207,6 +266,11 @@ async fn check_limits(config: &DifferentialConfig, targets: &[Url]) -> Result<()
             )
             .await?;
             assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY.as_u16());
+            assert_eq!(
+                password_verification_count(),
+                before + 1,
+                "IP budget: user {index}, attempt {attempt} must reach bcrypt"
+            );
         }
         last_account = Some(account);
     }
@@ -220,12 +284,27 @@ async fn check_limits(config: &DifferentialConfig, targets: &[Url]) -> Result<()
         "fixture-password",
     )
     .await?;
-    assert_eq!(response.status, StatusCode::TOO_MANY_REQUESTS.as_u16());
-    assert_eq!(password_verification_count(), before);
-    // Expire only fixture windows deterministically; no wall-clock sleep.
-    let mut connection =
-        PgConnection::connect(config.rust_write_database.as_ref().unwrap().url()).await?;
-    sqlx::query("UPDATE rustodon.rate_limit_windows SET expires_at = clock_timestamp() - INTERVAL '1 second' WHERE window_key LIKE 'browser_reauthentication:%'").execute(&mut connection).await?;
+    assert_eq!(
+        response.status,
+        StatusCode::TOO_MANY_REQUESTS.as_u16(),
+        "IP budget: challenge 26 must be blocked across users and instances"
+    );
+    assert!(response.headers.contains_key("retry-after"));
+    assert_eq!(
+        password_verification_count(),
+        before,
+        "IP-limited request reached bcrypt"
+    );
+    // Expire exactly this fixture's exhausted IP window, without changing buckets.
+    let expired = sqlx::query(
+        "UPDATE rustodon.rate_limit_windows \
+         SET expires_at = to_timestamp($2::double precision) WHERE window_key = $1",
+    )
+    .bind(IP_BUDGET_KEY)
+    .bind(FIXTURE_REAUTH_TIME - 1)
+    .execute(&mut connection)
+    .await?;
+    assert_eq!(expired.rows_affected(), 1);
     let response = challenge(
         &targets[0],
         &account,

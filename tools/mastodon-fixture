@@ -1156,6 +1156,12 @@ EOF
   RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
     cargo test --locked --lib web::tests::shared_rate_limiter_coordinates_independent_pools \
       -- --ignored --exact --nocapture
+  require_ignored_tests exact --features test-support --lib \
+    web::tests::shared_rate_limiter_fixed_clock_preserves_epoch_boundaries
+  RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
+    cargo test --locked --features test-support --lib \
+      web::tests::shared_rate_limiter_fixed_clock_preserves_epoch_boundaries \
+      -- --ignored --exact --nocapture
   RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
     cargo test --locked --lib remote::tests::remote_domain_budget_coordinates_independent_pools_and_reclaims_expired_leases \
       -- --ignored --exact --nocapture
