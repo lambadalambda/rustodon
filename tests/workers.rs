@@ -476,142 +476,241 @@ async fn worker_reclaims_job_after_database_failure_before_acknowledgement()
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
+async fn retrying_smtp_fixture_rejects_eof_during_data() -> Result<(), Box<dyn std::error::Error>> {
+    use futures_util::FutureExt;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let mut server = tokio::task::JoinSet::new();
+    server.spawn(fixture_retrying_smtp_server(listener));
+    // The pre-fix DATA loop can spin without yielding: run the red snapshot
+    // under a process watchdog, not just this cooperative Tokio deadline.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        std::panic::AssertUnwindSafe(async {
+            let socket = tokio::net::TcpStream::connect(address).await?;
+            let mut client = BufReader::new(socket);
+            let mut line = String::new();
+            client.read_line(&mut line).await?;
+            assert!(line.starts_with("220 "), "{line:?}");
+            for (command, replies) in [
+                ("EHLO client.invalid\r\n", &["250-", "250-", "250 "][..]),
+                ("MAIL FROM:<from@example.invalid>\r\n", &["250 "][..]),
+                ("RCPT TO:<to@example.invalid>\r\n", &["250 "][..]),
+                ("DATA\r\n", &["354 "][..]),
+            ] {
+                client.get_mut().write_all(command.as_bytes()).await?;
+                for prefix in replies {
+                    line.clear();
+                    client.read_line(&mut line).await?;
+                    assert!(line.starts_with(prefix), "{line:?}");
+                }
+            }
+            client
+                .get_mut()
+                .write_all(b"Subject: interrupted\r\n\r\npartial DATA")
+                .await?;
+            client.get_mut().shutdown().await?;
+            let error = server.join_next().await.unwrap()?.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })
+        .catch_unwind(),
+    )
+    .await;
+    server.abort_all();
+    while server.join_next().await.is_some() {}
+    match outcome {
+        Ok(Ok(result)) => result,
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
 #[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
 #[allow(clippy::too_many_lines)]
 async fn smtp_acceptance_before_job_ack_is_retried_with_the_same_message_id()
 -> Result<(), Box<dyn std::error::Error>> {
-    let url = std::env::var("RUSTODON_WORKER_DATABASE_URL")?;
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect(&url)
-        .await?;
-    reset().await?;
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-    let first_accepted = Arc::new(Notify::new());
-    let server = tokio::spawn(fixture_retrying_smtp_server(
-        listener,
-        Arc::clone(&first_accepted),
-    ));
-    let mail = worker_mail_config(port, "smtp-first.invalid");
-    let queue = Queue::new(pool.clone()).with_complete_fault();
-    let current_job = mail.password_reset_job("person@example.invalid", "sealed-reset-token")?;
-    let mut legacy_arguments = current_job.arguments().clone();
-    legacy_arguments
-        .as_object_mut()
-        .unwrap()
-        .remove("message_id_local");
-    legacy_arguments
-        .as_object_mut()
-        .unwrap()
-        .remove("message_id_domain");
-    let first_job = JobSpec::new(Lane::Mail, current_job.kind(), legacy_arguments)
-        .logical_key(current_job.logical_key_value().unwrap());
-    let job_id = queue.enqueue(&first_job).await?;
-    let handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
-        &queue,
-        None,
-        mail.runtime()?,
-        None,
-    )?;
-    let executor = WorkerExecutor::new(queue, handlers, 1, 1)?;
-    let first_attempt = tokio::spawn(async move {
-        executor
-            .process_one(
-                "smtp-before-ack",
-                &[Lane::Mail],
-                Duration::milliseconds(100),
-            )
-            .await
-    });
-    first_accepted.notified().await;
-    assert!(matches!(
-        first_attempt.await?,
-        Err(WorkerError::Jobs(JobError::InvalidData(
-            "injected durable-job completion failure"
-        )))
-    ));
-    let persisted_arguments: Value =
-        sqlx::query_scalar("SELECT arguments FROM rustodon.durable_jobs WHERE id = $1")
-            .bind(job_id)
-            .fetch_one(&pool)
-            .await?;
-    let expected = format!(
-        "Message-ID: <{}@{}>",
-        persisted_arguments["message_id_local"].as_str().unwrap(),
-        persisted_arguments["message_id_domain"].as_str().unwrap()
-    );
-    assert_eq!(persisted_arguments["message_id_domain"], "example.invalid");
+    use futures_util::FutureExt;
 
-    tokio::time::sleep(std::time::Duration::from_millis(125)).await;
-    let recovery_pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect(&url)
-        .await?;
-    let recovery_queue = Queue::new(recovery_pool.clone());
-    let changed_smtp_mail = worker_mail_config(port, "smtp-changed.invalid");
-    let recovery_handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
-        &recovery_queue,
-        None,
-        changed_smtp_mail.runtime()?,
-        None,
-    )?;
-    let recovery = WorkerExecutor::new(recovery_queue.clone(), recovery_handlers, 1, 1)?;
-    assert!(
-        recovery
-            .process_one("smtp-recovery", &[Lane::Mail], Duration::seconds(1))
-            .await?,
-        "the accepted but unacknowledged message must be retried"
-    );
-    let distinct_job = mail.confirmation_job("person@example.invalid", "another-sealed-token")?;
-    let distinct_message_id = format!(
-        "Message-ID: <{}@{}>",
-        distinct_job.arguments()["message_id_local"]
-            .as_str()
-            .unwrap(),
-        distinct_job.arguments()["message_id_domain"]
-            .as_str()
-            .unwrap()
-    );
-    recovery_queue.enqueue(&distinct_job).await?;
-    assert!(
-        recovery
-            .process_one("smtp-distinct", &[Lane::Mail], Duration::seconds(1))
-            .await?
-    );
-    assert!(
-        recovery_queue
-            .claim("smtp-idle", &[Lane::Mail], Duration::seconds(1))
-            .await?
-            .is_none()
-    );
+    let mut server = tokio::task::JoinSet::new();
+    // Bound setup, all processing phases, durable acknowledgement checks, and
+    // server completion together, below the live lease duration.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        std::panic::AssertUnwindSafe(async {
+            let url = std::env::var("RUSTODON_WORKER_DATABASE_URL")?;
+            let pool = PgPoolOptions::new()
+                .max_connections(8)
+                .connect(&url)
+                .await?;
+            reset().await?;
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let port = listener.local_addr()?.port();
+            server.spawn(fixture_retrying_smtp_server(listener));
+            let mail = worker_mail_config(port, "smtp-first.invalid");
+            let queue = Queue::new(pool.clone()).with_complete_fault();
+            let current_job =
+                mail.password_reset_job("person@example.invalid", "sealed-reset-token")?;
+            let mut legacy_arguments = current_job.arguments().clone();
+            legacy_arguments
+                .as_object_mut()
+                .unwrap()
+                .remove("message_id_local");
+            legacy_arguments
+                .as_object_mut()
+                .unwrap()
+                .remove("message_id_domain");
+            let first_job = JobSpec::new(Lane::Mail, current_job.kind(), legacy_arguments)
+                .logical_key(current_job.logical_key_value().unwrap());
+            let job_id = queue.enqueue(&first_job).await?;
+            let handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
+                &queue,
+                None,
+                mail.runtime()?,
+                None,
+            )?;
+            let executor = WorkerExecutor::new(queue, handlers, 1, 1)?;
+            // Legacy jobs must persist their generated identity under a live lease
+            // before SMTP. Observe completion directly; a separate acceptance Notify
+            // can wait forever when processing fails before reaching the server.
+            assert!(matches!(
+                executor
+                    .process_one("smtp-before-ack", &[Lane::Mail], Duration::seconds(30))
+                    .await,
+                Err(WorkerError::Jobs(JobError::InvalidData(
+                    "injected durable-job completion failure"
+                )))
+            ));
+            let persisted_arguments: Value =
+                sqlx::query_scalar("SELECT arguments FROM rustodon.durable_jobs WHERE id = $1")
+                    .bind(job_id)
+                    .fetch_one(&pool)
+                    .await?;
+            let expected = format!(
+                "Message-ID: <{}@{}>",
+                persisted_arguments["message_id_local"].as_str().unwrap(),
+                persisted_arguments["message_id_domain"].as_str().unwrap()
+            );
+            assert_eq!(persisted_arguments["message_id_domain"], "example.invalid");
 
-    let messages = server.await??;
-    assert_eq!(messages.len(), 3);
-    for message in &messages[..2] {
-        let message = String::from_utf8_lossy(message);
-        assert!(message.contains(&expected), "{message:?}");
-        assert!(!message.contains("worker-mail-secret"), "{message:?}");
-        assert!(!message.contains("smtp-first.invalid"), "{message:?}");
-        assert!(!message.contains("smtp-changed.invalid"), "{message:?}");
-        assert!(
-            !message.contains(&format!("rustodon-mail-{job_id}@")),
-            "{message:?}"
-        );
+            // Simulate the crashed worker's lease expiry only after the injected
+            // completion failure, without racing identity persistence or sleeping.
+            assert_eq!(
+                sqlx::query(
+                    "UPDATE rustodon.durable_jobs \
+                     SET lease_expires_at = clock_timestamp() - interval '1 second' \
+                     WHERE id = $1 AND lease_owner = 'smtp-before-ack'",
+                )
+                .bind(job_id)
+                .execute(&pool)
+                .await?
+                .rows_affected(),
+                1
+            );
+            let recovery_pool = PgPoolOptions::new()
+                .max_connections(8)
+                .connect(&url)
+                .await?;
+            let recovery_queue = Queue::new(recovery_pool.clone());
+            let changed_smtp_mail = worker_mail_config(port, "smtp-changed.invalid");
+            let recovery_handlers = infrastructure_handlers_with_writer_and_mail_and_federation(
+                &recovery_queue,
+                None,
+                changed_smtp_mail.runtime()?,
+                None,
+            )?;
+            let recovery = WorkerExecutor::new(recovery_queue.clone(), recovery_handlers, 1, 1)?;
+            assert!(
+                recovery
+                    .process_one("smtp-recovery", &[Lane::Mail], Duration::seconds(30))
+                    .await?,
+                "the accepted but unacknowledged message must be retried"
+            );
+            assert!(
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT NOT EXISTS (SELECT 1 FROM rustodon.durable_jobs WHERE id = $1)",
+                )
+                .bind(job_id)
+                .fetch_one(&recovery_pool)
+                .await?,
+                "recovery must durably acknowledge the replayed job"
+            );
+            let distinct_job =
+                mail.confirmation_job("person@example.invalid", "another-sealed-token")?;
+            let distinct_message_id = format!(
+                "Message-ID: <{}@{}>",
+                distinct_job.arguments()["message_id_local"]
+                    .as_str()
+                    .unwrap(),
+                distinct_job.arguments()["message_id_domain"]
+                    .as_str()
+                    .unwrap()
+            );
+            let distinct_job_id = recovery_queue.enqueue(&distinct_job).await?;
+            assert!(
+                recovery
+                    .process_one("smtp-distinct", &[Lane::Mail], Duration::seconds(30))
+                    .await?
+            );
+            assert!(
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT NOT EXISTS (SELECT 1 FROM rustodon.durable_jobs WHERE id = $1)",
+                )
+                .bind(distinct_job_id)
+                .fetch_one(&recovery_pool)
+                .await?,
+                "the distinct message must also be durably acknowledged"
+            );
+            assert!(
+                recovery_queue
+                    .claim("smtp-idle", &[Lane::Mail], Duration::seconds(1))
+                    .await?
+                    .is_none()
+            );
+
+            let messages = server.join_next().await.unwrap()??;
+            assert_eq!(messages.len(), 3);
+            for message in &messages[..2] {
+                let message = String::from_utf8_lossy(message);
+                assert!(message.contains(&expected), "{message:?}");
+                assert!(!message.contains("worker-mail-secret"), "{message:?}");
+                assert!(!message.contains("smtp-first.invalid"), "{message:?}");
+                assert!(!message.contains("smtp-changed.invalid"), "{message:?}");
+                assert!(
+                    !message.contains(&format!("rustodon-mail-{job_id}@")),
+                    "{message:?}"
+                );
+            }
+            assert_eq!(
+                message_id_header(&messages[0]),
+                message_id_header(&messages[1]),
+                "an SMTP duplicate of one durable job must retain its identity"
+            );
+            assert_eq!(message_id_header(&messages[2]), Some(distinct_message_id));
+            assert_ne!(
+                message_id_header(&messages[0]),
+                message_id_header(&messages[2]),
+                "distinct durable messages must have distinct identities"
+            );
+            reset().await?;
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })
+        .catch_unwind(),
+    )
+    .await;
+    // The processing futures are owned by the bounded scenario, not detached
+    // worker tasks. Always abort and reap any remaining fixture task, including
+    // on assertion panic, before returning the failure.
+    server.abort_all();
+    while server.join_next().await.is_some() {}
+    match outcome {
+        Ok(Ok(result)) => result,
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(error) => Err(error.into()),
     }
-    assert_eq!(
-        message_id_header(&messages[0]),
-        message_id_header(&messages[1]),
-        "an SMTP duplicate of one durable job must retain its identity"
-    );
-    assert_eq!(message_id_header(&messages[2]), Some(distinct_message_id));
-    assert_ne!(
-        message_id_header(&messages[0]),
-        message_id_header(&messages[2]),
-        "distinct durable messages must have distinct identities"
-    );
-    reset().await?;
-    Ok(())
 }
 
 #[tokio::test]
@@ -17376,10 +17475,9 @@ async fn fixture_delivery_request(
 
 async fn fixture_retrying_smtp_server(
     listener: TcpListener,
-    first_accepted: Arc<Notify>,
 ) -> Result<Vec<Vec<u8>>, std::io::Error> {
     let mut messages = Vec::with_capacity(3);
-    for attempt in 0..3 {
+    for _ in 0..3 {
         let (socket, _) = listener.accept().await?;
         let mut reader = BufReader::new(socket);
         reader
@@ -17428,16 +17526,18 @@ async fn fixture_retrying_smtp_server(
         let mut message = Vec::new();
         loop {
             line.clear();
-            reader.read_line(&mut line).await?;
+            if reader.read_line(&mut line).await? == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "SMTP fixture connection closed before DATA terminator",
+                ));
+            }
             if line == ".\r\n" {
                 break;
             }
             message.extend_from_slice(line.as_bytes());
         }
         reader.get_mut().write_all(b"250 2.0.0 queued\r\n").await?;
-        if attempt == 0 {
-            first_accepted.notify_one();
-        }
         messages.push(message);
     }
     Ok(messages)
