@@ -28,4 +28,3 @@
 - [ ] [Port mixed profile-media preservation matrix](issues/port-mixed-profile-media-matrix.md)
 - [ ] [Exercise delayed browser settings save and reload](issues/exercise-browser-delayed-settings-save.md)
 - [ ] [Diagnose private boost Undo returning HTTP 500](issues/diagnose-private-boost-undo-http-500.md)
-- [ ] [Align OAuth metadata with supported response modes](issues/align-oauth-metadata-response-modes.md)

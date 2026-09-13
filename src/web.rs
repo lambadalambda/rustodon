@@ -9335,7 +9335,7 @@ async fn oauth_metadata(State(state): State<WebState>) -> Response<Body> {
         "revocation_endpoint": revocation_endpoint,
         "scopes_supported": OAUTH_CONFIGURED_SCOPES,
         "response_types_supported": ["code"],
-        "response_modes_supported": ["query"],
+        "response_modes_supported": ["query", "fragment", "form_post"],
         "grant_types_supported": ["authorization_code", "client_credentials"],
         "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
         "code_challenge_methods_supported": ["S256"],
@@ -9382,6 +9382,35 @@ async fn oauth_revoke(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OAuthResponseMode {
+    Query,
+    Fragment,
+    FormPost,
+}
+
+impl OAuthResponseMode {
+    fn parse(value: Option<&str>) -> Option<Self> {
+        match value
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("query")
+        {
+            "query" => Some(Self::Query),
+            "fragment" => Some(Self::Fragment),
+            "form_post" => Some(Self::FormPost),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::Fragment => "fragment",
+            Self::FormPost => "form_post",
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn oauth_authorize(
     State(state): State<WebState>,
@@ -9389,13 +9418,14 @@ async fn oauth_authorize(
     Extension(parameters): Extension<RackParameters>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    // Reject before login/consent redirects, on both entry and form submission.
-    if !matches!(
-        oauth_scalar(&parameters, "response_mode"),
-        Ok(None | Some("query"))
-    ) {
+    // Fail closed before login/consent for malformed or unknown modes; blank
+    // scalar modes use the authorization-code flow's query default.
+    let Ok(mode) = oauth_scalar(&parameters, "response_mode") else {
         return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_request");
-    }
+    };
+    let Some(response_mode) = OAuthResponseMode::parse(mode) else {
+        return oauth_authorize_error(StatusCode::BAD_REQUEST, "unsupported_response_mode");
+    };
     let Some(session_id) = request_cookie(&headers, BROWSER_SESSION_COOKIE) else {
         return oauth_authorize_sign_in_redirect(&parameters);
     };
@@ -9430,6 +9460,22 @@ async fn oauth_authorize(
     {
         return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_request");
     }
+    let Ok(redirect) = Url::parse(redirect_uri) else {
+        return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    // Registration and session checks have passed. Refuse unsupported transport
+    // combinations before consent, denial or any grant/code mutation.
+    if response_mode == OAuthResponseMode::FormPost
+        && !matches!(redirect.scheme(), "http" | "https")
+    {
+        return browser_json_response(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({
+                "error": "unsupported_response_mode",
+                "error_description": "form_post requires an HTTP(S) redirect_uri."
+            }),
+        );
+    }
     if method == Method::GET {
         let (csrf_token, csrf_cookie) = browser_page_csrf(
             &headers,
@@ -9440,6 +9486,7 @@ async fn oauth_authorize(
             &application.name,
             client_id,
             redirect_uri,
+            response_mode,
             oauth_scalar(&parameters, "scope")
                 .ok()
                 .flatten()
@@ -9473,8 +9520,9 @@ async fn oauth_authorize(
         .or_else(|| oauth_scalar(&parameters, "commit").ok().flatten())
         .is_some_and(|value| matches!(value, "1" | "true" | "Authorize" | "authorize"));
     if !approved {
-        return oauth_authorize_redirect(
-            redirect_uri,
+        return oauth_authorize_response(
+            &redirect,
+            response_mode,
             state_value,
             Some("access_denied"),
             Some("The resource owner or authorization server denied the request."),
@@ -9484,16 +9532,20 @@ async fn oauth_authorize(
     let Some(writer) = state.write_repository.as_ref() else {
         return internal_error();
     };
+    let (Ok(code_challenge), Ok(code_challenge_method)) = (
+        oauth_scalar(&parameters, "code_challenge"),
+        oauth_scalar(&parameters, "code_challenge_method"),
+    ) else {
+        return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
     let grant = match writer
         .create_oauth_authorization_grant(
             client_id,
             session.user_id,
             redirect_uri,
             oauth_scalar(&parameters, "scope").ok().flatten(),
-            oauth_scalar(&parameters, "code_challenge").ok().flatten(),
-            oauth_scalar(&parameters, "code_challenge_method")
-                .ok()
-                .flatten(),
+            code_challenge,
+            code_challenge_method,
         )
         .await
     {
@@ -9501,12 +9553,34 @@ async fn oauth_authorize(
         Err(OAuthAuthorizationGrantError::InvalidClient) => {
             return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_client");
         }
+        Err(OAuthAuthorizationGrantError::InvalidCodeChallenge)
+            if code_challenge.is_some_and(|value| !value.trim().is_empty())
+                && code_challenge_method != Some("S256") =>
+        {
+            // The repository has rejected issuance. Distinguish the pinned
+            // method error without weakening its required/syntax PKCE checks.
+            return oauth_authorize_response(
+                &redirect,
+                response_mode,
+                state_value,
+                Some("invalid_code_challenge_method"),
+                Some("The code_challenge_method must be S256."),
+                None,
+            );
+        }
         Err(
             OAuthAuthorizationGrantError::InvalidRedirectUri
             | OAuthAuthorizationGrantError::InvalidCodeChallenge,
         ) => return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_request"),
         Err(OAuthAuthorizationGrantError::InvalidScope) => {
-            return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_scope");
+            return oauth_authorize_response(
+                &redirect,
+                response_mode,
+                state_value,
+                Some("invalid_scope"),
+                Some("The requested scope is invalid, unknown, or malformed."),
+                None,
+            );
         }
         Err(OAuthAuthorizationGrantError::Database(_)) => return internal_error(),
     };
@@ -9517,7 +9591,14 @@ async fn oauth_authorize(
         );
         return html_response(StatusCode::OK, html);
     }
-    oauth_authorize_redirect(redirect_uri, state_value, None, None, Some(&grant.code))
+    oauth_authorize_response(
+        &redirect,
+        response_mode,
+        state_value,
+        None,
+        None,
+        Some(&grant.code),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9525,37 +9606,31 @@ fn oauth_consent_response(
     application_name: &str,
     client_id: &str,
     redirect_uri: &str,
+    response_mode: OAuthResponseMode,
     scope: &str,
     state: Option<&str>,
     code_challenge: Option<&str>,
     code_challenge_method: Option<&str>,
     csrf_token: Option<&str>,
 ) -> Response<Body> {
-    let hidden = |name: &str, value: &str| {
-        format!(
-            "<input type=\"hidden\" name=\"{}\" value=\"{}\">",
-            html_escape::encode_quoted_attribute(name),
-            html_escape::encode_quoted_attribute(value)
-        )
-    };
     let mut fields = String::new();
     for (name, value) in [("client_id", client_id), ("redirect_uri", redirect_uri)] {
-        fields.push_str(&hidden(name, value));
+        fields.push_str(&oauth_hidden_field(name, value));
     }
-    fields.push_str(&hidden("response_type", "code"));
-    fields.push_str(&hidden("response_mode", "query"));
-    fields.push_str(&hidden("scope", scope));
+    fields.push_str(&oauth_hidden_field("response_type", "code"));
+    fields.push_str(&oauth_hidden_field("response_mode", response_mode.as_str()));
+    fields.push_str(&oauth_hidden_field("scope", scope));
     if let Some(state) = state {
-        fields.push_str(&hidden("state", state));
+        fields.push_str(&oauth_hidden_field("state", state));
     }
     if let Some(challenge) = code_challenge {
-        fields.push_str(&hidden("code_challenge", challenge));
+        fields.push_str(&oauth_hidden_field("code_challenge", challenge));
     }
     if let Some(method) = code_challenge_method {
-        fields.push_str(&hidden("code_challenge_method", method));
+        fields.push_str(&oauth_hidden_field("code_challenge_method", method));
     }
     if let Some(csrf_token) = csrf_token {
-        fields.push_str(&hidden("csrf_token", csrf_token));
+        fields.push_str(&oauth_hidden_field("csrf_token", csrf_token));
     }
     html_response(
         StatusCode::OK,
@@ -9572,32 +9647,84 @@ fn oauth_authorize_error(status: StatusCode, error: &str) -> Response<Body> {
     browser_json_response(status, &serde_json::json!({ "error": error }))
 }
 
-fn oauth_authorize_redirect(
-    redirect_uri: &str,
+fn oauth_hidden_field(name: &str, value: &str) -> String {
+    format!(
+        "<input type=\"hidden\" name=\"{}\" value=\"{}\">",
+        html_escape::encode_quoted_attribute(name),
+        html_escape::encode_quoted_attribute(value)
+    )
+}
+
+// The caller must validate registration and mode/transport before grant issuance.
+fn oauth_authorize_response(
+    redirect: &Url,
+    response_mode: OAuthResponseMode,
     state: Option<&str>,
     error: Option<&str>,
     error_description: Option<&str>,
     code: Option<&str>,
 ) -> Response<Body> {
-    let Ok(mut redirect) = Url::parse(redirect_uri) else {
-        return oauth_authorize_error(StatusCode::BAD_REQUEST, "invalid_request");
-    };
-    {
-        let mut query = redirect.query_pairs_mut();
-        if let Some(code) = code {
-            query.append_pair("code", code);
-        }
-        if let Some(error) = error {
-            query.append_pair("error", error);
-        }
-        if let Some(error_description) = error_description {
-            query.append_pair("error_description", error_description);
-        }
-        if let Some(state) = state {
-            query.append_pair("state", state);
+    // Match pinned blank-state handling: only a successful form-post retains
+    // empty/whitespace state. Do not trim nonblank opaque state values.
+    let state = state.filter(|value| {
+        (response_mode == OAuthResponseMode::FormPost && error.is_none())
+            || !value.trim().is_empty()
+    });
+    let fields = [
+        ("code", code),
+        ("error", error),
+        ("error_description", error_description),
+        ("state", state),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| value.map(|value| (name, value)))
+    .collect::<Vec<_>>();
+    match response_mode {
+        OAuthResponseMode::FormPost => oauth_form_post_response(redirect, &fields),
+        OAuthResponseMode::Query | OAuthResponseMode::Fragment => {
+            let mut redirect = redirect.clone();
+            if response_mode == OAuthResponseMode::Query {
+                redirect.query_pairs_mut().extend_pairs(fields);
+            } else {
+                let fragment = url::form_urlencoded::Serializer::new(String::new())
+                    .extend_pairs(fields)
+                    .finish();
+                redirect.set_fragment(Some(&fragment));
+            }
+            browser_redirect_response(redirect.as_str())
         }
     }
-    browser_redirect_response(redirect.as_str())
+}
+
+fn oauth_form_post_response(redirect: &Url, fields: &[(&str, &str)]) -> Response<Body> {
+    const SCRIPT: &str = "document.forms[0].submit();";
+    let fields = fields
+        .iter()
+        .map(|(name, value)| oauth_hidden_field(name, value))
+        .collect::<String>();
+    let html = format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>Authorization response</title><form method=\"post\" action=\"{}\">{}<noscript><button type=\"submit\">Continue</button></noscript></form><script>{SCRIPT}</script>",
+        html_escape::encode_quoted_attribute(redirect.as_str()),
+        fields
+    );
+    // Only the static auto-submit script is executable. The validated callback
+    // origin is allowed only on this response, never on login/consent pages.
+    let policy = format!(
+        "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action {}; script-src 'sha256-{}'",
+        redirect.origin().ascii_serialization(),
+        STANDARD.encode(Sha256::digest(SCRIPT.as_bytes()))
+    );
+    let Ok(policy) = HeaderValue::from_str(&policy) else {
+        return internal_error();
+    };
+    let mut response = html_response(StatusCode::OK, html);
+    response
+        .headers_mut()
+        .insert("content-security-policy", policy);
+    response
+        .headers_mut()
+        .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    response
 }
 
 fn html_response(status: StatusCode, body: String) -> Response<Body> {

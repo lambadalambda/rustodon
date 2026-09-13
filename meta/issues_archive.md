@@ -75,3 +75,4 @@
 - [x] [Assert remote semantic no-op edit-history behavior](issues/assert-remote-noop-edit-history-stability.md)
 - [x] [Separate worker live-lease assertions from forced expiry](issues/stabilize-worker-live-lease-tests.md)
 - [x] [Port failed parent-fetch recovery and distribution matrix](issues/port-parent-fetch-recovery-matrix.md)
+- [x] [Align OAuth metadata with supported response modes](issues/align-oauth-metadata-response-modes.md)
