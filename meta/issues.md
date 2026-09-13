@@ -23,4 +23,3 @@
 - [ ] [Diagnose missing posts from followed lain.com account](issues/diagnose-missing-followed-lain-com-posts.md)
 - [ ] [Diagnose missing remote animated media](issues/diagnose-missing-remote-animated-media.md)
 - [ ] [Support frontend web settings API](issues/support-frontend-web-settings-api.md)
-- [ ] [Implement the test audit action plan](issues/implement-test-audit-plan.md)

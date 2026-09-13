@@ -184,9 +184,10 @@ Logs below are beneath `/srv/workspaces/rustodon-audit-green/logs/`:
 
 - `final17-schema-*.log`: all12 independent selectors pass (including batch
   accounts); these precede the final test-only budget-clock/cleanup seams.
-- `final18-{default,feature,release,clippy,harnesses}.log`: combined-tree ordinary
-  default/debug-all-feature/release-all-feature tests, strict lint, offline checks.
-  `final19` additionally checks formatting. Ignored tests are not inferred.
+- `final23-{default,feature,release}.log`: final combined-tree ordinary default,
+  debug-all-feature and release-all-feature tests pass. `final24-{fmt,clippy,static,
+  media,harness,deny}.log`: formatting, strict lint, static/vendored assets, offline
+  checks and dependency policy pass. Ignored tests are not inferred from these.
 - `final18-operational.log`: complete operational/Rails gate, including actual
   asynchronous domain-lease cleanup and the fixed-clock regression.
 - `startup-retry.log`: all5 startup cases pass. `final18-preflight.log`: canonical
@@ -200,16 +201,27 @@ Logs below are beneath `/srv/workspaces/rustodon-audit-green/logs/`:
   cutover independently passes. Intermediate HTTP CSRF422, Puma readiness, exact
   settings rollback and pending-leading-response failures remain recorded; no
   blanket TLS bypass, removed equality guard, or widened browser deadline.
-- The latest worker rerun exposed fixture coordination failures after the earlier
-  100/100 pass; [the focused follow-up](../meta/issues/stabilize-worker-executor-coordination-tests.md)
-  remains open pending a restored combined worker result.
+- `final23-worker.log`: **100/100** plus the unchanged CLI readiness/shutdown
+  gate passes in the final combined tree, after the six test-only coordination,
+  retry and readiness corrections. The named focused runs and deterministic
+  counter RED/GREEN are retained in the [coordination](../meta/issues/stabilize-worker-executor-coordination-tests.md)
+  and [retry/readiness](../meta/issues/stabilize-worker-retry-and-readiness-tests.md)
+  issues. Earlier failed runs are not erased or counted as successes.
 
-This is not a full `mise run check`, full differential, hosted-CI, Pleroma, or
-read-only source-contract execution claim. Earlier five-peer results retain their
-source/evidence boundary above.
+Schema/startup/differential/browser evidence precedes the final worker-test-only
+edits; no production code changed in those worker commits. A final equivalent
+`120 seconds` → `2 minutes` lint spelling follows the final23 runtime evidence.
+All ordinary `check` components have individual passing results; Mise itself was
+not invoked as one aggregate command. Full differential, hosted-CI, Pleroma and
+read-only source-contract execution remain unclaimed. Earlier five-peer results
+retain their source/evidence boundary above. Final resource inspection found only
+unrelated compose services: no running task fixture containers, browser TLS key
+directories or task API sockets remained. No live deployment or replay occurred.
 
-Dependency-policy execution note: the currently provisioned NAS browser/tooling
-image does not include `cargo-deny`. The new Markdown dependency resolves under
-the committed lockfile and compiles/tests on NAS, but a fresh dependency-policy
-run is not claimed from those checks. The configured CI policy lane remains
-separate; no host-wide tool installation or policy bypass was performed.
+Dependency policy now passes too: the parent installed the repo-pinned
+`cargo-deny 0.20.2` with `cargo install --locked` into the task-owned
+`/srv/workspaces/rustodon-audit-green/ops/cargo-deny` directory, using a separate
+build target inside the existing bounded tooling container. `cargo-deny-install.log`
+records provisioning; `final-deny.log` reports **advisories, bans, licenses and
+sources all OK** against the committed project lockfile. The tooling image itself
+was not changed; no host-wide installation, policy exception or bypass was added.

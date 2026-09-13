@@ -100,3 +100,36 @@ fixture tests before its aggregate watchdog despite earlier100/100 success;
 that latest failure is not hidden by the earlier pass. Full-source checkout,
 Pleroma exact-image, dependency-policy and hosted/full-differential execution
 remain separately blocked or unclaimed, not inferred from other gates.
+
+The four executor/media tests now pass focused and in the completed final21
+matrix; two additional [retry/readiness fixture regressions](stabilize-worker-retry-and-readiness-tests.md)
+were isolated there (98/100). They remain under focused validation before final
+closure. Dependency policy is no longer blocked: task-local pinned cargo-deny
+0.20.2 reports advisories/bans/licenses/sources all OK (`final-deny.log`), without
+policy exceptions or host-wide installation.
+
+## Completion
+
+All implementation/port subissues and the approved ordering/history follow-ups
+are satisfied and archived. The last two worker follow-ups are now verified:
+`final23-worker.log` passes **100/100** plus the unchanged runner's CLI readiness
+and graceful-shutdown checks. Final23 default/all-feature/release tests pass;
+final24 formatting, strict Clippy, static fixture/vendored media, offline harnesses
+and dependency policy all pass. Only an equivalent duration spelling changed
+after runtime validation to satisfy Clippy.
+
+The schema12, operational/Rails, startup5, preflight, required differential10,
+authenticated browser/complete cutover, and five real Mastodon peer outcomes are
+recorded with their exact source boundaries in `docs/testing-on-nas.md`. Worker
+stabilization changes only tests; earlier gate evidence is not presented as a
+fresh execution of every lane on the final commit. Intermediate failures remain
+recorded, including the browser's unchanged leading-response deadline.
+
+The umbrella's "green evidence or explicitly documented blockers" criterion is
+satisfied. The authorized read-only full-source checkout lane and Pleroma exact
+image prerequisites remain separately blocked; full-differential and hosted-CI
+execution remain configured/unclaimed. They are not silently inferred or closed
+under broader release/federation backlog issues. Cargo-deny is now verified,
+not blocked. Unrelated backlog, deployment, replay and live services are untouched.
+Final inspection found no running task fixture containers, TLS key directories
+or task API sockets; unrelated compose services were preserved.
