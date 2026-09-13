@@ -17983,3 +17983,7 @@ async fn private_announce_local_audience(worker: bool) -> Result<(), Box<dyn std
 mod direct_visibility;
 #[path = "workers/semantic_updates.rs"]
 mod semantic_updates;
+
+#[cfg(feature = "test-support")]
+#[path = "workers/parent_fetch_recovery.rs"]
+mod parent_fetch_recovery;
