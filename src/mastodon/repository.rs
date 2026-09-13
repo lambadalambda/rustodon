@@ -758,6 +758,21 @@ impl Repository {
         }
     }
 
+    // AccountsController#index uses without_unapproved, not searchable: suspended
+    // and moved accounts are still eligible, but local accounts need an approved,
+    // confirmed user. Filter the whole batch before loading serializer projections.
+    pub(crate) async fn rest_batch_account_ids(&self, ids: &[i64]) -> sqlx::Result<Vec<i64>> {
+        sqlx::query_scalar(
+            "SELECT account.id FROM accounts account \
+             LEFT JOIN users account_user ON account_user.account_id = account.id \
+             WHERE account.id = ANY($1) AND (account.domain IS NOT NULL OR \
+               (account_user.approved = true AND account_user.confirmed_at IS NOT NULL))",
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await
+    }
+
     pub(crate) async fn rest_account_showable(&self, account_id: i64) -> sqlx::Result<bool> {
         sqlx::query_scalar(
             "SELECT CASE WHEN account.domain IS NULL THEN EXISTS ( \

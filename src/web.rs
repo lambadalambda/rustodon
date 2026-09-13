@@ -1754,6 +1754,13 @@ pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
         Private
     ),
     route!(
+        "/api/v1/accounts",
+        Implemented,
+        ApiAuthentication::Optional(READ_ACCOUNTS.as_slice()),
+        None,
+        Private
+    ),
+    route!(
         "/api/v1/accounts/{id}",
         Implemented,
         ApiAuthentication::Optional(READ_ACCOUNTS.as_slice()),
@@ -3594,6 +3601,7 @@ pub fn router(state: WebState) -> Router {
         )
         .route("/api/v1/profile/avatar", delete(delete_profile_avatar))
         .route("/api/v1/profile/header", delete(delete_profile_header))
+        .route("/api/v1/accounts", get(accounts_index))
         .route("/api/v1/accounts/{id}", get(account_show))
         .route("/api/v1/collections/{id}", get(collection_show))
         .route("/api/v1/accounts/{id}/statuses", get(account_statuses))
@@ -3821,6 +3829,7 @@ pub fn router(state: WebState) -> Router {
         )
         .route("/api/v1/profile/avatar/", delete(delete_profile_avatar))
         .route("/api/v1/profile/header/", delete(delete_profile_header))
+        .route("/api/v1/accounts/", get(accounts_index))
         .route("/api/v1/accounts/{id}/", get(account_show))
         .route("/api/v1/collections/{id}/", get(collection_show))
         .route("/api/v1/accounts/{id}/statuses/", get(account_statuses))
@@ -8638,6 +8647,44 @@ async fn custom_emojis(State(state): State<WebState>) -> Response<Body> {
         .iter()
         .map(|emoji| serializer.custom_emoji(emoji))
         .collect::<Vec<_>>();
+    match serde_json::to_vec(&values) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(_) => internal_error(),
+    }
+}
+
+async fn accounts_index(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let viewer = match optional_viewer(&state, &headers, READ_ACCOUNTS).await {
+        Ok(viewer) => viewer,
+        Err(response) => return response,
+    };
+    let Ok(ids) = batch_account_ids(&rack) else {
+        return framework_internal_error();
+    };
+    if ids.len() > 40 {
+        return error_response(StatusCode::UNPROCESSABLE_ENTITY, "Validation failed");
+    }
+    if ids.is_empty() {
+        return json_response(StatusCode::OK, b"[]".to_vec());
+    }
+    let Ok(ids) = state.repository.rest_batch_account_ids(&ids).await else {
+        return internal_error();
+    };
+    let Ok(accounts) = state.loader(viewer).accounts(&ids).await else {
+        return internal_error();
+    };
+    let serializer = state.serializer();
+    let Ok(values) = accounts
+        .iter()
+        .map(|account| serializer.account(account))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return internal_error();
+    };
     match serde_json::to_vec(&values) {
         Ok(body) => json_response(StatusCode::OK, body),
         Err(_) => internal_error(),
@@ -18004,6 +18051,32 @@ fn tagged_parameter(parameters: &RackParameters) -> Option<String> {
     }
 }
 
+fn batch_account_ids(parameters: &RackParameters) -> Result<Vec<i64>, ()> {
+    let Some(RackValue::Array(values)) = parameters.get("id") else {
+        return Ok(Vec::new());
+    };
+    // Strong parameters permit(id: []) discards the entire value unless it is
+    // an array of permitted scalars; do not salvage IDs from mixed nested arrays.
+    if values
+        .iter()
+        .any(|value| matches!(value, RackValue::Array(_) | RackValue::Object(_)))
+    {
+        return Ok(Vec::new());
+    }
+    let coerced = relationship_ids(parameters)?;
+    let mut seen = std::collections::HashSet::new();
+    // Count raw unique values, not unique integers. Keep JSON strings and numbers
+    // distinct too: ["1", 1] occupies two slots in Ruby's uniq before map(&:to_i).
+    Ok(values
+        .iter()
+        .zip(coerced)
+        .filter_map(|(raw, id)| {
+            seen.insert((std::mem::discriminant(raw), rack_value_display(raw)))
+                .then_some(id)
+        })
+        .collect())
+}
+
 fn relationship_ids(parameters: &RackParameters) -> Result<Vec<i64>, ()> {
     match parameters.get("id") {
         None | Some(RackValue::Null) => Ok(Vec::new()),
@@ -18699,6 +18772,9 @@ fn framework_internal_error() -> Response<Body> {
 
 #[cfg(all(test, feature = "test-support"))]
 mod account_search_tests;
+
+#[cfg(all(test, feature = "test-support"))]
+mod batch_accounts_tests;
 
 mod extended_description;
 
@@ -19670,7 +19746,7 @@ mod tests {
 
     #[test]
     fn api_route_inventory_is_unique_and_declares_protocol_contracts() {
-        assert_eq!(API_ROUTE_INVENTORY.len(), 118);
+        assert_eq!(API_ROUTE_INVENTORY.len(), 119);
         assert_eq!(REST_BODY_LIMIT_BYTES, 103_809_024);
         assert_eq!(
             API_ROUTE_INVENTORY

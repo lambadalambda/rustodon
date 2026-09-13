@@ -26,9 +26,10 @@ api_empty_reads
 web_settings
 media_proxy
 media_state
+batch_accounts
 EOF
 cmp "$work/expected" "$work/selected" || die 'default schema gate omits a required HTTP regression'
-for selector in v2_account_search api_empty_reads web_settings media_proxy media_state; do
+for selector in v2_account_search api_empty_reads web_settings media_proxy media_state batch_accounts; do
   : > "$work/selected"
   dispatch schema-read-test "$selector"
   [ "$(cat "$work/selected")" = "$selector" ] || die "wrong selector: $selector"
@@ -47,7 +48,7 @@ cargo() {
     *) [ "$cargo_mode" != run-error ] || return 9 ;;
   esac
 }
-for pair in 'v2_account_search account_search_tests' 'api_empty_reads api_empty_reads_tests' 'web_settings web_settings_tests' 'media_proxy cached_media_response_tests::cached_private_media_http_requires_status_access_even_when_files_exist'; do
+for pair in 'batch_accounts batch_accounts_tests' 'v2_account_search account_search_tests' 'api_empty_reads api_empty_reads_tests' 'web_settings web_settings_tests' 'media_proxy cached_media_response_tests::cached_private_media_http_requires_status_access_even_when_files_exist'; do
   set -- $pair
   : > "$work/cargo"
   schema_read_rust_test "$1"
