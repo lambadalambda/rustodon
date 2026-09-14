@@ -183,11 +183,6 @@ jobs:
           fi
           podman info
 
-      # Full differential media writes and cutover read pinned source assets.
-      # Fresh hosted checkout only; on NAS reuse verified existing source.
-      - name: Obtain pinned extended-lane source prerequisite
-        run: mise run fixture-obtain
-
       - name: Install pinned browser CLI and Chromium
         if: matrix.task == 'browser-integration'
         run: |
