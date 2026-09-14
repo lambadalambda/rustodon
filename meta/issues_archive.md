@@ -91,3 +91,4 @@
 - [x] [Stabilize worker executor coordination regressions](issues/stabilize-worker-executor-coordination-tests.md)
 - [x] [Stabilize worker retry and readiness regressions](issues/stabilize-worker-retry-and-readiness-tests.md)
 - [x] [Implement the test audit action plan](issues/implement-test-audit-plan.md)
+- [x] [Refresh public documentation and publish the repository](issues/refresh-public-documentation-and-publish-repository.md)
