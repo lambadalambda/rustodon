@@ -15,15 +15,20 @@ The real peer smoke found that `/api/v2/search` always returns an empty accounts
 
 - HTTP regressions cover local and cached account results, type separation, pagination, and scope failures.
 - Authenticated remote-handle resolution uses the existing safe fetch/persistence path; unauthenticated resolve cannot initiate outbound requests.
-- Applicable client and differential gates pass on Secunda and behavior limits are documented.
+- Applicable client and differential gates pass in the current owner-authorized
+  execution environment and behavior limits are documented.
 
 ## Notes
 
 - Discovered by the Mastodon peer smoke, which currently uses v1 account search instead.
-- Source confirmed in `src/web.rs::search_v2`; source implementation is now present, but execution evidence remains pending.
-- Secunda is currently unreachable. The user requested continuing without it; source changes and independent reviews may proceed, but no local builds/tests/formatting/lint/container fallback is authorized. New checks remain unexecuted until remote access returns.
+- Source confirmed in `src/web.rs::search_v2`; implementation and its named HTTP
+  regression are present and passed on the authorized NAS. Broader client and
+  differential evidence remains pending.
+- At implementation time Secunda was unreachable, so the user requested
+  continuing source work without local build/test fallback. That historical
+  verification state is superseded in part by the authorized-NAS evidence below.
 
-## Status — OPEN: source implementation, execution pending
+## Status — OPEN: named HTTP regression green; broader client/differential evidence pending
 
 - Extracted the v1 handler's account loading, domain policy, freshness check, shared
   resolution limits, instance signing, safe remote fetch and persistence into one
@@ -39,11 +44,12 @@ The real peer smoke found that `/api/v2/search` always returns an empty accounts
   falling through to the loader's unrestricted anonymous search.
 - Hashtag selection/serialization is unchanged. Status and collection search remain
   empty; this is not a full-text status-search implementation or full v2 parity claim.
-- No browser settings, `write_repository.rs`, peer tests, issue indexes, or unrelated
-  fixture infrastructure changed. The harness change only adds the named
-  `schema-read-test v2_account_search` target; the existing default suite is unchanged.
+- No browser settings, `write_repository.rs`, peer tests, issue indexes, or
+  unrelated fixture infrastructure changed. The harness exposes the named
+  `schema-read-test v2_account_search` target; the current default schema
+  aggregate also includes it among its 12 selectors.
 
-### Source-first regressions (NOT EXECUTED)
+### Initially unexecuted source-first regressions
 
 `src/web/account_search_tests.rs` was written before the production refactor. It is
 an ignored HTTP/router fixture test compiled only with `test-support`, using the
@@ -78,17 +84,15 @@ accounts for ownerless following-only requests, and the mock uses the existing
 HTTP `.onion` path with explicit loopback routing. Final review found no remaining
 substantive source-level blockers. This is not compilation or runtime evidence.
 
-### Verification limits and queued Secunda gates
+### Historical initial verification limits
 
 TDD RED/GREEN execution was infeasible because Secunda DNS was unavailable. **No new
 build, test, formatter, lint or container command has run**, locally or remotely; no
 SSH retry was attempted. The new regression has not even been compiled. Formatting
 and test assumptions require remote verification before closing this issue.
 
-When access returns, run only on `lain@secunda.local`, in
-`/home/lain/rustodon-parity/clients`, after a tracked-source sync excluding `.git`,
-`target`, `.local-instance*`, `.env*`, without `--delete`, with
-`export CARGO_BUILD_JOBS=2`:
+At that time, the queued Secunda command set (now historical, not current
+execution guidance) was:
 
 ```sh
 # Pending, not execution evidence:
@@ -100,11 +104,15 @@ sh -n tools/mastodon-fixture
 tools/mastodon-fixture schema-read-test
 ```
 
-The v1 account-search/hashtag differential cases and the real peer/client discovery
-smoke also remain pending. To record a behavioral RED, run the new regression with
-its test module/harness wiring but before the production handler refactor; the
-baseline v2 local-account assertion should fail because `accounts` is hard-coded
-empty. That is a source prediction, **not an observed test result**.
+The later required `core_rest_serializers` differential invocation covers v1
+account search and hashtag behavior and passed. It does not exercise v2 account
+results. A dedicated v2 account-result differential/client case and peer use of
+v2 discovery remain pending.
+
+The intended original behavioral RED was the named v2 regression against the
+pre-refactor handler: its local-account assertion should fail because `accounts`
+was hard-coded empty. That boundary was source-predicted at the time, not newly
+executed as a historical mutation.
 
 Pinned Mastodon source was unavailable during this follow-up: canonical read-only
 `/workspace/rustodon/target/mastodon-v4.6.5`, actual remote read-only
@@ -112,4 +120,18 @@ Pinned Mastodon source was unavailable during this follow-up: canonical read-onl
 `1440d55b139e39ec722c2a3db7f60b66cd889048`. No replacement was fetched and no fresh
 upstream/differential comparison is claimed. Fixture-owner setup/persistence will
 not itself establish production-role permissions.
+
+### Later authorized-NAS evidence
+
+The later test-audit run superseded the initial compile/runtime uncertainty:
+`tools/mastodon-fixture schema-read-test v2_account_search` passed as one of the
+12 independently bounded final schema selectors, and the final combined tree's
+ordinary default/debug-all-feature/release tests, formatting, and strict Clippy
+checks passed. See `docs/testing-on-nas.md` and its `final17-schema-*.log`,
+`final23-*.log`, and `final24-*.log` references.
+
+The peer runner intentionally still uses v1 account discovery. A dedicated
+v2-search differential/client run and fresh peer use of v2 discovery have not
+been claimed, so this issue remains open rather than treating the named HTTP
+regression as complete client acceptance.
 

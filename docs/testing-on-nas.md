@@ -1,11 +1,11 @@
 # Testing on the authorized NAS
 
-This is the user's explicit exception to the default
-[Secunda policy](testing-on-secunda.md), not permission to test on the local
-coding machine or on a production instance. During the test-audit implementation
-**the parent runs every build, test, formatter, lint, and container workload
-sequentially**. Child agents prepare source and commands only. Never add this NAS
-as a self-hosted CI runner or run the heavy lanes against production.
+This is the current owner-authorized build/test environment. It is not
+permission to test on the local coding machine, historical Secunda, or a
+production instance. During the test-audit implementation **the parent runs
+every build, test, formatter, lint, and container workload sequentially**. Child
+agents prepare source and commands only. Never add this NAS as a self-hosted CI
+runner or run the heavy lanes against production.
 
 ## Host, synchronization, and resource isolation
 
@@ -90,11 +90,11 @@ fallback. Keep the source-dependent lane separate rather than disabling its guar
 | Pinned source | `mise run pinned-source-contracts` | Required separate hosted job; verified read-only checkout on authorized hosts. |
 | Real peers | `mise run peer-public`, `peer-privacy`, `peer-notes`, `peer-profile`, `peer-interactions` | Manual authorized-host commands only; see exact NAS contract below. No workflow job. |
 
-The mixed-profile selector uses test-profile opt-level3 for both discovery and
-execution, preserving debug assertions and the exact animated fixture's2s connect,
-10s total and5s read budgets. The full differential lane skips that case in its
-ordinary batch and runs it once afterward with the scoped optimization. Other
-selectors and CLI builds keep their caller profile.
+The mixed-profile selector uses test-profile `opt-level=3` for both discovery and
+execution, preserving debug assertions and the exact animated fixture's 2s
+connect, 10s total, and 5s read budgets. The full differential lane skips that
+case in its ordinary batch and runs it once afterward with the scoped
+optimization. Other selectors and CLI builds keep their caller profile.
 
 The browser lane exercises fixture-authenticated shell/settings/logout plus real
 Home boost/reply actions: leading and trailing settings PUTs, omission of the
@@ -169,20 +169,21 @@ Use a workload-side watchdog for long fixture commands, for example
 **inside** the NAS tooling container. An SSH-client timeout alone can leave the
 remote process alive. On timeout, inspect only that task's process/container IDs
 and let fixture cleanup run while its task-owned API socket is still available;
-do not prune the engine or terminate unrelated workloads. The1200-second example
-is a test-workload bound, not a production queue/HTTP/SMTP timeout.
-For schema coverage, bound each of the12 named selectors separately; the final16
-aggregate cutoff after six successes was not an assertion failure. Preflight has
-many canonical/drift checks and needs an aggregate budget appropriate to that work;
-600/1200-second aggregate cutoffs did not establish a failing individual check.
-The final18 diagnostic run printed fixed case labels only and passed all checks
-under a3600-second workload bound, with unchanged production/check deadlines.
+do not prune the engine or terminate unrelated workloads. The 1200-second
+example is a test-workload bound, not a production queue/HTTP/SMTP timeout.
+For schema coverage, bound each of the 12 named selectors separately; the
+`final16` aggregate cutoff after six successes was not an assertion failure.
+Preflight has many canonical/drift checks and needs an aggregate budget
+appropriate to that work; 600/1200-second aggregate cutoffs did not establish a
+failing individual check. The `final18` diagnostic run printed fixed case labels
+only and passed all checks under a 3600-second workload bound, with unchanged
+production/check deadlines.
 
 ### Remaining-audit final evidence
 
 Logs below are beneath `/srv/workspaces/rustodon-audit-green/logs/`:
 
-- `final17-schema-*.log`: all12 independent selectors pass (including batch
+- `final17-schema-*.log`: all 12 independent selectors pass (including batch
   accounts); these precede the final test-only budget-clock/cleanup seams.
 - `final23-{default,feature,release}.log`: final combined-tree ordinary default,
   debug-all-feature and release-all-feature tests pass. `final24-{fmt,clippy,static,
@@ -190,7 +191,7 @@ Logs below are beneath `/srv/workspaces/rustodon-audit-green/logs/`:
   checks and dependency policy pass. Ignored tests are not inferred from these.
 - `final18-operational.log`: complete operational/Rails gate, including actual
   asynchronous domain-lease cleanup and the fixed-clock regression.
-- `startup-retry.log`: all5 startup cases pass. `final18-preflight.log`: canonical
+- `startup-retry.log`: all 5 startup cases pass. `final18-preflight.log`: canonical
   and all configuration-drift cases pass with sanitized stage-only diagnostics.
 - Required differential: seven invocations in `final17-diff-*.log` pass;
   `final18-{oauth-diff,core-diff,reauth}.log` supplies the remaining three greens.

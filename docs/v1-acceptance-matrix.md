@@ -18,28 +18,29 @@ or a cutover rehearsal. An open row must not be described as complete.
 | Surface | Contract and proof | Status |
 | --- | --- | --- |
 | REST inventory | `API_ROUTE_INVENTORY` contains every advertised method/path, rejects duplicate method/path pairs, and `V1_REQUIRED_API_ROUTES` checks every required v1 route. `mise run pinned-source-contracts` independently derives ordinary startup probes from the pinned frontend and checks router/support declarations, including announcements and hashtag search. | A |
-| CLI inventory | `tests/cli_help.rs` checks the process modes and every administrative command exposed by `rustodon --help` and `rustodon admin --help`. | A |
-| Differential compatibility | `mise run differential` defines 21 unique Rails-versus-Rust cases and performs 22 gate executions: 19 broad cases, isolated notification and authorization phases, and a second actor-media-root configuration. In this review, one broad run passed 17 cases before the local 10-minute command limit; its remaining `rest_protocol_contracts` and `write_transactions` cases passed independently, as did the isolated notification and authorization phases. `mise run differential-ci` runs a high-value fresh-clone subset in CI. | A locally from combined case evidence; peer convergence remains open |
+| CLI inventory | `tests/cli_help.rs` checks all four process modes and all 14 administrative command/help contracts exposed by `rustodon --help` and `rustodon admin --help`. | A |
+| Differential compatibility | `mise run differential` defines 26 guarded differential cases and performs 27 executions: a 23-case broad batch plus isolated notification, authorization, absolute actor-media-root, and optimized mixed-profile-media cases. `mise run differential-ci` runs nine distinct high-value cases in ten fresh-fixture invocations, including both actor-media-root modes; all ten retained required-lane invocations passed. The full differential lane and hosted-CI execution remain unclaimed. | A locally for the required lane; full differential and hosted-CI execution remain open |
 | Authorized-fetch reads | `mise run differential -- authorized_fetch_read_routes_require_signatures` starts Rustodon with limited federation enabled and checks protected actor, Note, activity, outbox, followers, and following routes reject unsigned reads while `/actor` remains public. | A locally |
 | Fixture and schema | `mise run fixture-verify`, `mise run mastodon-schema-integration`, and `mise run operational-schema-integration`. | A |
 | Fixture cutover and rollback | `mise run cutover-integration` migrates the isolated operational schema, starts Rustodon, runs the operator smoke, reopens the pinned Mastodon web process, and compares stable public state and media. | A locally; live production rehearsal remains open |
-| Browser web-client smoke | `mise run browser-integration` starts the cutover fixture, drives Chromium through `agent-browser`, and checks the React mount, app body, SPA deep link, and page errors. | A locally; mobile-client recording remains open |
-| Workers | `mise run worker-integration` covers 49 restored-fixture cases for enqueue, leases, cancellation, retries, dead letters, resource limits, media reconciliation, URI-only Create resolution, mail acceptance/acknowledgement faults, readiness, shutdown, and crash recovery. | A locally; peer convergence remains open |
+| Browser web-client smoke | `mise run browser-integration` starts the HTTPS cutover fixture and drives Chromium through `agent-browser`. It renders and fills the sign-in form, authenticates through the local form endpoint, loads the authenticated shell, exercises leading and trailing Home-settings PUTs with reload persistence, renders profile settings, proves logout, audits API responses, checks the SPA deep link and page errors, and completes the enclosing cutover/rollback comparison. | A locally for the named smoke; untested browser forms, WebSocket/EventSource behavior, and mobile-client recording remain open |
+| Workers | `mise run worker-integration` runs 100 restored-fixture tests covering queue/runtime ACLs, enqueue and leases, all-lane recovery, cancellation, ordering and deduplication, retries and dead letters, resource limits, ActivityPub and account lifecycles, URI and parent fetches, media/profile reconciliation, SMTP acknowledgement ambiguity, readiness, shutdown, and crash recovery. It then exercises the real CLI readiness and graceful-shutdown gate. The final combined-tree run passed 100/100 plus that CLI gate. | A locally; production load/power-loss and final-tree peer acceptance remain open |
 | Startup and preflight | `mise run startup-integration` and `mise run preflight-integration`. | A |
 | Operator smoke | `tools/rustodon-smoke` checks health, readiness, authentication, reads, a no-op write, media, WebFinger, and actor discovery against a running instance. | A locally; live operator run remains open |
 
 ## Supported Commands
 
-The web process, worker, and preflight modes are covered by the root CLI help
-test. The following administrative commands are the complete current command
-surface; their help entries are checked by
-`tests/cli_help.rs::admin_help_exposes_operational_schema_migration`.
+The web, worker, admin, and preflight process modes are covered by the root CLI
+help tests. The following 14 `rustodon admin` commands are the complete current
+administrative surface; their help contracts are checked by `tests/cli_help.rs`.
+The standalone operator smoke tool is listed separately.
 
 | Command | Purpose | Status |
 | --- | --- | --- |
 | `rustodon web` | Serve REST, web, federation, media, and streaming requests. | A |
 | `rustodon worker` | Process durable background work. | A |
 | `rustodon preflight` | Validate a Mastodon cutover without mutation. | A |
+| `rustodon admin refresh-remote-account --account-id ID` | Refresh one existing remote account from its stored canonical actor URI and queue profile-media cache repair. | A |
 | `rustodon admin migrate-operational-schema` | Create or upgrade Rustodon-owned operational tables. | A |
 | `rustodon admin worker-readiness` | Inspect lane, scheduler, queue, and dead-letter readiness. | A |
 | `rustodon admin dead-jobs --limit N` | List bounded dead-letter metadata. | A |
@@ -52,17 +53,19 @@ surface; their help entries are checked by
 | `rustodon admin unsuspend-account` | Remove a moderation suspension. | A |
 | `rustodon admin block-domain` | Create or update a global domain policy. | A |
 | `rustodon admin unblock-domain` | Remove a global domain policy. | A |
+| `rustodon admin purge-domain` | Queue a full purge of remote accounts and custom emoji for a domain. | A |
 | `tools/rustodon-smoke` | Run non-destructive operator smoke checks against a live origin. | M |
 
 ## Supported API Routes
 
-`src/web.rs::API_ROUTE_INVENTORY` is the complete advertised API surface: 115
+`src/web.rs::API_ROUTE_INVENTORY` is the complete advertised API surface: 119
 canonical method/path contracts, with trailing-slash aliases registered by the
 router but not duplicated in the inventory. The inventory and route-contract
 tests check unique method/path pairs, representative authentication and
 pagination declarations, while response-finalization tests check cache
 behavior and explicitly disabled collection/translation responses.
-The nine frontend read groups and their limitations are documented in
+The nine compatibility read groups added as stable empty/read-only fallbacks and
+their limitations are documented in
 [`return-empty-unimplemented-api-reads`](../meta/issues/return-empty-unimplemented-api-reads.md). The
 `V1_REQUIRED_API_ROUTES` test checks the required v1 subset against that same
 inventory, so adding a required route without a support declaration fails the
@@ -95,11 +98,11 @@ owning issue, code surface, or acceptance command.
 | --- | --- | --- | --- |
 | AUTH-01 | Accept existing bearer tokens with revocation, expiry, owner-state, and scope checks. | `src/mastodon/auth.rs`; `tests/oauth.rs`; differential `oauth_bearer_authentication`. | A |
 | AUTH-02 | Password login and logout for existing users. | Rust-owned browser auth routes in `src/web.rs`; lifecycle parity is covered by differential `browser_authentication`, and `mise run browser-integration` proves a fixture-authenticated browser shell plus settings/logout. Full browser form-flow acceptance remains required. | M |
-| AUTH-03 | Existing TOTP and backup-code verification; WebAuthn is not required. | `src/crypto.rs`, `src/mastodon/auth.rs`, browser authentication/settings handlers, auth tests, and guarded `browser_authentication`/`browser_two_factor_management` cases. | M; local fixture proof complete, live browser evidence remains open |
+| AUTH-03 | Existing TOTP and backup-code verification; WebAuthn is not required. | `src/crypto.rs`, `src/mastodon/auth.rs`, browser authentication/settings handlers, auth tests, guarded `browser_authentication`/`browser_two_factor_management` cases, and the browser gate's password-plus-backup-code sign-in. | M; backup-code browser proof exists, while interactive TOTP browser evidence and a retained recording remain open |
 | AUTH-04 | OAuth authorization code, PKCE, and revocation. | `src/mastodon/oauth.rs`, `src/web.rs`; public applications require RFC 7636 S256 while confidential clients retain compatible optional PKCE; differential `oauth_authorization_code` and OAuth tests. | A |
 | AUTH-05 | Dynamic app registration and application credential verification. | `POST /api/v1/apps`, `/api/v1/apps/verify_credentials`; differential OAuth coverage. | A |
 | AUTH-06 | Password reset, confirmation email when SMTP is configured, and administrator reset. | `src/mail.rs`, browser reset routes, and `admin reset-password`; stable opaque mail identity, legacy-job backfill, mail tests, and worker acceptance-before-ack recovery prove bounded at-least-once semantics. | M |
-| AUTH-07 | Rust-owned browser session format; Rails cookie compatibility is not required. | Browser session handlers and lifecycle session tests in `src/mastodon/repository.rs` and `tests/differential/writes.rs`; browser run remains open. | M |
+| AUTH-07 | Rust-owned browser session format; Rails cookie compatibility is not required. | Browser session handlers and lifecycle tests in `src/mastodon/repository.rs` and `tests/differential/writes.rs`; `mise run browser-integration` obtains the Rust-owned session from the sign-in endpoint, uses it in Chromium, logs out, and verifies that the stale cookie is rejected. | A locally |
 
 ### Web Client
 
@@ -127,8 +130,8 @@ owning issue, code surface, or acceptance command.
 | ID | Requirement | Implementation and proof | Status |
 | --- | --- | --- | --- |
 | FED-01 | WebFinger, host-meta, NodeInfo, actors, Notes, emoji resources, and collection representations. | Federation routes in `src/web.rs`; differential `federation_discovery` plus relative/absolute actor-media-root cases; HTTP signature and emoji serializer tests. | A locally |
-| FED-02 | Signed transport, digest/skew checks, inbox enqueue, remote fetch, SSRF checks, shared-inbox deduplication, retries, and domain health. | `src/mastodon/signatures.rs`, `src/remote.rs`, `src/worker.rs`; bounded DNS answer sets, lifecycle-aware 401 classification, bounded per-client-IP signature-key refresh circuit, signed POST DNS/redirect/timeout/response-limit fixtures, signature, remote, and worker tests. | A locally; real peer proof remains open |
-| FED-03 | Follow, Accept, Reject, Undo, embedded and URI-only Note, Like, Announce, Block, actor Update/Delete, audiences, replies, mentions, media, custom emoji, and tombstones. | ActivityPub inbox/outbox workers and 49-case restored-fixture coverage include URI fetch/retry/deduplication, recipient repair, forwarding replay, emoji fetch/replacement, and existing relationship/order convergence. Pinned-source contracts establish Mastodon's URI dereference behavior; the production Mastodon image lacks RSpec dependencies for a live Rails URI-only test. | A locally; complete peer/order matrix remains open |
+| FED-02 | Signed transport, digest/skew checks, inbox enqueue, remote fetch, SSRF checks, shared-inbox deduplication, retries, and domain health. | `src/mastodon/signatures.rs`, `src/remote.rs`, `src/worker.rs`; bounded DNS answer sets, lifecycle-aware 401 classification, bounded per-client-IP signature-key refresh, signed POST DNS/redirect/timeout/response-limit fixtures, and signature, remote, and worker tests. All five bounded Mastodon peer scenarios passed, including signed bidirectional transport, but on a pre-final tree. | A locally; pre-final Mastodon peer evidence exists, while a final-tree rerun and Pleroma interoperability remain open |
+| FED-03 | Follow, Accept, Reject, Undo, embedded and URI-only Note, Like, Announce, Block, actor Update/Delete, audiences, replies, mentions, media, custom emoji, and tombstones. | ActivityPub inbox/outbox workers are exercised within the 100-test restored-fixture worker gate, including URI fetch/retry/deduplication, recipient and parent repair, forwarding replay, provenance checks, emoji fetch/replacement, and relationship/order convergence. Pinned-source contracts establish Mastodon's URI dereference behavior. Five bounded Mastodon peer scenarios passed on a pre-final tree; they do not establish the complete final-tree peer/order profile or Pleroma parity. | A locally; complete final-tree peer/order acceptance remains open |
 
 ### Durable Work
 
@@ -193,7 +196,7 @@ owning issue, code surface, or acceptance command.
 | ACCEPT-03 | Existing users log in with password/TOTP and existing OAuth clients remain authorized. | Guarded browser authentication and 2FA-management cases, local `mise run browser-integration` server-authenticated password/backup-code shell and settings/logout proof, plus differential OAuth cases; full browser recording remains open. | M |
 | ACCEPT-04 | Pinned web frontend and recorded mobile client publish and read normal v1 content. | Browser recording plus a versioned mobile-client recording. | O |
 | ACCEPT-05 | Public/private/direct content remains visible only to correct viewers. | Differential `status_authorization_matrix`, policy unit tests, REST/timeline/schema coverage, and streaming suppression coverage. | A locally |
-| ACCEPT-06 | A pinned Mastodon 4.6.5 peer discovers, follows, receives, replies, likes, boosts, updates, and deletes in both directions. | `prove-mastodon-peer-federation-compatibility` fixture and peer run. | O |
+| ACCEPT-06 | A pinned Mastodon 4.6.5 peer discovers, follows, receives, replies, likes, boosts, updates, and deletes in both directions. | The five manual `peer-public`, `peer-privacy`, `peer-notes`, `peer-profile`, and `peer-interactions` scenarios all passed against an actual pinned Mastodon peer on 2026-09-13. Those runs predate final browser API additions, and the bounded suite does not assert the required reply flow; a complete final-tree Mastodon peer run remains required. Pleroma is unclaimed. | O |
 | ACCEPT-07 | Worker crashes and duplicate deliveries do not duplicate effects. | Restored worker integration now covers all-lane abort recovery, database failure before acknowledgement, a twenty-job bounded-concurrency burst, an eight-wave twenty-user worker-executor soak, duplicate relationship activities, delivery replay, live-lease Follow/Undo and Block/Undo ordering cases, and ambiguous remote-media metadata commits before and after PostgreSQL commit; peer-side idempotency, end-to-end sustained 1-20-user load, and hard-power-loss proof remain open. | M |
 | ACCEPT-08 | Existing media works and newly uploaded images reopen after Mastodon rollback. | Media differential plus `mise run cutover-integration`, which uploads through Rustodon and verifies the row and original/small files through reopened Mastodon. | M |
 | ACCEPT-09 | Unsupported active configurations fail preflight. | Preflight rejection matrix and integration task. | A |
@@ -201,8 +204,13 @@ owning issue, code surface, or acceptance command.
 
 ## Current Exit Condition
 
-The local implementation and fixture gates are strong enough to continue
-implementation, but v1 is not yet complete. The matrix cannot be closed until
-the `O` rows are either implemented and proven or explicitly removed from the
-authoritative v1 scope. In particular, live peer, browser/mobile, and
-cutover/rollback evidence are still required.
+The local implementation and fixture gates are substantial, but v1 is not yet
+complete. The matrix cannot be closed until the `O` rows are either implemented
+and proven or explicitly removed from the authoritative v1 scope. The retained
+evidence includes the required differential lane, authenticated browser and
+fixture cutover/rollback, worker, startup, preflight, schema, ordinary checks,
+and a bounded five-scenario Mastodon peer run. Remaining acceptance includes a
+recorded mobile client, unexercised browser/TOTP and streaming flows, a
+final-tree Mastodon peer run completing the reply profile, and a live production
+cutover/rollback rehearsal. The earlier peer run is not final-tree or Pleroma
+acceptance.

@@ -22,5 +22,8 @@ Bring the README and related public-facing documentation in line with the curren
 
 ## Notes
 
-- Documentation-only work does not require executing Rust/container workloads locally. Use static validation for links and source-derived counts.
+- Most changes are documentation/assets. The canonical repository metadata also
+  feeds the public instance API's source URL, so that small runtime metadata
+  change must receive normal source verification on the authorized NAS; no
+  Rust/container workload runs locally.
 - Do not claim deployment, final-tree peer reruns, Pleroma interoperability, full hosted-CI execution, or historical replay.

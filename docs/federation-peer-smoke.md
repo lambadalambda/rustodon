@@ -1,6 +1,7 @@
 # Isolated Mastodon peer smoke
 
-The runner accepts two exact host/physical-workspace pairs:
+The runner recognizes two exact host/physical-workspace profiles, but only the
+NAS profile is currently authorized:
 
 - NAS: `podman-worker`, `/srv/workspaces/rustodon-peer-tests/source`.
 - Historical Secunda: `secunda`, `/home/lain/rustodon-parity/peer-tests`.
@@ -20,11 +21,12 @@ markers, cached digests, and absence of its intended resources. A workspace
 lock prevents concurrent peer runs. It refuses pulls/builds of container images;
 provision missing exact pins separately through normal verified fixture tooling.
 
-All five scenario commands below work in either authorized workspace. Actual
-NAS results live in [the owning issue](../meta/issues/adapt-and-run-peer-matrix-on-nas.md),
-not in the historical scope notes below. Pleroma is separate and remains unclaimed.
+All five scenario commands below support both runner profiles. Use the NAS
+profile unless the owner explicitly reauthorizes Secunda. Actual NAS results
+live in [the owning issue](../meta/issues/adapt-and-run-peer-matrix-on-nas.md).
+Pleroma is separate and remains unclaimed.
 
-Historical Secunda invocation:
+Historical Secunda invocation (do not run without explicit reauthorization):
 
 ```sh
 ssh lain@secunda.local bash -s <<'REMOTE'
@@ -34,18 +36,27 @@ CARGO_BUILD_JOBS=2 tools/federation-peer-smoke
 REMOTE
 ```
 
-## Historical scenario scope and pre-NAS evidence
+## Scenario scope and retained evidence
 
-This is bounded acceptance source, not the full interoperability matrix. The
-`public` scenario has prior remote pass evidence. The new privacy/lifecycle
-scenarios are **source-reviewed but unverified**: Secunda became unavailable
-before the fresh observer bootstrap could be run. Do not interpret source
-presence as privacy/lifecycle acceptance. Pleroma and broader coverage remain
-unclaimed. See
-[the open issue](../meta/issues/add-isolated-federation-peer-tests.md) for exact
-passing, red and pending evidence.
+This is bounded acceptance evidence, not the full interoperability matrix. All
+five scenarios passed against the pinned Mastodon peer on the authorized NAS on
+2026-09-13:
 
-Run each scenario in a fresh invocation on its authorized workspace:
+| Scenario | Result |
+| --- | --- |
+| `public` | Public discovery, follow, delivery, and signed Create passed. |
+| `privacy` | Followers-only/direct delivery and outsider denial passed. |
+| `notes` | Note create, update, delete, and visibility preservation passed. |
+| `profile` | Profile text, flags, fields, and media URL updates passed. |
+| `interactions` | Like/Undo and private Announce/Undo passed. |
+
+The exact run IDs and logs are recorded in
+[`adapt-and-run-peer-matrix-on-nas`](../meta/issues/adapt-and-run-peer-matrix-on-nas.md).
+These runs predate the final browser API additions, do not include an explicit
+reply scenario or simultaneous convergence stress, and do not establish Pleroma
+or final-tree acceptance.
+
+Run each scenario in a fresh invocation from the authorized NAS workspace:
 
 ```sh
 CARGO_BUILD_JOBS=2 tools/federation-peer-smoke public
@@ -65,7 +76,7 @@ checks require recipient 200, nonrecipient/outsider/anonymous 404; origin-side
 outsider/anonymous access must also be denied. These REST probes do not fetch
 the canonical ActivityPub status URL. No wire identifier is rewritten.
 
-`notes` is also **source-only, unexecuted**. It creates public and followers-only
+`notes` creates public and followers-only
 Notes in each direction, waits for received state plus signed Create, edits
 content and warning through the originating REST API, and requires Update to
 change the same received row without changing URI or visibility. Private access
@@ -74,23 +85,21 @@ rejected. Delete then requires both a signed Delete and retirement of that
 previously observed row, followed by REST 404 for the former author/recipient.
 The no-canonical-status-GET audit is checked throughout. Tombstone audience
 privacy is not asserted. Ordinary `tag:` atomUri values are never altered by
-the runner; parent fix `a3fe48a` is integrated, with its execution also pending.
+the runner; parent fix `a3fe48a` is integrated.
 
-`profile` is **source-only, unexecuted**. After reciprocal follows, each author
-PATCHes text, bot/locked/discoverable/indexable flags, a profile field, and both
-avatar/header PNG uploads in one full API request. Source checks require both
-uploads/descriptions; receiver checks bind the existing actor ID/URI, rendered
-note, flags, field and exact advertised media URLs to a signed inbox Update.
-Actor-URL GETs after mutation are rejected through the end of the scenario, so
-refreshing an actor cannot substitute for Update ingestion. URL convergence is
-not a claim of successful remote image download. The multipart unit regression,
-image encoding/upload and all live assertions await Secunda; no profile pass is
-claimed.
+After reciprocal follows, `profile` has each author PATCH text,
+bot/locked/discoverable/indexable flags, a profile field, and both avatar/header
+PNG uploads in one full API request. Request checks require both uploads and
+descriptions; receiver checks bind the existing actor ID/URI, rendered note,
+flags, field, and exact advertised media URLs to a signed inbox Update. Actor-URL
+GETs after mutation are rejected through the end of the scenario, so refreshing
+an actor cannot substitute for Update ingestion. URL convergence is not a claim
+of successful remote image download.
 
-`interactions` is **source-only, unexecuted**. Each direction first receives a
-new public Note through push, then Likes and un-Likes it. The receiver must
-observe the correct favourite row before its removal and a signed Undo whose
-object is the exact Like ID captured from the wire—not a guessed ID scheme.
+`interactions` has each direction first receive a new public Note through push,
+then Like and unlike it. The receiver must observe the correct favourite row
+before its removal and a signed Undo whose object is the exact Like ID captured
+from the wire—not a guessed ID scheme.
 It then creates a followers-only **boost of that public Note**, requiring the
 exact Announce ID, actor, target and followers audience in the same signed,
 successful audit event; the original author
@@ -112,34 +121,20 @@ on the application's real verification/worker path. Notification/counter parity,
 boosts of other people's private Notes and concurrent interaction stress are
 not claimed.
 
-Pending verification includes source compilation, formatting/Clippy, observer
-bootstrap, unit regressions, all commands above and repeated cleanup. TDD for
-changes after the outage is deferred rather than simulated; no local workload
-or further SSH attempt is allowed until the parent restores access.
-
-After access is restored, run these additional gates on Secunda only, with
-`CARGO_BUILD_JOBS=2` and the prescribed workspace:
-
-```sh
-cargo test --locked --features test-support --test federation_peers
-PYTHONDONTWRITEBYTECODE=1 python3 tools/peer-tests/test_tls_proxy.py
-cargo clippy --locked --features test-support --test federation_peers -- -D warnings
-cargo fmt --all --check
-bash -n tools/federation-peer-smoke
-```
-
-Then execute every selected live command above and repeat successful scenarios
-to check task-owned cleanup. The harness verifies the selected ignored test is
-listed before starting containers; a renamed/missing case fails instead of
-silently passing an empty test selection. The previous three Python audit passes
-predate the latest activity-ID/envelope fields; current regressions need reruns.
+Each invocation verifies that its selected ignored test is listed before any
+containers start; a renamed or missing case fails instead of silently passing an
+empty selection. Future reruns must retain the task-owned cleanup checks and run
+the shell/Python harness regressions in the same authorized environment. See
+[Testing on NAS](testing-on-nas.md) for the current execution contract.
 
 ## What runs
 
-- Cached pinned Mastodon 4.6.5, PostgreSQL and Redis images and the database
-  lifecycle from `tools/mastodon-fixture`. No image pull or source fetch. The
-  existing read-only `/home/lain/repos/rustodon/target/mastodon-v4.6.5` checkout
-  must match `1440d55b139e39ec722c2a3db7f60b66cd889048` (canonical reference path:
+- On NAS, cached pinned Mastodon 4.6.5, PostgreSQL and Redis images plus the
+  committed schema fixture drive the database lifecycle. The runner neither
+  pulls/fetches nor requires a Mastodon source checkout.
+- The historical Secunda profile additionally requires its existing read-only
+  `/home/lain/repos/rustodon/target/mastodon-v4.6.5` checkout to match
+  `1440d55b139e39ec722c2a3db7f60b66cd889048` (canonical reference path:
   `/workspace/rustodon/target/mastodon-v4.6.5`).
 - Two independently cloned, emptied schema databases. Rails creates three fresh
   functional local users (normal peer, recipient, outsider), OAuth tokens and
@@ -199,10 +194,11 @@ with a final kill deadline after cleanup's grace period. This is sequential
 peer convergence, not a simultaneous reciprocal-follow stress test. A trial
 with overlapping follows hit a pinned Mastodon `account_stats` deadlock and
 left pending requests after retry; that concurrency case is not claimed.
-The initial v2 search attempt returned no account results. Parent source repair
-`0d513f5` now exists but is unexecuted; this runner retains v1 discovery and does
-not claim v2 parity. Its separate deferred gate is
-`tools/mastodon-fixture schema-read-test v2_account_search`.
+The initial peer-runner v2 search attempt returned no account results. Source
+repair `0d513f5` now has passing named schema evidence in
+`tools/mastodon-fixture schema-read-test v2_account_search`; the peer runner
+retains v1 discovery, so these peer scenarios do not themselves prove v2 search
+interoperability.
 
 HTTP 2xx is never reported as successful convergence. Workers must be ready
 before scenarios start. Unsupported ingestion fails the test; do not preseed

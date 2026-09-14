@@ -1,12 +1,11 @@
-# Build and test on Secunda
+# Historical Secunda build and test procedure
 
-The default build/test host for essential-parity work is
-**`lain@secunda.local`**, not the local coding machine. The user-authorized NAS
-exception and its exact peer workspace contract are documented in
-[Testing on NAS](testing-on-nas.md). During the audit implementation the parent
-alone runs all workloads sequentially on NAS; child worktrees only edit source.
-Source editing and Git commits may otherwise remain local. Queue-performance
-review observations R17/R18 are deferred.
+Secunda was the default build/test host for earlier essential-parity work. It is
+**not currently authorized for workloads**; the current owner-authorized
+execution environment and exact isolation contract are documented in
+[Testing on NAS](testing-on-nas.md). Keep this runbook only for historical host
+layout and source-oracle context unless the owner explicitly reauthorizes
+Secunda. The local coding machine remains source-editing/Git only.
 
 ## Host and isolation
 
@@ -68,9 +67,10 @@ Do not delete the shared source to simulate its absence. The dedicated
 `tools/pinned-source-contracts` command verifies the referenced checkout before
 executing its ignored upstream-contract tests.
 
-## Running gates
+## Historical gate commands
 
-A remote command pattern (adjust the task path):
+Do not run these commands unless Secunda is explicitly reauthorized. The former
+remote command pattern was:
 
 ```sh
 ssh lain@secunda.local bash -s <<'REMOTE'
@@ -84,8 +84,7 @@ tools/mastodon-fixture verify
 REMOTE
 ```
 
-Run appropriate integration gates on Secunda too, with the pinned source link
-when required:
+The corresponding integration commands were:
 
 ```sh
 tools/mastodon-fixture schema-read-test
@@ -95,11 +94,11 @@ tools/mastodon-fixture differential-test <case-name>
 tools/pinned-source-contracts
 ```
 
-These are existing gates, not a claim that every command above has passed for
-every worktree. Check the owning issue for exact red/green commands and results.
-The complete release gate also includes dependency policy, startup/preflight,
-browser, and cutover checks from `mise.toml`; install/verify any missing pinned
-tools on Secunda rather than silently skipping them or running locally.
+These are historical command examples, not evidence that every command passed
+for every worktree. Current gate definitions live in `mise.toml`; current NAS
+execution and retained evidence live in
+[`testing-on-nas.md`](testing-on-nas.md). Do not resume Secunda execution or use
+the local coding machine as a fallback without explicit authorization.
 
 ## Peer-test acceptance
 
@@ -110,6 +109,8 @@ unavailable in ordinary release builds. Assert received objects, actor IDs,
 audiences, access denial, notifications, and lifecycle convergence. HTTP 2xx
 from an inbox only establishes acceptance/queuing, not successful ingestion.
 
-Peer harness implementation and actual direction/activity evidence are tracked
-in `meta/issues/run-essential-parity-gates-on-secunda.md`; this document does not
-claim that the full bidirectional peer matrix is already implemented or passing.
+All five bounded Mastodon peer scenarios later passed on the authorized NAS; see
+[`federation-peer-smoke.md`](federation-peer-smoke.md) and the
+[retained issue evidence](../meta/issues/adapt-and-run-peer-matrix-on-nas.md).
+Those runs predate the final browser API additions and do not establish
+final-tree, reply-flow, Pleroma, or full interoperability acceptance.

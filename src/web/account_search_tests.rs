@@ -1,4 +1,4 @@
-//! Source-first regressions; execute only in a disposable Secunda schema fixture.
+//! Source-first regressions; execute only through the named disposable restored-schema fixture.
 use std::error::Error;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -101,7 +101,7 @@ async fn remote_rows(pool: &PgPool) -> TestResult<i64> {
 }
 
 #[tokio::test]
-#[ignore = "requires tools/mastodon-fixture schema-read-test v2_account_search on Secunda"]
+#[ignore = "requires tools/mastodon-fixture schema-read-test v2_account_search"]
 #[allow(clippy::too_many_lines)]
 async fn v2_accounts_reuse_search_and_authenticated_resolution() -> TestResult {
     let owner_url = std::env::var("RUSTODON_MASTODON_OWNER_DATABASE_URL")?;

@@ -6,15 +6,14 @@ and shared API OPTIONS/CORS handling follow existing instance surfaces.
 
 ## Source and verification boundary
 
-The parent extracted the exact cached Mastodon 4.6.5 image, digest
-`696439e1ada71d0cf3d51d4d6a4744d6e40b57aafa64980b18f4d3b78230d0cf`, without
-network access. The extracted model/controller/serializer/spec log is on NAS at
-`/srv/workspaces/rustodon-audit-green/logs/pinned-extended-description-source.log`.
-The base-controller extract supplied to this task is
-`/Users/lainsoykaf/repos/rustodon/.local-instance/pinned-instance-base-controllers.txt`.
-These are image extracts, not modifications to the pinned read-only checkouts
-`/workspace/rustodon/target/mastodon-v4.6.5` or
-`/home/lain/repos/rustodon/target/mastodon-v4.6.5`.
+The implementation was derived from the exact cached Mastodon 4.6.5 image,
+digest
+`696439e1ada71d0cf3d51d4d6a4744d6e40b57aafa64980b18f4d3b78230d0cf`,
+without network access. The extraction logs remain machine-local historical
+evidence and are not prerequisites or artifacts in a clean checkout. The
+committed serializer expectations, fixture metadata, and pinned revision
+`1440d55b139e39ec722c2a3db7f60b66cd889048` are the durable public contract;
+none of this modifies or substitutes for the separate pinned-source oracle.
 
 The pinned serializer spec directly establishes:
 
@@ -28,8 +27,8 @@ blockquotes, soft/hard breaks, horizontal rules, and trusted HTML. These are
 explicit expected-byte regressions checked on NAS against the pinned engine:
 **11/11 passed** (`extended-description-pinned-corpus.log`). All five Rust
 serializer units and both normal/limited-mode HTTP cases also passed. The browser
-now passes its anonymous startup API audit; authenticated delayed-save acceptance
-is tracked separately. This corpus is not complete dialect parity.
+lane passes its anonymous startup API audit and authenticated delayed-save/reload
+persistence checks. This corpus is not complete dialect parity.
 
 ## Storage and errors
 
@@ -50,8 +49,8 @@ offset, not the ordinary REST millisecond timestamp format.
 `pulldown-cmark` uses the deliberate Cargo requirement `0.13.0` (caret semantics:
 `>=0.13.0, <0.14.0`), with default features disabled and only `html` enabled.
 This is a maintained Rust library parser/renderer, with no CLI, FFI, or native
-Redcarpet build dependency. The NAS-resolved lockfile pins `pulldown-cmark`0.13.4 and its escape helper0.11.0;
-no existing dependency versions changed.
+Redcarpet build dependency. The NAS-resolved lockfile pins `pulldown-cmark` 0.13.4 and its escape helper
+0.11.0; no existing dependency versions changed.
 
 This is **not full Redcarpet dialect parity**. The parser is CommonMark; no
 optional tables, strikethrough, footnotes, task lists, or smart punctuation are
