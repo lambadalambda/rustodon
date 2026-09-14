@@ -2,7 +2,7 @@
 
 ## Summary
 
-The real NAS Mastodon/Rustodon interactions scenario reaches bidirectional
+The real isolated worker Mastodon/Rustodon interactions scenario reaches bidirectional
 Like/Undo and delivery of a followers-only Rustodon Announce, then Rustodon's
 unreblog endpoint returns HTTP 500. This is synthetic peer evidence, not a live
 instance report or a result inferred from worker unit tests.
@@ -23,14 +23,13 @@ instance report or a result inferred from worker unit tests.
 
 ## Evidence
 
-- `/srv/workspaces/rustodon-peer-tests/logs/interactions.log`:
-  `/api/v1/statuses/<original-id>/unreblog` returned
-  `500 {"error":"Internal Server Error"}` after successful private Announce.
-- Run evidence:
-  `source/target/peer-86911789209305125467036/` under the same workspace.
+- The interactions scenario returned
+  `500 {"error":"Internal Server Error"}` from
+  `/api/v1/statuses/<original-id>/unreblog` after successful private Announce.
+  Detailed evidence is a historical external artifact not in the repository.
 - Public, privacy and Note lifecycle peer scenarios passed independently.
 - The initial Rustodon web log was empty; the later parent diagnostic is below.
-- Follow-up to [NAS peer execution](adapt-and-run-peer-matrix-on-nas.md).
+- Follow-up to [isolated worker peer execution](adapt-and-run-peer-matrix-on-isolated-worker.md).
 
 ## Independent source diagnosis
 
@@ -55,12 +54,10 @@ instance report or a result inferred from worker unit tests.
 - Parent's actual peer diagnostic now identifies `stage=repository`, before
   commit, SQLx `Discriminant(6)` = pinned sqlx-core 0.8.6 `RowNotFound`, with no PG
   ERROR. Wrapper remained live and target reblog count remained 1.
-- Evidence supplied by parent:
-  `/srv/workspaces/rustodon-peer-tests/logs/interactions-stage-diagnostic.log`,
-  run `peer-71789240590114588204`. Original `117259676533846837`, author
-  `117259676367241788`, wrapper `117259676729435604`, boost owner
-  `117259675314923474`; that fresh Rails-seeded zero-post owner has **no**
-  `account_stats` row. Only two other fixture accounts appear in the stats snapshot.
+- The fresh peer run reproduced the missing-`account_stats` condition for the
+  original status, wrapper, author, and boost owner. That newly seeded zero-post
+  owner had no stats row; only two other fixture accounts appeared in the stats
+  snapshot. The detailed historical external artifact is not in the repository.
 - Phase 1 refinement: add HTTP/repository variants that remove and retain Alice's
   full stats row before boost in the disposable fixture, restoring it only on
   success. Use nullable stats snapshots so diagnostic SQL itself cannot raise
@@ -89,10 +86,10 @@ instance report or a result inferred from worker unit tests.
 - Parent subsequently confirmed the repository **RED on a fresh fixture** before
   overlaying the fix: `row_not_found=true`, `transaction_unchanged=true`, account
   stats count `None`, no wrapper deletion and no Delete/Undo outbox intents.
-  Evidence: `private-unreblog-repository-fresh-red.log` (parent-reported NAS log).
-- Parent applied the production and test patches, formatted on NAS, and confirmed
+  The parent-reported historical external artifact is not in the repository.
+- Parent applied the production and test patches, formatted on an isolated worker, and confirmed
   **all six `private_unreblog` tests PASS in 17.43s**.
-  Evidence: `private-unreblog-fix-green.log` (parent-reported NAS log).
+  The parent-reported historical external artifact is not in the repository.
   This establishes focused regression green, not real-peer acceptance; the
   post-fix peer scenarios remain pending.
 - Production scope is one private `lock_account_statuses_count` helper and its
@@ -115,23 +112,20 @@ instance report or a result inferred from worker unit tests.
 - Independent read-only correctness/architecture review found **no unresolved
   in-scope blockers**. The overlap test is coverage, not a deterministic proof of
   lock contention. Malformed imported direct wrappers remain outside this fix.
-- Parent completed focused execution and NAS formatting as recorded above. No
-  local tests/builds/fmt, NAS/SSH, or commits were performed here. Keep this issue
+- Parent completed focused execution and isolated-worker formatting as recorded above. No
+  local tests/builds/fmt, external-worker, or commits were performed here. Keep this issue
   open: actual post-fix peer interactions and the wider peer scenarios are pending.
 
 ### Incremental overlay handoff (applied by parent)
 
 Parent ran the fresh repository red **before** applying both overlays below. The
-pre-fix test source is retained at `/tmp/private-unreblog-before-production-fix.rs`.
-The handoff used incremental parts rather than replacing whole parent files:
-
-- Production: `/tmp/private-unreblog-production.patch-parts.json`
-- Tests: `/tmp/private-unreblog-fix-tests.patch-parts.json`
-  (ordinary diff also at `/tmp/private-unreblog-fix-tests.patch`)
+pre-fix test source was retained in a historical external artifact not in the repository. The handoff
+used separate incremental production and test parts rather than replacing whole
+parent files; an ordinary test diff was also retained privately.
 
 The test parts leave `unreblog_http` and `deliver_pair` untouched, including the
 parent's reqwest JSON correction. Parent reports successful application followed
-by NAS formatting and focused green. Additional selectors in `--test workers` are:
+by isolated-worker formatting and focused green. Additional selectors in `--test workers` are:
 
 - `private_unreblog::restricted_writer_private_unreblog_imported_wrapper_without_account_stats`
 - `private_unreblog::restricted_writer_fresh_boost_counters_serialize_without_resetting_existing_stats`
@@ -141,9 +135,9 @@ Use fresh disposable fixture state per case after any failure, exact selectors,
 
 ## Phase 1 ownership (historical)
 
-- Alice owns the tests-only regression in `task/remaining-unreblog`.
-- Parent exclusively owns peer harness diagnostics and all NAS execution. No
-  local tests/builds/formatting, SSH, commits, production changes or grants changes
+- The tests-only regression was developed separately.
+- Parent exclusively owns peer harness diagnostics and all isolated worker execution. No
+  local tests/builds/formatting, remote access, commits, production changes or grants changes
   in this phase. Await the focused missing-stats red before a production correction.
 
 ## Phase 1 regression handoff (historical; superseded by overlay above)
@@ -170,11 +164,11 @@ Use fresh disposable fixture state per case after any failure, exact selectors,
   fixture, separately and sequentially, stopping on failure; do not run the second
   case over the first case's retained state. Success restores fixture changes.
 - Apply incremental patch parts, **not** the whole worktree file, to preserve
-  the parent's NAS formatting and reqwest JSON fix. Parts are supplied at
-  `/tmp/private-unreblog-missing-stats.patch-parts.json`; each has an old/new
-  fragment for the same Rust file, allowing whitespace-aware application to the
-  parent's formatted source. Neither `unreblog_http` nor `deliver_pair` is replaced.
-  With the existing worker fixture environment provisioned on NAS, the new
+  the parent's isolated-worker formatting and reqwest JSON fix. A historical
+  external patch artifact not in the repository supplies an old/new fragment for
+  the same Rust file, allowing whitespace-aware application to the parent's
+  formatted source. Neither `unreblog_http` nor `deliver_pair` is replaced.
+  With the existing worker fixture environment provisioned on an isolated worker, the new
   focused selectors are (commands provided only, not run here):
 
   ```sh
@@ -199,7 +193,7 @@ Use fresh disposable fixture state per case after any failure, exact selectors,
   ActivityPub protocol setup/restoration and exact Undo ID/full embedded Announce
   equality (including publication timestamp). The missing-stats refinement and
   patch-part contents also passed independent source-only review with no blocking
-  findings. Tests are ready for parent execution; NAS-formatted patch application
+  findings. Tests are ready for parent execution; isolated worker-formatted patch application
   and the focused red have not been verified here.
 - Peripheral review finding, deliberately not changed: shared
   `fixture_delivery_request` recognizes only title-case `Content-Length:`. A
@@ -221,10 +215,10 @@ broaden grants or change the status ID to make a diagnostic run pass.
 ## Completion
 
 Fresh repository RED confirmed `row_not_found=true` and unchanged transaction;
-HTTP RED independently returned500. All six corrected restricted-writer tests,
-the combined100-worker gate and strict Clippy pass. The real pinned Mastodon
-interactions scenario now passes, including private Announce and Undo:
-`peer-71789273216189507306`, NAS peer log `interactions-remaining.log`.
+HTTP RED independently returned 500. All six corrected restricted-writer tests,
+the combined 100-worker gate and strict Clippy pass. The real pinned Mastodon
+interactions scenario now passes, including private Announce and Undo, as recorded
+in the later [five-scenario run](adapt-and-run-peer-matrix-on-isolated-worker.md#remaining-audit-peer-rerun-2026-09-13).
 Public/privacy/notes/profile also pass on the same production changes. No grant
 widening, blanket error catch, live deployment or historical replay. Independent
 correctness/architecture reviews approved the implementation and incremental tests.

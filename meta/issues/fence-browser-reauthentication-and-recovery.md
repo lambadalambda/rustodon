@@ -29,13 +29,13 @@ Prevent stale credential checks from authorizing writes after recovery, and rate
 - GREEN: both races `rejected=true, recovered_password=true, sessions=0, live_tokens=0`; 1 passed. Existing `browser_authentication`, `password_recovery`, and `account_settings` cases each passed (1 test per case).
 - Independent read-only review: no correctness/architecture blockers; typed authority, row locking, shared replacement helper, and deterministic schedules verified. Optional follow-ups: stale login currently maps safe fence rejection to HTTP 500, and public authentication metadata could eventually become accessors (session authority already uses only the private proof).
 
-All Rust execution is on `lain@secunda.local`, isolated mirror `/home/lain/rustodon-parity/reauth`, Rust 1.97.1. Exact RED/GREEN race command (executed before/after the fix):
+All Rust execution used an isolated worker and task-owned workspace, Rust 1.97.1. Exact RED/GREEN race command (executed before/after the fix):
 
 ```sh
-ssh lain@secunda.local 'bash -lc "cd /home/lain/rustodon-parity/reauth && CARGO_BUILD_JOBS=4 tools/mastodon-fixture differential-test browser_recovery_fences"'
+CARGO_BUILD_JOBS=4 tools/mastodon-fixture differential-test browser_recovery_fences
 ```
 
-Remote validation commands, in that same directory:
+Validation commands, in that same task-owned workspace:
 
 ```sh
 cargo fmt
@@ -45,9 +45,9 @@ CARGO_BUILD_JOBS=4 tools/mastodon-fixture differential-test account_settings
 CARGO_BUILD_JOBS=4 cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
 
-Clippy initially flagged the newly added timeout's `from_secs(120)`; changed to `from_mins(2)` and rerun. The fixture harness uses disposable PID-named containers/clones, not live data. The pinned upstream source is the existing read-only remote checkout `/home/lain/repos/rustodon/target/mastodon-v4.6.5` at `1440d55b139e39ec722c2a3db7f60b66cd889048`, symlinked in the mirror's target; absent local `/workspace/rustodon/target/mastodon-v4.6.5` was not fetched. New race assertions are Rust regression proofs, not a new Rails differential claim.
+Clippy initially flagged the newly added timeout's `from_secs(120)`; changed to `from_mins(2)` and rerun. The fixture harness uses disposable PID-named containers/clones, not live data. The existing read-only pinned Mastodon source checkout was verified at `1440d55b139e39ec722c2a3db7f60b66cd889048` and linked read-only into the task workspace; the prescribed pinned Mastodon 4.6.5 checkout was absent locally and was not fetched. New race assertions are Rust regression proofs, not a new Rails differential claim.
 
-Sync uses `rsync -az --exclude='/.git' --exclude='/target/' --exclude='/.local-instance/' --exclude='/.local-instance-backups/' --exclude='/.env*' ./ lain@secunda.local:/home/lain/rustodon-parity/reauth/`, without `--delete`. Only changed Rust source files formatted remotely are retrieved. No local builds/tests/format/lint, live instance/env secrets, OAuth client fixes, upstream edits, or remote user tracked-config changes. Issue indexes are intentionally untouched.
+Source transfer included tracked source only and excluded Git metadata, build targets, instance state, backups, environment files, and unrelated user configuration; it did not delete destination files. Only changed Rust source files formatted externally were retrieved. No local builds/tests/format/lint, live instance credentials, OAuth client fixes, or upstream edits occurred. Issue indexes were intentionally untouched.
 
 ## R13 implementation and evidence
 
@@ -60,7 +60,7 @@ Sync uses `rsync -az --exclude='/.git' --exclude='/target/' --exclude='/.local-i
 Exact RED/GREEN command, both before and after the limiting fix:
 
 ```sh
-ssh lain@secunda.local 'bash -lc "cd /home/lain/rustodon-parity/reauth && CARGO_BUILD_JOBS=4 tools/mastodon-fixture differential-test browser_reauthentication_limits"'
+CARGO_BUILD_JOBS=4 tools/mastodon-fixture differential-test browser_reauthentication_limits
 ```
 
 The named harness runs `cargo test --locked --features test-support --test differential browser_reauthentication_limits -- --ignored --exact --nocapture --test-threads=1` with its disposable fixture URLs. GREEN output:
@@ -71,7 +71,7 @@ IP budget: 25 challenges shared across three users/two instances; blocked before
 test result: ok. 1 passed; 0 failed
 ```
 
-Final remote checks (same SSH `bash -lc` wrapper/directory as above):
+Final external checks in the same task-owned workspace:
 
 ```sh
 cargo fmt --check

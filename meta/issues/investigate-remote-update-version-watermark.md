@@ -6,7 +6,7 @@ Inbound Update rejection currently compares the supplied version with the last
 meaningful `edited_at` (or `created_at`). A newer semantic no-op reconciles
 metadata without advancing that version. After a meaningful edit at T1 and a
 no-op at T3, an out-of-order meaningful Update at T2 still applies. The pinned
-4.6.5 source confirms this policy; the NAS regression passes against unchanged
+4.6.5 source confirms this policy; the isolated-worker regression passes against unchanged
 production. No separate accepted-version watermark is warranted for this sequence.
 
 ## Requirements
@@ -34,20 +34,20 @@ production. No separate accepted-version watermark is warranted for this sequenc
 - Follow-up to [semantic no-op edits](suppress-semantic-noop-remote-edits.md).
 - Source entry point: `WriteRepository::apply_remote_note_update`.
 - User approved adding this follow-up after the audit implementation checkpoint.
-- Phase 1 owned by Alice in `task/remaining-updates`; tests and this issue only.
-- No watermark implementation. Parent-reported NAS regression/mutation evidence
+- Phase 1 covered tests and this issue only.
+- No watermark implementation. Parent-reported isolated-worker regression/mutation evidence
   is recorded below; formatting and topical commit remain parent-owned.
 
 ## Pinned decision (phase 1)
 
 Read-only source inspected at
-`/Users/lainsoykaf/repos/rustodon/.local-instance/audit-reference/remaining/`,
+a historical external reference artifact not in the repository,
 provided from cached pinned 4.6.5 image
 `sha256:696439e1ada71d0cf3d51d4d6a4744d6e40b57aafa64980b18f4d3b78230d0cf`
 (expected source revision `1440d55b139e39ec722c2a3db7f60b66cd889048`).
-Canonical `/workspace/rustodon/target/mastodon-v4.6.5` and Secunda
-`/home/lain/repos/rustodon/target/mastodon-v4.6.5` are unavailable for this
-scope; no fetch, SSH, or image workload performed.
+The prescribed pinned Mastodon 4.6.5 checkout and the external
+read-only pinned Mastodon source checkout are unavailable for this
+scope; no fetch, remote access, or image workload performed.
 
 - `app/lib/activitypub/activity/update.rb:29-43` locates the owned status and
   delegates to `ActivityPub::ProcessStatusUpdateService`.
@@ -87,7 +87,7 @@ Note ordering regression, not a reason to expand the scope silently.
 - No production changes. This is a regression characterization of existing
   correct behavior; the controlled-mutation evidence below is not a production
   defect reproduction.
-- No tests, builds, formatter, lint, SSH/NAS workloads, or commits run here.
+- No tests, builds, formatter, lint, external-worker workloads, or commits run here.
   Parent owns sequential fixture execution and any shared harness registration.
   Issue remains open for parent finalization; no shared index/archive edits.
 
@@ -99,24 +99,23 @@ test diff with no remaining blockers. Parent owns formatting and the topical
 regression-test commit; no ordinary-check result claimed here.
 
 
-## Parent-reported NAS evidence
+## Parent-reported isolated-worker evidence
 
 - Baseline: all **15** `semantic_updates::` tests passed against unchanged
   production (nine existing, one ordering, five history).
-  Log: `/srv/workspaces/rustodon-audit-green/logs/semantic_updates-baseline.log`.
+  The historical external run artifact is not in the repository.
 - Controlled mutation M1 moved the existing `edited_at` SQL update before the
   semantic no-op equality guard in `apply_remote_note_update`, retaining its
   early return. The ordering regression failed at the **T3 state-equality
   assertion**, because the no-op advanced edit time. It stopped before T2:
   this red run did **not** observe or prove T2 rejection.
-  Log: `ordering-stamp-mutant.log`.
+  The historical external run artifact is not in the repository.
 - The separate history fallback mutation M2 also failed its targeted control
   (see the sibling history issue). Parent restored both mutations, then the
   complete **15-test** semantic-update suite passed again.
-  Log: `semantic-updates-restored-green.log`.
-- These are parent-reported executions on the authorized NAS disposable fixture;
-  this worktree did not execute workloads or independently retrieve the logs.
-  Mutation/restore log basenames are recorded exactly as supplied by parent.
+  The historical external run artifact is not in the repository.
+- Results were supplied from isolated disposable workloads; this worktree did not
+  execute them or inspect the external artifacts.
 - Passing baseline/restored ordering runs exercise T1, T3 no-op/replay, accepted
   meaningful T2/replay, and equal/older conflicting-text controls. The M1 red
   proves sensitivity to fabricated no-op edit time, not a previously existing
@@ -127,7 +126,7 @@ regression-test commit; no ordinary-check result claimed here.
 
 ## Completion
 
-NAS formatting and the restored 15-test fixture suite passed. Both controlled
-mutations failed at their intended assertions. Final independent correctness and
-architecture review found no blockers. Regression scope complete; no production,
-schema, grant, deployment or historical replay change.
+Isolated-worker formatting and the restored 15-test fixture suite passed. Both
+controlled mutations failed at their intended assertions. Final independent
+correctness and architecture review found no blockers. Regression scope complete;
+no production, schema, grant, deployment or historical replay change.

@@ -14,11 +14,11 @@ A login whose verified password becomes stale during recovery is now safely deni
 
 - A barrier-controlled login/recovery HTTP regression receives the chosen authentication-failure response rather than 500, with no newly issued session or live token.
 - Fresh login still succeeds and genuine internal errors remain distinguishable internally.
-- Focused authentication/recovery regressions and independent review pass on Secunda.
+- Focused authentication/recovery regressions and independent review pass on an isolated worker.
 
 ## Notes
 
 - Follow-up to [reauthentication and recovery fencing](fence-browser-reauthentication-and-recovery.md), R03.
 - The security fence passed remote regressions; the remaining HTTP rendering behavior was source-reviewed, not a new security bypass.
 
-- Tracking only: no implementation or tests were performed for this issue. Builds, tests, formatting, lint and containers remain Secunda-only.
+- Tracking only: no implementation or tests were performed for this issue. Builds, tests, formatting, lint and containers remain isolated-worker-only.

@@ -1,28 +1,28 @@
-# Run essential parity gates and peer tests on Secunda
+# Run essential parity gates and peer tests on an isolated worker
 
 ## Summary
 
-Execute all builds and tests for the essential-parity fixes on `lain@secunda.local`, leaving the local machine and live Rustodon/Pleroma instances untouched.
+Execute all builds and tests for the essential-parity fixes on an isolated worker, leaving the local machine and live Rustodon/Pleroma instances untouched.
 
 ## Requirements
 
-- Use isolated task workspaces and rootless Podman on Secunda for fixture/integration and peer tests.
-- Reuse the existing read-only pinned Mastodon source at `/home/lain/repos/rustodon/target/mastodon-v4.6.5` (revision `1440d55b139e39ec722c2a3db7f60b66cd889048`); do not retrieve another copy when this one exists.
+- Use isolated task workspaces and a rootless container engine on an isolated worker for fixture/integration and peer tests.
+- Reuse the existing read-only pinned Mastodon source checkout (revision `1440d55b139e39ec722c2a3db7f60b66cd889048`); do not retrieve another copy when this one exists.
 - Never synchronize local instance credentials, backups, or untracked remote configuration.
 - Add reproducible Mastodon-to-Rustodon and Pleroma-to-Rustodon peer coverage where useful, checking ingestion, identity, visibility, notifications, and lifecycle convergence rather than HTTP acceptance alone.
 - Keep review observations R17/R18 (queue performance) deferred.
 
 ## Acceptance Criteria
 
-- Focused red/green regressions, independent reviews, and the applicable aggregate quality gates run on Secunda for the implemented fixes.
+- Focused red/green regressions, independent reviews, and the applicable aggregate quality gates run on an isolated worker for the implemented fixes.
 - Containerized peer evidence distinguishes passed activities/directions from remaining unproven cases.
 - Commands, prerequisites, isolation, cleanup, and remaining blockers are documented for repeatable runs.
 
 ## Notes
 
-- Secunda runs Linux x86-64, has Rust/Cargo 1.97.1, and has an existing checkout at `/home/lain/repos/rustodon` with untracked `tracked-configs/`; that checkout is not modified.
-- With explicit user approval, installed Podman 6.1.1, slirp4netns, fuse-overlayfs, and package-manager-selected dependencies on Secunda. Rootless `podman info` succeeds with netavark.
-- SSH user is `lain`, not the local machine's default `lainsoykaf`.
+- Historical gates ran on an isolated Linux x86-64 worker with Rust/Cargo 1.97.1
+  and a rootless container engine. Private host provisioning and configuration
+  details are intentionally omitted.
 
 ## Cached fixture images
 
@@ -41,7 +41,7 @@ Execute all builds and tests for the essential-parity fixes on `lain@secunda.loc
 
 ## Combined security and ingestion checkpoint
 
-After integrating R01/R02/R03/R04/R06/R13 on Secunda:
+After integrating R01/R02/R03/R04/R06/R13 on the isolated worker:
 
 - Restored worker suite: **53 passed**.
 - Schema-read suite: **37 passed** plus saved-status HTTP lifecycle **1 passed**.
@@ -49,33 +49,32 @@ After integrating R01/R02/R03/R04/R06/R13 on Secunda:
   passed. Ignored database suites were not counted as ordinary test passes.
 - Both recovery-fence and shared-reauthentication-limit differential cases passed
   again on the integrated tree.
-- Logs: `/home/lain/rustodon-parity/combined-security-{tests,workers,schema,clippy}.log`
-  and `combined-browser_{recovery_fences,reauthentication_limits}.log`.
+- Historical external run artifacts are not in the repository.
 - This checkpoint is not a final parity gate: audience/lifecycle/client repairs
   and real peer acceptance remain in progress.
 
 ## Latest completed gates and outage
 
 - The integrated R05/R07 checkpoint passed **57 restored-worker tests**, ordinary
-  all-target/all-feature tests, formatting and warnings-denied Clippy. Logs:
-  `/home/lain/rustodon-parity/combined-audience-{tests,workers,clippy}.log`.
-- All seven `tools/ci-differential` invocations passed at that checkpoint; log:
-  `/home/lain/rustodon-parity/combined-core-differential.log`.
+  all-target/all-feature tests, formatting and warnings-denied Clippy. Historical
+  external run artifacts are not in the repository.
+- All seven `tools/ci-differential` invocations passed at that checkpoint; the
+  historical external run artifact is not in the repository.
 - R08/R09/R10 and R11/R12/R14/R15 were subsequently integrated from independently
   reviewed, remotely tested topical commits. Initial real Mastodon public push
   smoke and test-only transport also passed remotely in their isolated task.
   These are not a substitute for a final combined-tree run.
-- Secunda then stopped resolving in SSH. The attempted atom-tag parser/worker RED
+- Remote access to the isolated worker then failed. The attempted atom-tag parser/worker RED
   timed out; its logs are unavailable and its result is unknown. Do not count it
   as an executed regression pass or failure.
-- The user requested continuing without Secunda for now. Continue source edits,
+- The user requested continuing without that isolated worker for now. Continue source edits,
   Git and independent source review only: **no local builds, tests, formatting,
   lint, or container fallback**. Atom-tag repair, expanded peer scenarios and v2
   account-search followup require execution when access returns.
-- Pleroma remains separately blocked by Docker Hub anonymous pull quota. The user
-  chose waiting for reset, not configuring registry authentication.
+- Pleroma remained blocked by Docker Hub's anonymous pull quota; no pinned Pleroma
+  build or peer result is claimed.
 
-### Resume verification (Secunda only)
+### Resume verification (isolated worker only)
 
 1. Reconcile only the recorded timed-out run's processes/resources before starting
    another fixture. Do not prune other task containers, images or volumes.
@@ -107,4 +106,4 @@ R17/R18 and the separately noted stress/legacy-history limits remain deferred.
   `interactions`) and current audit/multipart unit regressions as documented in
   `docs/federation-peer-smoke.md`. Each scenario starts fresh peers.
 - Source-only work is complete for this continuation. Runtime acceptance remains
-  blocked on Secunda access and, separately, the Pleroma base-image quota.
+  blocked on isolated-worker access and, separately, the Pleroma base-image quota.

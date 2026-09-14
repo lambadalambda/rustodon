@@ -29,11 +29,11 @@ Accept ordinary serializer-produced documents and preserve the audience fields n
 - Serializer-produced Create and Update round trips cover empty and nonempty
   warnings. Existing durable worker fixtures now exercise null summaries for
   Create/Update, fetched URI-only Notes, and fetched/embedded Announce targets.
-- Secunda RED: serializer roundtrip failed with `Activity` before the fix.
+- Isolated-worker RED: serializer roundtrip failed with `Activity` before the fix.
   GREEN: both targeted regressions; `tools/mastodon-fixture worker-test` **49/49**;
   all-feature library tests **241 passed, 2 ignored**; formatting and
   all-target/all-feature Clippy with warnings denied passed.
-- Logs: `/home/lain/rustodon-parity/null-summary-{red,green,workers,library,clippy}.log`.
+- Historical external run artifacts are not in the repository.
   Independent review found no blockers. R05/R06/R09 and real-peer acceptance
   remain open; this does not claim complete ingestion/audience parity.
 
@@ -45,15 +45,13 @@ Accept ordinary serializer-produced documents and preserve the audience fields n
 - Serializer-produced full actor Update now roundtrips through the inbox. Tests
   cover invalid schemes/shapes and URL precedence; the restored actor lifecycle
   asserts profile text and both persisted media URLs before deletion.
-- Secunda RED: serialized Update rejected with `Activity`. A second run with
+- Isolated-worker RED: serialized Update rejected with `Activity`. A second run with
   validation fixed but persistence unchanged proved avatar `None` and header
   empty despite updated profile text. Its early assertion also left fixture data
   that caused two later failures; all disappeared in GREEN.
 - GREEN: library **242 passed, 2 ignored**, restored worker **49/49**, formatting,
-  and all-target/all-feature Clippy with warnings denied. Logs beneath
-  `/home/lain/rustodon-parity/`: `actor-media-red.log`,
-  `actor-media-worker-red.log`, `actor-media-worker-green.log`,
-  `actor-media-library.log`, `actor-media-clippy.log`.
+  and all-target/all-feature Clippy with warnings denied. Historical external run
+  artifacts are not in the repository.
 - Independent review's test-import blocker was fixed and re-reviewed; no remaining
   blockers. These gates preceded integration of R01; combined gates follow.
   Real-peer profile convergence and the remaining audience criteria stay open.
@@ -66,9 +64,9 @@ Accept ordinary serializer-produced documents and preserve the audience fields n
 - Regression discovers an actor through WebFinger/actor GET, persists it, follows
   it, accepts the follow, and ingests a shared-inbox followers-only Note without
   preseeded `followers_url`. RED: no Note; GREEN: private visibility `2`.
-- Isolated Secunda worker **50/50**, schema **37/37**, targeted actor parser **2/2**,
+- Isolated worker **50/50**, schema **37/37**, targeted actor parser **2/2**,
   formatting and all-target/all-feature Clippy passed. Independent review approved.
-  Logs: `/home/lain/rustodon-parity/audiences/target/r05-*`.
+  Historical external run artifacts are not in the repository.
 - Inbound fixture jobs start after signature verification; actual peer signatures
   and follower receipt remain separate acceptance work. R09 is still pending.
 
@@ -77,8 +75,8 @@ Accept ordinary serializer-produced documents and preserve the audience fields n
 - Writer, Undo writer and worker share one visibility-aware helper deriving the
   local followers URI from the canonical actor URI, never stored collection text.
 - Both fresh-account regressions failed with empty `to` before the fix. GREEN on
-  Secunda: worker **52/52**, schema **37/37**, ActivityPub units **22/22**,
+  isolated worker: worker **52/52**, schema **37/37**, ActivityPub units **22/22**,
   formatting and warnings-denied Clippy. Independent review approved.
-- Logs: `/home/lain/rustodon-parity/audiences/target/r09-{red,green,schema,unit,clippy}.log`.
+- Historical external run artifacts are not in the repository.
   Outbound mock capture proves the audience, not real-peer follower ingestion;
   that last acceptance criterion remains open in the expanding peer suite.

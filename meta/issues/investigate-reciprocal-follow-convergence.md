@@ -15,11 +15,11 @@ An overlapping reciprocal-follow trial in the isolated Mastodon/Rustodon peer ha
 
 - Repeated simultaneous reciprocal follows converge to exactly one accepted relationship in each direction, with correct counters and no orphan requests or permanently stuck jobs; or an upstream-only blocker is precisely reproduced and documented.
 - Follow-option changes and unfollow remain correct after convergence.
-- Actual database/worker state, not inbox HTTP acceptance, establishes the result. Independent review and repeated task-owned cleanup checks pass on Secunda.
+- Actual database/worker state, not inbox HTTP acceptance, establishes the result. Independent review and repeated task-owned cleanup checks pass on an isolated worker.
 
 ## Notes
 
 - Follow-up to [isolated federation peer tests](add-isolated-federation-peer-tests.md); see the stress limit in [peer smoke documentation](../../docs/federation-peer-smoke.md).
 - The observed deadlock is not yet attributed to a Rustodon defect. Initial sequential public smoke passed, while the expanded source-only scenarios await remote execution.
 
-- Tracking only: no implementation or tests were performed for this issue. Builds, tests, formatting, lint and containers remain Secunda-only.
+- Tracking only: no implementation or tests were performed for this issue. Builds, tests, formatting, lint and containers remain isolated-worker-only.

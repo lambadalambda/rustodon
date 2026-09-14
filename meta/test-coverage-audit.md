@@ -6,7 +6,8 @@ Reviewed Rustodon production/test source at `f1ed300a42722631b9d42ef2935e9694728
 (the subsequent audit-tracking commit changes documentation only). This was a
 read-only audit: no new Rust/test/lint runs, live requests, preference writes,
 replays, or implementation changes. Counts below reconcile source annotations
-with the retained NAS `web-settings-nas/ordinary.log`, not a fresh execution.
+with retained historical external-run results; artifacts are not in the repository,
+and this was not a fresh execution.
 
 **Most ignored tests are legitimately fixture-gated. The problem is incomplete
 execution wiring and some missing independent behavioral assertions, not simply
@@ -16,17 +17,17 @@ were also found; they need focused red/green regressions, not fixes hidden in th
 
 Reference sources:
 
-- User-provided read-only `/Users/lainsoykaf/repos/pleroma-org/mastodon`, clean
+- User-provided read-only source checkout, clean
   revision `761c61b42590a2fd91442fc15a0a7583e48bbea4`. Its version module declares
   **4.7.0-alpha.1**, despite `git describe` showing a 4.6.0-rc.1 ancestor. It is a
   useful test-discovery corpus, **not** the project's pinned 4.6.5 oracle.
-- Canonical pin: `/workspace/rustodon/target/mastodon-v4.6.5`; existing Secunda
-  counterpart `/home/lain/repos/rustodon/target/mastodon-v4.6.5`, revision
+- Canonical pin: a repository-external pinned Mastodon 4.6.5 checkout; existing external
+  counterpart: the read-only pinned Mastodon source checkout, revision
   `1440d55b139e39ec722c2a3db7f60b66cd889048`. Neither local checkout was substituted.
 - For the two federation differences below, inspected the corresponding source
   and sanitized-update spec in the already-cached exact 4.6.5 harness image
   `sha256:696439e1ada71d0cf3d51d4d6a4744d6e40b57aafa64980b18f4d3b78230d0cf`
-  on the NAS, without network access. No checkout was fetched or modified.
+  in an isolated worker, without network access. No checkout was fetched or modified.
   Other proposed ports still require confirmation against that compatibility pin.
 
 ## 1. What “163 ignored” actually means
@@ -96,7 +97,7 @@ tools/Podman, but never obtains upstream source. `worker_test`
 Six tests read `attachment.gif`, `avatar.gif` or `attachment.jpg` under
 `target/mastodon-v4.6.5/spec/fixtures/files`.
 
-This is more than conjecture: the earlier clean NAS run passed **65/71** and failed
+This is more than conjecture: the earlier clean isolated worker run passed **65/71** and failed
 six cases with ENOENT until those three files were extracted from the exact pinned
 image. CI configuration has the same missing prerequisite on a fresh checkout.
 This audit did not inspect hosted CI runs and does not claim their observed status.
@@ -143,15 +144,15 @@ scripts are also not selected by this workflow. Add fast harness tests and
 high-risk auth/startup/HTTP suites to the required lane; schedule broader
 Rails differential, browser/cutover and peer matrices in bounded separate lanes.
 
-The recorded real-peer evidence is only an earlier public push smoke. Expanded
-privacy, Note lifecycle, profile and interaction scenarios are implemented but
-not proven executed; Pleroma's build/peer evidence remains separately incomplete.
-Ordinary peer helper tests and synthetic workers do not change that fact.
-`tools/federation-peer-smoke:4–6` also enforces a Secunda-only host/work-directory
-guard, and `:22` hardcodes that host's reference path. NAS execution requires a
-narrowly authorized guard/path adaptation while preserving source/fixture
-verification and isolation; provisioning source alone is insufficient.
-Host-policy/runbook text still says Secunda-only despite the user's NAS exception.
+The recorded real-peer evidence was initially limited to a public push smoke.
+Expanded privacy, Note lifecycle, profile and interaction scenarios were implemented
+but not yet proven at audit time; Pleroma's build/peer evidence remained separately
+incomplete. Ordinary peer helper tests and synthetic workers did not change that
+fact. The peer runner also enforced nonportable worker/work-directory guards and a
+workspace-specific reference path. Execution elsewhere required a narrow adapter
+that preserved source/fixture verification and isolation; provisioning source alone
+was insufficient. The later portable run is recorded in
+[the adapter issue](issues/adapt-and-run-peer-matrix-on-isolated-worker.md).
 
 ## 3. Concrete behavioral mismatches found during the audit
 
@@ -240,11 +241,11 @@ contracts to check, not newly established provenance or delivery failures.
 1. **Make existing coverage trustworthy:** repair feature/profile gates, provide
    pinned worker assets, permanent HTTP selectors, nonzero-selection guards and
    clear prerequisite diagnostics. Add focused regressions/startup/security and
-   fast shell/Python harness tests to automation. Update NAS/source run instructions.
+   fast shell/Python harness tests to automation. Update isolated worker/source run instructions.
 2. **Three small bug/regression changes:** direct-vs-limited classification,
    meaningful inbound edits, and derivative MIME. Keep them independent of runner
    changes; preserve privacy/provenance/least-privilege fences.
-3. **Run the already-written peer matrix** on the authorized NAS with verified
+3. **Run the already-written peer matrix** on the isolated worker with verified
    prerequisites. Re-run public plus privacy/notes/profile/interactions on the
    combined revision; retain per-scenario received-state/privacy evidence. Complete
    Pleroma separately rather than calling Mastodon-only success universal parity.
@@ -258,9 +259,9 @@ feature implementation or live remediation is proposed as part of this audit.
 
 ## Independent review
 
-Read-only synthesis review `09764a20-7962-4bcc-aeef-f85bbe47c1c5` found no material
-blocker. Applied its corrections: real-peer runner is not a Mise task; NAS use
-requires adapting the executable host/work-directory guard as well as the source
-path; reply-notification expectations are per mentioned status, not one total
+Read-only synthesis review found no material
+blocker. Applied its corrections: real-peer runner is not a Mise task; portable
+execution requires adapting the executable workspace guard as well as the source
+reference; reply-notification expectations are per mentioned status, not one total
 notification after both child and parent arrive. Review did not rerun tests or
 inspect live services.

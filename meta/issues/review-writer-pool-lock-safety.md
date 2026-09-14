@@ -13,7 +13,7 @@ session settings, and concurrent worker write paths.
 - Check lock acquisition order, timeout behavior, filesystem boundaries, and
   retry/rollback interactions.
 - Compare relevant domain, actor, media, and durable-job behavior with the pinned
-  Mastodon 4.6.5 checkout at `/workspace/rustodon/target/mastodon-v4.6.5`.
+  repository-external pinned Mastodon 4.6.5 checkout.
 
 ## Acceptance Criteria
 
@@ -142,7 +142,7 @@ startup integration tests successfully.
   transaction remains held, preserving the canonical domain-lock coverage
   (`src/mastodon/write_repository.rs:2697-2717`, `src/worker.rs:2906-2948`).
 - Relevant domain, actor, media, and durable-job behavior was compared with the
-  pinned checkout at `/workspace/rustodon/target/mastodon-v4.6.5`. No additional
+  repository-external pinned Mastodon 4.6.5 checkout. No additional
   confirmed compatibility finding was identified in the reviewed paths.
 
 ## Unproved and Deferred Behavior

@@ -29,7 +29,7 @@ are covered without assuming that all metadata must remain frozen.
   for semantic no-ops and the documented behavior of the current-state fallback.
 - Test evidence distinguishes coverage gaps from confirmed production defects;
   any discovered correction receives its own failing regression and review.
-- Relevant NAS fixture and ordinary checks pass; no live state is modified.
+- Relevant isolated-worker fixture and ordinary checks pass; no live state is modified.
 
 ## Notes
 
@@ -37,18 +37,17 @@ are covered without assuming that all metadata must remain frozen.
 - Starting points: `tests/workers/semantic_updates.rs` and the history projection
   in `src/mastodon/rest/loader.rs`.
 - User approved adding this follow-up after the audit implementation checkpoint.
-- Phase 1 owned by Alice in `task/remaining-updates`; tests and this issue only.
-- No new history implementation. Parent-reported NAS regression/mutation evidence
+- Phase 1 covered tests and this issue only.
+- No new history implementation. Parent-reported isolated-worker regression/mutation evidence
   is recorded below; formatting and topical commit remain parent-owned.
 
 ## Pinned findings and scope (phase 1)
 
-Oracle: read-only
-`/Users/lainsoykaf/repos/rustodon/.local-instance/audit-reference/remaining/`,
-provided from pinned image
-`sha256:696439e1ada71d0cf3d51d4d6a4744d6e40b57aafa64980b18f4d3b78230d0cf`,
-expected revision `1440d55b139e39ec722c2a3db7f60b66cd889048`.
-No source fetch, SSH, image execution, or modification of oracle files.
+The oracle was a historical read-only extract, not retained in the repository,
+from pinned image
+`sha256:696439e1ada71d0cf3d51d4d6a4744d6e40b57aafa64980b18f4d3b78230d0cf`
+at revision `1440d55b139e39ec722c2a3db7f60b66cd889048`. No source fetch,
+remote access, image execution, or oracle modification occurred.
 
 - `app/services/activitypub/process_status_update_service.rb:43-55,174-184,403-411`
   builds an original snapshot only when history is empty and saves original
@@ -100,9 +99,9 @@ red/green evidence/review.
   explicitly cleaned up; HTTP server is aborted on errors and assertion panics.
 
 No production/schema/grant changes; no storage implementation bundled in these
-regressions. This worktree ran no local or NAS test/build/fmt/lint workloads and
-made no commits. Parent ran the authorized disposable fixture with existing
-worker roles; see reported results below. Shared harness registration and NAS
+regressions. This worktree ran no local or isolated worker test/build/fmt/lint workloads and
+made no commits. The parent ran the disposable fixture with the existing
+worker roles; see reported results below. Shared harness registration and isolated worker
 workspace selection remain untouched here. The issue remains open for parent
 formatting/ordinary-check gates and finalization; no shared index/archive edits.
 
@@ -116,11 +115,11 @@ both follow and mention grants. Existing storage/metadata parity gaps remain
 separate, not silently fixed here.
 
 
-## Parent-reported NAS evidence
+## Parent-reported isolated-worker evidence
 
 - Baseline: all **15** `semantic_updates::` tests passed against unchanged
   production (nine existing, one ordering, five history).
-  Log: `/srv/workspaces/rustodon-audit-green/logs/semantic_updates-baseline.log`.
+  The historical external run artifact is not in the repository.
 - Controlled mutation M2 changed only the no-row history fallback timestamp
   from `current.edited_at.unwrap_or(current.created_at)` to `current.created_at`
   in `ProjectionLoader::status_history`.
@@ -129,14 +128,13 @@ separate, not silently fixed here.
   (`2026-08-25T12:01:00Z`), but REST returned publication time
   (`2026-08-25T12:00:00Z`). This red is not a no-op failure or an existing
   production defect; it shows the real REST fallback timestamp assertion works.
-  Log: `history-fallback-mutant.log`.
+  The historical external run artifact is not in the repository.
 - M1 separately advanced `edited_at` before the no-op guard and failed the
   ordering test at T3 equality (not T2 rejection); see the ordering issue.
   Parent restored both mutations and all **15** semantic-update tests passed.
-  Log: `semantic-updates-restored-green.log`.
-- Results were supplied by parent from authorized NAS disposable workloads;
-  this worktree did not execute them or independently retrieve the logs.
-  Mutation/restore log basenames are recorded exactly as supplied by parent.
+  The historical external run artifact is not in the repository.
+- Results were supplied from isolated disposable workloads; this worktree did not
+  execute them or inspect the external artifacts.
 - No mutation red is claimed for stored-row authorization or sensitivity:
   those assertions ran in the passing baseline/restored suite. No upstream
   runtime differential or full remote-history storage parity is claimed.
@@ -151,7 +149,7 @@ separate, not silently fixed here.
 
 ## Completion
 
-NAS formatting and the restored 15-test fixture suite passed. Both controlled
-mutations failed at their intended assertions. Final independent correctness and
-architecture review found no blockers. Regression scope complete; no production,
-schema, grant, deployment or historical replay change.
+Isolated-worker formatting and the restored 15-test fixture suite passed. Both
+controlled mutations failed at their intended assertions. Final independent
+correctness and architecture review found no blockers. Regression scope complete;
+no production, schema, grant, deployment or historical replay change.

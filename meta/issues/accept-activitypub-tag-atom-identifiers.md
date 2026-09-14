@@ -15,7 +15,7 @@ The R10 receiver regression exposed another ordinary ingestion gap: locally seri
 
 - Ordinary serialized Create/Update/Delete with a tag atom identifier converge through the receiver worker.
 - Malformed identifiers and cross-author/cross-origin alias attempts cannot change another actor's status.
-- Targeted regressions and applicable aggregate gates pass on Secunda, with independent review.
+- Targeted regressions and applicable aggregate gates pass on an isolated worker, with independent review.
 
 ## Notes
 
@@ -43,9 +43,9 @@ The R10 receiver regression exposed another ordinary ingestion gap: locally seri
 - **Compatibility limit:** a receiver row stored solely under a legacy tag remains
   unsupported, as before this repair. Sender-side legacy tags no longer prevent
   canonical ingestion; this does not implement Mastodon's historical alias fallback.
-- **Execution pending:** parser/worker RED was launched on Secunda but SSH timed
+- **Execution pending:** parser/worker RED was launched on an isolated worker but remote access timed
   out during the outage and logs are unavailable; no result is claimed. The user
-  requested continued work without Secunda, so implementation/review proceeds
+  requested continued work without the isolated worker, so implementation/review proceeds
   source-only. No local builds, tests, formatting, lint or containers ran. R10's
   old HTTP-URI isolation is removed in source but acceptance remains pending until
   remote red/green and aggregate gates execute. Do not archive this issue yet.

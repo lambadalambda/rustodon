@@ -14,7 +14,7 @@ Priorities below use **P1** for release-blocking security/core correctness and *
 
 - Independent read-only reviews covered inbound federation, outbound federation, authenticated social REST, and browser/OAuth authentication. Separate secondary reviews assessed clean-checkout gates and durable queue behavior. The primary review cross-checked critical source paths and consolidated the duplicated follow-options finding.
 - This is a targeted source review, not an exhaustive audit or a new full release-gate run. Except for the two parser reproductions explicitly identified below, the scenarios are **source-traced regression specifications, not executed end-to-end results**.
-- The prescribed pinned Mastodon checkout (`/workspace/rustodon/target/mastodon-v4.6.5`, revision `1440d55b139e39ec722c2a3db7f60b66cd889048`) and project-local `target/mastodon-v4.6.5` were unavailable. No upstream source was fetched. No new Rails differential comparison is claimed.
+- The prescribed repository-external Mastodon 4.6.5 checkout at revision `1440d55b139e39ec722c2a3db7f60b66cd889048` and project-local `target/mastodon-v4.6.5` were unavailable. No upstream source was fetched. No new Rails differential comparison is claimed.
 - No live application writes, credential inspection, or federation replays were performed. No production code was changed; red/green regression tests belong in the individual fixes.
 
 ### Checks performed

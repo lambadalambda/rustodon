@@ -15,18 +15,18 @@ The real peer smoke found that `/api/v2/search` always returns an empty accounts
 
 - HTTP regressions cover local and cached account results, type separation, pagination, and scope failures.
 - Authenticated remote-handle resolution uses the existing safe fetch/persistence path; unauthenticated resolve cannot initiate outbound requests.
-- Applicable client and differential gates pass in the current owner-authorized
+- Applicable client and differential gates pass in the supported isolated
   execution environment and behavior limits are documented.
 
 ## Notes
 
 - Discovered by the Mastodon peer smoke, which currently uses v1 account search instead.
 - Source confirmed in `src/web.rs::search_v2`; implementation and its named HTTP
-  regression are present and passed on the authorized NAS. Broader client and
+  regression are present and passed on the isolated worker. Broader client and
   differential evidence remains pending.
-- At implementation time Secunda was unreachable, so the user requested
+- At implementation time isolated worker was unreachable, so the user requested
   continuing source work without local build/test fallback. That historical
-  verification state is superseded in part by the authorized-NAS evidence below.
+  verification state is superseded in part by the later isolated-worker evidence below.
 
 ## Status — OPEN: named HTTP regression green; broader client/differential evidence pending
 
@@ -86,12 +86,12 @@ substantive source-level blockers. This is not compilation or runtime evidence.
 
 ### Historical initial verification limits
 
-TDD RED/GREEN execution was infeasible because Secunda DNS was unavailable. **No new
+TDD RED/GREEN execution was infeasible because isolated worker DNS was unavailable. **No new
 build, test, formatter, lint or container command has run**, locally or remotely; no
-SSH retry was attempted. The new regression has not even been compiled. Formatting
+execution retry was attempted. The new regression has not even been compiled. Formatting
 and test assumptions require remote verification before closing this issue.
 
-At that time, the queued Secunda command set (now historical, not current
+At that time, the queued isolated worker command set (now historical, not current
 execution guidance) was:
 
 ```sh
@@ -114,21 +114,19 @@ pre-refactor handler: its local-account assertion should fail because `accounts`
 was hard-coded empty. That boundary was source-predicted at the time, not newly
 executed as a historical mutation.
 
-Pinned Mastodon source was unavailable during this follow-up: canonical read-only
-`/workspace/rustodon/target/mastodon-v4.6.5`, actual remote read-only
-`/home/lain/repos/rustodon/target/mastodon-v4.6.5`, expected revision
-`1440d55b139e39ec722c2a3db7f60b66cd889048`. No replacement was fetched and no fresh
-upstream/differential comparison is claimed. Fixture-owner setup/persistence will
-not itself establish production-role permissions.
+The prescribed and external read-only pinned Mastodon 4.6.5 checkouts were
+unavailable during this follow-up; expected revision
+`1440d55b139e39ec722c2a3db7f60b66cd889048`. No replacement was fetched and no
+fresh upstream/differential comparison is claimed. Fixture-owner
+setup/persistence will not itself establish production-role permissions.
 
-### Later authorized-NAS evidence
+### Later isolated-worker evidence
 
 The later test-audit run superseded the initial compile/runtime uncertainty:
 `tools/mastodon-fixture schema-read-test v2_account_search` passed as one of the
 12 independently bounded final schema selectors, and the final combined tree's
 ordinary default/debug-all-feature/release tests, formatting, and strict Clippy
-checks passed. See `docs/testing-on-nas.md` and its `final17-schema-*.log`,
-`final23-*.log`, and `final24-*.log` references.
+checks passed. See `../../docs/testing.md` and its historical external results.
 
 The peer runner intentionally still uses v1 account discovery. A dedicated
 v2-search differential/client run and fresh peer use of v2 discovery have not

@@ -12,26 +12,28 @@ Verify pinned expectations, durable retry/idempotency and final received thread/
 
 - Subissue of [selected matrix ports](port-mastodon-media-and-browser-matrices.md).
 - Tests first; separate topical implementation and independent review.
-- Phase 1 owned in `ilar-task-remaining-reply` (`task/remaining-reply`): tests and this issue only; parent owns shared registration and all execution.
-- Inspect existing reply hydration coverage and the read-only extracted cached 4.6.5 oracle before adding the transient-failure/recovery matrix. No production changes, local workloads, NAS/SSH, commits, or live replay.
-- Standalone test/mutation verification complete by parent-reported NAS evidence
+- Phase 1 used a task-owned workspace: tests and this issue only; parent owns
+  shared registration and all execution.
+- Inspect existing reply hydration coverage and the read-only extracted cached 4.6.5 oracle before adding the transient-failure/recovery matrix. No production changes, local workloads, external-worker, commits, or live replay.
+- Standalone test/mutation verification complete by parent-reported isolated-worker evidence
   below; combined-worker integration remains pending after a follow-prerequisite
   failure. No production defect or firsthand execution claimed by this worktree.
 
 ## Completion evidence — parent-reported
 
-| Run | Selected / result | Evidence log |
-| --- | --- | --- |
-| Unmuted baseline | 3 selected, 3 PASS | `parent-fetch-unmuted-green.log` |
-| R: retry policy mutant | 3 selected, 3 FAIL at intended retry assertion (parent-formatted line 198) | `parent-fetch-retry-mutant.log` |
-| T: thread repair mutant | 3 selected, 3 FAIL at intended thread assertion (line 229) | `parent-fetch-thread-mutant.log` |
-| D: home distribution mutant | 3 selected, 3 FAIL at intended home assertion (line 242) | `parent-fetch-distribution-mutant.log` |
-| Restored baseline | 3 selected, 3 PASS in 3.05s | `parent-fetch-restored-green.log` |
+| Run | Selected / result |
+| --- | --- |
+| Unmuted baseline | 3 selected, 3 PASS |
+| R: retry policy mutant | 3 selected, 3 FAIL at intended retry assertion (parent-formatted line 198) |
+| T: thread repair mutant | 3 selected, 3 FAIL at intended thread assertion (line 229) |
+| D: home distribution mutant | 3 selected, 3 FAIL at intended home assertion (line 242) |
+| Restored baseline | 3 selected, 3 PASS in 3.05s |
 
 Parent confirms no setup/compile failures, sequential controls, and source restoration
 after each mutation. These are controlled behavioral reds followed by restored green,
 not manufactured production defects. `[child, parent]` remains the feed expectation.
-The logs/results are supplied by the parent; no log retrieval or execution here.
+Historical external artifacts are not in the repository; no execution was performed
+for this issue update.
 
 Independent read-only reviews covered test correctness/compactness, fixture
 corrections, oracle limits and exact mutation controls. The later combined-worker
@@ -41,7 +43,7 @@ source revision, not proof that the new combined correction has run.
 Parent formatting and the test-only commit remain parent-owned. Shared
 gate/index/archive changes remain parent-owned; this worktree does not claim their
 completion. The limited extracted-oracle qualifications below remain unchanged.
-No workload, formatting, NAS/SSH operation or commit performed by this worktree.
+No workload, formatting, external-worker operation or commit performed by this worktree.
 
 ## Combined-worker follow prerequisite correction
 
@@ -89,7 +91,7 @@ No evidence connected these mutations to deletion of Alice → Bob mute `9503`, 
 exact mute seed-count assertion remains unchanged rather than expanding this fix.
 
 Combined and standalone reruns of this correction remain parent-owned/pending; no
-workload, formatting, NAS/SSH operation, production edit or commit performed here.
+workload, formatting, external-worker operation, production edit or commit performed here.
 
 ## Phase 1 matrix
 
@@ -152,11 +154,11 @@ Assertions cover:
 ## Pinned oracle and scope of claims
 
 Read-only extracted oracle supplied by the parent:
-`/Users/lainsoykaf/repos/rustodon/.local-instance/audit-reference/remaining/`, from
+a historical external reference artifact not in the repository, from
 cached Mastodon 4.6.5 image
 `sha256:696439e1ada71d0cf3d51d4d6a4744d6e40b57aafa64980b18f4d3b78230d0cf`.
-The canonical `/workspace/rustodon/target/mastodon-v4.6.5` and Secunda
-`/home/lain/repos/rustodon/target/mastodon-v4.6.5` are absent locally. Nothing was
+The prescribed pinned Mastodon 4.6.5 checkout and the external
+read-only pinned Mastodon source checkout are absent locally. Nothing was
 fetched, and the supplied extraction was not modified.
 
 Inspected oracle:
@@ -185,9 +187,9 @@ stream intents, not Mastodon's Redis scheduling timing or live WebSocket receipt
 - Shared `tests/workers.rs` registration remains parent-owned. Add the module under
   `#[cfg(feature = "test-support")]` with path `workers/parent_fetch_recovery.rs`.
 - Parent should wire the `parent_fetch_recovery::` filter into the permanent worker
-  gate and run all three cases serially in the disposable NAS fixture with
+  gate and run all three cases serially in the disposable isolated-worker fixture with
   `test-support` and `--ignored`; no shared harness/gate file changed here.
-- **No local tests, builds, formatting, lint, NAS/SSH workloads, or commits run.**
+- **No local tests, builds, formatting, lint, external-worker workloads, or commits run.**
   Phase 1 is test preparation, not verified red or green; TDD execution is delegated
   to the parent by explicit instruction.
 - Source inspection suggests existing behavior should pass. Run the unchanged
@@ -215,7 +217,7 @@ interference is claimed; parent suites were serialized.
 
 Parent must rerun the unchanged-production baseline through the subsequent recovery,
 privacy/thread/feed, notification and idempotency assertions before mutation controls.
-No test, formatting, NAS/SSH workload or commit performed for this correction.
+No test, formatting, external-worker workload or commit performed for this correction.
 Focused independent read-only review confirmed the exact message matches both
 production error layers, retains a meaningful retryable-HTTP boundary, and leaves
 all subsequent recovery assertions unchanged. **Correction patch ready**; later
@@ -223,8 +225,8 @@ baseline steps remain unverified until the parent reruns them.
 
 ### Second baseline: feed exclusion diagnosis
 
-Parent reports `parent_fetch_recovery-baseline2.log`: all three serialized cases
-pass recovery, repaired author/thread/privacy rows and per-status notifications,
+The parent reports that a historical external run recorded all three serialized cases
+passing recovery, repaired author/thread/privacy rows and per-status notifications,
 then fail the home-feed assertion with only the fetched parent ID. No log fetched
 or workload run here.
 
@@ -268,12 +270,12 @@ Focused independent review confirmed the SQL/JSONB types, narrow fixture scope,
 full-row restoration on returned errors/caught panics, and unchanged two-status
 expectation. **Fixture correction patch ready**; parent must rerun the complete
 serialized baseline before treating this matrix as green or starting mutation
-controls. No workload, formatting, NAS/SSH or commit run here.
+controls. No workload, formatting, external-worker or commit run here.
 
 ## Parent-reported green baseline and bounded mutation plan
 
-Parent reports a fresh NAS run after the scoped mute fixture correction:
-**all three cases PASS**, log `parent-fetch-unmuted-green.log`. This is reported
+Parent reports a fresh isolated worker run after the scoped mute fixture correction:
+**all three cases PASS** in a historical external run. This is reported
 parent execution evidence, not a workload or log inspection performed in this
 worktree. The preserved `[child, parent]` feed expectation passed. Earlier failures
 were test-error/fixture-boundary corrections, not established production defects.
@@ -283,7 +285,7 @@ limited extracted-oracle qualification above still applies.
 
 ### Parent execution protocol
 
-1. Use a disposable parent-owned NAS workspace with the exact source/tests of the
+1. Use a disposable parent-owned isolated-worker workspace with the exact source/tests of the
    green baseline. Preserve that baseline's source bytes, including parent formatting;
    do not restore from this worktree or overwrite unrelated edits.
 2. Apply **one** mutation at a time, only inside the named function. Match the old
@@ -291,7 +293,7 @@ limited extracted-oracle qualification above still applies.
    by line number. Keep tests and fixture isolation unchanged.
 3. Reuse the green baseline worker harness/environment and `test-support` build
    configuration, retaining the parent-owned module registration. Rebuild the test
-   executable from each mutated source on the authorized worker; never reuse a stale
+   executable from each mutated source on the isolated worker; never reuse a stale
    baseline executable. Exact test binary: `workers`. Filter for each control:
    `parent_fetch_recovery::` with `--ignored --test-threads=1` (three tests expected).
    Full names, if the harness requires individual selectors:
@@ -393,7 +395,7 @@ Independent read-only review confirmed all three exact fragments, type/SQL
 plausibility, intended earliest assertions, and one-at-a-time restoration protocol.
 No blocking plan defect found; the parent subsequently confirmed all three intended
 behavioral reds and restored green (see Completion evidence).
-No production mutations, workload, formatting, NAS/SSH operation or commit
+No production mutations, workload, formatting, external-worker operation or commit
 performed by this worktree.
 
 Nonblocking review limits retained: the positive stream assertion is for the
@@ -405,8 +407,8 @@ residue, deferred rather than expanding this phase).
 ## Completion
 
 The self-contained relationship setup passed the corrected **100/100 combined
-worker gate** on NAS (`workers-corrected.log`,375.35s), with strict all-target/
-all-feature Clippy green (`clippy-corrected.log`). Earlier focused R/T/D mutations
-each failed all three intended assertions, then restored baseline passed3/3.
+worker gate** on an isolated worker (375.35s), with strict all-target/all-feature
+Clippy green. Earlier focused R/T/D mutations each failed all three intended
+assertions, then the restored baseline passed 3/3.
 The follow/membership correction was independently reviewed; it retains both
 required follows and every privacy/thread/home assertion. No production change.

@@ -2,7 +2,7 @@
 
 ## Summary
 
-Six worker tests depend on attachment.gif, avatar.gif and attachment.jpg from an absent upstream source path on fresh CI/NAS workspaces.
+Six worker tests depend on attachment.gif, avatar.gif and attachment.jpg from an absent upstream source path on fresh CI/isolated-worker workspaces.
 
 ## Requirements
 
@@ -18,17 +18,17 @@ Six worker tests depend on attachment.gif, avatar.gif and attachment.jpg from an
 ## Notes
 
 - Source: [test coverage audit](../test-coverage-audit.md).
-- User authorized this implementation plan on 2026-09-12; no live deployment is implied.
+- Implementation plan recorded on 2026-09-12; no live deployment is implied.
 
 ## Completion evidence (2026-09-12)
 
 - Vendored exactly three assets and upstream license from the cached pinned
   Mastodon image, with independent hardcoded hashes and provenance README.
 - Prerequisite regression failed on old missing-source paths, then passed valid,
-  corrupted, absent-file, and incomplete-manifest checks on NAS without a source
-  checkout. Logs: `rustodon-audit-main/logs/worker-media-{red,green}.log`.
+  corrupted, absent-file, and incomplete-manifest checks on an isolated worker without a source
+  checkout. Historical external run artifacts are not in the repository.
 - Full combined worker suite: **85 passed**, including all seven vendored reads
-  and the new direct/semantic regressions. Log:
-  `/srv/workspaces/rustodon-audit-green/logs/workers.log`.
+  and the new direct/semantic regressions. Its historical external artifact is
+  not in the repository.
 - Independent review found no blockers; full-source contract checks remain
   separate. No live instance or reference checkout changed.

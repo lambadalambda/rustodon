@@ -18,13 +18,13 @@ A genuinely newer inbound Update that sanitizes to unchanged content still chang
 ## Notes
 
 - Source: [test coverage audit](../test-coverage-audit.md).
-- User authorized this implementation plan on 2026-09-12; no live deployment is implied.
+- Implementation plan recorded on 2026-09-12; no live deployment is implied.
 
 ## Status: open — parent green and review pending
 
-### Phase 1: behavioral red (parent-owned NAS execution)
+### Phase 1: behavioral red (parent-owned isolated worker execution)
 
-- Workspace/log: `/srv/workspaces/rustodon-audit-red/logs/edits.log`.
+- The historical external run artifact is not in the repository.
 - Parent reported **5 passed, 4 failed** for the nine-case
   `semantic_updates::` worker module against unchanged production code.
 - Failures:
@@ -64,8 +64,8 @@ A genuinely newer inbound Update that sanitizes to unchanged content still chang
 - Rustodon's separate local `update_status` path explicitly includes sensitivity
   (and language) in its significant changes. That local UI/API policy is left
   untouched; this issue does not claim that local and inbound policies match.
-- Canonical `/workspace/rustodon/target/mastodon-v4.6.5` and Secunda counterpart
-  `/home/lain/repos/rustodon/target/mastodon-v4.6.5` were absent in this coding
+- The prescribed pinned Mastodon 4.6.5 checkout and the external
+  read-only pinned Mastodon source checkout were absent in this coding
   environment. No source was fetched/replaced and the 4.7-alpha discovery checkout
   was not used as an oracle. Parent previously confirmed the exact pinned-image
   service/spec contract; sensitivity relies on the parent's Phase 2 observation,
@@ -87,7 +87,7 @@ cargo test --locked --features test-support --test workers semantic_updates:: \
   HTTP transport or Pull/Push execution is required for this filter.
 - Parent owns baseline execution of the corrected control, green, formatting,
   lint, broader lifecycle regressions, and independent production review. No
-  build/test/fmt/lint/SSH/Podman workload or commit was run by the coding agent.
+  build/test/fmt/lint/remote/container workload or commit was run by the coding agent.
 - Deliberately no new received-version watermark: the existing timestamp fence
   remains based on the last meaningful edited_at (or created_at). If the desired
   contract includes rejecting timestamps newer than the last edit but older than
@@ -102,9 +102,9 @@ cargo test --locked --features test-support --test workers semantic_updates:: \
 
 - Original baseline: nine tests, five passed/four failed; corrected pinned
   sensitivity-only no-edit control separately failed on baseline (0 passed,
-  1 failed). Logs: `/srv/workspaces/rustodon-audit-red/logs/{edits,sensitivity-red}.log`.
-- Combined NAS worker suite: 85 passed including all nine semantic cases.
-  `/srv/workspaces/rustodon-audit-green/logs/workers.log`.
+  1 failed). Historical external run artifacts are not in the repository.
+- Combined isolated-worker suite: 85 passed including all nine semantic cases;
+  its historical external artifact is not in the repository.
 - Default/all-feature debug, release all-feature, formatting and strict Clippy
   pass. Independent review found no blockers. No live deployment or replay.
 - Follow-ups deliberately not added: received-version watermark and explicit

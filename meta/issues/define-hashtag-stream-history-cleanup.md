@@ -15,11 +15,11 @@ Current hashtag-stream fan-out selects currently eligible recipients. A client t
 
 - WebSocket plus REST regressions demonstrate the agreed client-cache behavior across each lifecycle, including reconnect/resume where relevant.
 - Former recipients receive no unauthorized status body, and unrelated users receive no cleanup events.
-- Independent review and applicable Secunda stream/fixture gates pass; deliberate protocol limits are documented explicitly.
+- Independent review and applicable isolated-worker stream/fixture gates pass; deliberate protocol limits are documented explicitly.
 
 ## Notes
 
 - Follow-up to R12 in [reviewed client workflows](close-reviewed-client-workflow-gaps.md).
 - Current-eligibility and actual WebSocket lifecycle tests passed remotely. These historical schedules were not exercised; stale-cache impact must be established before choosing an implementation.
 
-- Tracking only: no implementation or tests were performed for this issue. Builds, tests, formatting, lint and containers remain Secunda-only.
+- Tracking only: no implementation or tests were performed for this issue. Builds, tests, formatting, lint and containers remain isolated-worker-only.

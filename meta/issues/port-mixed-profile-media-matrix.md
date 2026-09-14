@@ -8,14 +8,15 @@ Permanent credentials HTTP coverage for mixed GIF-avatar/JPEG-header upload, tex
 
 Assert API/reload results, independently decoded stored/served bytes, unchanged opposite slot, and no partial account/user/file mutation on rejection. Wire the matrix into selected and all-case fixture execution.
 
-## Completion Evidence — Parent NAS Reports
+## Completion Evidence — Parent external-run reports
 
 - Exact mixed matrix initially passed with `profile=test,opt-level=3`, total **83.36s**, unchanged fixtures/assertions/deadlines.
 - Permanent wiring offline regression: **RED before / GREEN after**. **All offline harnesses PASS.** This verifies all-case dispatch wiring, not a claim that the complete live all-case fixture lane ran.
 - Actual-media sensitivity control: temporarily made an omitted header remove existing media. **FAIL in 14.84s**, specifically at text-only preserved-header `Slot` equality; initial mixed upload completed in **3516ms**, within unchanged budgets. This was a preservation failure, not a setup/timeout substitute for red.
-- Mutation reverted; permanently wired optimized matrix **PASS**, log **`mixed-profile-wired-green.log`**. Final duration has not yet been read/reported; do not reuse the earlier 83.36s value for this run. Parent confirms **no production mutations remain**.
+- Mutation reverted; the permanently wired optimized matrix **PASS** is recorded
+  by a historical external run whose artifact is not in the repository. Final duration has not yet been read/reported; do not reuse the earlier 83.36s value for this run. Parent confirms **no production mutations remain**.
 - Parent preserved the early `$ROOT/tools/verify-worker-media` preflight from `410fb8f`. The offline sandbox supplies an executable verifier stub and asserts exactly one call before Cargo/provisioning. No pinned-source/fixture oracle was removed.
-- All execution above is parent-reported NAS evidence. This worktree agent ran no builds/tests/formatting/NAS/SSH workloads and made no commits. Parent is awaiting SSH-agent unlock before committing; no workaround attempted.
+- All execution above is parent-reported isolated-worker evidence. This worktree agent ran no builds/tests/formatting/external-worker workloads and made no commits. The commit remained pending; no credential workaround was attempted.
 
 ## Permanent Implementation
 
@@ -34,9 +35,10 @@ Assert API/reload results, independently decoded stored/served bytes, unchanged 
 ## Pinned Oracle and Ownership
 
 - Subissue of [selected matrix ports](port-mastodon-media-and-browser-matrices.md).
-- Read-only 4.6.5 oracle: `/Users/lainsoykaf/repos/rustodon/.local-instance/audit-reference/remaining/spec/requests/api/v1/accounts/credentials_spec.rb`, extracted from existing exact cached image `696439e1ada71d0cf3d51d4d6a4744d6e40b57aafa64980b18f4d3b78230d0cf`. Lines 53–67 and 99–129 establish mixed GIF/JPEG success; lines 83–96 establish overlong-note 422. Preservation/removal/atomicity extend that request spec rather than being falsely attributed to it.
-- Pinned revision `1440d55b139e39ec722c2a3db7f60b66cd889048`; fixture provenance in `tests/fixtures/README.md` and `fixtures/worker-media/mastodon-v4.6.5/{README.md,SHA256SUMS}`. Canonical `/workspace/rustodon/target/mastodon-v4.6.5` and Secunda `/home/lain/repos/rustodon/target/mastodon-v4.6.5` absent locally; no fetching or 4.7 substitution.
-- Owned worktree `/Users/lainsoykaf/repos/ilar-task-remaining-profile` (`task/remaining-profile`). Parent owns execution, integration, issue-index closure, and commits.
+- Read-only 4.6.5 oracle: `spec/requests/api/v1/accounts/credentials_spec.rb` in a historical external reference artifact not in the repository, extracted from existing exact cached image `696439e1ada71d0cf3d51d4d6a4744d6e40b57aafa64980b18f4d3b78230d0cf`. Lines 53–67 and 99–129 establish mixed GIF/JPEG success; lines 83–96 establish overlong-note 422. Preservation/removal/atomicity extend that request spec rather than being falsely attributed to it.
+- Pinned revision `1440d55b139e39ec722c2a3db7f60b66cd889048`; fixture provenance in `tests/fixtures/README.md` and `fixtures/worker-media/mastodon-v4.6.5/{README.md,SHA256SUMS}`. The prescribed pinned Mastodon 4.6.5 checkout and the external read-only pinned Mastodon source checkout were absent locally; no fetching or 4.7 substitution.
+- Work used a task-owned workspace. Execution, integration, issue closure, and
+  commits remained separate.
 
 ## Final Diagnostic-Only Follow-up
 
@@ -44,10 +46,10 @@ The mutant exposed oversized panic output from derived `StoredImage::Debug`. Rep
 
 ## Completion
 
-Permanent exact-selector execution passes (`mixed-profile-wired-green.log`,88.68s)
+Permanent exact-selector execution passes (88.68s)
 with unchanged request budgets. The omitted-header mutation fails at the intended
 preservation assertion, not timeout. Offline wrapper RED/GREEN and all harnesses
-pass. Compact-debug regression was independently RED then GREEN on NAS; strict
+pass. Compact-debug regression was independently RED then GREEN on an isolated worker; strict
 all-target/all-feature Clippy passes after formatting. Reviews approved matrix,
 profile scoping, and concise diagnostics without weakening exact byte/frame equality.
 The full all-case wiring is covered offline; this is not a claim every unrelated

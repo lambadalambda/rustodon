@@ -15,11 +15,11 @@ Investigate compatibility with preserved remote statuses whose only stored URI i
 
 - A restored tag-only remote row can be reconciled with its authenticated canonical object without duplicate statuses, lost history or resurrection after deletion.
 - Cross-account/cross-origin tags and conflicting canonical/legacy rows cannot mutate content, remove media, forward activities or create tombstones for a victim.
-- Regression tests, independent review and applicable Secunda gates pass before acceptance is claimed.
+- Regression tests, independent review and applicable isolated-worker gates pass before acceptance is claimed.
 
 ## Notes
 
 - Follow-up to [opaque atom metadata handling](accept-activitypub-tag-atom-identifiers.md), not a reopening of the provenance security fix.
 - This is a documented compatibility limit, not an executed legacy-mapping regression. Source-only repair `a3fe48a` still has its own pending remote verification.
 
-- Tracking only: no implementation or tests were performed for this issue. Builds, tests, formatting, lint and containers remain Secunda-only.
+- Tracking only: no implementation or tests were performed for this issue. Builds, tests, formatting, lint and containers remain isolated-worker-only.

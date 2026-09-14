@@ -20,13 +20,14 @@ The user requests another code/test review: explain the many disabled or ignored
 ## Notes
 
 - Start source revision: `f1ed300a42722631b9d42ef2935e9694728ce0d0`.
-- NAS is authorized for workloads if needed; local/upstream inspection is read-only. No broad test execution is requested for this audit.
+- Any needed workloads run only in an isolated environment; local and upstream
+  inspection remains read-only. No broad test execution is requested for this audit.
 
 ## Audit findings
 
 Detailed report: [test gating and Mastodon coverage audit](../test-coverage-audit.md).
 
-- Reconciled 163 ignored source annotations with retained NAS evidence (431 passed,
+- Reconciled 163 ignored source annotations with retained isolated-worker evidence (431 passed,
   163 ignored). Distinguished fixture gates, feature-hidden tests, subprocess
   scaffolding, default/release configuration defects and absent CI selectors.
 - Three bounded read-only subreviews covered annotation inventory, upstream API/
@@ -35,7 +36,7 @@ Detailed report: [test gating and Mastodon coverage audit](../test-coverage-audi
 - The user-provided local upstream is clean revision `761c61b42590a2fd91442fc15a0a7583e48bbea4`,
   declaring 4.7.0-alpha.1, not the 4.6.5 compatibility pin. For the direct-message
   and semantic-edit findings, parent also inspected matching source/specs inside
-  the exact existing pinned 4.6.5 image on NAS, read-only and network-disabled.
+  the exact existing pinned 4.6.5 image on an isolated worker, read-only and network-disabled.
 - Findings include nonpermanent HTTP regression selectors, missing fresh-worker
   media prerequisites, incomplete CI/release lanes, and three source-confirmed
   behavioral mismatches: direct/limited classification, meaningless edit side
@@ -49,7 +50,7 @@ Detailed report: [test gating and Mastodon coverage audit](../test-coverage-audi
 ## Completion
 
 - Independent synthesis review found no material blocker. Corrected runner/task
-  wording, the executable Secunda-only NAS prerequisite, and per-status reply
+  wording, the isolated-execution prerequisite, and per-status reply
   notification expectations before committing.
 - Audit acceptance is satisfied and this review issue is archived. The report's
   implementation/porting recommendations remain proposed future work; no bug fix

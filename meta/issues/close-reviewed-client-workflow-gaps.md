@@ -38,17 +38,18 @@ Repair qualified local mentions, hashtag stream fan-out, and public OAuth/discov
   do not grant local access; anonymous access and pre-edit recipient access are denied.
 - The fixture command retains its existing schema/saved-status tests and includes
   R11 in its default run; `schema-read-test qualified_local_mentions` selects only R11.
-- Read-only upstream inspection: canonical `/workspace/rustodon/target/mastodon-v4.6.5`,
-  actual `/home/lain/repos/rustodon/target/mastodon-v4.6.5`, verified revision
-  `1440d55b139e39ec722c2a3db7f60b66cd889048`. `ProcessMentionsService#scan_text!`
-  normalizes local domains to nil before account lookup. No source fetched or changed.
+- Read-only upstream inspection used pinned Mastodon 4.6.5 source at revision
+  `1440d55b139e39ec722c2a3db7f60b66cd889048`.
+  `ProcessMentionsService#scan_text!` normalizes local domains to nil before
+  account lookup. No source was fetched or changed.
 
-### Exact remote TDD evidence
+### External TDD evidence
 
-All commands below ran through `ssh lain@secunda.local bash -s`, from
-`/home/lain/rustodon-parity/clients`, with `export CARGO_BUILD_JOBS=2`.
+All commands below ran through an external shell, from
+a task-owned workspace, with `export CARGO_BUILD_JOBS=2`.
 New tests were staged before synchronization. Only tracked changed files were
-synced (excluding `.git`, `target`, `.local-instance*`, `.env*`, no `--delete`);
+synced without Git metadata, build outputs, local state, environment files, or
+destination deletion;
 the workspace already contained the tracked source. An initial full tracked sync
 stopped at the existing dangling `public/500.html` symlink, so changed-file sync
 was used. Only intentionally formatted source was retrieved.
@@ -56,7 +57,7 @@ was used. Only intentionally formatted source was retrieved.
 **RED, before production changes:**
 
 ```sh
-tools/mastodon-fixture schema-read-test qualified_local_mentions > /tmp/r11-red.log 2>&1
+tools/mastodon-fixture schema-read-test qualified_local_mentions
 ```
 
 Exit 101, one failing integration test (10.89s). Both create and edit produced
@@ -68,15 +69,13 @@ to use the project's existing string-body JSON approach before this behavioral R
 
 **GREEN:** the normal command hit Docker Hub's anonymous pull rate limit (exit 125)
 while inspecting the PostgreSQL index. The pinned child images were already cached.
-A temporary, untracked harness copy skipped only registry manifest inspection/pull,
-retaining local pinned image digest and linux/amd64 verification, static fixture
-checksums, and the original PID-isolated rootless database lifecycle:
+A temporary untracked selector skipped only registry inspection/pull while
+retaining pinned-image verification, fixture checksums, and the normal rootless
+fixture lifecycle. It ran the `qualified_local_mentions` schema-read test. The
+following ordinary checks also ran:
 
 ```sh
-sed '/^  manifest=$(run_podman manifest inspect /,/^  run_podman pull --quiet /d' \
-  tools/mastodon-fixture > tools/.r11-cached-fixture
-sh tools/.r11-cached-fixture schema-read-test qualified_local_mentions > /tmp/r11-green-final.log 2>&1
-cargo test --locked --lib > /tmp/r11-unit.log 2>&1
+cargo test --locked --lib
 rustfmt --edition 2024 --check src/mastodon/write_repository.rs src/web.rs tests/qualified_local_mentions.rs
 sh -n tools/mastodon-fixture
 cargo clippy --locked --all-features --lib --test qualified_local_mentions -- -D warnings
@@ -91,8 +90,8 @@ cargo clippy --locked --all-features --lib --test qualified_local_mentions -- -D
   `src/paperclip.rs:1129`; no unrelated fix or lint suppression was added.
 - Independent read-only `explore` correctness and architecture/DRY review approved
   the supplied exact implementation diff and inspected test, with no substantive
-  blockers. Reviewer could not independently run Git/SSH; execution evidence was
-  supplied by the implementing agent.
+  blockers. Reviewer could not independently run Git or access the execution
+  environment; execution evidence was supplied by the implementing agent.
 
 ### Limits and remaining scope
 
@@ -125,36 +124,29 @@ indexes changed.
   silenced author, and an unfollowed tag. Two matching tags yield only one event.
   A real WebSocket additionally receives `user` envelopes for `update`,
   `status.update`, and ID-only `delete`, including the edited content.
-- Read-only upstream source: canonical `/workspace/rustodon/target/mastodon-v4.6.5`,
-  actual `/home/lain/repos/rustodon/target/mastodon-v4.6.5`, revision rechecked as
-  `1440d55b139e39ec722c2a3db7f60b66cd889048`. Inspected
+- Read-only inspection of pinned Mastodon 4.6.5 source at revision
+  `1440d55b139e39ec722c2a3db7f60b66cd889048` covered
   `FanOutOnWriteService#deliver_to_hashtag_followers!` and its public-recipient
-  dispatch. No source fetched/changed; no fresh Rails differential claim.
+  dispatch. No source was fetched or changed; no fresh Rails differential is claimed.
 
-### Exact remote RED/GREEN evidence
+### External RED/GREEN evidence
 
-All execution ran through `ssh lain@secunda.local bash -s`, in
-`/home/lain/rustodon-parity/clients`, with `export CARGO_BUILD_JOBS=2`.
-The new test was staged before syncing tracked changed files only, excluding
-`.git`, `target`, `.local-instance*`, `.env*`, without `--delete`.
+All execution ran through an external shell, in
+a task-owned workspace, with `export CARGO_BUILD_JOBS=2`.
+The new test was staged before syncing tracked changed files only, excluding Git
+metadata, build outputs, local state, and environment files, without destination
+deletion.
 
 Docker Hub's previously confirmed anonymous limit was not retried. The same
-transparent temporary cached-child workaround as R11 retained pinned local
-linux/amd64 image/digest verification, fixture checksums, and PID-isolated rootless
-fixture setup/cleanup, skipping only registry manifest inspection and pull:
+temporary selector retained pinned-image and fixture checks while avoiding the
+unavailable registry operation. It ran the `followed_hashtag_streams` RED/GREEN
+and aggregate schema-read gates. The following ordinary checks also ran:
 
 ```sh
-sed '/^  manifest=$(run_podman manifest inspect /,/^  run_podman pull --quiet /d' \
-  tools/mastodon-fixture > tools/.r12-cached-fixture
-# RED before the production SQL change:
-sh tools/.r12-cached-fixture schema-read-test followed_hashtag_streams > /tmp/r12-red.log 2>&1
-# GREEN after the production SQL change:
-sh tools/.r12-cached-fixture schema-read-test followed_hashtag_streams > /tmp/r12-green.log 2>&1
 rustfmt --edition 2024 --check src/mastodon/write_repository.rs tests/followed_hashtag_streams.rs
 sh -n tools/mastodon-fixture
 cargo clippy --locked --all-features --lib --test followed_hashtag_streams -- -D warnings
-cargo test --locked --lib > /tmp/r12-unit.log 2>&1
-sh tools/.r12-cached-fixture schema-read-test > /tmp/r12-schema-all.log 2>&1
+cargo test --locked --lib
 ```
 
 - **RED:** exit 101, one failed test (9.97s). Public create/edit were present in REST
@@ -169,7 +161,7 @@ sh tools/.r12-cached-fixture schema-read-test > /tmp/r12-schema-all.log 2>&1
 - Full default restored-schema command passed all **40 tests** across four fresh
   fixture databases: schema **37** (19.47s), saved-status authorization **1** (9.08s),
   R11 qualified mentions **1** (11.32s), R12 hashtag streams **1** (11.80s).
-  The SSH call exceeded its 120-second foreground wait; the remote run continued
+  The remote command exceeded its 120-second foreground wait; the remote run continued
   and its completed log and harness cleanup were checked before returning.
 - Independent read-only `explore` correctness and architecture/DRY review found no
   substantive blockers. It checked the REST exclusions, shared callers, retained
@@ -209,27 +201,27 @@ belongs to the parent task and is not included here. R14/R15 were not included i
   exercise or modify password authentication. Redirect following is disabled, so no
   callback origin, live credentials, tunnel, or remote peer is contacted.
 
-### Exact remote RED/GREEN evidence
+### External RED/GREEN evidence
 
 Parent cache-safe fixture commit `52fa99a` was first cherry-picked as `183a8e0`.
 The real harness was used throughout: **no temporary bypass, registry retry,
 credentials, unpinning, or harness verification repair in the R14 commit**.
-All execution ran through `ssh lain@secunda.local bash -s`, from
-`/home/lain/rustodon-parity/clients`, with `export CARGO_BUILD_JOBS=2`.
-The new test was staged before syncing tracked changed files only, excluding `.git`,
-`target`, `.local-instance*`, `.env*`, without `--delete`. The parent fixture fix's
-tracked files were also synchronized before RED.
+All execution ran through an external shell, from
+a task-owned workspace, with `export CARGO_BUILD_JOBS=2`.
+The new test was staged before syncing tracked changed files only, excluding Git
+metadata, build outputs, local state, and environment files, without destination
+deletion. The parent fixture fix's tracked files were also synchronized before RED.
 
 ```sh
 # RED before the production OAuth changes:
-tools/mastodon-fixture schema-read-test public_oauth_revocation > /tmp/r14-red.log 2>&1
+tools/mastodon-fixture schema-read-test public_oauth_revocation
 # GREEN after the production OAuth changes:
-tools/mastodon-fixture schema-read-test public_oauth_revocation > /tmp/r14-green.log 2>&1
-cargo test --locked --lib > /tmp/r14-unit.log 2>&1
+tools/mastodon-fixture schema-read-test public_oauth_revocation
+cargo test --locked --lib
 cargo clippy --locked --all-features --lib --test public_oauth_revocation -- -D warnings
 rustfmt --edition 2024 --check src/mastodon/write_repository.rs src/web.rs tests/public_oauth_revocation.rs
 sh -n tools/mastodon-fixture
-tools/mastodon-fixture schema-read-test > /tmp/r14-schema-all.log 2>&1
+tools/mastodon-fixture schema-read-test
 ```
 
 - **RED:** exit 101, one failing test (9.73s). Both public clients successfully
@@ -242,22 +234,21 @@ tools/mastodon-fixture schema-read-test > /tmp/r14-schema-all.log 2>&1
   changed-source formatting and shell syntax passed.
 - Full real restored-schema command: **41 passed** across five fresh fixture
   databases: schema **37** (20.87s), saved-status authorization **1** (9.47s),
-  R11 **1** (9.85s), R12 **1** (13.05s), R14 **1** (10.68s). The SSH call exceeded
+  R11 **1** (9.85s), R12 **1** (13.05s), R14 **1** (10.68s). The remote command exceeded
   its 120-second wait; the remote run continued, and its completed log and fixture
   cleanup were checked before returning.
 - Independent read-only `explore` correctness and architecture/DRY review approved
   the supplied change scope and inspected source/test, including all shared OAuth
   parser callers. It found no substantive blockers; execution evidence was supplied
-  by the implementing agent because the reviewer lacked Git/SSH tools.
+  by the implementing agent because the reviewer lacked Git and execution tools.
 
 ### Limits / optional follow-up
 
 Fixture owner writes do not prove production-role permissions; the consent session
 was seeded, not obtained by password login. No fresh Rails differential, live
-browser/mobile/peer, or full all-target release gate is claimed. The pinned source
-revision was rechecked remotely at `/home/lain/repos/rustodon/target/mastodon-v4.6.5`
-(canonical `/workspace/rustodon/target/mastodon-v4.6.5`),
-`1440d55b139e39ec722c2a3db7f60b66cd889048`; no source fetched or changed.
+browser/mobile/peer, or full all-target release gate is claimed. Pinned Mastodon
+4.6.5 source at revision `1440d55b139e39ec722c2a3db7f60b66cd889048` was
+rechecked read-only; no source was fetched or changed.
 
 Optional follow-up: explicit HTTP negatives for confidential empty-password Basic
 and public `client_credentials` requests. Source review also noted pre-existing
@@ -287,19 +278,20 @@ No browser credential functions or issue indexes were changed.
 
 ### Exact remote RED/GREEN and combined-gate evidence
 
-All execution ran through `ssh lain@secunda.local bash -s`, in
-`/home/lain/rustodon-parity/clients`, with `export CARGO_BUILD_JOBS=2`.
-The new test was staged before syncing tracked changed files only, excluding `.git`,
-`target`, `.local-instance*`, `.env*`, without `--delete`. The real cache-safe harness
+All execution ran through an external shell, in
+a task-owned workspace, with `export CARGO_BUILD_JOBS=2`.
+The new test was staged before syncing tracked changed files only, excluding Git
+metadata, build outputs, local state, and environment files, without destination
+deletion. The real cache-safe harness
 used PID-isolated rootless fixture databases; no bypass, registry retry, credentials,
 tunnel, source fetch, or callback-origin network request was used.
 
 ```sh
 # RED before the production discovery/authorize/form changes:
-tools/mastodon-fixture schema-read-test oauth_response_modes > /tmp/r15-red.log 2>&1
+tools/mastodon-fixture schema-read-test oauth_response_modes
 # GREEN after the production changes:
-tools/mastodon-fixture schema-read-test oauth_response_modes > /tmp/r15-green.log 2>&1
-cargo test --locked --lib > /tmp/r15-unit.log 2>&1
+tools/mastodon-fixture schema-read-test oauth_response_modes
+cargo test --locked --lib
 cargo clippy --locked --all-features --lib --test oauth_response_modes -- -D warnings
 # Combined client-workflow checks:
 rustfmt --edition 2024 --check src/web.rs src/mastodon/write_repository.rs \
@@ -308,8 +300,8 @@ rustfmt --edition 2024 --check src/web.rs src/mastodon/write_repository.rs \
 sh -n tools/mastodon-fixture
 cargo clippy --locked --all-features --lib --test qualified_local_mentions \
   --test followed_hashtag_streams --test public_oauth_revocation \
-  --test oauth_response_modes -- -D warnings > /tmp/r15-combined-clippy.log 2>&1
-tools/mastodon-fixture schema-read-test > /tmp/r15-schema-all.log 2>&1
+  --test oauth_response_modes -- -D warnings
+tools/mastodon-fixture schema-read-test
 ```
 
 - **RED:** exit 101, one failing test (8.57s). Discovery listed three modes; four
@@ -322,7 +314,7 @@ tools/mastodon-fixture schema-read-test > /tmp/r15-schema-all.log 2>&1
   for all four client-workflow integration targets passed.
 - Full real restored-schema command: **42 passed** across six fresh databases:
   schema **37** (18.49s), saved-status authorization **1** (8.48s), R11 **1** (9.49s),
-  R12 **1** (11.02s), R14 **1** (8.31s), R15 **1** (8.24s). The SSH call exceeded
+  R12 **1** (11.02s), R14 **1** (8.31s), R15 **1** (8.24s). The remote command exceeded
   its 120-second wait; the continuing remote run's completed log and harness cleanup
   were checked before returning.
 - Independent read-only `explore` correctness and architecture/DRY review
@@ -335,10 +327,9 @@ The authenticated consent session and application are seeded fixture data, not a
 password-login test. Login return-target preservation is exercised, but no browser
 credential functions were changed. Fixture owner writes do not prove production-role
 permissions. No fresh Rails differential, live browser/mobile/peer, or complete
-all-target release gate is claimed. Pinned read-only source remains
-`/home/lain/repos/rustodon/target/mastodon-v4.6.5` (canonical
-`/workspace/rustodon/target/mastodon-v4.6.5`), revision
-`1440d55b139e39ec722c2a3db7f60b66cd889048`; no source fetched or changed.
+all-target release gate is claimed. Pinned read-only source was Mastodon 4.6.5
+at revision `1440d55b139e39ec722c2a3db7f60b66cd889048`; no source was fetched
+or changed.
 
 Optional additional cases are empty/non-scalar modes and directly posting consent
 with the mode omitted; the current default GET flow submits the rendered canonical

@@ -2,12 +2,11 @@
 
 ## Summary
 
-The final combined NAS worker gate stalled at
+The final combined isolated-worker gate stalled at
 `smtp_acceptance_before_job_ack_is_retried_with_the_same_message_id` beyond the
-two-hour parent job budget. Earlier100-worker runs passed. The worker was still
-running remotely after SSH termination; parent explicitly terminated only the
-identified worker test process, allowing fixture cleanup and offline harnesses
-to finish. No live services or unrelated resources were touched.
+two-hour parent job budget. Earlier 100-worker runs passed. The interrupted run
+was explicitly stopped; fixture cleanup and offline harnesses then completed. No
+live services or unrelated resources were touched.
 
 ## Requirements
 
@@ -15,19 +14,19 @@ to finish. No live services or unrelated resources were touched.
 - Preserve accepted-message identity and real retry/ack assertions.
 - Make fixture waits bounded and deterministic where practical, without extending
   production SMTP/queue deadlines or weakening fences.
-- Bound NAS worker commands inside the workload, not solely the SSH client.
-- NAS-only verification, independent review, topical commit.
+- Bound isolated-worker commands inside the workload, not solely the remote access client.
+- Isolated-worker-only verification, independent review, topical commit.
 
 ## Acceptance Criteria
 
-- Focused crash/replay and combined100-worker gate pass with bounded shutdown.
+- Focused crash/replay and combined 100-worker gate pass with bounded shutdown.
 
 ## Evidence
 
-- `logs/final-extended-workers.log` under NAS audit-green: hung at the named test;
-  final SIGTERM evidence is interruption, not a behavioral red assertion.
-- Task container exited0 after the parent terminated testPID27628; the worker
-  fixture postgres27186 was removed and final offline harnesses passed.
+- A historical external run hung at the named test; its artifact is not in the repository.
+  Final SIGTERM evidence is interruption, not a behavioral RED assertion.
+- The task exited successfully after its test process was stopped; fixture cleanup
+  and final offline harnesses passed.
 
 ## Tests-only fixture correction (awaiting parent verification)
 
@@ -55,17 +54,17 @@ before waiting for final server completion. The entire scenario has a 20s test
 budget; processing futures are inline, and fixture tasks are aborted and joined
 on error, panic, or timeout. The EOF regression has a 5s cooperative budget.
 
-No production deadlines/fences change. Build/test/fmt/NAS/SSH execution, the
-outer NAS workload watchdog, and commits remain parent-owned. Keep this issue
-open until the focused and combined NAS gates have been verified.
+No production deadlines/fences change. Build/test/fmt/external-worker execution, the
+outer isolated worker workload watchdog, and commits remain parent-owned. Keep this issue
+open until the focused and combined isolated-worker gates have been verified.
 
 
 ## Parent execution evidence
 
-- New ordinary EOF regression failed pre-fix with its5-second `Elapsed` error
-  (`smtp-eof-red.log`,exit101), rather than requiring the outer10-second kill.
-- Corrected EOF regression passes immediately (`smtp-eof-green.log`). The bounded
-  combined worker gate passes100/100 (`smtp-combined-green.log`,454.81s).
+- New ordinary EOF regression failed pre-fix with its 5-second `Elapsed` error
+  (exit 101), rather than requiring the outer 10-second kill.
+- The corrected EOF regression passes immediately. The bounded combined worker
+  gate passes 100/100 (454.81s).
 - All-feature debug/release, strict Clippy and offline harnesses pass on the
   correction. Default compilation exposed a misplaced inherited `test-support`
   cfg from insertion of the new test; the parent restored that cfg on the old
@@ -75,9 +74,10 @@ open until the focused and combined NAS gates have been verified.
 
 ## Completion
 
-Restoring the original scenario's `test-support` cfg makes the full default
-all-target test run pass (`smtp-default-cfg-green.log`). Together with EOF
-RED/GREEN, bounded combined100-worker pass, all-feature debug/release, strict
-Clippy and offline harness greens, the focused issue is complete. No production
-mail, queue, timeout or fencing behavior changed. The watchdog recipe is recorded
-in the NAS runbook; future SSH termination is not treated as remote cleanup proof.
+Restoring the original scenario's `test-support` configuration makes the full
+default all-target test run pass. Together with the EOF RED/GREEN, bounded
+100-worker combined pass, all-feature debug/release, strict Clippy and offline
+harness greens, the focused issue is complete. No production mail, queue, timeout,
+or fencing behavior changed. The watchdog recipe is recorded
+in the documented cleanup contract; future remote-client termination is not
+treated as remote cleanup proof.

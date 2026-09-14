@@ -2,7 +2,7 @@
 
 ## Summary
 
-Add repeatable Mastodon/Rustodon and Pleroma/Rustodon interoperability scenarios on Secunda, complementing—not replacing—the fixture differential suite.
+Add repeatable Mastodon/Rustodon and Pleroma/Rustodon interoperability scenarios on an isolated worker, complementing—not replacing—the fixture differential suite.
 
 ## Requirements
 
@@ -11,26 +11,26 @@ Add repeatable Mastodon/Rustodon and Pleroma/Rustodon interoperability scenarios
 - Keep any private-network/test-CA transport capability behind explicit test-only build/runtime boundaries. Never weaken ordinary release SSRF, TLS, signature, origin, redirect, or response-size checks.
 - Use fresh cross-peer actors without preseeded actor caches or follows; assert discovery, accepted follows, and push-ingested public statuses in both directions first, then extend lifecycle/privacy coverage.
 - A resolver/search fetch must not substitute for successful push ingestion of a status. Check actual remote state rather than treating HTTP 2xx as completion.
-- Run all builds, tests, and containers on `lain@secunda.local`, with bounded task-owned resources and cleanup; never touch the live tunnel, lain.com, or instance secrets.
+- Run all builds, tests, and containers on an isolated worker, with bounded task-owned resources and cleanup; never touch the live tunnel, lain.com, or instance secrets.
 
 ## Acceptance Criteria
 
-- A documented command starts isolated peers on Secunda and exercises real application GET/signature/inbox/worker paths.
+- A documented command starts isolated peers on an isolated worker and exercises real application GET/signature/inbox/worker paths.
 - Each claimed direction/activity passes assertions on actor/object identity and received state; unsupported or blocked scenarios fail or remain explicitly open.
 - Test-network routing fails closed for unconfigured destinations and is unavailable to ordinary release builds, with regression tests.
 - Cleanup removes only the run's recorded resources; repeated runs do not require production credentials or public origins.
 
 ## Notes
 
-- Subissue of [Secunda parity verification](run-essential-parity-gates-on-secunda.md).
+- Subissue of [isolated worker parity verification](run-essential-parity-gates-on-isolated-worker.md).
 - Existing differential mode compares two implementations under one logical fixture identity and does not run Mastodon Sidekiq; it cannot serve as the peer convergence test unchanged.
 - Begin with one thin Mastodon smoke and share the scenario runner with a Pleroma bootstrap rather than building a general orchestration framework.
 
 ## First Mastodon smoke foundation — implemented
 
 - Command and boundaries: [docs/federation-peer-smoke.md](../../docs/federation-peer-smoke.md),
-  `CARGO_BUILD_JOBS=2 tools/federation-peer-smoke` on `lain@secunda.local` in
-  `/home/lain/rustodon-parity/peer-tests`. The thin sibling sources fixture image
+  `CARGO_BUILD_JOBS=2 tools/federation-peer-smoke` on an isolated worker in
+  a task-owned workspace. The thin sibling sources fixture image
   pins/database lifecycle; it never pulls images or fetches reference source.
 - Transport commit `c82a0a9` (`8e980ba` before cherry-pick): debug **and**
   `test-support` gated exact HTTPS `.invalid` origin map plus explicit PEM CA,
@@ -52,9 +52,10 @@ Add repeatable Mastodon/Rustodon and Pleroma/Rustodon interoperability scenarios
   cached-image verifier `52fa99a`. No ingestion/parity implementation was repaired
   by the peer harness. R01/R06 were not required for this initial public smoke.
 
-### Remote evidence
+### Historical external-run evidence
 
-All commands below ran in the prescribed Secunda workspace with two Cargo jobs.
+All commands below ran in an isolated task workspace with two Cargo jobs; the
+machine-local artifacts are not in the repository.
 
 - Transport RED: `cargo test --locked --features test-support --test
   remote_peer_transport -- --nocapture` failed with mapped validation returning
@@ -66,34 +67,36 @@ All commands below ran in the prescribed Secunda workspace with two Cargo jobs.
 - Bootstrap RED runs found/fixed only harness assumptions: Mastodon approval
   callbacks, generated Doorkeeper tokens, numeric actor paths, current `keypairs`
   storage, and TEMP privilege required for Mastodon's materialized-view refresh.
-- First full live pass: `target/peer-260149/smoke.log`, **1 passed in 4.54s**.
-  Audited sequential pass: `target/peer-288879/smoke.log`, **1 passed in 4.34s**,
-  all eight discovery/follow/public-push/audit direction assertions passed;
-  cleanup exit **0**. Full command logs: `target/peer-smoke-seventh.log` and
-  `target/peer-smoke-audited-sequential.log`. Final race-corrected repeat:
-  **1 passed in 4.23s**, `target/peer-300477/smoke.log`, command log
-  `target/peer-smoke-final.log`; all eight direction assertions and cleanup
-  exit **0** again. The outer remote shell continued after the harness.
-- Audit extraction TDD: `target/peer-audit-{red,green}.log`, **2 Python tests
-  passed**. Concurrent JSONL reader regression:
-  `target/peer-audit-reader-{red,green}.log`, **1 passed, live test ignored**.
-  Scoped harness Clippy with `-D warnings`: `target/peer-harness-clippy.log`.
+- First full live pass: **1 passed in 4.54s**. The audited sequential pass was
+  **1 passed in 4.34s**; all eight discovery/follow/public-push/audit direction
+  assertions passed and cleanup exited **0**. A final race-corrected repeat was
+  **1 passed in 4.23s**; all eight direction assertions passed and cleanup exited
+  **0** again. Task cleanup completed successfully.
+- Audit extraction TDD: **2 Python tests passed**. The concurrent JSONL reader
+  regression: **1 passed, live test ignored**. Scoped harness Clippy with
+  `-D warnings` passed.
 
 ### Explicitly open / unclaimed
 
-- Pleroma bootstrap and the broader lifecycle/privacy/media matrix remain open;
-  this foundation does not attest any Pleroma release or image.
+- A later [five-scenario Mastodon run](adapt-and-run-peer-matrix-on-isolated-worker.md#remaining-audit-peer-rerun-2026-09-13)
+  supersedes the source-only execution status below: `public`, `privacy`, `notes`,
+  `profile`, and `interactions` passed on the recorded combined source. That
+  historical run does **not** establish acceptance for the current final tree,
+  reply lifecycle behavior, or Pleroma.
+- Pleroma bootstrap remains open; this foundation does not attest any Pleroma
+  release or image.
 - The initial v2 search attempt returned empty account results. Parent source
-  repair `0d513f5` now exists but is **unexecuted**. This runner retains the v1
-  resolver and does not claim v2 parity. Historical evidence:
-  `target/peer-254966/`; deferred v2 gate:
+  repair `0d513f5` existed but was **unexecuted** in this early run. This runner
+  retained the v1 resolver and did not claim v2 parity. Deferred v2 gate:
   `tools/mastodon-fixture schema-read-test v2_account_search`.
-- Simultaneous reciprocal follows are not claimed: `target/peer-271058/` records
-  a pinned Mastodon `account_stats` PostgreSQL deadlock, retry and remaining
-  pending follow requests. The bounded first smoke deliberately exercises each
-  direction to convergence in sequence; it does not alter activity handling or
-  retry policy. Keep concurrency stress as separate follow-up work.
-- This issue stays open for the remaining peer matrix. Parent owns issue indexes.
+- Simultaneous reciprocal follows are not claimed: an early historical run
+  encountered a pinned Mastodon `account_stats` PostgreSQL deadlock, retry and
+  remaining pending follow requests. The bounded first smoke deliberately
+  exercises each direction to convergence in sequence; it does not alter
+  activity handling or retry policy. Keep concurrency stress as separate
+  follow-up work.
+- This issue stays open for the remaining acceptance scope. Parent owns issue
+  indexes.
 
 
 ## Privacy extension — source implemented, verification pending
@@ -103,17 +106,16 @@ All commands below ran in the prescribed Secunda workspace with two Cargo jobs.
   and outsider accounts on each side, followers-only/direct received-row and
   signed inbox audience checks, and recipient versus outsider/anonymous REST
   authorization. No canonical status URL is fetched to create received state.
-- Remote TDD: `target/peer-privacy-audit-red.log` rejected missing audience audit
-  metadata; `target/peer-privacy-audit-green.log` passed all three extraction
-  tests. `target/peer-313351/smoke.log` / `target/peer-privacy-red.log` reached
-  both successful Follow/Accept directions then failed with `RowNotFound`, the
+- Audit extraction TDD initially rejected missing audience metadata, then all
+  three extraction tests passed. The first live privacy attempt reached both
+  successful Follow/Accept directions, then failed with `RowNotFound`, the
   expected RED before observer bootstrap was added.
-- Observer bootstrap is now edited locally, but its sync/run is blocked by
-  Secunda SSH timeouts followed by `Could not resolve hostname secunda.local`.
-  No runtime assertion is disabled and no privacy pass is claimed. A review also
-  requested rejecting any Public-addressed attempt for the private object even
-  alongside a valid private delivery; that assertion and unit regression are
-  added locally but await remote execution (host outage prevented its red run).
+- Observer bootstrap was then edited, but execution became unavailable after
+  timeouts and name-resolution failure. No runtime assertion was disabled and no
+  privacy pass was claimed at this stage. A review also requested rejecting any
+  Public-addressed attempt for the private object even alongside a valid private
+  delivery; that assertion and unit regression were added but not executed in
+  this stage.
 - Note edit/delete, profile Update, and interaction coverage are subsequent
   bounded extensions. The parent owns ordinary `tag:` atom identifier handling;
   the runner must not rewrite wire identifiers or repair production code.
@@ -132,9 +134,9 @@ All commands below ran in the prescribed Secunda workspace with two Cargo jobs.
 - No resolver fetch manufactures received state, and canonical status GETs fail
   the audit. No wire metadata is rewritten. Parent `a3fe48a` (local cherry-pick
   `e7e7002`) handles ordinary `tag:` atomUri metadata; its execution is pending too.
-- All new lifecycle compilation, formatting/lint, unit and live verification is
-  deferred until Secunda returns. Source TDD was unavailable during the outage;
-  no lifecycle pass is claimed. The issue remains open.
+- All new lifecycle compilation, formatting/lint, unit and live verification was
+  deferred while isolated execution was unavailable. Source TDD was unavailable;
+  no lifecycle pass was claimed at this stage. The issue remained open.
 
 ## Full profile Update extension — source only, unexecuted
 
@@ -146,8 +148,8 @@ All commands below ran in the prescribed Secunda workspace with two Cargo jobs.
   directions. The source uploads/descriptions must exist, but remote image
   download and remote image-description persistence are not claimed.
 - Multipart source regression, compilation, format/lint, actual upload and live
-  propagation have **not run**. TDD execution is deferred due the host outage;
-  independent review is source-only and cannot establish profile acceptance.
+  propagation had **not run** at this stage because execution was unavailable;
+  independent review was source-only and could not establish profile acceptance.
 
 ## Interaction extension — source only, unexecuted
 
@@ -174,24 +176,22 @@ All commands below ran in the prescribed Secunda workspace with two Cargo jobs.
 - Selected ignored tests are checked in the compiled test list before resources
   start, preventing missing/renamed scenarios from silently passing zero tests.
 - These audit/schema/helper changes, new unit cases and all interaction execution
-  remain **pending**. Earlier three passing Python audit tests predate the new
-  activity-ID/envelope fields. No compilation, formatting/lint, unit tests, live
-  scenarios or SSH retry was performed during source-only continuation.
+  were **pending** at this stage. Earlier three passing Python audit tests predated
+  the new activity-ID/envelope fields. No compilation, formatting/lint, unit tests
+  or live scenarios were performed during the source-only continuation.
 
-## Deferred execution checklist
+## Historical deferred execution checklist
 
-After the parent restores access, in `/home/lain/rustodon-parity/peer-tests` with
-`CARGO_BUILD_JOBS=2`, rerun Rust and Python unit regressions, formatting and scoped
-Clippy, observer bootstrap and all five fresh commands (`public`, `privacy`,
-`notes`, `profile`, `interactions`), then repeat successful live runs to verify
-cleanup. Commands and exact historical evidence are in the linked smoke doc and
-above. All new privacy/lifecycle acceptance stays OPEN; source review is not a
-substitute for these gates. Pleroma remains separately deferred.
+This checklist was later executed for the five Mastodon scenarios in the linked
+[2026-09-13 run](adapt-and-run-peer-matrix-on-isolated-worker.md#remaining-audit-peer-rerun-2026-09-13):
+with `CARGO_BUILD_JOBS=2`, rerun Rust and Python unit regressions, formatting and
+scoped Clippy, observer bootstrap, and all five fresh commands (`public`,
+`privacy`, `notes`, `profile`, `interactions`), then repeat successful live runs
+to verify cleanup. That superseding result remains historical combined-source
+evidence, not current-final-tree, reply-lifecycle, or Pleroma acceptance.
 
 ## Pleroma quota decision
 
-The exact v2.10.2 source archive and guarded build helper are prepared, but the
-required release base image pull failed under Docker Hub's anonymous quota.
-The user chose to leave Pleroma blocked until that quota resets rather than
-configure registry authentication. Do not claim Pleroma coverage or retry in a
-loop. See [build evidence](../../docs/federation-pleroma-build.md).
+Pleroma remained blocked by Docker Hub's anonymous pull quota; no pinned Pleroma
+build or peer result is claimed. See the public
+[build record](../../docs/federation-pleroma-build.md).

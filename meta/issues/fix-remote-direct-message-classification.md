@@ -19,7 +19,7 @@ Remote Note classification never returns direct visibility 3; explicitly mention
 ## Notes
 
 - Source: [test coverage audit](../test-coverage-audit.md).
-- User authorized this implementation plan on 2026-09-12; no live deployment is implied.
+- Implementation plan recorded on 2026-09-12; no live deployment is implied.
 
 ## Progress — open, awaiting parent green/review
 
@@ -28,11 +28,11 @@ Remote Note classification never returns direct visibility 3; explicitly mention
   workers and REST router; they cover explicit `to`/`cc`, silent-only and mixed
   recipients, public/unlisted/followers controls, conversations, access denial,
   stream privacy and replay. Existing peer privacy coverage is unchanged.
-- Parent-reported NAS behavioral red:
-  `/srv/workspaces/rustodon-audit-red/logs/direct.log`, **3 passed, 2 failed**.
+- Parent-reported isolated-worker behavioral red:
+  **3 passed, 2 failed**; the historical external artifact is not in the repository.
   Both explicitly mentioned `to`/`cc` cases stored visibility **4**, expected **3**.
   The tests compiled; this worktree did not execute or independently inspect the
-  NAS log. The parent confirmed the pinned Mastodon 4.6.5 Create lines 126–150
+  isolated-worker log. The parent confirmed the pinned Mastodon 4.6.5 Create lines 126–150
   explicit-versus-silent contract before drafting.
 - Phase 2 refines only newly created limited-candidate Notes after local mentions
   and the implicit inbox recipient have been resolved. A resolved explicit
@@ -46,7 +46,7 @@ Remote Note classification never returns direct visibility 3; explicitly mention
   conversation implementation, grants, schema changes or historical-row rewrite.
   Provenance, relevance and existing-row replay checks are unchanged.
 - Parent owns green, formatting/lint and independent implementation review. No
-  local/NAS builds, tests, formatting, lint or commits were run in this worktree;
+  local/isolated worker builds, tests, formatting, lint or commits were run in this worktree;
   regression assertions were not weakened. The parent's separate default-profile
   gating fix (`1a0b9c6`) is not duplicated here.
 - Pending command in the parent's prepared disposable fixture:
@@ -61,9 +61,9 @@ Remote Note classification never returns direct visibility 3; explicitly mention
 ## Completion evidence (2026-09-12)
 
 - Baseline: five tests, three passed and two explicit-recipient cases failed
-  (stored visibility 4, expected 3), `rustodon-audit-red/logs/direct.log`.
-- Combined NAS worker suite: 85 passed, including all five direct visibility
-  regressions; `/srv/workspaces/rustodon-audit-green/logs/workers.log`.
+  (stored visibility 4, expected 3); the historical external artifact is not in the repository.
+- Combined isolated-worker suite: 85 passed, including all five direct visibility
+  regressions; the historical external artifact is not in the repository.
 - Default/all-feature debug, release all-feature, formatting and strict Clippy
   pass on the combined fixes. Independent correctness/privacy/DRY review found
   no blockers. No schema, grants, historical replay, or live deployment.

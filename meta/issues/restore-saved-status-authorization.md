@@ -37,37 +37,33 @@ Recheck current root-status authorization when returning bookmarks and favourite
   database, separately from the existing schema suite. The lifecycle intentionally
   mutates only disposable fixture data.
 
-All builds, tests, Clippy, and formatting ran on `lain@secunda.local`, in
-`/home/lain/rustodon-parity/saved-auth`, using Rust 1.97.1 and rootless Podman.
-No local Rust execution or live instance credentials were used. Source was synced
-with this command (no deletion or remote target sync-back):
-
-```sh
-rsync -az --exclude='/.git' --exclude='/target/' \
-  --exclude='/.local-instance/' --exclude='/.local-instance-backups/' \
-  --exclude='/.env*' ./ lain@secunda.local:/home/lain/rustodon-parity/saved-auth/
-```
+All builds, tests, Clippy, and formatting ran on an isolated worker in a
+task-owned workspace, using Rust 1.97.1 and rootless containers. No local Rust
+execution or live instance credentials were used. Source transfer included only
+tracked source and excluded Git metadata, build targets, instance state, backups,
+environment files, and unrelated user configuration; no destination deletion or
+build-target transfer back occurred.
 
 The exact RED/GREEN command, before and after the production fix respectively:
 
 ```sh
-ssh lain@secunda.local 'bash -lc '\''cd /home/lain/rustodon-parity/saved-auth && CARGO_BUILD_JOBS=4 tools/mastodon-fixture schema-read-test'\'''
+CARGO_BUILD_JOBS=4 tools/mastodon-fixture schema-read-test
 ```
 
 - **RED:** exit 101; 37 existing schema tests passed, new lifecycle test failed.
   Its combined assertion showed both bookmarks and favourites returning five IDs
   and the new-private-content marker (`true`), instead of three authorized IDs and
-  no marker (`false`). Status-show 404 assertions had already passed. Remote log:
-  `/tmp/r02-red.log`.
+  no marker (`false`). Status-show 404 assertions had already passed. The
+  historical external RED artifact is not in the repository.
 - **GREEN:** exit 0; 37 existing schema tests and the new lifecycle test passed,
   including all pagination assertions. Repeated after remote formatting:
-  `/tmp/r02-green-final.log` (37 + 1 passed).
+  The repeated historical external run passed 37 + 1 tests; its artifact is not in the repository.
 - Before the behavioral RED, test setup required correcting a migration call,
   separating restored databases to avoid existing schema-suite catalog changes,
   and using the positive-ID local follower fixture because stream events reject
   negative account IDs. Those setup failures were not counted as behavioral RED.
 
-Additional remote commands (same SSH/bash prefix and working directory):
+Additional commands in the same task-owned workspace:
 
 ```sh
 cargo fmt --all
@@ -78,21 +74,20 @@ CARGO_BUILD_JOBS=4 cargo test --locked --all-targets --all-features
 
 All passed. The ordinary test run reported **406 passed, 0 failed, 126 ignored**
 across 23 binaries; ignored fixture tests are not implied to have run. The first
-all-target test invocation exceeded the local SSH tool's 120-second wait; the
-explicit rerun completed with exit 0 (`/tmp/r02-tests-final.log`). Clippy log:
-`/tmp/r02-clippy.log`. Only the changed formatted Rust files were retrieved.
+all-target test invocation exceeded the remote client's 120-second wait; the
+explicit rerun completed with exit 0. Clippy also passed. Historical external
+run artifacts are not in the repository. Only the changed formatted Rust files were retrieved.
 
 The read-only pinned source was inspected remotely at
-`/home/lain/repos/rustodon/target/mastodon-v4.6.5`, verified revision
+the read-only pinned Mastodon source checkout, verified revision
 `1440d55b139e39ec722c2a3db7f60b66cd889048` (symlinked in the mirror's target).
-The AGENTS path `/workspace/rustodon/target/mastodon-v4.6.5` was absent locally.
+The prescribed pinned Mastodon 4.6.5 checkout was absent locally.
 Upstream bookmarks/favourites controllers paginate association results and base
 continuation on association count; no Mastodon source was fetched or modified.
 This was a Rustodon HTTP regression, not a live Mastodon differential run.
 
 Independent read-only review found no actionable R02 correctness or
-architecture/DRY/compactness issues. Review was source-only, without execution or
-Git/SSH tools. It noted a separate shared-loader concurrency concern: authorization
+architecture/DRY/compactness issues. Review was source-only, without execution tools. It noted a separate shared-loader concurrency concern: authorization
 and projection queries do not share a snapshot. Concurrent revocation/edit races
 were not tested or redesigned in this sequential lifecycle fix.
 

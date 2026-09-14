@@ -2,12 +2,18 @@
 
 ## Summary
 
-Final required differential browser_reauthentication_limits returned302 rather than429 after66.70s. Production uses epoch-aligned five-minute IP and one-hour user windows. A66.70s run can cross an epoch boundary; this is a source-backed timing hazard, not proof of the original failure cause. Preserve production limits and assertion strength; deterministic test-only state/clock control must retain cross-user/IP and pre-bcrypt controls. Obtain red/green and actual pinned differential evidence.
+The final required `browser_reauthentication_limits` differential returned 302
+rather than 429 after 66.70 seconds. Production uses epoch-aligned five-minute IP
+and one-hour user windows. A 66.70-second run can cross an epoch boundary; this is
+a source-backed timing hazard, not proof of the original failure cause. Preserve
+production limits and assertion strength; deterministic test-only state/clock
+control must retain cross-user/IP and pre-bcrypt controls. Obtain red/green and
+actual pinned differential evidence.
 
 ## Acceptance Criteria
 
 - Source-backed focused regression, independently reviewed minimal correction.
-- NAS-only execution; final affected gate passes without weakening production policy.
+- Isolated-worker-only execution; final affected gate passes without weakening production policy.
 
 ## Verification
 
@@ -20,9 +26,9 @@ budget matrix still performs every allowed request through HTTP and real bcrypt,
 with cross-user/IP/two-instance limits, Retry-After, and no-bcrypt denial checks.
 Explicit expiry touches only the selected fixture IP key.
 
-NAS `reauth-clock-red.log` fails the deterministic historical control422vs429.
-`final18-reauth.log` passes the actual differential (75.70s), and
-`final18-operational.log` passes the new permanently wired ignored fixed-clock
+A historical external isolated-worker run failed the deterministic historical control
+(422 versus 429). A later run passed the actual differential (75.70s), and
+A historical external run passed the new permanently wired ignored fixed-clock
 regression, with an exact nonempty selector. A regular unit checks five-minute
 and one-hour epoch rollover; default/all-feature/release and strict Clippy pass.
 Independent security/correctness/DRY component review approved. The earlier

@@ -19,7 +19,7 @@ After foundational gates and the audited fixes, extend existing tests with indep
 ## Notes
 
 - Source: [test coverage audit](../test-coverage-audit.md).
-- User authorized this implementation plan on 2026-09-12; no live deployment is implied.
+- Implementation plan recorded on 2026-09-12; no live deployment is implied.
 
 ## Subissues
 
@@ -34,5 +34,5 @@ All four selected subissues are satisfied and archived: media-state HTTP,
 mixed-profile media, parent-fetch recovery/distribution, and actual browser
 settings-save/reload. Each retained pinned expectations, meaningful rejection or
 durable-state assertions, and permanent gate wiring. Exact topical evidence is
-in the linked subissues; `final19-browser.log` also passes the enclosing full
+in the linked subissues; a historical external run also passed the enclosing full
 cutover/rollback. Broader frontend/federation coverage is not inferred.

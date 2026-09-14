@@ -27,15 +27,16 @@ do not establish these request outcomes or nonmutation on rejected operations.
 ## Notes
 
 - Subissue of [selected matrix ports](port-mastodon-media-and-browser-matrices.md).
-- Local extracted oracle: `.local-instance/audit-reference/pinned-media/`, from
-  exact pinned image `sha256:696439e1ada71d0cf3d51d4d6a4744d6e40b57aafa64980b18f4d3b78230d0cf`.
+- Oracle extracted from exact pinned image
+  `sha256:696439e1ada71d0cf3d51d4d6a4744d6e40b57aafa64980b18f4d3b78230d0cf`;
+  the historical external extraction artifact is not in the repository.
 - No live deployment or data replay authorized by this work.
 
 ## Phase 1: tests only
 
-- Dedicated worktree: `task/audit-media-state`; ownership limited to
-  `tests/media_state.rs` and this issue. Parent owns fixture selector/CI wiring
-  and all NAS workloads. No local tests, builds, formatting, SSH, or commits.
+- Phase 1 ownership was limited to `tests/media_state.rs` and this issue; fixture
+  selector/CI integration and isolated execution remained separate. No local tests,
+  builds, formatting, or commits.
 - Plan: 14 real-router JPEG requests. Owner/unattached processing 0 and 1:
   GET/PUT 206 with persisted metadata updates; failed 3: GET/PUT 422. Other
   user/ready: GET/PUT/DELETE 404; other user/failed: GET/PUT 404. Owner/attached
@@ -43,7 +44,7 @@ do not establish these request outcomes or nonmutation on rejected operations.
   (including timestamps and explicit attachment order), original/preview bytes,
   and cleanup outbox/durable jobs before every rejected request.
 - Oracle read-only at
-  `/Users/lainsoykaf/repos/rustodon/.local-instance/audit-reference/pinned-media/`:
+  a historical external reference artifact not in the repository:
   `spec/requests/api/v1/media_spec.rb` lines 32–68, 149–244 and
   `app/controllers/api/v1/media_controller.rb` lines 6–7, 23–49, 63–68.
   The controller supplies processing PUT/failed-state outcomes not separately
@@ -62,7 +63,7 @@ do not establish these request outcomes or nonmutation on rejected operations.
 ## Phase 2: minimal production fix
 
 - Parent reported real HTTP baseline RED in
-  `/srv/workspaces/rustodon-audit-green/logs/media-state-red.log`: only owner
+  a historical external run; only owner
   pending PUT `/api/v1/media/940701` and owner in-progress PUT
   `/api/v1/media/940702` returned 404 instead of 206. The other 12 requests
   matched. Parent corrected the test's missing final closing brace before that
@@ -73,7 +74,7 @@ do not establish these request outcomes or nonmutation on rejected operations.
   and unpublished staging rejection, transaction/row locking, and processing
   state preservation remain intact. Existing HTTP response handling supplies
   206 and failed-state 422; no `web.rs`, schema, grants, or async changes needed.
-- No local tests, builds, formatting, lint, NAS/SSH, or commits performed.
+- No local tests, builds, formatting, lint, external-worker, or commits performed.
   Await parent green and independent review; issue remains open.
 
 ## Completion evidence (2026-09-12)
@@ -85,9 +86,8 @@ do not establish these request outcomes or nonmutation on rejected operations.
   retaining filename-present, owner, unattached and failed/staging exclusions.
 - Permanent `schema-read-test media_state` green: one matrix / 14 requests, with
   exact outcomes and full row/file/cleanup-intent rejection snapshots.
-- Full final NAS gates passed: all 11 schema selectors, 85 workers, ordinary
+- Full final isolated-worker gates passed: all 11 schema selectors, 85 workers, ordinary
   default/all-feature debug, release all-feature, formatting, strict Clippy and
-  offline harness aggregate. Logs in `/srv/workspaces/rustodon-audit-green/logs/`:
-  `media-state-{red,green}.log`, `{schema,workers,default,feature,release,clippy}-final.log`.
+  offline harness aggregate. Historical external run artifacts are not in the repository.
 - Independent review found no blockers. No new formats, asynchronous uploader,
   schema/grants, live deployment or historical mutation.

@@ -18,11 +18,11 @@ The cached proxy selects PNG video or JPEG converted-image small files but keeps
 ## Notes
 
 - Source: [test coverage audit](../test-coverage-audit.md).
-- User authorized this implementation plan on 2026-09-12; no live deployment is implied.
-- Parent-reported NAS behavioral red: `web::cached_media_response_tests` ran seven
+- Implementation plan recorded on 2026-09-12; no live deployment is implied.
+- Parent-reported isolated-worker behavioral red: `web::cached_media_response_tests` ran seven
   tests, with five passing and two failing at response MIME assertions: MP4 small
   returned `video/mp4` instead of `image/png`; HEIC small returned `image/heic`
-  instead of `image/jpeg`. Log: `/srv/workspaces/rustodon-audit-red/logs/mime.log`.
+  instead of `image/jpeg`. The historical external run artifact is not in the repository.
 - The proposed fix shares media-file style MIME selection between Paperclip
   filenames and cached response headers. Parent-reported independent review
   `57b0fa82` found no production blocker; authorization remains unchanged.
@@ -38,12 +38,13 @@ The cached proxy selects PNG video or JPEG converted-image small files but keeps
 ## Completion evidence (2026-09-12)
 
 - Baseline unit regression: five passed/two failed (video PNG and HEIC JPEG
-  responses retained original MIME), `rustodon-audit-red/logs/mime.log`.
-- Combined NAS green: seven MIME unit tests; permanent `schema-read-test
+  responses retained original MIME); its historical external artifact is not in
+  the repository.
+- Combined isolated worker green: seven MIME unit tests; permanent `schema-read-test
   media_proxy` selects one real private-media HTTP regression. Both cached
   styles deny anonymous/non-follower access despite existing files, allow the
   follower with exact bytes/MIME/cache headers, then deny anonymous access again.
-- Logs: `/srv/workspaces/rustodon-audit-green/logs/{mime,media-http}.log`.
+- Historical external run artifacts are not in the repository.
   Default/all-feature debug, release all-feature, formatting and strict Clippy
   also pass; independent production and added HTTP reviews found no blockers.
 - `media_proxy` is included in the permanent schema aggregate and offline

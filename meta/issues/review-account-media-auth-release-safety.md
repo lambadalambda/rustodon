@@ -11,7 +11,7 @@ the pinned Mastodon 4.6.5 behavior.
 - Review authorization, CSRF, session/token revocation, settings defaults, media
   ownership, filesystem cleanup, media proxy access, reset tokens, and mail failure
   behavior.
-- Compare relevant behavior with `/workspace/rustodon/target/mastodon-v4.6.5`.
+- Compare relevant behavior with a repository-external pinned Mastodon 4.6.5 checkout.
 - Run the available unit, integration, and guarded differential coverage.
 - Record confirmed findings and unproved or deferred behavior without modifying the
   pinned reference checkout.

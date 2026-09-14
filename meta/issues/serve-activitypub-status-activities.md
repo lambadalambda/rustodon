@@ -27,7 +27,7 @@ documents.
 ## Notes
 
 - Use the pinned Mastodon 4.6.5 checkout at
-  `/workspace/rustodon/target/mastodon-v4.6.5` as the behavior reference.
+  a repository-external pinned Mastodon 4.6.5 checkout as the behavior reference.
 
 ## Progress
 

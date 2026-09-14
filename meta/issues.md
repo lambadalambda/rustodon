@@ -12,7 +12,7 @@
 - [ ] [Address release-readiness review findings](issues/address-release-readiness-review-findings.md)
 - [ ] [Set up a local federating Rustodon instance](issues/set-up-local-federating-instance.md)
 - [ ] [Repair ActivityPub ingestion and audiences](issues/repair-activitypub-ingestion-and-audiences.md)
-- [ ] [Run essential parity gates and peer tests on Secunda](issues/run-essential-parity-gates-on-secunda.md)
+- [ ] [Run essential parity gates and peer tests on an isolated worker](issues/run-essential-parity-gates-on-isolated-worker.md)
 - [ ] [Add isolated bidirectional federation peer tests](issues/add-isolated-federation-peer-tests.md)
 - [ ] [Accept ordinary ActivityPub tag atom identifiers](issues/accept-activitypub-tag-atom-identifiers.md)
 - [ ] [Restore v2 account search for clients](issues/restore-v2-account-search.md)
@@ -23,4 +23,3 @@
 - [ ] [Diagnose missing posts from followed lain.com account](issues/diagnose-missing-followed-lain-com-posts.md)
 - [ ] [Diagnose missing remote animated media](issues/diagnose-missing-remote-animated-media.md)
 - [ ] [Support frontend web settings API](issues/support-frontend-web-settings-api.md)
-- [ ] [Make public documentation environment-neutral](issues/make-public-documentation-environment-neutral.md)

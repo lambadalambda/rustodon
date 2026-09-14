@@ -8,28 +8,28 @@ After deploying the parity fixes, the local user reports that following `lain@la
 
 - Trace the live relationship, inbox acceptance, worker processing and timeline visibility using read-only diagnostics first.
 - Preserve the permanent origin, account identities, follow relationship and persistent data; do not print credentials or private post bodies.
-- Reproduce any identified code defect on Secunda before implementing a minimal reviewed repair.
+- Reproduce any identified code defect on an isolated worker before implementing a minimal reviewed repair.
 
 ## Acceptance Criteria
 
 - Identify the failing boundary with concrete evidence, distinguishing absent historical backfill from missed new deliveries.
-- Any code repair has regression coverage and applicable Secunda checks.
+- Any code repair has regression coverage and applicable isolated-worker checks.
 - Verify receipt and timeline eligibility of a new remote post, or explicitly record the remaining external verification blocker.
 
 ## Notes
 
 - Deployment source `16c0b09`; readiness passed with three dead-letter jobs.
-- Read-only live diagnostics on 2026-09-11: accepted follow row `2` links local
-  account `117250541985141990` to `117250871421421944` (`https://lain.com/users/lain`),
-  created at 11:40:11 UTC; no pending request and no stored statuses from lain.com.
-- Five ingress dead letters (`154`, `168`, `412`, `440`, `450`) are signed Create
-  Notes from that actor, each permanently rejected after one attempt with
-  `ActivityPub inbox activity is invalid`. Latest delivery at 11:40:35 follows
-  the accepted relationship and contains a Note published at 11:40:23.
+- Read-only live diagnostics on 2026-09-11 confirmed an accepted follow with no
+  pending request and no stored statuses from the remote account.
+- Five ingress dead letters were signed Create Notes from that actor, each
+  permanently rejected after one attempt with
+  `ActivityPub inbox activity is invalid`. The latest delivery followed the
+  accepted relationship.
 - All five Note objects carry JSON null `sensitive`, string `summary` and array
-  `tag`. Latest Note is public in both envelope/object audiences. This establishes
-  a processing failure rather than merely absent historical backfill or a hidden
-  home-timeline row. Payload bodies/credentials were not displayed or committed.
+  `tag`. The latest Note was public in both envelope/object audiences. This
+  establishes a processing failure rather than merely absent historical backfill
+  or a hidden home-timeline row. Payload bodies/credentials were not displayed or
+  committed.
 
 ## Repair and regression evidence
 
@@ -45,40 +45,31 @@ After deploying the parity fixes, the local user reports that following `lain@la
   checks persisted false. The Create check occurs before a valid duplicate could
   conceal a rejected first delivery. Existing update, follower stream, privacy,
   deduplication and Delete assertions remain intact.
-- Secunda passed 29 inbox tests, all 62 worker fixture tests, `cargo fmt --all
-  --check` and all-target/all-feature Clippy with warnings denied. Logs:
-  `/home/lain/rustodon-parity/nullable-sensitive-{red,green,workers,clippy}.log`.
+- Isolated worker passed 29 inbox tests, all 62 worker fixture tests, `cargo fmt --all
+  --check` and all-target/all-feature Clippy with warnings denied. Historical
+  external run artifacts are not in the repository.
 - Independent code review approved.
 
 ## Deployment and recovery — 2026-09-11 UTC
 
-- Deployed `f9b6af78f6863bef16960e918a426c2b13854213`, native ARM64 image
-  `da842de6c91857674c18051c2efdba8bc14297184ff324d91d9cbe1f5d99381a`, to both apps.
-  Used the existing resource-limited native deployment build exception; tests
-  and lint stayed on Secunda. No default/test-support features in the release.
-- App-only cutover evidence: `.local-instance/logs/deploy-20260911T115504Z/`.
-  Consistent backup: `.local-instance-backups/20260911T115509Z/`; files nonempty
-  mode 600, directory mode 700. No contents displayed or restore test performed.
-  PostgreSQL/Redis and local identities were preserved; follow row `2` unchanged.
-- Previous image `b2e9682f9a50040921a5b7358319fad8f45ebf0ba2f97c5235cad11cb6a01d94`
-  and stopped apps ending `-rollback-20260911T115504Z` remain available. Use the
-  application-only rollback procedure in the deployment issue with these names;
-  never start an old pair alongside the current apps or recreate data services.
-- Independently reviewed `.local-instance/retry-null-sensitive.sql` transaction
-  requeued exactly the five diagnosed jobs, guarded by IDs, signer/domain,
-  activity type, null sensitivity, error/attempt count and unleased dead state.
-  Worker was gracefully stopped with restart-on-error protection for the
-  transaction, then restarted. The recovery SQL preserved payloads,
-  order/idempotency keys, attempts and lease generations. Normal worker claiming
-  and validation resumed afterward.
-- All five ingress jobs completed; three statuses materialized with sensitivity
-  false and public visibility. IDs `117252276511693176`, `117252276513133141`,
-  `117252276514092511` are exposed by the public account-statuses API.
-- Ran the exact `rest_home_timeline_ids` SQL extracted from current repository
-  source, with the real viewer ID and no token access. Both top-level statuses
-  (`117252276511693176`, `117252276513133141`) appear on its first page. The third
-  is an unresolved reply and is not currently home-eligible. Local diagnostic
-  query: `.local-instance/logs/missing-lain-posts/home-check.sql`.
+- Source `f9b6af78f6863bef16960e918a426c2b13854213` was deployed in a
+  native ARM64 release with default/test-support features disabled. Tests and lint
+  remained in isolation.
+- The application-only deployment completed on **2026-09-11**; its artifacts are
+  not in the repository. A consistent restricted backup was nonempty, its
+  contents were not displayed, and restoration was not tested. PostgreSQL and
+  Redis services, local identities, and the accepted follow were preserved.
+- The previous application pair remains stopped and available for rollback; data
+  services must not be recreated or run concurrently with the old pair.
+- An independently reviewed bounded recovery replayed exactly the five diagnosed
+  jobs while preserving payloads, ordering/idempotency keys, attempts, and lease
+  generations. Normal worker claiming and validation resumed afterward.
+- All five ingress jobs completed; three public, non-sensitive statuses
+  materialized and were exposed by the public account-statuses API.
+- The exact `rest_home_timeline_ids` SQL extracted from current repository source
+  placed both top-level statuses on the first page. The third was an unresolved
+  reply and was not yet home-eligible. The local diagnostic result is retained
+  only as historical external evidence not in the repository.
 - Preflight passed with the same two existing warnings; worker, local and public
   readiness passed. No dead-letter jobs remained at postcheck.
 
@@ -89,21 +80,20 @@ After deploying the parity fixes, the local user reports that following `lain@la
   signed deliveries, not a new end-to-end HTTP delivery after deployment.
 - The other two acknowledged Create jobs did not leave status rows; the exact
   skip reason has not been established. Do not claim all five posts were restored.
-- Reply-thread job `472` is retrying with `remote reply thread persistence failed`;
-  the post itself is stored, but its parent is unresolved. This newly exposed
+- The reply-thread job was retrying with `remote reply thread persistence failed`;
+  the post itself was stored, but its parent was unresolved. This newly exposed
   downstream issue was not repaired or bypassed as part of the nullable parser fix.
 
 ## Follow-up evidence — 2026-09-11 UTC
 
-- A fresh remote top-level status `117252296570157832`, stored at
-  `2026-09-11 12:00:46.758103` after the nullable-sensitive deployment, arrived
+- A fresh remote top-level status arrived after the nullable-sensitive deployment
   without the bounded replay. The exact repository home selector put it on the
-  first page for local account `117250541985141990`; inbox acceptance also
-  continued afterward. This addresses the fresh-delivery evidence gap above.
+  local account's first page; inbox acceptance also continued afterward. This
+  addresses the fresh-delivery evidence gap above.
 - Subsequent combined repair deployment `b2937cf` preserved the accepted follow
-  row 2 and recovered the reply thread through its separate reviewed permission
-  repair. Child `117252276514092511` now has its correct parent and public context;
-  see [thread recovery](repair-remote-reply-thread-persistence.md#combined-nas-validation-and-live-recovery--2026-09-11-utc).
+  and recovered the reply thread through its separate reviewed permission repair.
+  The child now has its correct parent and public context; see
+  [thread recovery](repair-remote-reply-thread-persistence.md#combined-isolated-worker-validation-and-live-recovery--2026-09-11-utc).
 - Public bundled profile and status pages now render the recovered remote account
   media and diagnosed GIF. The two earlier acknowledged Creates without rows
   remain unexplained; do not claim historical backfill or recovery of all five.

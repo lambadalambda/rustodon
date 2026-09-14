@@ -15,7 +15,7 @@ The user requests empty results instead of the current API 404 responses that re
 
 - Representative frontend polling/list requests no longer return implementation-placeholder 404 errors.
 - Tests cover empty response shapes, applicable authorization and retained real-resource/mutation 404 behavior.
-- Applicable checks pass on Secunda; live verification follows deployment.
+- Applicable checks pass on an isolated worker; live verification follows deployment.
 
 ## Notes
 
@@ -23,13 +23,10 @@ The user requests empty results instead of the current API 404 responses that re
 
 ## Owned implementation scope
 
-- Worktree `task/api-empty-reads`; isolated Secunda workspace
-  `/home/lain/rustodon-parity/api-empty-reads`, Cargo jobs 2.
+- Execution used a task-specific isolated-worker workspace with two Cargo jobs.
 - Nine GET groups: trends tags/links/statuses, v2 suggestions, directory,
   link timeline, user domain blocks, instance domain blocks, familiar followers.
-- Reference inspected read-only on Secunda at
-  `/home/lain/repos/rustodon/target/mastodon-v4.6.5` (canonical
-  `/workspace/rustodon/target/mastodon-v4.6.5`), verified revision
+- An external read-only run inspected pinned Mastodon 4.6.5 source at revision
   `1440d55b139e39ec722c2a3db7f60b66cd889048`. Controllers:
   `api/v1/trends/*`, `api/v2/suggestions`, `api/v1/directories`,
   `api/v1/timelines/{link,topic}`, `api/v1/domain_blocks`,
@@ -88,23 +85,22 @@ its normal pinned fixture, least-privilege roles, and task-owned cleanup:
 tools/mastodon-fixture schema-read-test api_empty_reads
 ```
 
-Run it on the authorized isolated Linux worker (currently NAS), not the local
-coding machine. No temporary harness or upstream media checkout is needed.
+Run it on an isolated Linux worker, not the local coding machine. No temporary harness or upstream media checkout is needed.
 The historical evidence below used the earlier temporary selector and is not
 rewritten as evidence of the new command.
 
 ## Verification evidence
 
-Logs are task-local under `/home/lain/rustodon-parity/api-empty-reads/`:
+Historical external evidence; artifacts are not in the repository:
 
-- `red-contracts.log`: new route test failed on absent `/api/v1/trends/tags`.
-- `red-http.log`: new HTTP test failed on the unregistered route response
+- A historical external RED recorded the new route test failing on absent `/api/v1/trends/tags`.
+- A historical external RED recorded the new HTTP test failing on the unregistered route response
   lacking API CORS finalization (before handlers existed).
-- `green-contracts.log`: explicit route contracts pass.
-- `green-http.log`: disposable schema HTTP regression passes (1 test), including
+- A historical external GREEN recorded explicit route contracts passing.
+- A historical external GREEN recorded the disposable schema HTTP regression passing (1 test), including
   real moderation rows, empty shapes/cursors, auth/scope/app-only rejection,
   trailing slash/HEAD, and missing-resource/mutation error preservation.
-- `all-tests.log`: `cargo test --locked --all-targets --all-features` passes
+- A historical external run recorded `cargo test --locked --all-targets --all-features` passing
   without the workspace's pinned-source symlink; ignored integration gates
   are not claimed by this run.
 - Independent read-only review completed: no confirmed handler defect;
@@ -117,27 +113,27 @@ verification. No live environment or container was modified.
 
 Review follow-up found an in-scope publishing-auth mismatch: upstream permits
 functional moved users to view user-published instance blocks/rationale, unlike
-`require_user!` used for mutations. `red-publishing.log` reproduces the incorrect
+`require_user!` used for mutations. The historical external RED reproduces the incorrect
 403. A read-specific `functional_or_moved?` eligibility predicate now reuses the
 existing OAuth facts query (without decrypting OTP secrets or weakening shared
 authentication); ineligible users get the hidden `[]`/null rationale rather than
-an extra user-required error. The expanded `green-http.log` passes moved-user and
+an extra user-required error. The expanded historical external GREEN passes moved-user and
 disabled-user publishing cases, HEAD rejection, mixed public-list/user-only
 rationale, and query-bearer injection. Suspended-token rejection remains in the
 existing authenticator.
 
-Final gates: `fmt.log` (`cargo fmt --all --check`) and `clippy.log`
-(`cargo clippy --locked --all-targets --all-features -- -D warnings`) pass.
-`all-tests.log` totals **423 passed, 0 failed, 152 ignored** across targets;
-`pinned-source.log` records **2 passing** explicit pinned-source contract tests.
+Final historical external gates `cargo fmt --all --check` and
+`cargo clippy --locked --all-targets --all-features -- -D warnings` pass.
+The historical external all-target run totals **423 passed, 0 failed, 152 ignored** across targets;
+A historical external run recorded **2 passing** explicit pinned-source contract tests.
 The independent reviewer rechecked the publishing correction and approved the
 scoped commit. Live frontend/deployment acceptance remains with the parent.
 
 ## Live verification — 2026-09-11 UTC
 
-- Deployed source `b2937cf` after combined NAS formatting, ordinary tests, strict
+- Deployed source `b2937cf` after combined isolated-worker formatting, ordinary tests, strict
   Clippy, workers, startup and the focused API HTTP fixture passed. See the
-  [combined deployment record](repair-remote-reply-thread-persistence.md#combined-nas-validation-and-live-recovery--2026-09-11-utc).
+  [combined deployment record](repair-remote-reply-thread-persistence.md#combined-isolated-worker-validation-and-live-recovery--2026-09-11-utc).
 - Through the permanent public origin, GET trends tags/links/statuses, directory,
   link timeline and instance domain blocks all return **200 `[]`**.
 - Unauthenticated suggestions, familiar-followers and owner domain-block reads
@@ -147,7 +143,7 @@ scoped commit. Live frontend/deployment acceptance remains with the parent.
 - Unknown API route and a genuinely absent status both retain **404**. No live
   mutation was attempted; unchanged mutation errors are fixture-covered.
 - Bundled public profile/status pages loaded without browser runtime errors.
-  Evidence: `.local-instance/logs/deploy-20260911T140542Z/public-repairs.jsonl`
-  and `browser-errors.txt`. Scoped collection-read acceptance is satisfied;
-  issue archived. The explicitly deferred noncollection/lookup routes above
-  remain unimplemented; this is not a claim that every possible API 404 is gone.
+  The historical external artifacts are not in the repository. Scoped
+  collection-read acceptance is satisfied; issue archived. The explicitly
+  deferred noncollection/lookup routes above remain unimplemented; this is not
+  a claim that every possible API 404 is gone.

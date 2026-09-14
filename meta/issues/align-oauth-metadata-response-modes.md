@@ -2,7 +2,7 @@
 
 ## Summary
 
-The required pinned Rails differential, unblocked by the task-owned NAS socket,
+The required pinned Rails differential, unblocked by the task-owned fixture control path,
 fails because Rustodon advertises only query mode while Mastodon advertises
 query, fragment and form_post. Rustodon already has response-mode behavior gates.
 
@@ -31,24 +31,24 @@ query, fragment and form_post. Rustodon already has response-mode behavior gates
   supported-mode contracts, retaining unknown/malformed-mode rejection and unsafe
   callback guards. Include ordinary metadata regression and fixture coverage for
   consent, success, denial, errors, PKCE, state escaping and form-post security.
-- Report phase 1 ready for parent-owned NAS RED before changing production.
+- Report phase 1 ready for parent-owned isolated-worker RED before changing production.
 - Implement behavior before advertising all three modes. Obtain independent
   read-only review before substantial handoff.
 - Parent runs pinned `oauth_bearer_authentication`, response-mode fixture,
-  formatting and strict lint; no local tests/builds/fmt, NAS/SSH or commits here.
+  formatting and strict lint; no local tests/builds/fmt, external-worker or commits here.
 - Use supplied pinned 4.6.5 evidence/extracts for upstream-specific expectations;
   do not fetch missing upstream source or weaken the differential oracle.
 
 ## Evidence
 
-- `/srv/workspaces/rustodon-audit-green/logs/differential-task-socket.log`:
+- A historical external run recorded:
   missing `response_modes_supported[1]` fragment and `[2]` form_post.
 - `src/web.rs` OAuth metadata currently emits `["query"]`.
 - Follow-up from required audit gate execution; no live deployment.
 
 ## Original handler verification (superseded scope blocker)
 
-- Owner: Alice, worktree `ilar-task-remaining-oauth-modes` at `c948975`.
+- Work was performed in a task-specific worktree at `c948975`.
 - `src/web.rs:9392–9397` accepts only omitted/query response modes and rejects
   fragment/form_post before login or consent on both GET and POST. Consent
   hardcodes query mode; authorization responses append fields to the callback
@@ -64,7 +64,7 @@ query, fragment and form_post. Rustodon already has response-mode behavior gates
   support exceeds this issue's assigned narrow scope.
 - The initial phase stopped without code/test changes. The user subsequently
   authorized implementing fragment and form_post; the requirements above now
-  govern the work. Production remains query-only until tests-first NAS RED.
+  govern the work. Production remains query-only until tests-first isolated-worker RED.
 
 ## Phase 1 test preparation
 
@@ -92,7 +92,7 @@ query, fragment and form_post. Rustodon already has response-mode behavior gates
   reuse existing grant issuance/PKCE/session checks. No schema or grant-type
   changes are expected. Keep any callback-specific CSP local to form-post output.
 - Independent read-only review found no apparent compile blocker and judged the
-  draft suitable for parent NAS RED. Addressed its CSP findings: parse the consent
+  draft suitable for parent isolated-worker RED. Addressed its CSP findings: parse the consent
   directive exactly, accept callback origin/path sources rather than query URLs.
   Added single-form extraction, duplicate-field rejection, static-script target
   checking, and HTML/URL-encoded CRLF normalization in the small renderer parser.
@@ -101,20 +101,20 @@ query, fragment and form_post. Rustodon already has response-mode behavior gates
   stale sessions, for every mode on GET and POST approval/denial with valid CSRF.
   Restore the disabled fixture user before propagating request errors/assertions.
 - Follow-up independent read-only review found no remaining blocking compile or
-  correctness issue by inspection and approved phase 1 for parent NAS RED. Its
+  correctness issue by inspection and approved phase 1 for parent isolated-worker RED. Its
   small cookie-header cleanup was applied (absent session sends only CSRF cookie).
 - Parent owns all execution/formatting and must observe RED before a production
-  fix. No local tests/builds/fmt, NAS/SSH operations, fetches or commits performed.
+  fix. No local tests/builds/fmt, external-worker operations, fetches or commits performed.
   Issue remains open.
 
 ## Cached pinned OAuth verification
 
-Parent-provided read-only extract:
-`/Users/lainsoykaf/repos/rustodon/.local-instance/audit-reference/oauth-pinned/`.
-`opt/mastodon/Gemfile.lock:213` confirms Doorkeeper **5.9.2**.
-Below, `D` means `usr/local/bundle/gems/doorkeeper-5.9.2/`, and `M` means
-`opt/mastodon/`, relative to that extract. No runtime was executed here.
-An independent read-only reviewer confirmed these conclusions.
+A historical read-only extract from the pinned `/opt/mastodon` image tree, not
+retained in the repository, confirms Doorkeeper **5.9.2** at
+`/opt/mastodon/Gemfile.lock:213`. Below, `D` means
+`/usr/local/bundle/gems/doorkeeper-5.9.2/` and `M` means `/opt/mastodon/`. No
+runtime was executed here. An independent read-only reviewer confirmed these
+conclusions.
 
 - **Validation errors:** `D/app/controllers/doorkeeper/authorizations_controller.rb`
   (7–16, 43–52, 71–92, 132–137) renders GET preauthorization failures locally as
@@ -210,13 +210,12 @@ and helper changes were inspected but not executed.
 
 ## Phase 2: parent-observed RED and implementation
 
-Parent reported actual NAS RED:
+Parent reported actual isolated-worker RED:
 - Ordinary metadata regression expected `["query", "fragment", "form_post"]`,
   received `["query"]`.
 - Fixture first failed query blank-state handling (`Some("")` versus `None`,
-  line 716 in the parent's NAS-formatted source).
-- Logs: `/srv/workspaces/rustodon-audit-green/logs/oauth-metadata-red.log` and
-  `/srv/workspaces/rustodon-audit-green/logs/oauth-modes-red.log`.
+  line 716 in the parent's isolated worker-formatted source).
+- Historical external run artifacts are not in the repository.
 
 Phase 2 is now implemented in `src/web.rs`; the tests snapshot is untouched:
 - Private query/fragment/form-post parsing, blank-mode query default and distinct
@@ -252,18 +251,18 @@ checks, escaped non-executable state, exact static-script CSP hashing and
 response-local callback CSP. No production changes were recommended by review.
 Both reviews were source-only: HTML/CSP assertions model form encoding but do not
 execute browser submission. Execution remains parent-owned; no local workloads,
-NAS/SSH activity, fetches or commits performed here.
+external-worker activity, fetches or commits performed here.
 
 ## Parent-verified focused GREEN
 
 Parent applied the web implementation and reported:
-- NAS formatting completed.
+- isolated-worker formatting completed.
 - Ordinary `metadata_advertises_query_fragment_and_form_post`: **1 passed**.
-  Log: `/srv/workspaces/rustodon-audit-green/logs/oauth-metadata-green.log`.
+  The historical external run artifact is not in the repository.
 - Real ignored schema selector
   `supported_response_modes_preserve_authorization_security`: **1 passed** in
   **14.48 seconds**.
-  Log: `/srv/workspaces/rustodon-audit-green/logs/oauth-modes-green.log`.
+  The historical external run artifact is not in the repository.
 
 These are parent-reported focused results, not independently executed here.
 Combined Clippy, schema, ordinary and required differential gates are underway;
@@ -272,12 +271,12 @@ pending those remaining acceptance checks.
 
 ## Completion
 
-NAS metadata and real response-mode fixture tests passed after their recorded
-reds. The full schema aggregate, default/all-feature debug/release tests and
-strict all-target/all-feature Clippy passed. Pinned `oauth_bearer_authentication`
-now passes (`differential-required-remaining.log`); its later unrelated preflight
-failure was separately tracked and corrected. Evidence also includes
-`schema-remaining.log`, `clippy-corrected.log`, and `{default,feature,release}-remaining.log`.
+Isolated-worker metadata and real response-mode fixture tests passed after their
+recorded reds. The full schema aggregate, default/all-feature debug/release tests
+and strict all-target/all-feature Clippy passed. Pinned
+`oauth_bearer_authentication` now passes; its later unrelated preflight failure
+was separately tracked and corrected. Historical external run artifacts are not
+in the repository.
 Separate security, architecture and final integrated reviews found no blockers.
 No schema/grant changes, deployment, or weaker PKCE/CSP policy were introduced.
 Optional grant-snapshot/error-precedence test strengthening remains out of scope.

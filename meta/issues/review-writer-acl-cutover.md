@@ -14,7 +14,7 @@ ACL validation, and the documented cutover ordering.
 - Exercise public ACLs, grant options, default privileges, role attributes, and
   operational-role discovery against PostgreSQL.
 - Preserve the pinned Mastodon checkout at
-  `/workspace/rustodon/target/mastodon-v4.6.5` and do not change application
+  a repository-external pinned Mastodon 4.6.5 checkout and do not change application
   files during the review.
 
 ## Acceptance Criteria
