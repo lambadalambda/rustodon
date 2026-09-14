@@ -1,4 +1,4 @@
-//! Run on Secunda with the disposable schema-read fixture (see the owning issue).
+//! Run with the disposable schema-read fixture (see the owning issue).
 use super::*;
 use serde_json::{Value, json};
 
@@ -127,7 +127,7 @@ async fn setting(pool: &PgPool, name: &str, value: &str) {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated Secunda schema-read fixture; see meta/issues/return-empty-unimplemented-api-reads.md"]
+#[ignore = "requires isolated schema-read fixture; see meta/issues/return-empty-unimplemented-api-reads.md"]
 #[allow(clippy::too_many_lines)]
 async fn frontend_empty_reads_preserve_shapes_auth_and_errors() -> TestResult {
     let owner_url = std::env::var("RUSTODON_MASTODON_OWNER_DATABASE_URL")?;

@@ -7,8 +7,7 @@ mod history;
 
 // Behavioral port of the pinned 4.6.5 sanitized-HTML update contract, confirmed
 // by the parent from the exact image. Reference checkout (read-only):
-// /workspace/rustodon/target/mastodon-v4.6.5, or on Secunda
-// /home/lain/repos/rustodon/target/mastodon-v4.6.5 at
+// `target/mastodon-v4.6.5` at
 // 1440d55b139e39ec722c2a3db7f60b66cd889048. No upstream source is needed to run.
 // Only supported Note fields are exercised: inbound Question/poll editing is
 // not implemented. Metadata refresh is not itself proof of a meaningful edit.

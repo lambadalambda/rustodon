@@ -1,4 +1,4 @@
-//! Pinned web settings contract; disposable NAS fixture only.
+//! Pinned web settings contract; disposable fixture only.
 use super::*;
 use serde_json::{Value, json};
 use std::error::Error;
@@ -130,7 +130,7 @@ fn web_settings_route_inventory_is_private_and_write_only() {
 }
 
 #[tokio::test]
-#[ignore = "requires isolated NAS schema-read-test fixture; see web settings issue"]
+#[ignore = "requires isolated schema-read-test fixture; see web settings issue"]
 #[allow(clippy::too_many_lines)]
 async fn web_settings_persist_frontend_snapshot() -> TestResult {
     let owner = PgPool::connect(&std::env::var("RUSTODON_MASTODON_OWNER_DATABASE_URL")?).await?;

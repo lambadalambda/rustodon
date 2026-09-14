@@ -3,7 +3,7 @@
 //! Oracle: parent-extracted cached Mastodon 4.6.5 image, digest
 //! 696439e1ada71d0cf3d51d4d6a4744d6e40b57aafa64980b18f4d3b78230d0cf,
 //! pinned-extended-description-source.log. No upstream HTTP comparison is claimed.
-//! Run only on a disposable, guarded NAS fixture, sequentially with settings tests.
+//! Run only on a disposable, guarded fixture, sequentially with settings tests.
 
 use std::error::Error;
 use std::fmt::Debug;

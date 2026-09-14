@@ -1,31 +1,29 @@
 # Agent Guidance
 
-## Build and Test Host
+## Build and test safety
 
-- Run builds, tests, formatting, lint, and container workloads on the authorized
-  NAS worker `podman-worker`, not the local coding machine or unstable Secunda.
-- Parent exclusively owns sequential NAS SSH/Podman execution; editing subagents
-  must not start independent NAS workloads. Use disposable task workspaces below
-  `/srv/workspaces/` and explicit rootful socket routing; never change the user's
-  default Podman connection or prune unrelated resources.
-- Sync tracked source and explicitly selected test files only, never instance
-  environments, credentials, backups, or unrelated untracked files.
-- See `docs/testing-on-nas.md`. Secunda instructions remain historical/fallback;
-  preserve `/home/lain/repos/rustodon` and its `tracked-configs/` untouched.
-- If the SSH agent cannot sign, retry once sequentially, then request an unlock.
+- Use the task and lane definitions in `mise.toml` and
+  [`docs/testing.md`](docs/testing.md).
+- Run container-backed, browser, and peer fixtures only in disposable,
+  non-production environments with task-owned databases, media roots, ports,
+  identities, and container resources.
+- Run heavy fixture lanes sequentially with explicit CPU, memory, process, and
+  wall-time bounds. Clean only resources created by the current task; never
+  broadly prune a shared container engine.
+- Synchronize only intended tracked source and explicit new fixture files. Never
+  copy instance environments, credentials, backups, `.git`, build output, or
+  unrelated untracked files into test workspaces.
+- Preserve production SSRF, TLS, signature, privilege, and test-only feature
+  boundaries. A synthetic or image-only check is not a substitute for its named
+  source, database, browser, or peer gate.
 
-## Mastodon Reference Source
+## Mastodon reference source
 
-- Use the existing pinned Mastodon 4.6.5 checkout at
-  `/workspace/rustodon/target/mastodon-v4.6.5` when inspecting upstream code,
-  tests, migrations, routes, serializers, policies, or behavior.
-- On Secunda, the existing checkout is
-  `/home/lain/repos/rustodon/target/mastodon-v4.6.5`. Use it read-only when the
-  canonical `/workspace/` path is absent; do not fetch a replacement merely
-  because the source is absent on the local coding machine.
-- The expected revision is `1440d55b139e39ec722c2a3db7f60b66cd889048`.
-- Do not clone, fetch, pull, or otherwise retrieve Mastodon source from GitHub
-  when this checkout is present.
-- Treat the checkout as read-only. Do not modify it.
-- Include this local checkout path explicitly in every Mastodon-related
-  subagent prompt.
+- The compatibility target is Mastodon 4.6.5 revision
+  `1440d55b139e39ec722c2a3db7f60b66cd889048`.
+- `mise run fixture-obtain` places the verified source under the repository's
+  ignored `target/mastodon-v4.6.5` path.
+- Treat the reference checkout as read-only. Do not modify it, use a dirty or
+  wrong-revision tree, or substitute another Mastodon version.
+- Reuse an existing verified checkout when available instead of fetching a
+  replacement. The source-contract lane verifies the revision before use.

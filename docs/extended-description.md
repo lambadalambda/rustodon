@@ -9,10 +9,9 @@ and shared API OPTIONS/CORS handling follow existing instance surfaces.
 The implementation was derived from the exact cached Mastodon 4.6.5 image,
 digest
 `696439e1ada71d0cf3d51d4d6a4744d6e40b57aafa64980b18f4d3b78230d0cf`,
-without network access. The extraction logs remain machine-local historical
-evidence and are not prerequisites or artifacts in a clean checkout. The
-committed serializer expectations, fixture metadata, and pinned revision
-`1440d55b139e39ec722c2a3db7f60b66cd889048` are the durable public contract;
+without network access. No external extraction artifact is required in a clean
+checkout. The committed serializer expectations, fixture metadata, and pinned
+revision `1440d55b139e39ec722c2a3db7f60b66cd889048` are the durable public contract;
 none of this modifies or substitutes for the separate pinned-source oracle.
 
 The pinned serializer spec directly establishes:
@@ -24,8 +23,8 @@ The pinned serializer spec directly establishes:
 Additional compatibility cases in `src/web/extended_description_tests.rs` cover
 paragraph/heading separation, emphasis, links, inline code, simple lists,
 blockquotes, soft/hard breaks, horizontal rules, and trusted HTML. These are
-explicit expected-byte regressions checked on NAS against the pinned engine:
-**11/11 passed** (`extended-description-pinned-corpus.log`). All five Rust
+explicit expected-byte regressions checked against the pinned engine in an
+isolated fixture: **11/11 passed**. All five Rust
 serializer units and both normal/limited-mode HTTP cases also passed. The browser
 lane passes its anonymous startup API audit and authenticated delayed-save/reload
 persistence checks. This corpus is not complete dialect parity.
@@ -49,7 +48,7 @@ offset, not the ordinary REST millisecond timestamp format.
 `pulldown-cmark` uses the deliberate Cargo requirement `0.13.0` (caret semantics:
 `>=0.13.0, <0.14.0`), with default features disabled and only `html` enabled.
 This is a maintained Rust library parser/renderer, with no CLI, FFI, or native
-Redcarpet build dependency. The NAS-resolved lockfile pins `pulldown-cmark` 0.13.4 and its escape helper
+Redcarpet build dependency. The resolved lockfile pins `pulldown-cmark` 0.13.4 and its escape helper
 0.11.0; no existing dependency versions changed.
 
 This is **not full Redcarpet dialect parity**. The parser is CommonMark; no

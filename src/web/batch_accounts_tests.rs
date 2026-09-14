@@ -1,5 +1,5 @@
 //! Pinned 4.6.5 AccountsController#index contracts; parent wires the test wrappers.
-//! Execute only on podman-worker with the disposable schema-read fixture.
+//! Execute only with the disposable schema-read fixture.
 use super::*;
 use serde_json::{Value, json};
 

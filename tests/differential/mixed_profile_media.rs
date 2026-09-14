@@ -1,7 +1,6 @@
 //! Focused credentials HTTP regression matrix, run only in the disposable fixture gate.
 //!
-//! Oracle: pinned Mastodon 4.6.5 `credentials_spec.rb`, read-only extraction at
-//! /Users/lainsoykaf/repos/rustodon/.local-instance/audit-reference/remaining/spec/requests/api/v1/accounts/credentials_spec.rb.
+//! Oracle: pinned Mastodon 4.6.5 `credentials_spec.rb` at the recorded revision.
 //! The upstream request establishes GIF avatar + JPEG header and overlong-note 422;
 //! preservation/slot isolation/rollback below extend those cases. No 4.7 oracle,
 //! production preparation helpers, or cross-implementation encoded-byte equality.

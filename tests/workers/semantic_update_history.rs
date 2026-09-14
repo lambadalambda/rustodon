@@ -1,6 +1,5 @@
 //! Real HTTP history projection around restricted-writer semantic Updates.
-//! Pinned source: read-only /Users/lainsoykaf/repos/rustodon/.local-instance/
-//! audit-reference/remaining (4.6.5 image 696439e1...230d0cf). See the two owned
+//! Pinned source: Mastodon 4.6.5 image 696439e1...230d0cf. See the two owned
 //! issues for line-level evidence and the separate remote-history storage gap.
 use super::*;
 

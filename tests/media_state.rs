@@ -3,7 +3,6 @@
 //! Oracle: read-only extracted spec/requests/api/v1/media_spec.rb:32-68,149-244
 //! and app/controllers/api/v1/media_controller.rb:6-7,23-49,63-68 from image
 //! sha256:696439e1ada71d0cf3d51d4d6a4744d6e40b57aafa64980b18f4d3b78230d0cf.
-//! Extraction: /Users/lainsoykaf/repos/rustodon/.local-instance/audit-reference/pinned-media/.
 //! In particular, the controller updates unprocessed attachments and returns 206;
 //! failed processing returns 422 *after* owner/unattached lookup. These expectations
 //! are not inferred from Rust's repository predicates.
