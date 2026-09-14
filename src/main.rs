@@ -947,7 +947,7 @@ async fn run_web() -> ExitCode {
     let runtime = InstanceRuntimeConfig {
         domain: domain.clone(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        source_url: "https://github.com/rustodon/rustodon".to_owned(),
+        source_url: env!("CARGO_PKG_REPOSITORY").to_owned(),
         streaming_api: format!("wss://{domain}"),
         vapid_public_key: public_vapid_key,
         thumbnail_url: config
