@@ -7,33 +7,49 @@ trap 'rm -rf "$work"' EXIT
 source "$ROOT/tools/peer-tests/preflight.sh"
 die() { echo "$*" >&2; exit 1; }
 expect_fail() { if ( "$@" ) >"$work/error" 2>&1; then die "unexpected success: $*"; fi; }
-NAS=/srv/workspaces/rustodon-peer-tests/source
-SECUNDA=/home/lain/rustodon-parity/peer-tests
-peer_profile podman-worker "$NAS" "$NAS"
-[[ $PEER_PROFILE == nas-cached-image ]]
-peer_profile secunda "$SECUNDA" "$SECUNDA"
-[[ $PEER_PROFILE == secunda-source ]]
-expect_fail peer_profile laptop "$NAS" "$NAS"
-expect_fail peer_profile podman-worker "$SECUNDA" "$SECUNDA"
-expect_fail peer_profile secunda "$NAS" "$NAS"
-expect_fail peer_profile podman-worker "$NAS/child" "$NAS/child"
-expect_fail peer_profile podman-worker "$NAS-sibling" "$NAS-sibling"
-expect_fail peer_profile podman-worker "$NAS" /different/source
 
-REVISION=pinned
+PHYSICAL_ROOT=$(cd -P "$ROOT" && pwd)
+MARKER="$work/peer-workspace"
+printf 'rustodon-peer-workspace-v1:%s\n' "$PHYSICAL_ROOT" >"$MARKER"
+chmod 600 "$MARKER"
+unset RUSTODON_PEER_SMOKE
+expect_fail peer_contract "$PHYSICAL_ROOT" "$PHYSICAL_ROOT" "$MARKER"
+RUSTODON_PEER_SMOKE=0; expect_fail peer_contract "$PHYSICAL_ROOT" "$PHYSICAL_ROOT" "$MARKER"
+RUSTODON_PEER_SMOKE=1; export RUSTODON_PEER_SMOKE
+peer_contract "$PHYSICAL_ROOT" "$PHYSICAL_ROOT" "$MARKER"
+expect_fail peer_contract "$PHYSICAL_ROOT/child" "$PHYSICAL_ROOT" "$MARKER"
+expect_fail peer_contract "$PHYSICAL_ROOT" /different/source "$MARKER"
+rm "$MARKER"; expect_fail peer_contract "$PHYSICAL_ROOT" "$PHYSICAL_ROOT" "$MARKER"
+printf 'wrong workspace\n' >"$MARKER"; chmod 600 "$MARKER"
+expect_fail peer_contract "$PHYSICAL_ROOT" "$PHYSICAL_ROOT" "$MARKER"
+printf 'rustodon-peer-workspace-v1:%s\n' "$PHYSICAL_ROOT" >"$MARKER"
+chmod 644 "$MARKER"; expect_fail peer_contract "$PHYSICAL_ROOT" "$PHYSICAL_ROOT" "$MARKER"
+chmod 600 "$MARKER"
+
+actual_fixture_sum=$(sha256sum "$ROOT/fixtures/mastodon/v4.6.5/SHA256SUMS")
+[[ ${actual_fixture_sum%% *} == "$FIXTURE_SUMS_SHA256" ]]
+digest_a=$(printf 'a%.0s' {1..64})
+digest_b=$(printf 'b%.0s' {1..64})
+digest_c=$(printf 'c%.0s' {1..64})
 PLATFORM=linux/amd64
-MASTODON_IMAGE=mastodon@sha256:m
-POSTGRES_IMAGE=postgres@sha256:p
-REDIS_IMAGE=redis@sha256:r
-FIXTURE_DIR=fixture
+MASTODON_IMAGE="mastodon@sha256:$digest_a"
+POSTGRES_IMAGE="postgres@sha256:$digest_b"
+REDIS_IMAGE="redis@sha256:$digest_c"
+FIXTURE_DIR="$work/fixture"
 mode=good
 : >"$work/calls"
-git() { echo git >>"$work/calls"; [[ $mode != git-error ]] || return 128; echo "${revision:-pinned}"; }
+sha256sum() {
+  [[ $mode != checksum-error ]] || return 1
+  if [[ $mode == changed-checksums ]]; then
+    echo "$(printf '0%.0s' {1..64})  $1"
+  else
+    echo "$FIXTURE_SUMS_SHA256  $1"
+  fi
+}
 verify_static() { [[ $mode != bad-fixture ]]; }
 run_podman() {
   echo "$*" >>"$work/calls"
   case "$1 $2" in
-    'info --format') echo "${engine:-podman-worker|false}" ;;
     'image exists') [[ $mode != "missing-$3" ]] ;;
     'image inspect')
       [[ $mode != inspect-error ]] || return 125
@@ -42,36 +58,61 @@ run_podman() {
     *) die "unexpected engine operation: $*" ;;
   esac
 }
-PEER_PROFILE=nas-cached-image
 peer_prerequisites
-! grep -q git "$work/calls"
-for mode in bad-fixture inspect-error; do expect_fail peer_prerequisites; done
+for mode in changed-checksums checksum-error bad-fixture inspect-error; do expect_fail peer_prerequisites; done
+mode=good
+floating=$MASTODON_IMAGE; MASTODON_IMAGE=mastodon:latest
+expect_fail peer_prerequisites
+MASTODON_IMAGE=$floating
 for image in "$MASTODON_IMAGE" "$POSTGRES_IMAGE" "$REDIS_IMAGE"; do
   for mode in "missing-$image" "wrong-$image"; do expect_fail peer_prerequisites; done
 done
-mode=good
-for engine in 'wrong|false' 'podman-worker|true'; do expect_fail peer_prerequisites; done
-engine='podman-worker|false'
-PEER_PROFILE=secunda-source
-peer_prerequisites
-revision=wrong; expect_fail peer_prerequisites
-revision=pinned; mode=git-error; expect_fail peer_prerequisites
 mode=good
 for kind in container network volume; do
   exists_status=1; peer_require_absent "$kind" owned
   exists_status=0; expect_fail peer_require_absent "$kind" occupied
   exists_status=125; expect_fail peer_require_absent "$kind" uncertain
 done
-# The peer wrapper applies cache-only policy to every run, including shared helpers.
+# The peer wrapper forces local mode, applies cache-only policy, and bounds every run.
 peer_engine() { printf '%s\n' "$*"; }
-[[ $(peer_podman run --name owned image) == 'run --pull=never --name owned image' ]]
+[[ $(peer_podman run --name owned image) == \
+  'run --pull=never --memory=1200m --cpus=1 --pids-limit=256 --name owned image' ]]
 [[ $(peer_podman image inspect image) == 'image inspect image' ]]
 expect_fail peer_podman pull image
 expect_fail peer_podman build .
+# The live runner keeps the generic safety gates visible and reviewable.
+RUNNER="$ROOT/tools/federation-peer-smoke"
+grep -F 'peer_contract "$(pwd -P)" "$PEER_ROOT" "$PEER_ROOT/target/.rustodon-peer-workspace"' "$RUNNER" >/dev/null
+grep -F 'PEER_ROOT=$(CDPATH= cd -P' "$RUNNER" >/dev/null
+grep -F '[[ $(cd -P "$ROOT/target" && pwd) == "$ROOT/target" ]]' "$RUNNER" >/dev/null
+grep -F 'export CARGO_TARGET_DIR="$ROOT/target"' "$RUNNER" >/dev/null
+grep -F 'unset CARGO_BUILD_TARGET' "$RUNNER" >/dev/null
+grep -F 'CARGO_TARGET_DIR="$CARGO_TARGET_DIR"' "$RUNNER" >/dev/null
+grep -F 'flock -n 9' "$RUNNER" >/dev/null
+grep -F 'timeout --signal=TERM --kill-after=60 600' "$RUNNER" >/dev/null
+grep -F -- '--network host --cap-drop=ALL' "$RUNNER" >/dev/null
+grep -F -- '-- --list --ignored' "$RUNNER" >/dev/null
+grep -F 'trap cleanup EXIT' "$RUNNER" >/dev/null
+grep -F 'podman --remote=false "$@"' "$ROOT/tools/peer-tests/preflight.sh" >/dev/null
 # Sanitized final Cargo invocation must retain toolchain/cache locations, not
 # database credentials inherited from the outer environment.
-grep -F 'RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"' "$ROOT/tools/federation-peer-smoke" >/dev/null
-grep -F 'CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"' "$ROOT/tools/federation-peer-smoke" >/dev/null
+grep -F 'RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"' "$RUNNER" >/dev/null
+grep -F 'CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"' "$RUNNER" >/dev/null
 first=$(peer_run_id); second=$(peer_run_id)
 [[ $first != "$second" && $first != *[!0-9]* && $second != *[!0-9]* ]]
-echo 'peer profile and cache-only prerequisite tests passed' 
+inventory=$(peer_resource_inventory peer-123 42)
+[[ $inventory == "$(cat <<'EOF'
+container rustodon-fixture-v4-6-5-postgres-42
+container rustodon-differential-v4-6-5-redis-42
+container peer-123-probe
+container peer-123-seed-mastodon
+container peer-123-seed-rustodon
+container peer-123-web
+container peer-123-sidekiq
+network rustodon-fixture-v4-6-5-network-42
+volume rustodon-fixture-v4-6-5-postgres-42
+EOF
+)" ]]
+grep -F 'peer_resource_inventory "$RUN" "$$" > "$RUN_ROOT/.peer-resources"' "$RUNNER" >/dev/null
+grep -F -- '--name "$RUN-probe"' "$RUNNER" >/dev/null
+echo 'generic peer opt-in and cache-only prerequisite tests passed'

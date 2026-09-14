@@ -23,7 +23,8 @@ set -eu
 # Semantic eval checkpoints keep this offline test independent of the installed
 # CLI's network envelope. They test shell sequencing/fail-closed handling, NOT
 # the JavaScript predicates, real debounce timing, or response allowlisting.
-# Parent must verify those on NAS with the installed CLI skill and real fixture.
+# Parent must verify those in the authorized environment with the installed CLI
+# skill and real fixture.
 printf '%s\n' "$*" >> "$BROWSER_TEST_COMMANDS"
 # Model the verified 0.31.1 invocation, rather than silently accepting arbitrary
 # global flags. Every browser operation, including cleanup, owns one run session.
@@ -79,8 +80,8 @@ esac
 case "$*" in
   *' wait --load '*) printf '%s\n' 'load-state waiting is not DOM readiness' >&2; exit 80 ;;
 esac
-# Inject CLI failures without launching or sleeping. The parent runs this mock
-# on NAS; 124 models timeout's result, not a real timed browser process.
+# Inject CLI failures without launching or sleeping. Exit 124 models timeout's
+# result, not a real timed browser process.
 case "${BROWSER_TEST_FAIL_AT:-}:$*" in
   command-session-id:'session id --scope worktree --prefix rustodon-browser'|\
   command-network:*' network requests --clear'|\
@@ -378,7 +379,7 @@ fi
 
 # TLS adapter contract: parent confirmed this suite RED before implementation.
 # CA bytes here are an opaque mock fixture, not a real certificate. Real trust,
-# wrong-host rejection and Chromium SPKI behavior require parent NAS integration.
+# wrong-host rejection and Chromium SPKI behavior require authorized integration.
 tls_url=https://fixture.invalid:18443
 tls_ca="$test_root/fixture CA.pem"
 printf '%s\n' 'opaque fixture CA for argument checks' > "$tls_ca"
@@ -601,7 +602,8 @@ if [ -f "$test_root/authenticated.session" ] && [ -f "$test_root/anonymous-true.
 fi
 
 # Test the actual production JS predicates, not a copied implementation or an
-# invented agent-browser response envelope. The parent runs Node on NAS only.
+# invented agent-browser response envelope. Node runs only in the authorized
+# environment.
 if ! command -v node >/dev/null 2>&1; then
   fail_test 'node is required for offline browser predicate checks'
 else

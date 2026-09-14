@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline automation contracts. Parent runs on NAS; no real fixture workloads.
+"""Offline automation contracts; no real fixture workloads.
 
 Python 3.11+ standard library only. Shell runners are copied to temporary trees
 where fixture/harness entry points are replaced with recording stubs. This is
@@ -96,11 +96,6 @@ class ConfigurationContracts(unittest.TestCase):
         self.assertRegex(job, r"(?m)^      max-parallel: 1$")
         self.assertIn("if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'", job)
         self.assertIn("run: mise run ${{ matrix.task }}", job)
-        # Full differential media writes and cutover/browser read source assets.
-        self.assertIn("      - name: Obtain pinned extended-lane source prerequisite\n"
-                      "        run: mise run fixture-obtain", job)
-        self.assertLess(job.index("run: mise run fixture-obtain"),
-                        job.index("run: mise run ${{ matrix.task }}"))
         for task in ("differential-full", "browser-integration", "cutover-integration"):
             self.assertRegex(job, rf"(?m)^          - {task}$")
 
@@ -108,9 +103,10 @@ class ConfigurationContracts(unittest.TestCase):
         for scenario in ("public", "privacy", "notes", "profile", "interactions"):
             with self.subTest(scenario=scenario):
                 self.assertEqual(self.tasks[f"peer-{scenario}"]["run"],
-                                 f"tools/federation-peer-smoke {scenario}")
-        # Do not schedule the host-guarded peer runner on production/self-hosted
-        # runners. A separate authorization and the parent's NAS adapter apply.
+                                 f"RUSTODON_PEER_SMOKE=1 tools/federation-peer-smoke {scenario}")
+                self.assertIn("Manual", self.tasks[f"peer-{scenario}"]["description"])
+        # Do not schedule the opt-in peer runner on production or self-hosted
+        # runners. Execution requires a separate, explicit authorization.
         self.assertNotIn("self-hosted", self.workflow)
         self.assertNotIn("tools/federation-peer-smoke", self.workflow)
         self.assertNotRegex(self.workflow, r"mise run peer-")

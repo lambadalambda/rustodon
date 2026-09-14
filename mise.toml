@@ -105,26 +105,26 @@ run = "tools/ci-differential"
 description = "Run the full differential suite plus relative media-root mode (extended lane)"
 run = "tools/ci-differential full"
 
-# Manual only: retain the peer runner's host, workspace, and cached-image guards.
+# Manual only: each peer task explicitly authorizes the generic cache-only runner.
 [tasks.peer-public]
-description = "Isolated real-peer public push; authorized host/workspace only"
-run = "tools/federation-peer-smoke public"
+description = "Manual isolated real-peer public push (cache-only)"
+run = "RUSTODON_PEER_SMOKE=1 tools/federation-peer-smoke public"
 
 [tasks.peer-privacy]
-description = "Isolated real-peer recipient/outsider privacy; authorized host/workspace only"
-run = "tools/federation-peer-smoke privacy"
+description = "Manual isolated real-peer recipient/outsider privacy (cache-only)"
+run = "RUSTODON_PEER_SMOKE=1 tools/federation-peer-smoke privacy"
 
 [tasks.peer-notes]
-description = "Isolated real-peer Note lifecycle; authorized host/workspace only"
-run = "tools/federation-peer-smoke notes"
+description = "Manual isolated real-peer Note lifecycle (cache-only)"
+run = "RUSTODON_PEER_SMOKE=1 tools/federation-peer-smoke notes"
 
 [tasks.peer-profile]
-description = "Isolated real-peer profile updates; authorized host/workspace only"
-run = "tools/federation-peer-smoke profile"
+description = "Manual isolated real-peer profile updates (cache-only)"
+run = "RUSTODON_PEER_SMOKE=1 tools/federation-peer-smoke profile"
 
 [tasks.peer-interactions]
-description = "Isolated real-peer interactions and Undo; authorized host/workspace only"
-run = "tools/federation-peer-smoke interactions"
+description = "Manual isolated real-peer interactions and Undo (cache-only)"
+run = "RUSTODON_PEER_SMOKE=1 tools/federation-peer-smoke interactions"
 
 [tasks.check]
 description = "Run bounded ordinary/profile, static fixture, and offline harness checks"

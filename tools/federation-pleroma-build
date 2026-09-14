@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare/build the exact Pleroma release archive on Secunda, without base pulls."""
+"""Prepare/build the exact Pleroma release archive without base pulls."""
 import argparse
 from datetime import datetime, timezone
 import hashlib
@@ -7,18 +7,40 @@ import json
 import os
 from pathlib import Path
 import re
-import socket
+import signal
 import subprocess
 import tarfile
+import uuid
 
 REVISION = "cd8816eccec355b5ff1533dc75fc86e9927baf2b"
 ARCHIVE_SHA256 = "bb5c9cd6e6c6be270b119f12e5879710a496f12d1015d5448bb5c925a402046e"
 LOCK_SHA256 = "3e44cbaa4ed88ee13e1992345cba44d8bc9b9348fb43dc41036e9a8fe93ab456"
-WORKSPACE = Path("/home/lain/rustodon-parity/pleroma-peer")
+REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+ARTIFACT_ROOT = (REPOSITORY_ROOT / "target" / "pleroma-peer").resolve()
 ELIXIR_REPO = "docker.io/hexpm/elixir"
 ALPINE_REPO = "docker.io/library/alpine"
 ELIXIR_TAG = ELIXIR_REPO + ":1.17.3-erlang-26.2.5.6-alpine-3.17.9"
 ALPINE_TAG = ALPINE_REPO + ":3.17.9"
+INSPECT_TIMEOUT_SECONDS = 30
+EVIDENCE_TIMEOUT_SECONDS = 120
+BUILD_TIMEOUT_SECONDS = 3600
+RECONCILE_TIMEOUT_SECONDS = 30
+TERMINATE_TIMEOUT_SECONDS = 5
+FAILURE_OUTPUT_LIMIT = 16 * 1024
+TASK_LABEL_KEY = "org.rustodon.federation-pleroma-build.task"
+SENSITIVE_ARGUMENT = re.compile(r"(?:auth|credential|password|secret|token)", re.IGNORECASE)
+
+
+class CommandInterrupted(KeyboardInterrupt):
+    def __init__(self, command, output, returncode=None):
+        super().__init__("command interrupted")
+        self.cmd = command
+        self.output = output
+        self.returncode = returncode
+
+
+def interrupt_as_keyboard_interrupt(_signum, _frame):
+    raise KeyboardInterrupt
 
 
 def sha256(path):
@@ -29,6 +51,14 @@ def sha256(path):
 def verify_archive(archive):
     if sha256(archive) != ARCHIVE_SHA256:
         raise ValueError("archive checksum differs from the verified release export")
+
+
+def resolve_output(output, artifact_root=ARTIFACT_ROOT):
+    root = artifact_root.resolve()
+    resolved = output.resolve()
+    if not resolved.is_relative_to(root) or resolved == root:
+        raise ValueError(f"output must be beneath {root}")
+    return resolved
 
 
 def cached_digest(image, repository):
@@ -42,11 +72,14 @@ def cached_digest(image, repository):
     return digests[0]
 
 
-def pinned_recipe(original, builder, runtime):
+def pinned_recipe(original, builder, runtime, task_label):
     build_from = "FROM ${ELIXIR_IMG}:${ELIXIR_VER}-erlang-${ERLANG_VER}-alpine-${ALPINE_VER} AS build"
     runtime_from = "FROM alpine:${ALPINE_VER}"
     if any(original.count(marker) != 1 for marker in [build_from, runtime_from, "USER pleroma"]):
         raise ValueError("unexpected release Dockerfile")
+    if not re.fullmatch(re.escape(TASK_LABEL_KEY) + r"=[0-9a-f]{32}", task_label):
+        raise ValueError("invalid task label")
+    stage_label = "\nLABEL " + task_label
     # Preserve release install/build commands; add only immutable bases and evidence.
     evidence = f'''RUN echo '{LOCK_SHA256}  mix.lock' | sha256sum -c - &&\\
     mkdir -p /release/build-provenance &&\\
@@ -58,26 +91,266 @@ def pinned_recipe(original, builder, runtime):
     test -s /release/build-provenance/rebar.txt
 
 '''
-    return (original.replace(build_from, f"FROM {builder} AS build")
-            .replace(runtime_from, evidence + f"FROM {runtime}")
+    return (original.replace(build_from, f"FROM {builder} AS build" + stage_label)
+            .replace(runtime_from, evidence + f"FROM {runtime}" + stage_label)
             .replace("USER pleroma", "RUN apk info -vv > /usr/local/share/pleroma-runtime-packages.txt\n\nUSER pleroma"))
 
 
-def capture(*args):
-    return subprocess.check_output(args, text=True)
+def podman_command(*args):
+    return ["podman", "--remote=false", *args]
+
+
+def podman_environment(source=None):
+    source = os.environ if source is None else source
+    return {
+        key: source[key]
+        for key in ("PATH", "HOME", "XDG_RUNTIME_DIR")
+        if source.get(key)
+    }
+
+
+def task_resources(task_id):
+    if not re.fullmatch(r"[0-9a-f]{32}", task_id):
+        raise ValueError("task ID must be 32 lowercase hexadecimal characters")
+    stem = "rustodon-pleroma-build-" + task_id
+    return {
+        "id": task_id,
+        "label": f"{TASK_LABEL_KEY}={task_id}",
+        "image_name": f"localhost/{stem}:task",
+        "container_name": stem + "-evidence",
+    }
+
+
+def build_command(output, recipe, source, build_date, resources):
+    return podman_command(
+        "build", "--pull=never", "--retry=0", "--no-cache", "--rm", "--force-rm",
+        "--jobs=2", "--memory=4g", "--cpu-period", "100000", "--cpu-quota", "200000",
+        "--pids-limit=512", "--platform=linux/amd64",
+        "--label", resources["label"], "--layer-label", resources["label"],
+        "--tag", resources["image_name"],
+        "--iidfile", str(output / "image.id"),
+        "--build-arg", "VCS_REF=" + REVISION,
+        "--build-arg", "BUILD_DATE=" + build_date,
+        "-f", str(recipe), str(source),
+    )
+
+
+def evidence_command(image_id, resources):
+    return podman_command(
+        "run", "--rm", "--pull=never", "--network=none",
+        "--name", resources["container_name"], "--label", resources["label"],
+        "--memory=512m", "--cpus=1", "--pids-limit=128",
+        "--entrypoint", "/bin/sh", image_id, "-ec",
+        'for f in /opt/pleroma/build-provenance/* /usr/local/share/pleroma-runtime-packages.txt; '
+        'do echo "=== $f"; cat "$f"; done; '
+        f"echo '{LOCK_SHA256}  /opt/pleroma/build-provenance/mix.lock' | sha256sum -c -",
+    )
+
+
+def reconciliation_commands(resources):
+    return [
+        podman_command(
+            "container", "rm", "--force", "--ignore", resources["container_name"]
+        ),
+        podman_command(
+            "image", "rm", "--force", "--ignore", resources["image_name"]
+        ),
+    ]
+
+
+def reconciliation_queries(resources):
+    selector = "label=" + resources["label"]
+    return [
+        (
+            podman_command(
+                "ps", "--all", "--external", "--quiet", "--filter", selector
+            ),
+            ["container", "rm", "--force", "--storage"],
+        ),
+        (
+            podman_command("images", "--all", "--quiet", "--filter", selector),
+            ["image", "rm", "--force"],
+        ),
+    ]
+
+
+def exact_resource_ids(output):
+    identifiers = sorted(set(output.splitlines()))
+    if any(not re.fullmatch(r"[0-9a-f]{12,64}", value) for value in identifiers):
+        raise ValueError("resource query returned an invalid ID")
+    return identifiers
+
+
+def _kill_process_group(process, sig):
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def _terminate_process_group(process):
+    _kill_process_group(process, signal.SIGTERM)
+    try:
+        return process.communicate(timeout=TERMINATE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(process, signal.SIGKILL)
+        try:
+            return process.communicate(timeout=TERMINATE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            return (None, None)
+
+
+def run_bounded(command, *, timeout, stdout=subprocess.PIPE):
+    command = list(command)
+    process = subprocess.Popen(
+        command,
+        text=True,
+        stdout=stdout,
+        stderr=subprocess.STDOUT,
+        env=podman_environment(),
+        start_new_session=True,
+    )
+    try:
+        output, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        terminated_output, _ = _terminate_process_group(process)
+        if terminated_output is None:
+            terminated_output = error.output
+        raise subprocess.TimeoutExpired(
+            command, timeout, output=terminated_output
+        ) from error
+    except KeyboardInterrupt as error:
+        output, _ = _terminate_process_group(process)
+        raise CommandInterrupted(command, output, process.returncode) from error
+    except BaseException:
+        _terminate_process_group(process)
+        raise
+    if process.returncode:
+        raise subprocess.CalledProcessError(process.returncode, command, output=output)
+    return subprocess.CompletedProcess(command, process.returncode, output, None)
+
+
+def capture(*args, timeout=INSPECT_TIMEOUT_SECONDS):
+    return run_bounded(args, timeout=timeout).stdout
+
+
+def sanitize_command(command):
+    if command is None:
+        return None
+    sanitized = []
+    redact_next = False
+    for argument in map(str, command):
+        if redact_next:
+            sanitized.append("<redacted>")
+            redact_next = False
+            continue
+        option, separator, value = argument.partition("=")
+        if option.startswith("-") and SENSITIVE_ARGUMENT.search(option):
+            sanitized.append(option + (separator + "<redacted>" if separator else ""))
+            redact_next = not separator
+        elif separator and SENSITIVE_ARGUMENT.search(option):
+            sanitized.append(option + "=<redacted>")
+        else:
+            sanitized.append(argument)
+    return sanitized
+
+
+def _bounded_bytes(data, truncated=False):
+    marker = b"[...truncated to final output...]\n"
+    if len(data) > FAILURE_OUTPUT_LIMIT:
+        truncated = True
+        data = data[-(FAILURE_OUTPUT_LIMIT - len(marker)):]
+    if truncated:
+        data = marker + data[-(FAILURE_OUTPUT_LIMIT - len(marker)):]
+    return data.decode("utf-8", errors="ignore"), truncated
+
+
+def bounded_output(output):
+    if output is None:
+        return "", False
+    if isinstance(output, bytes):
+        return _bounded_bytes(output)
+    return _bounded_bytes(str(output).encode())
+
+
+def bounded_file_output(path):
+    size = path.stat().st_size
+    with path.open("rb") as source:
+        if size > FAILURE_OUTPUT_LIMIT:
+            source.seek(size - FAILURE_OUTPUT_LIMIT)
+        return _bounded_bytes(source.read(FAILURE_OUTPUT_LIMIT), size > FAILURE_OUTPUT_LIMIT)
+
+
+def failure_details(phase, command, error, output_path=None):
+    if output_path is not None and output_path.exists():
+        output, truncated = bounded_file_output(output_path)
+    else:
+        captured = getattr(error, "output", None)
+        if captured is None and not hasattr(error, "cmd"):
+            captured = str(error)
+        output, truncated = bounded_output(captured)
+    timed_out = isinstance(error, subprocess.TimeoutExpired)
+    return {
+        "phase": phase,
+        "command": sanitize_command(command),
+        "return_code": getattr(error, "returncode", None),
+        "timed_out": timed_out,
+        "timeout_seconds": error.timeout if timed_out else None,
+        "interrupted": isinstance(error, (KeyboardInterrupt, CommandInterrupted)),
+        "combined_output": output,
+        "combined_output_truncated": truncated,
+    }
+
+
+def reconcile(resources):
+    results = []
+
+    def attempt(command):
+        try:
+            completed = run_bounded(command, timeout=RECONCILE_TIMEOUT_SECONDS)
+            results.append({"command": sanitize_command(command), "status": "completed"})
+            return completed
+        except (Exception, KeyboardInterrupt) as error:
+            results.append({
+                "command": sanitize_command(command),
+                "status": "best-effort cleanup failed",
+                "details": failure_details("failure-reconciliation", command, error),
+            })
+            return None
+
+    direct = reconciliation_commands(resources)
+    attempt(direct[0])
+    for query, removal in reconciliation_queries(resources):
+        completed = attempt(query)
+        if completed is None:
+            continue
+        try:
+            identifiers = exact_resource_ids(completed.stdout)
+        except ValueError as error:
+            results.append({
+                "command": sanitize_command(query),
+                "status": "invalid scoped resource query output",
+                "details": failure_details("failure-reconciliation", query, error),
+            })
+            continue
+        for identifier in identifiers:
+            attempt(podman_command(*removal, identifier))
+    attempt(direct[1])
+    return results
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path, help="exact git archive tar (see provenance doc)")
-    parser.add_argument("output", type=Path, help="new directory beneath the task workspace")
+    parser.add_argument("output", type=Path, help="new directory beneath target/pleroma-peer")
     parser.add_argument("--build", action="store_true", help="build using exact release tags already cached; never pull")
     args = parser.parse_args()
-    if socket.gethostname().split(".")[0] != "secunda" or os.getuid() == 0:
-        parser.error("run as an unprivileged user on Secunda")
-    output = args.output.resolve()
-    if not output.is_relative_to(WORKSPACE) or output == WORKSPACE:
-        parser.error(f"output must be beneath {WORKSPACE}")
+    if os.getuid() == 0:
+        parser.error("run as an unprivileged user")
+    try:
+        output = resolve_output(args.output)
+    except ValueError as error:
+        parser.error(str(error))
     verify_archive(args.archive)
     output.mkdir(parents=True, exist_ok=False)
     source = output / "source"
@@ -102,57 +375,91 @@ def main():
     if not args.build:
         print(manifest)
         return
+    resources = task_resources(uuid.uuid4().hex)
+    record.update({
+        "status": "checking local cached build prerequisites",
+        "task_resources": resources,
+    })
+    save()
+    phase = "inspect-engine"
+    command = None
+    build_log = output / "build.log"
+    signal.signal(signal.SIGTERM, interrupt_as_keyboard_interrupt)
     # Local inspection only. Missing tags/digests fail, rather than contacting a registry.
     try:
-        info = json.loads(capture("podman", "info", "--format", "json"))
+        command = podman_command("info", "--format", "json")
+        info = json.loads(capture(*command))
+        phase = "validate-rootless-engine"
+        command = None
         if not info["host"]["security"]["rootless"]:
             raise ValueError("rootless Podman required")
         pins = []
         for tag, repository in [(ELIXIR_TAG, ELIXIR_REPO), (ALPINE_TAG, ALPINE_REPO)]:
-            image = json.loads(capture("podman", "image", "inspect", tag))[0]
+            phase = "inspect-cached-base"
+            command = podman_command("image", "inspect", tag)
+            image = json.loads(capture(*command))[0]
             (output / ("elixir-base.json" if repository == ELIXIR_REPO else "alpine-base.json")).write_text(
                 json.dumps(image, indent=2) + "\n"
             )
+            phase = "validate-cached-base"
+            command = None
             pins.append(cached_digest(image, repository))
+        phase = "generate-pinned-recipe"
+        command = None
         recipe = output / "Containerfile.pinned"
-        recipe.write_text(pinned_recipe((source / "Dockerfile").read_text(), *pins))
+        recipe.write_text(pinned_recipe(
+            (source / "Dockerfile").read_text(), *pins, resources["label"]
+        ))
+        build_date = datetime.now(timezone.utc).isoformat()
+        phase = "inspect-engine-version"
+        command = podman_command("--version")
+        podman_version = capture(*command).strip()
         record.update({
             "base_images": dict(zip([ELIXIR_TAG, ALPINE_TAG], pins)),
             "generated_recipe_sha256": sha256(recipe),
-            "build_date": datetime.now(timezone.utc).isoformat(),
-            "podman_version": capture("podman", "--version").strip(),
+            "build_date": build_date,
+            "podman_version": podman_version,
             "status": "building",
         })
         save()
-        command = [
-            "podman", "build", "--pull=never", "--retry=0", "--no-cache",
-            "--platform=linux/amd64", "--iidfile", str(output / "image.id"),
-            "--build-arg", "VCS_REF=" + REVISION,
-            "--build-arg", "BUILD_DATE=" + record["build_date"],
-            "-f", str(recipe), str(source),
-        ]
-        record["build_command"] = command
+        phase = "build-image"
+        command = build_command(output, recipe, source, build_date, resources)
+        record["build_command"] = sanitize_command(command)
         save()
-        with (output / "build.log").open("w") as log:
-            subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
+        with build_log.open("w") as log:
+            run_bounded(command, timeout=BUILD_TIMEOUT_SECONDS, stdout=log)
+        phase = "read-built-image-id"
+        command = None
         image_id = (output / "image.id").read_text().strip()
         record["image_id"] = image_id
-        (output / "image-inspect.json").write_text(capture("podman", "image", "inspect", image_id))
+        phase = "inspect-built-image"
+        command = podman_command("image", "inspect", image_id)
+        (output / "image-inspect.json").write_text(capture(*command))
         # No database/network/startup: collect the package/tool evidence baked into the image.
-        evidence = capture(
-            "podman", "run", "--rm", "--pull=never", "--network=none",
-            "--entrypoint", "/bin/sh", image_id, "-ec",
-            'for f in /opt/pleroma/build-provenance/* /usr/local/share/pleroma-runtime-packages.txt; '
-            'do echo "=== $f"; cat "$f"; done; '
-            f"echo '{LOCK_SHA256}  /opt/pleroma/build-provenance/mix.lock' | sha256sum -c -",
-        )
+        phase = "collect-package-evidence"
+        command = evidence_command(image_id, resources)
+        evidence = capture(*command, timeout=EVIDENCE_TIMEOUT_SECONDS)
         (output / "toolchain-packages.txt").write_text(evidence)
         record["status"] = "built; package/lock evidence collected; bootstrap not tested"
         save()
         print(image_id)
-    except (ValueError, subprocess.CalledProcessError) as error:
+    except (Exception, KeyboardInterrupt) as error:
         record["status"] = "blocked or failed (not verified)"
-        record["error"] = str(error)
+        record["failure"] = failure_details(
+            phase,
+            command,
+            error,
+            output_path=build_log if phase == "build-image" else None,
+        )
+        save()
+        record["failure_reconciliation"] = {
+            "scope": {
+                "label": resources["label"],
+                "container_name": resources["container_name"],
+                "image_name": resources["image_name"],
+            },
+            "results": reconcile(resources),
+        }
         save()
         raise
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline cutover rollback wiring/SQL coverage; parent executes on NAS only.
+"""Offline cutover rollback wiring/SQL coverage; no fixture workload.
 
 Runs the actual auth snapshot/restore shell blocks with a local SQLite-backed
 psql double. Only PostgreSQL format(%s/%L) and setval are emulated; this is not

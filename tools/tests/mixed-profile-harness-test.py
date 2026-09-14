@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline real-shell wiring regression; parent executes on NAS only.
+"""Offline real-shell wiring regression; no fixture workload.
 
 --fixture-script PATH permits red-before-change evidence against a saved script.
 Cargo, Podman, database/server setup, and cleanup are stubs; no real workloads.

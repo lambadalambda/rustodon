@@ -1,10 +1,10 @@
 #!/bin/bash
-# Real Mastodon <-> Rustodon smoke; exact disposable workspaces only.
+# Real Mastodon <-> Rustodon smoke; generic cache-only contract.
 set -euo pipefail
 PEER_ROOT=$(CDPATH= cd -P -- "$(dirname -- "$0")/.." && pwd)
 source "$PEER_ROOT/tools/peer-tests/preflight.sh"
 die() { echo "peer smoke: $*" >&2; exit 2; }
-peer_profile "$(hostname)" "$(pwd -P)" "$PEER_ROOT"
+peer_contract "$(pwd -P)" "$PEER_ROOT" "$PEER_ROOT/target/.rustodon-peer-workspace"
 [[ $# -le 1 ]] || { echo 'Use public, privacy, notes, profile or interactions' >&2; exit 2; }
 SCENARIO=${1:-public}
 case "$SCENARIO" in
@@ -16,7 +16,8 @@ case "$SCENARIO" in
   *) echo 'Use public, privacy, notes, profile or interactions' >&2; exit 2 ;;
 esac
 if [[ ${PEER_SMOKE_DEADLINE:-0} != 1 ]]; then
-  exec timeout --signal=TERM --kill-after=60 600 env PEER_SMOKE_DEADLINE=1 "$0" "$SCENARIO" </dev/null
+  exec timeout --signal=TERM --kill-after=60 600 \
+    env RUSTODON_PEER_SMOKE=1 PEER_SMOKE_DEADLINE=1 "$0" "$SCENARIO" </dev/null
 fi
 export CARGO_BUILD_JOBS=2
 MASTODON_FIXTURE_LIBRARY=1 source tools/mastodon-fixture
@@ -26,6 +27,8 @@ run_podman() { peer_podman "$@"; }
 peer_prerequisites
 mkdir -p "$ROOT/target"
 [[ $(cd -P "$ROOT/target" && pwd) == "$ROOT/target" ]] || die 'peer target must be a physical directory'
+export CARGO_TARGET_DIR="$ROOT/target"
+unset CARGO_BUILD_TARGET
 PEER_ID=$(peer_run_id)
 RUN="peer-$PEER_ID"
 exec 9>"$ROOT/target/.peer-smoke.lock"
@@ -34,31 +37,30 @@ flock -n 9 || die 'another peer smoke owns this workspace'
 peer_require_absent network "rustodon-fixture-v4-6-5-network-$$"
 peer_require_absent volume "rustodon-fixture-v4-6-5-postgres-$$"
 for name in "rustodon-fixture-v4-6-5-postgres-$$" "rustodon-differential-v4-6-5-redis-$$" \
-  "$RUN-seed-mastodon" "$RUN-seed-rustodon" "$RUN-web" "$RUN-sidekiq"; do
+  "$RUN-probe" "$RUN-seed-mastodon" "$RUN-seed-rustodon" "$RUN-web" "$RUN-sidekiq"; do
   peer_require_absent container "$name"
 done
+RUN_ROOT="$ROOT/target/$RUN"
+mkdir -m 700 "$RUN_ROOT"
+printf '%s\n' "$RUN" > "$RUN_ROOT/.peer-run"
+peer_resource_inventory "$RUN" "$$" > "$RUN_ROOT/.peer-resources"
 cargo build --locked --features test-support --bin rustodon
 cargo test --locked --features test-support --test federation_peers --no-run
 # A renamed/non-ignored test must fail here, not report an empty smoke as success.
 cargo test --locked --features test-support --test federation_peers -- --list --ignored |
   grep -Fx "$TEST: test" >/dev/null || die 'selected ignored peer scenario is missing'
-RUN_ROOT="$ROOT/target/$RUN"
-mkdir -m 700 "$RUN_ROOT"
-if [[ $PEER_PROFILE == nas-cached-image ]]; then
-  # Sibling mounts resolve on the engine host; loopback must be shared as well.
-  # The unique marker proves new host-visible writes, not just a stale source copy.
-  printf '%s\n' "$RUN" > "$RUN_ROOT/.mount-probe"
-  if ! probe=$(run_podman run --rm --network host --cap-drop=ALL \
-    --volume "$RUN_ROOT:$RUN_ROOT:ro" --entrypoint /bin/sh "$POSTGRES_IMAGE" \
-    -c 'cat "$1/.mount-probe"; readlink /proc/self/ns/net' sh "$RUN_ROOT"); then
-    rm -f "$RUN_ROOT/.mount-probe"
-    die 'NAS peer host mount/network probe failed'
-  fi
+# Absolute mounts must resolve on the engine host, and loopback must be shared.
+# The unique marker proves new host-visible writes, not a stale source copy.
+printf '%s\n' "$RUN" > "$RUN_ROOT/.mount-probe"
+if ! probe=$(run_podman run --rm --name "$RUN-probe" --network host --cap-drop=ALL \
+  --volume "$RUN_ROOT:$RUN_ROOT:ro" --entrypoint /bin/sh "$POSTGRES_IMAGE" \
+  -c 'cat "$1/.mount-probe"; readlink /proc/self/ns/net' sh "$RUN_ROOT"); then
   rm -f "$RUN_ROOT/.mount-probe"
-  [[ $probe == "$(printf '%s\n%s' "$RUN" "$(readlink /proc/self/ns/net)")" ]] ||
-    die 'NAS peer runner requires same absolute host mounts and host networking'
+  die 'peer host mount/network probe failed'
 fi
-printf '%s\n' "$RUN" > "$RUN_ROOT/.peer-run"
+rm -f "$RUN_ROOT/.mount-probe"
+[[ $probe == "$(printf '%s\n%s' "$RUN" "$(readlink /proc/self/ns/net)")" ]] ||
+  die 'peer runner requires same absolute host mounts and host networking'
 PIDS=()
 EXTRA_CONTAINERS=()
 cleanup() {
@@ -156,7 +158,6 @@ mastodon() {
   [[ $side != rustodon ]] || redis_db=1
   for value in "${COMMON[@]}"; do args+=(--env "$value"); done
   run_podman run --rm --name "$name" --network host --user 0 \
-    --memory 1200m --cpus 1 --pids-limit 256 \
     --volume "$ROOT/tools/peer-tests:/peer:ro" \
     --volume "$RUN_ROOT/ca.crt:/peer-ca.crt:ro" \
     --volume "$ROOT/tools/peer-tests/mastodon-transport.rb:/opt/mastodon/config/initializers/peer_transport.rb:ro" \
@@ -252,6 +253,7 @@ done
 [[ $ready == 1 ]] || die 'federation workers did not become ready'
 # The ignored test validates the run marker and DB comments before API mutations.
 env -i PATH="$PATH" HOME="$HOME" CARGO_BUILD_JOBS=2 \
+  CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
   RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
   PEER_RUN="$RUN" PEER_ROOT="$RUN_ROOT" \
   PEER_MASTODON_HTTP="http://127.0.0.1:$MASTODON_PORT" PEER_RUSTODON_HTTP="http://127.0.0.1:$RUSTODON_PORT" \

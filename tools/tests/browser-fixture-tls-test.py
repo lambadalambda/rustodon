@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline real-TLS tests. Parent runs on NAS; no containers/DNS/global trust."""
+"""Offline real-TLS tests; no containers, DNS changes, or global trust."""
 import base64
 import hashlib
 import os
