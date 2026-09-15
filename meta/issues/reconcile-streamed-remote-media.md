@@ -62,9 +62,12 @@ A newly streamed status with a tall remote attachment initially renders as a hor
   successful file write. Existing failed-fetch, stale/deleted, denied-policy,
   and lease-fence regressions compositionally cover those shared gates.
   Metadata and stream rows commit together. After an ambiguous commit result,
-  the worker checks the exact installed metadata marker: confirmed commits are
-  acknowledged, while rolled-back final attempts remove files before entering
-  the existing failed/dead-letter state.
+  the worker locks the attachment row before checking the exact installed
+  metadata marker, so it cannot observe pre-commit state. Written file paths are
+  removed from the automatic cleanup guard before the `COMMIT` await; cancellation
+  or an inconclusive probe therefore preserves them, while a locked read that
+  proves rollback removes them explicitly before the existing failed/dead-letter
+  path.
 
 ## Verification
 
@@ -83,11 +86,19 @@ A newly streamed status with a tall remote attachment initially renders as a hor
 - Current-tree `cargo fmt --check` and `git diff --check` pass. Native Rust
   checking reaches the changed worker code but remains blocked only by the
   expected Linux-only `rustix` `openat2`, `ResolveFlags`, and `NOATIME` APIs.
-  The shared Podman VM did not answer either the API or direct SSH during the
-  final rerun, so the expanded Linux worker/streaming suites and strict Clippy
-  are not claimed as passed in these notes.
-- Independent final-diff review found no correctness blockers in the logical-key
-  namespace, shared audience helpers, wrapper fanout, ambiguity reconciliation,
-  or delivered payload coverage.
-- A deployed browser/live-instance replay has not been run in this workspace;
-  normal frontend-flow verification remains pending.
+  Before the final small ambiguity-synchronization edit, the Linux worker's four
+  focused `activitypub_media_fetch` tests, the delivered streaming-envelope
+  regression, and strict all-target/all-feature Clippy passed on the isolated
+  worker. The final edit was formatting/diff checked and independently reviewed
+  specifically for commit/probe cancellation safety.
+- Independent final-diff review found no release blockers after the attachment
+  row lock and cancellation-safe file preservation were added.
+- ARM64 release image `23ade3eb1f9fd4304be6948a008066d05bd6409f6e710ade0f21cb53408f79ab`
+  for revision `986e5c950c37e90f9ff296a11e5302c4e558daf4` built and passed production
+  preflight, then was deployed with healthy worker, web, readiness, and rollback
+  checks.
+- A browser-backed live replay of the exact previously missed media reconciliation
+  received `status.update` over the production WebSocket in one second. Its
+  serialized attachment had local original and preview URLs and original aspect
+  `0.5673076923076923`; the public status API and rendered image likewise exposed
+  the complete 944×1664 geometry without a reload.

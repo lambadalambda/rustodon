@@ -96,3 +96,4 @@
 - [x] [Style Rustodon-owned HTML surfaces](issues/style-rustodon-owned-html-surfaces.md)
 - [x] [Diagnose dead-letter accumulation](issues/diagnose-dead-letter-accumulation.md)
 - [x] [Restore frontend WebSocket streaming connection](issues/restore-frontend-websocket-streaming.md)
+- [x] [Reconcile streamed remote media after caching](issues/reconcile-streamed-remote-media.md)
