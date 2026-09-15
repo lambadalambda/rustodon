@@ -95,3 +95,4 @@
 - [x] [Make public documentation environment-neutral](issues/make-public-documentation-environment-neutral.md)
 - [x] [Style Rustodon-owned HTML surfaces](issues/style-rustodon-owned-html-surfaces.md)
 - [x] [Diagnose dead-letter accumulation](issues/diagnose-dead-letter-accumulation.md)
+- [x] [Restore frontend WebSocket streaming connection](issues/restore-frontend-websocket-streaming.md)

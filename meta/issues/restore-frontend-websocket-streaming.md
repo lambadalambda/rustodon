@@ -47,8 +47,7 @@ The Mastodon frontend repeatedly fails to connect to the Rustodon WebSocket endp
   selects that exact offered token only when protocol-token authentication won;
   repeated authentication, scopes, token identity, and stream authorization are
   unchanged.
-- Registered the focused regression in the operational-schema integration lane;
-  the issue remains open pending public deployment/browser verification.
+- Registered the focused regression in the operational-schema integration lane.
 
 ## Verification
 
@@ -66,3 +65,12 @@ The Mastodon frontend repeatedly fails to connect to the Rustodon WebSocket endp
   query > protocol precedence, empty-query fallback, and no selected protocol
   when a distinct offered protocol loses to query authentication.
 - `cargo fmt --check` and `git diff --check` passed.
+- Independent review found no remaining correctness, security, test, or
+  maintainability blockers after credential selection was made atomic.
+- Public verification used the frontend's exact `new WebSocket(url,
+  accessToken)` behavior: Chromium opened the connection, confirmed the selected
+  protocol, and sent the user-stream subscription without error. A raw public
+  handshake also confirmed HTTP 101 plus the selected protocol, while the query
+  token control returned HTTP 101 without selecting a protocol. Health,
+  readiness, worker readiness, and rollback retention remained healthy.
+- Acceptance is satisfied.
