@@ -20,3 +20,16 @@ The Mastodon frontend repeatedly fails to connect to the Rustodon WebSocket endp
 ## Notes
 
 - Keep deployment-specific evidence in the private operations note.
+
+## Reproduction
+
+- The bundled Mastodon frontend opens the socket with
+  `new WebSocket(url, accessToken)`, which sends the OAuth token as the requested
+  WebSocket subprotocol while leaving the URL query empty.
+- Rustodon accepts that token and returns HTTP 101, but its handshake does not
+  return `Sec-WebSocket-Protocol`. A minimal Chromium probe reproduced the same
+  connection error when a server omitted the requested protocol and opened
+  successfully when the server echoed it.
+- Bearer-header and query-token handshakes already upgrade successfully. The
+  failure is therefore WebSocket subprotocol negotiation, not Caddy routing or
+  general token validity.
