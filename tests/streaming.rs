@@ -24,6 +24,7 @@ const ACCESS_TOKEN: &str = "fixture-bearer-token-v4-6-5";
 const ACCOUNT_ID: i64 = 116_844_606_259_201_001;
 const MODERATOR_ID: i64 = 116_844_606_259_201_002;
 const PUBLIC_STATUS_ID: i64 = 116_844_842_188_805_001;
+const REMOTE_MEDIA_STATUS_ID: i64 = 116_845_105_643_525_105;
 const UNAUTHORIZED_STATUS_ID: i64 = -312;
 const ORIGIN: &str = "https://fixture-v4-6-5.rustodon.invalid/";
 const REVOKED_STREAM_TOKEN: &str = "fixture-stream-revoked-token-v4-6-5";
@@ -208,9 +209,15 @@ async fn websocket_stream_delivers_one_deduplicated_mastodon_envelope()
         event_logical_key(ACCOUNT_ID, "delete", 42, version),
         event_logical_key(ACCOUNT_ID, "update", UNAUTHORIZED_STATUS_ID, version + 1),
         event_logical_key(ACCOUNT_ID, "update", PUBLIC_STATUS_ID, version + 2),
+        event_logical_key(
+            ACCOUNT_ID,
+            "status.update",
+            REMOTE_MEDIA_STATUS_ID,
+            version + 3,
+        ),
     ];
     let reconnect_logical_key =
-        event_logical_key(ACCOUNT_ID, "update", PUBLIC_STATUS_ID, version + 3);
+        event_logical_key(ACCOUNT_ID, "update", PUBLIC_STATUS_ID, version + 4);
     for logical_key in &logical_keys {
         sqlx::query("DELETE FROM rustodon.outbox_events WHERE kind = $1 AND logical_key = $2")
             .bind(STREAM_EVENT_KIND)
@@ -251,6 +258,14 @@ async fn websocket_stream_delivers_one_deduplicated_mastodon_envelope()
         &logical_keys[2],
     )
     .await?;
+    let media_update = record_stream_event_in(
+        &mut transaction,
+        ACCOUNT_ID,
+        "status.update",
+        REMOTE_MEDIA_STATUS_ID,
+        &logical_keys[3],
+    )
+    .await?;
     transaction.commit().await?;
     assert_eq!(first, duplicate);
 
@@ -287,6 +302,39 @@ async fn websocket_stream_delivers_one_deduplicated_mastodon_envelope()
         .ok_or_else(|| std::io::Error::other("status event payload was not serialized JSON"))?;
     let payload: serde_json::Value = serde_json::from_str(payload)?;
     assert_eq!(payload["id"], json!(PUBLIC_STATUS_ID.to_string()));
+
+    let message = timeout(Duration::from_secs(5), socket.next())
+        .await?
+        .ok_or_else(|| std::io::Error::other("stream closed before media status update"))??;
+    let Message::Text(message) = message else {
+        return Err(std::io::Error::other("stream returned a non-text media update").into());
+    };
+    let envelope: serde_json::Value = serde_json::from_str(message.as_ref())?;
+    assert_eq!(envelope["stream"], json!(["user"]));
+    assert_eq!(envelope["event"], "status.update");
+    let payload = envelope["payload"]
+        .as_str()
+        .ok_or_else(|| std::io::Error::other("media update payload was not serialized JSON"))?;
+    let payload: serde_json::Value = serde_json::from_str(payload)?;
+    assert_eq!(payload["id"], json!(REMOTE_MEDIA_STATUS_ID.to_string()));
+    let attachment = &payload["media_attachments"][0];
+    let local_media_prefix = format!("{ORIGIN}system/cache/media_attachments/files/");
+    let url = attachment["url"]
+        .as_str()
+        .ok_or_else(|| std::io::Error::other("media update has no local original URL"))?;
+    let preview_url = attachment["preview_url"]
+        .as_str()
+        .ok_or_else(|| std::io::Error::other("media update has no local preview URL"))?;
+    assert!(
+        url.starts_with(&local_media_prefix),
+        "unexpected media URL: {url}"
+    );
+    assert!(
+        preview_url.starts_with(&local_media_prefix),
+        "unexpected preview URL: {preview_url}"
+    );
+    assert_ne!(url, "https://remote.fixture.invalid/media/cached.jpg");
+    assert_eq!(attachment["meta"]["original"]["aspect"], json!(1.5));
 
     socket.close(None).await?;
     let reconnect_endpoint =
@@ -333,7 +381,13 @@ async fn websocket_stream_delivers_one_deduplicated_mastodon_envelope()
     );
     reconnected.close(None).await?;
 
-    for event_id in [first, unauthorized, allowed, reconnected_event] {
+    for event_id in [
+        first,
+        unauthorized,
+        allowed,
+        media_update,
+        reconnected_event,
+    ] {
         sqlx::query("DELETE FROM rustodon.outbox_events WHERE id = $1")
             .bind(event_id)
             .execute(&write_pool)

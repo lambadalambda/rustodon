@@ -14,6 +14,16 @@ pub fn event_logical_key(account_id: i64, event: &str, object_id: i64, version: 
     format!("stream:{account_id}:{event}:{object_id}:{version}")
 }
 
+#[must_use]
+pub fn media_event_logical_key(
+    account_id: i64,
+    event: &str,
+    object_id: i64,
+    media_id: i64,
+) -> String {
+    format!("stream:{account_id}:{event}:{object_id}:media:{media_id}")
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamName {
     User,
@@ -114,7 +124,9 @@ pub struct StreamEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientCommand, StreamName, event_logical_key, event_message};
+    use super::{
+        ClientCommand, StreamName, event_logical_key, event_message, media_event_logical_key,
+    };
     use crate::mastodon::OAuthScopes;
 
     #[test]
@@ -184,5 +196,15 @@ mod tests {
         assert_eq!(first, event_logical_key(7, "status.update", 42, 3));
         assert_ne!(first, event_logical_key(8, "status.update", 42, 3));
         assert_ne!(first, event_logical_key(7, "status.update", 42, 4));
+    }
+
+    #[test]
+    fn media_event_keys_cannot_collide_with_semantic_versions() {
+        let semantic = event_logical_key(7, "status.update", 42, 3);
+        let media = media_event_logical_key(7, "status.update", 42, 3);
+        assert_eq!(media, "stream:7:status.update:42:media:3");
+        assert_ne!(semantic, media);
+        assert_eq!(media, media_event_logical_key(7, "status.update", 42, 3));
+        assert_ne!(media, media_event_logical_key(7, "status.update", 42, 4));
     }
 }

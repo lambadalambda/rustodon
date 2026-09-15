@@ -4095,6 +4095,12 @@ async fn process_activitypub_media(
                 )));
             }
         };
+    let install_marker = RemoteMediaInstallMarker {
+        file_name: prepared.file_name.clone(),
+        content_type: prepared.content_type.clone(),
+        file_size: prepared.file_size,
+    };
+    let transaction_install_marker = install_marker.clone();
     let metadata = PaperclipMetadata {
         attachment: PaperclipAttachment::MediaFile,
         id: media_id,
@@ -4163,7 +4169,7 @@ async fn process_activitypub_media(
             }
             let written_paths = write_prepared_media(&media_root, &metadata, &prepared)?;
             let mut written_files = WrittenMediaFiles::new(&media_root, written_paths);
-            let updated = match sqlx::query(
+            let status_id = match sqlx::query_scalar::<_, i64>(
                 "UPDATE media_attachments SET processing = 2, file_content_type = $3,
                     file_file_name = $4, file_file_size = $5, file_meta = $6::json,
                     file_storage_schema_version = 1, file_updated_at = clock_timestamp(),
@@ -4173,7 +4179,8 @@ async fn process_activitypub_media(
                         SELECT 1 FROM statuses
                          WHERE statuses.id = media_attachments.status_id
                            AND statuses.deleted_at IS NULL
-                    )",
+                    )
+                  RETURNING status_id",
             )
             .bind(media_id)
             .bind(remote_url.as_str())
@@ -4182,38 +4189,75 @@ async fn process_activitypub_media(
             .bind(prepared.file_size)
             .bind(file_meta)
             .bind(blurhash.or(prepared.blurhash))
-            .execute(&mut *transaction)
+            .fetch_optional(&mut *transaction)
             .await
             {
-                Ok(updated) => updated,
+                Ok(status_id) => status_id,
                 Err(error) => {
                     written_files.cleanup();
                     let _ = transaction.rollback().await;
                     return Err(error.into());
                 }
             };
-            if updated.rows_affected() == 0 {
+            let Some(status_id) = status_id else {
                 written_files.cleanup();
                 transaction.commit().await?;
                 return Ok(false);
-            }
-            // A commit error is ambiguous: PostgreSQL may have committed before the connection
-            // failed. Keep the files so a retry can reconcile either database outcome.
-            written_files.disarm();
+            };
+            WriteRepository::record_remote_media_installed_stream_events_in(
+                &mut transaction,
+                status_id,
+                media_id,
+            )
+            .await?;
+            // A cancelled or failed COMMIT is ambiguous: PostgreSQL may still commit after this
+            // future is dropped. Keep paths out of the drop guard until the synchronized probe
+            // below proves that the installation rolled back.
+            let written_paths = written_files.preserve();
             #[cfg(feature = "test-support")]
-            if media_root.take_commit_before_fault() {
-                return Err(WriteError::Sqlx(sqlx::Error::Protocol(
+            let commit_result = if media_root.take_commit_before_fault() {
+                transaction.rollback().await?;
+                Err(sqlx::Error::Protocol(
                     "injected ambiguous metadata commit failure".to_owned(),
-                )));
-            }
-            transaction.commit().await?;
+                ))
+            } else {
+                transaction.commit().await
+            };
+            #[cfg(not(feature = "test-support"))]
+            let commit_result = transaction.commit().await;
             #[cfg(feature = "test-support")]
-            if media_root.take_commit_after_fault() {
-                return Err(WriteError::Sqlx(sqlx::Error::Protocol(
+            let commit_result = if commit_result.is_ok() && media_root.take_commit_after_fault() {
+                Err(sqlx::Error::Protocol(
                     "injected ambiguous metadata commit result".to_owned(),
-                )));
+                ))
+            } else {
+                commit_result
+            };
+            match commit_result {
+                Ok(()) => Ok(true),
+                Err(error) => {
+                    match remote_media_install_committed(
+                        &pool,
+                        media_id,
+                        remote_url.as_str(),
+                        &transaction_install_marker,
+                    )
+                    .await
+                    {
+                        Ok(true) => Ok(true),
+                        Ok(false) => {
+                            WrittenMediaFiles::new(&media_root, written_paths).cleanup();
+                            Err(error.into())
+                        }
+                        Err(_) => {
+                            // A failed reconciliation leaves the commit genuinely ambiguous.
+                            // Preserve files because deleting them could corrupt an installation
+                            // that committed.
+                            Err(error.into())
+                        }
+                    }
+                }
             }
-            Ok(true)
         })
         .await;
     match persisted {
@@ -4233,7 +4277,17 @@ async fn process_activitypub_media(
             }
         }
         Err(_) => {
-            if attempt >= max_attempts {
+            let committed = remote_media_install_committed(
+                &pool,
+                media_id,
+                remote_url.as_str(),
+                &install_marker,
+            )
+            .await
+            .is_ok_and(|committed| committed);
+            if committed {
+                Ok(())
+            } else if attempt >= max_attempts {
                 mark_remote_media_failed(&pool, media_id, remote_url.as_str()).await?;
                 Err(HandlerFailure::permanent(
                     "remote media metadata retries were exhausted",
@@ -4244,6 +4298,52 @@ async fn process_activitypub_media(
             }
         }
     }
+}
+
+#[derive(Clone)]
+struct RemoteMediaInstallMarker {
+    file_name: String,
+    content_type: String,
+    file_size: i32,
+}
+
+async fn remote_media_install_committed(
+    pool: &PgPool,
+    media_id: i64,
+    remote_url: &str,
+    marker: &RemoteMediaInstallMarker,
+) -> Result<bool, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let installed = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<i32>,
+            Option<String>,
+            Option<String>,
+            Option<i32>,
+            Option<i32>,
+        ),
+    >(
+        "SELECT remote_url, processing, file_file_name, file_content_type,
+                file_file_size, file_storage_schema_version
+           FROM media_attachments WHERE id = $1 FOR UPDATE",
+    )
+    .bind(media_id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let committed = installed.is_some_and(
+        |(current_url, processing, file_name, content_type, file_size, storage_schema_version)| {
+            current_url == remote_url
+                && processing == Some(2)
+                && file_name.as_deref() == Some(marker.file_name.as_str())
+                && content_type.as_deref() == Some(marker.content_type.as_str())
+                && file_size == Some(marker.file_size)
+                && storage_schema_version == Some(1)
+        },
+    );
+    transaction.rollback().await?;
+    Ok(committed)
 }
 
 struct WrittenMediaFiles {
@@ -4267,6 +4367,10 @@ impl WrittenMediaFiles {
 
     fn disarm(&mut self) {
         self.paths.clear();
+    }
+
+    fn preserve(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.paths)
     }
 }
 

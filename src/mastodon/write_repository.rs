@@ -61,6 +61,7 @@ use crate::paperclip::{PaperclipAttachment, PaperclipMetadata, rails_blank};
 use crate::remote::{RemoteActor, canonical_remote_domain, canonical_remote_host};
 use crate::streaming::{
     STATUS_UPDATE_NOTIFICATION_EVENT, SYSTEM_KILL_EVENT, TOKEN_KILL_EVENT, event_logical_key,
+    media_event_logical_key,
 };
 
 use super::activitypub;
@@ -912,6 +913,31 @@ impl WriteRepository {
         limited_federation: bool,
     ) -> Result<bool, WriteError> {
         remote_media_allowed_in_transaction(transaction, domain, limited_federation).await
+    }
+
+    /// Records frontend reconciliation events in the transaction that installs remote media.
+    pub(crate) async fn record_remote_media_installed_stream_events_in(
+        transaction: &mut Transaction<'_, Postgres>,
+        status_id: i64,
+        media_id: i64,
+    ) -> Result<(), WriteError> {
+        let key = StreamEventLogicalKey::Media(media_id);
+        record_status_stream_events_with_key(transaction, status_id, "status.update", key).await?;
+        record_status_update_notification_stream_events_with_key(transaction, status_id, key)
+            .await?;
+        let wrapper_ids = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM statuses
+              WHERE reblog_of_id = $1 AND deleted_at IS NULL
+              ORDER BY id",
+        )
+        .bind(status_id)
+        .fetch_all(&mut **transaction)
+        .await?;
+        for wrapper_id in wrapper_ids {
+            record_status_stream_events_with_key(transaction, wrapper_id, "status.update", key)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Replace one user's complete web-client snapshot, never their posting defaults.
@@ -14875,12 +14901,44 @@ async fn revoke_user_access_tokens_in(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+#[derive(Clone, Copy)]
+enum StreamEventLogicalKey {
+    Version(i64),
+    Media(i64),
+}
+
+impl StreamEventLogicalKey {
+    fn for_recipient(self, account_id: i64, event: &str, object_id: i64) -> String {
+        match self {
+            Self::Version(version) => event_logical_key(account_id, event, object_id, version),
+            Self::Media(media_id) => {
+                media_event_logical_key(account_id, event, object_id, media_id)
+            }
+        }
+    }
+}
+
 async fn record_status_stream_events(
     transaction: &mut Transaction<'_, Postgres>,
     status_id: i64,
     event: &str,
     version: i64,
+) -> Result<(), WriteError> {
+    record_status_stream_events_with_key(
+        transaction,
+        status_id,
+        event,
+        StreamEventLogicalKey::Version(version),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn record_status_stream_events_with_key(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_id: i64,
+    event: &str,
+    key: StreamEventLogicalKey,
 ) -> Result<(), WriteError> {
     let deleting = event == "delete";
     // The tag-follow UNION mirrors rest_home_timeline_ids' hashtag branch, including
@@ -15009,7 +15067,7 @@ async fn record_status_stream_events(
     .fetch_all(&mut **transaction)
     .await?;
     for account_id in recipients {
-        let logical_key = event_logical_key(account_id, event, status_id, version);
+        let logical_key = key.for_recipient(account_id, event, status_id);
         record_stream_event_in(transaction, account_id, event, status_id, &logical_key).await?;
     }
     Ok(())
@@ -15045,6 +15103,19 @@ async fn record_status_update_notification_stream_events(
     status_id: i64,
     version: i64,
 ) -> Result<(), WriteError> {
+    record_status_update_notification_stream_events_with_key(
+        transaction,
+        status_id,
+        StreamEventLogicalKey::Version(version),
+    )
+    .await
+}
+
+async fn record_status_update_notification_stream_events_with_key(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_id: i64,
+    key: StreamEventLogicalKey,
+) -> Result<(), WriteError> {
     let recipients = sqlx::query_scalar::<_, i64>(
         "SELECT DISTINCT mention.account_id \
            FROM mentions mention \
@@ -15059,12 +15130,8 @@ async fn record_status_update_notification_stream_events(
     .fetch_all(&mut **transaction)
     .await?;
     for account_id in recipients {
-        let logical_key = event_logical_key(
-            account_id,
-            STATUS_UPDATE_NOTIFICATION_EVENT,
-            status_id,
-            version,
-        );
+        let logical_key =
+            key.for_recipient(account_id, STATUS_UPDATE_NOTIFICATION_EVENT, status_id);
         record_stream_event_in(
             transaction,
             account_id,

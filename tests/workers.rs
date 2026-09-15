@@ -51,7 +51,7 @@ use rustodon::paperclip::{
 #[cfg(feature = "test-support")]
 use rustodon::paperclip::{PaperclipCommitFault, PaperclipRemoveFault, PaperclipWriteFault};
 use rustodon::secret::SecretString;
-use rustodon::streaming::STREAM_EVENT_KIND;
+use rustodon::streaming::{STREAM_EVENT_KIND, media_event_logical_key};
 #[cfg(feature = "test-support")]
 use rustodon::web::cleanup_media_after_response_failure_for_test;
 use rustodon::worker::{
@@ -7832,9 +7832,12 @@ async fn activitypub_media_fetch_reclaims_after_lease_fence()
 #[tokio::test]
 #[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
 #[allow(clippy::too_many_lines)]
-async fn activitypub_media_fetch_caches_original_and_gif_thumbnail()
+async fn activitypub_media_fetch_caches_original_and_gif_thumbnail_and_streams_status_update()
 -> Result<(), Box<dyn std::error::Error>> {
     const BOB: i64 = 116_844_606_259_202_001;
+    const BOOSTER: i64 = 116_844_606_259_201_004;
+    const BOOST_RECIPIENT: i64 = 116_844_606_259_201_002;
+    const STATUS_ID: i64 = 116_845_105_643_525_105;
     const ORIGIN: &str = "https://fixture-v4-6-5.rustodon.invalid/";
     const LOGICAL_KEY: &str = "activitypub:test-media-fetch-success";
 
@@ -7858,9 +7861,54 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail()
     let media_root = PaperclipRoot::open(&root_path)?
         .with_write_fault(PaperclipWriteFault::storage_full_after(1));
     let status_id = sqlx::query_scalar::<_, i64>(
-        "SELECT id FROM statuses WHERE account_id = $1 AND deleted_at IS NULL ORDER BY id LIMIT 1",
+        "SELECT id FROM statuses
+          WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL",
     )
+    .bind(STATUS_ID)
     .bind(BOB)
+    .fetch_one(&writer_pool)
+    .await?;
+    let follow_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO follows
+             (account_id, target_account_id, show_reblogs, notify, created_at, updated_at)
+         VALUES ($1, $2, true, false, clock_timestamp(), clock_timestamp())
+         RETURNING id",
+    )
+    .bind(BOOSTER)
+    .bind(BOB)
+    .fetch_one(&writer_pool)
+    .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM follows WHERE account_id = $1 AND target_account_id = $2",
+        )
+        .bind(BOOST_RECIPIENT)
+        .bind(BOB)
+        .fetch_one(&writer_pool)
+        .await?,
+        0,
+        "boost recipient must not follow the original author",
+    );
+    let boost_follow_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO follows
+             (account_id, target_account_id, show_reblogs, notify, created_at, updated_at)
+         VALUES ($1, $2, true, false, clock_timestamp(), clock_timestamp())
+         RETURNING id",
+    )
+    .bind(BOOST_RECIPIENT)
+    .bind(BOOSTER)
+    .fetch_one(&writer_pool)
+    .await?;
+    let boost_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO statuses (
+             account_id, text, spoiler_text, visibility, local, reblog_of_id,
+             sensitive, reply, created_at, updated_at)
+         VALUES ($1, '', '', 0, true, $2, false, false,
+                 clock_timestamp(), clock_timestamp())
+         RETURNING id",
+    )
+    .bind(BOOSTER)
+    .bind(status_id)
     .fetch_one(&writer_pool)
     .await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -7934,6 +7982,19 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail()
     .fetch_one(&writer_pool)
     .await?;
     assert_eq!(failed_media_state, (Some(0), None));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM rustodon.outbox_events
+              WHERE kind = $1 AND payload ->> 'event' = 'status.update'
+                AND payload ->> 'object_id' = $2",
+        )
+        .bind(STREAM_EVENT_KIND)
+        .bind(status_id.to_string())
+        .fetch_one(&writer_pool)
+        .await?,
+        0,
+        "failed media installation must not stream a status update",
+    );
     let original_path = media_metadata
         .relative_path("original")
         .expect("original path");
@@ -7978,6 +8039,7 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail()
     );
     assert!(media_state.2.is_some_and(|size| size > 0));
     assert!(media_state.3["original"]["size"].is_string());
+    assert!(media_state.3["original"]["aspect"].is_number());
     assert!(media_state.3["small"]["size"].is_string());
     assert!(media_state.4.is_some());
 
@@ -8003,9 +8065,50 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail()
     let mut small_bytes = Vec::new();
     std::io::Read::read_to_end(&mut small, &mut small_bytes)?;
     assert!(!small_bytes.is_empty());
+    let streamed_updates = sqlx::query_as::<_, (i64, String)>(
+        "SELECT (payload ->> 'account_id')::bigint, payload ->> 'event'
+           FROM rustodon.outbox_events
+          WHERE kind = $1 AND payload ->> 'object_id' = $2
+          ORDER BY (payload ->> 'account_id')::bigint, payload ->> 'event'",
+    )
+    .bind(STREAM_EVENT_KIND)
+    .bind(status_id.to_string())
+    .fetch_all(&writer_pool)
+    .await?;
+    assert_eq!(
+        streamed_updates,
+        vec![(BOOSTER, "status.update".to_owned())],
+        "successful media installation must send the status audience a frontend-compatible update",
+    );
+    let boost_recipient_updates = sqlx::query_as::<_, (i64, String)>(
+        "SELECT (payload ->> 'object_id')::bigint, payload ->> 'event'
+           FROM rustodon.outbox_events
+          WHERE kind = $1 AND payload ->> 'account_id' = $2
+            AND payload ->> 'object_id' IN ($3, $4)
+          ORDER BY (payload ->> 'object_id')::bigint, payload ->> 'event'",
+    )
+    .bind(STREAM_EVENT_KIND)
+    .bind(BOOST_RECIPIENT.to_string())
+    .bind(status_id.to_string())
+    .bind(boost_id.to_string())
+    .fetch_all(&writer_pool)
+    .await?;
+    assert_eq!(
+        boost_recipient_updates,
+        vec![(boost_id, "status.update".to_owned())],
+        "a recipient following only the booster must receive convergence for the active wrapper",
+    );
 
     sqlx::query("DELETE FROM media_attachments WHERE id = $1")
         .bind(media_id)
+        .execute(&writer_pool)
+        .await?;
+    sqlx::query("DELETE FROM statuses WHERE id = $1")
+        .bind(boost_id)
+        .execute(&writer_pool)
+        .await?;
+    sqlx::query("DELETE FROM follows WHERE id = ANY($1)")
+        .bind(vec![follow_id, boost_follow_id])
         .execute(&writer_pool)
         .await?;
     drop(executor);
@@ -8020,6 +8123,8 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail()
 async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
 -> Result<(), Box<dyn std::error::Error>> {
     const BOB: i64 = 116_844_606_259_202_001;
+    const RECIPIENT: i64 = 116_844_606_259_201_004;
+    const STATUS_ID: i64 = 116_845_105_643_525_105;
     const ORIGIN: &str = "https://fixture-v4-6-5.rustodon.invalid/";
     const BEFORE_LOGICAL_KEY: &str = "activitypub:test-media-ambiguous-before";
     const AFTER_LOGICAL_KEY: &str = "activitypub:test-media-ambiguous-after";
@@ -8044,8 +8149,20 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
     let media_root = PaperclipRoot::open(&root_path)?
         .with_commit_fault(PaperclipCommitFault::before_and_after());
     let status_id = sqlx::query_scalar::<_, i64>(
-        "SELECT id FROM statuses WHERE account_id = $1 AND deleted_at IS NULL ORDER BY id LIMIT 1",
+        "SELECT id FROM statuses
+          WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL",
     )
+    .bind(STATUS_ID)
+    .bind(BOB)
+    .fetch_one(&writer_pool)
+    .await?;
+    let follow_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO follows
+             (account_id, target_account_id, show_reblogs, notify, created_at, updated_at)
+         VALUES ($1, $2, true, false, clock_timestamp(), clock_timestamp())
+         RETURNING id",
+    )
+    .bind(RECIPIENT)
     .bind(BOB)
     .fetch_one(&writer_pool)
     .await?;
@@ -8079,7 +8196,7 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
             .await?,
         );
     }
-    let mut server = tokio::spawn(fixture_media_server_for_retries(listener, body.clone(), 3));
+    let mut server = tokio::spawn(fixture_media_server_for_retries(listener, body.clone(), 2));
     let config = ActivityPubDeliveryConfig {
         origin: Url::parse(ORIGIN)?,
         local_domain: "fixture-v4-6-5.rustodon.invalid".to_owned(),
@@ -8106,7 +8223,8 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
                     ACTIVITYPUB_MEDIA_FETCH_JOB_KIND,
                     json!({"media_id": media_ids[0]}),
                 )
-                .logical_key(BEFORE_LOGICAL_KEY),
+                .logical_key(BEFORE_LOGICAL_KEY)
+                .max_attempts(1),
             )
             .await?;
         assert!(
@@ -8124,7 +8242,7 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
         .bind(media_ids[0])
         .fetch_one(&writer_pool)
         .await?;
-        assert_eq!(before_state, (Some(0), None));
+        assert_eq!(before_state, (Some(3), None));
         let before_metadata = PaperclipMetadata {
             attachment: PaperclipAttachment::MediaFile,
             id: media_ids[0],
@@ -8139,10 +8257,43 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
                 .relative_path(style)
                 .expect("ambiguous pre-commit path");
             assert!(
-                media_root.open_file(Path::new(&path)).is_ok(),
-                "files must survive a commit failure before PostgreSQL reports success"
+                media_root.open_file(Path::new(&path)).is_err(),
+                "rolled-back final attempt must not leave an orphan {style} file"
             );
         }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM rustodon.outbox_events
+                  WHERE kind = $1 AND logical_key = $2",
+            )
+            .bind(STREAM_EVENT_KIND)
+            .bind(media_event_logical_key(
+                RECIPIENT,
+                "status.update",
+                status_id,
+                media_ids[0],
+            ))
+            .fetch_one(&writer_pool)
+            .await?,
+            0,
+            "rolled-back metadata must not leave a stream event",
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (i32, i32, bool, Option<String>)>(
+                "SELECT attempts, max_attempts, dead_at IS NOT NULL, last_error
+                   FROM rustodon.durable_jobs WHERE logical_key = $1",
+            )
+            .bind(BEFORE_LOGICAL_KEY)
+            .fetch_one(&runtime_pool)
+            .await?,
+            (
+                1,
+                1,
+                true,
+                Some("remote media metadata retries were exhausted".to_owned()),
+            ),
+        );
+
         queue
             .enqueue(
                 &JobSpec::new(
@@ -8150,7 +8301,8 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
                     ACTIVITYPUB_MEDIA_FETCH_JOB_KIND,
                     json!({"media_id": media_ids[1]}),
                 )
-                .logical_key(AFTER_LOGICAL_KEY),
+                .logical_key(AFTER_LOGICAL_KEY)
+                .max_attempts(1),
             )
             .await?;
         assert!(
@@ -8162,70 +8314,87 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
                 )
                 .await?
         );
-        let after_state = sqlx::query_as::<_, (Option<i32>, Option<String>)>(
-            "SELECT processing, file_file_name FROM media_attachments WHERE id = $1",
+        let after_state = sqlx::query_as::<
+            _,
+            (
+                Option<i32>,
+                Option<String>,
+                Option<String>,
+                Option<i32>,
+                Value,
+                Option<i32>,
+            ),
+        >(
+            "SELECT processing, file_file_name, file_content_type, file_file_size,
+                    file_meta, file_storage_schema_version
+               FROM media_attachments WHERE id = $1",
         )
         .bind(media_ids[1])
         .fetch_one(&writer_pool)
         .await?;
         assert_eq!(after_state.0, Some(2));
-        assert!(after_state.1.is_some());
+        assert_eq!(after_state.1.as_deref(), Some(prepared.file_name.as_str()));
+        assert_eq!(
+            after_state.2.as_deref(),
+            Some(prepared.content_type.as_str())
+        );
+        assert_eq!(after_state.3, Some(prepared.file_size));
+        assert_eq!(after_state.4, prepared.file_meta);
+        assert_eq!(after_state.5, Some(1));
         let after_metadata = PaperclipMetadata {
             id: media_ids[1],
             file_name: after_state.1.clone().expect("committed media name"),
             ..before_metadata.clone()
         };
-        for style in ["original", "small"] {
-            let path = after_metadata
-                .relative_path(style)
-                .expect("ambiguous post-commit path");
-            assert!(
-                media_root.open_file(Path::new(&path)).is_ok(),
-                "files must survive an error after PostgreSQL committed metadata"
-            );
-        }
-        sqlx::query(
-            "UPDATE rustodon.durable_jobs SET run_at = clock_timestamp() WHERE logical_key = $1",
-        )
-        .bind(AFTER_LOGICAL_KEY)
-        .execute(&runtime_pool)
-        .await?;
-        assert!(
-            executor
-                .process_one(
-                    "ambiguous-after-retry",
-                    &[Lane::Pull],
-                    Duration::seconds(30)
-                )
-                .await?
-        );
-        sqlx::query(
-            "UPDATE rustodon.durable_jobs SET run_at = clock_timestamp() WHERE logical_key = $1",
-        )
-        .bind(BEFORE_LOGICAL_KEY)
-        .execute(&runtime_pool)
-        .await?;
-        assert!(
-            executor
-                .process_one(
-                    "ambiguous-before-retry",
-                    &[Lane::Pull],
-                    Duration::seconds(30)
-                )
-                .await?
-        );
-        let before_reconciled = sqlx::query_as::<_, (Option<i32>, Option<String>)>(
-            "SELECT processing, file_file_name FROM media_attachments WHERE id = $1",
-        )
-        .bind(media_ids[0])
-        .fetch_one(&writer_pool)
-        .await?;
-        assert_eq!(before_reconciled.0, Some(2));
-        assert!(before_reconciled.1.is_some());
-        assert_eq!(queue.queued_count().await?, 0);
-        assert!(queue.dead_letters(10).await?.is_empty());
+        let original_path = after_metadata
+            .relative_path("original")
+            .expect("ambiguous post-commit original path");
+        let mut original = media_root.open_file(Path::new(&original_path))?;
+        let mut original_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut original, &mut original_bytes)?;
+        assert_eq!(original_bytes, body);
+        let small_path = after_metadata
+            .relative_path("small")
+            .expect("ambiguous post-commit small path");
+        assert!(media_root.open_file(Path::new(&small_path)).is_ok());
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM rustodon.remote_fetch_leases",)
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM rustodon.outbox_events
+                  WHERE kind = $1 AND logical_key = $2",
+            )
+            .bind(STREAM_EVENT_KIND)
+            .bind(media_event_logical_key(
+                RECIPIENT,
+                "status.update",
+                status_id,
+                media_ids[1],
+            ))
+            .fetch_one(&writer_pool)
+            .await?,
+            1,
+            "committed metadata and stream event must remain atomic",
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM rustodon.durable_jobs WHERE logical_key = $1",
+            )
+            .bind(AFTER_LOGICAL_KEY)
+            .fetch_one(&runtime_pool)
+            .await?,
+            0,
+            "a committed-but-lost response must be acknowledged",
+        );
+        assert_eq!(queue.queued_count().await?, 0);
+        let dead_letters = queue.dead_letters(10).await?;
+        assert_eq!(dead_letters.len(), 1);
+        assert_eq!(dead_letters[0].attempts, 1);
+        assert_eq!(dead_letters[0].max_attempts, 1);
+        assert_eq!(
+            dead_letters[0].last_error.as_deref(),
+            Some("remote media metadata retries were exhausted")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM rustodon.remote_fetch_leases")
                 .fetch_one(&runtime_pool)
                 .await?,
             0
@@ -8250,8 +8419,19 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
         Ok(())
     };
     let cleanup_result = async {
+        sqlx::query(
+            "DELETE FROM rustodon.outbox_events WHERE kind = $1 AND payload ->> 'object_id' = $2",
+        )
+        .bind(STREAM_EVENT_KIND)
+        .bind(status_id.to_string())
+        .execute(&writer_pool)
+        .await?;
         sqlx::query("DELETE FROM media_attachments WHERE id = ANY($1)")
             .bind(&media_ids)
+            .execute(&writer_pool)
+            .await?;
+        sqlx::query("DELETE FROM follows WHERE id = $1")
+            .bind(follow_id)
             .execute(&writer_pool)
             .await?;
         sqlx::query("DELETE FROM rustodon.durable_jobs WHERE logical_key = ANY($1)")
