@@ -21,7 +21,7 @@ use sqlx::{Connection, PgConnection};
 use std::io::Read;
 use std::net::SocketAddr;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "A mostly-in-place Mastodon replacement")]
@@ -1017,10 +1017,61 @@ async fn configured_write_repository(
     };
     let options = preflight::postgres_options_for(database)
         .map_err(|_| "web write database configuration failed")?;
-    WriteRepository::connect_with_pool_size(options, database.pool_size)
+    let repository = WriteRepository::connect_with_pool_size(options, database.pool_size)
         .await
-        .map(|repository| Some(repository.with_active_record_encryption(encryption)))
-        .map_err(|_| "web write database connection failed")
+        .map_err(|_| "web write database connection failed")?
+        .with_active_record_encryption(encryption);
+    let startup_repair = tokio::time::timeout(
+        Duration::from_secs(3),
+        repository.repair_missing_account_stats_startup_batch(),
+    )
+    .await;
+    let repair_in_background = match startup_repair {
+        Ok(Ok((_, may_have_more))) => may_have_more,
+        Ok(Err(error)) => {
+            eprintln!("bounded startup account stats repair failed: {error}");
+            true
+        }
+        Err(_) => {
+            eprintln!("bounded startup account stats repair timed out");
+            true
+        }
+    };
+    if repair_in_background {
+        const MAX_BACKGROUND_ACCOUNT_STATS_BATCHES: usize = 24;
+        let background_repository = repository.clone();
+        let _account_stats_repair = tokio::spawn(async move {
+            for batch in 0..MAX_BACKGROUND_ACCOUNT_STATS_BATCHES {
+                let repair = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    background_repository.repair_missing_account_stats_startup_batch(),
+                )
+                .await;
+                match repair {
+                    Ok(Ok((_, true))) if batch + 1 < MAX_BACKGROUND_ACCOUNT_STATS_BATCHES => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Ok(Ok((_, true))) => {
+                        eprintln!(
+                            "background account stats repair reached its startup batch limit; \
+                             remaining rows will heal on later startup or mutation"
+                        );
+                        break;
+                    }
+                    Ok(Ok((_, false))) => break,
+                    Ok(Err(error)) => {
+                        eprintln!("background account stats repair failed: {error}");
+                        break;
+                    }
+                    Err(_) => {
+                        eprintln!("background account stats repair timed out");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    Ok(Some(repository))
 }
 
 async fn run_preflight() -> ExitCode {

@@ -2237,12 +2237,18 @@ impl Repository {
         sqlx::query_scalar(
             "SELECT COALESCE( \
                 (SELECT statuses_count FROM account_stats WHERE account_id = $1), \
-                (SELECT count(*) FROM statuses WHERE account_id = $1 AND deleted_at IS NULL) \
+                (SELECT count(*) FROM statuses \
+                  WHERE account_id = $1 AND deleted_at IS NULL AND visibility <> 3) \
               )",
         )
         .bind(account_id)
         .fetch_one(&self.pool)
         .await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn activitypub_outbox_count_for_test(&self, account_id: i64) -> sqlx::Result<i64> {
+        self.activitypub_outbox_count(account_id).await
     }
 
     pub(crate) async fn activitypub_status_has_pending_quote(

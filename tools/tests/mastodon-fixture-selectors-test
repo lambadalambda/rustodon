@@ -16,6 +16,7 @@ dispatch() ( command=$1; shift; . "$work/dispatch.sh"; )
 dispatch schema-read-test
 cat > "$work/expected" <<'EOF'
 mastodon_schema
+account_stats_repair
 saved_status_authorization
 qualified_local_mentions
 followed_hashtag_streams
@@ -58,6 +59,9 @@ done
 : > "$work/cargo"
 schema_read_rust_test media_state
 grep -F -- '--test media_state' "$work/cargo" >/dev/null || die 'incorrect media-state target'
+: > "$work/cargo"
+schema_read_rust_test account_stats_repair
+grep -F -- '--features test-support --test account_stats_repair' "$work/cargo" >/dev/null || die 'incorrect account-stats-repair target'
 for cargo_mode in empty list-error; do
   : > "$work/cargo"
   if (schema_read_rust_test web_settings) > "$work/error" 2>&1; then die "invalid selection succeeded: $cargo_mode"; fi

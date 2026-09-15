@@ -1,5 +1,21 @@
 # Development Log
 
+## 2026-09-16
+
+- Added insert-only self-healing for missing `account_stats` rows using the existing
+  reconciliation rules. Writer-backed web startup repairs one bounded account before
+  serving reads and attempts at most 24 additional one-account background batches;
+  later mutations continue healing any remainder. Local reciprocal and inbound
+  relationship writes pre-heal involved accounts before relationship/lifecycle
+  locks. Mutation boundaries otherwise initialize from post-mutation state and apply
+  one aggregate delta only when another transaction already won initialization;
+  populated counter rows remain authoritative. Missing-stats ActivityPub outbox
+  totals use the same direct-status exclusion as repaired rows.
+- Added focused restored-schema regressions for repaired account/instance and outbox
+  projections, idempotence, preservation of existing rows, deterministic reciprocal
+  local writes, inbound relationship writes, cascaded reblog deletion, and subsequent
+  counter correctness.
+
 ## 2026-09-10
 
 - Implemented the ten concrete release-readiness fixes. ActivityPub actor

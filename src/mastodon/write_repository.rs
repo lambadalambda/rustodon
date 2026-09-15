@@ -630,6 +630,8 @@ pub struct WriteRepository {
     active_record_encryption: Option<ActiveRecordEncryptionConfig>,
     #[cfg(feature = "test-support")]
     local_media_cleanup_intent_fault: Option<Arc<AtomicBool>>,
+    #[cfg(feature = "test-support")]
+    relationship_write_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 fn two_factor_attempt_is_rate_limited(failures: i64) -> bool {
@@ -675,6 +677,8 @@ impl WriteRepository {
             active_record_encryption: None,
             #[cfg(feature = "test-support")]
             local_media_cleanup_intent_fault: None,
+            #[cfg(feature = "test-support")]
+            relationship_write_barrier: None,
         })
     }
 
@@ -686,6 +690,8 @@ impl WriteRepository {
             active_record_encryption: None,
             #[cfg(feature = "test-support")]
             local_media_cleanup_intent_fault: None,
+            #[cfg(feature = "test-support")]
+            relationship_write_barrier: None,
         }
     }
 
@@ -710,6 +716,94 @@ impl WriteRepository {
     pub fn with_local_media_cleanup_intent_fault(mut self) -> Self {
         self.local_media_cleanup_intent_fault = Some(Arc::new(AtomicBool::new(true)));
         self
+    }
+
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_relationship_write_barrier_for_test(mut self, parties: usize) -> Self {
+        self.relationship_write_barrier = Some(Arc::new(tokio::sync::Barrier::new(parties)));
+        self
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn apply_remote_follow_for_test(
+        &self,
+        source_account_id: i64,
+        follow_uri: &str,
+        object_uri: &str,
+        origin: &str,
+        delivery_target_account_id: Option<i64>,
+    ) -> Result<Option<RemoteFollowOutcome>, WriteError> {
+        self.apply_remote_follow(
+            source_account_id,
+            follow_uri,
+            object_uri,
+            origin,
+            delivery_target_account_id,
+        )
+        .await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn apply_remote_undo_follow_for_test(
+        &self,
+        source_account_id: i64,
+        follow_uri: &str,
+        target_uri: Option<&str>,
+        origin: &str,
+        delivery_target_account_id: Option<i64>,
+    ) -> Result<(), WriteError> {
+        self.apply_remote_undo_follow(
+            source_account_id,
+            follow_uri,
+            target_uri,
+            origin,
+            delivery_target_account_id,
+        )
+        .await
+    }
+
+    #[cfg(feature = "test-support")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_remote_follow_decision_for_test(
+        &self,
+        source_account_id: i64,
+        follow_uri: &str,
+        target_uri: Option<&str>,
+        local_actor_uri: Option<&str>,
+        accepted: bool,
+        origin: &str,
+        delivery_target_account_id: Option<i64>,
+    ) -> Result<(), WriteError> {
+        self.apply_remote_follow_decision(
+            source_account_id,
+            follow_uri,
+            target_uri,
+            local_actor_uri,
+            accepted,
+            origin,
+            delivery_target_account_id,
+        )
+        .await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn apply_remote_block_for_test(
+        &self,
+        source_account_id: i64,
+        block_uri: &str,
+        object_uri: &str,
+        origin: &str,
+        delivery_target_account_id: Option<i64>,
+    ) -> Result<(), WriteError> {
+        self.apply_remote_block(
+            source_account_id,
+            block_uri,
+            object_uri,
+            origin,
+            delivery_target_account_id,
+        )
+        .await
     }
 
     #[must_use]
@@ -832,6 +926,49 @@ impl WriteRepository {
         ensure_account_write_allowed_in(&mut transaction, account_id).await?;
         transaction.commit().await?;
         Ok(())
+    }
+
+    async fn preheal_relationship_account_stats(
+        &self,
+        account_id: i64,
+        target_account_id: i64,
+    ) -> Result<(), WriteError> {
+        // Initialize missing FK-backed stats rows one account transaction at a
+        // time before a local reciprocal write takes either account-row lock.
+        self.repair_account_stats_for_accounts(&[account_id, target_account_id], false)
+            .await?;
+        Ok(())
+    }
+
+    async fn local_activitypub_account_id_before_relationship_locks(
+        &self,
+        object_uri: &str,
+        origin: &str,
+    ) -> Result<Option<i64>, WriteError> {
+        let mut transaction = self.pool.begin().await?;
+        let account_id = local_activitypub_account_id(&mut transaction, object_uri, origin).await?;
+        transaction.commit().await?;
+        Ok(account_id)
+    }
+
+    async fn begin_relationship_account_write(
+        &self,
+        account_id: i64,
+        target_account_id: i64,
+    ) -> Result<Transaction<'_, Postgres>, WriteError> {
+        self.preheal_relationship_account_stats(account_id, target_account_id)
+            .await?;
+        #[cfg(feature = "test-support")]
+        if let Some(barrier) = &self.relationship_write_barrier {
+            barrier.wait().await;
+        }
+        let mut transaction = self.pool.begin().await?;
+        // Serialize the unordered pair before locking the authenticated source.
+        // The winner can then acquire FK KEY SHARE on the other account without
+        // a reciprocal writer retaining that account while waiting on this lock.
+        lock_relationship(&mut transaction, account_id, target_account_id).await?;
+        ensure_account_write_allowed_in(&mut transaction, account_id).await?;
+        Ok(transaction)
     }
 
     async fn begin_account_write(
@@ -1951,6 +2088,7 @@ impl WriteRepository {
         purge_account_relationships(&mut transaction, account_id).await?;
         purge_account_notifications(&mut transaction, account_id).await?;
         purge_account_associations(&mut transaction, account_id).await?;
+        ensure_account_stats_after_mutation(&mut transaction, account_id).await?;
         sqlx::query(
             "UPDATE account_stats SET statuses_count = 0, following_count = 0,
                 followers_count = 0, last_status_at = NULL, updated_at = clock_timestamp()
@@ -2611,6 +2749,107 @@ impl WriteRepository {
         Ok(())
     }
 
+    /// Inserts reconciled counter rows for every account whose stats row is absent.
+    ///
+    /// Existing stats rows remain authoritative and are never rewritten. Repairs at
+    /// most one account on the startup critical path and reports whether
+    /// a background pass is needed. Each transaction has short lock and statement
+    /// deadlines; startup invokes only a fixed number of background batches.
+    pub async fn repair_missing_account_stats_startup_batch(
+        &self,
+    ) -> Result<(u64, bool), WriteError> {
+        const BATCH_SIZE: usize = 1;
+        const QUERY_LIMIT: i64 = 2;
+        let mut account_ids = sqlx::query_scalar::<_, i64>(
+            "SELECT account.id FROM accounts account \
+             LEFT JOIN account_stats stats ON stats.account_id = account.id \
+             WHERE stats.id IS NULL \
+             ORDER BY (account.domain IS NOT NULL), account.id LIMIT $1",
+        )
+        .bind(QUERY_LIMIT)
+        .fetch_all(&self.pool)
+        .await?;
+        let may_have_more = account_ids.len() > BATCH_SIZE;
+        account_ids.truncate(BATCH_SIZE);
+        let repaired = self
+            .repair_account_stats_for_accounts(&account_ids, true)
+            .await?;
+        Ok((repaired, may_have_more))
+    }
+
+    pub async fn repair_missing_account_stats(&self) -> Result<u64, WriteError> {
+        const BATCH_SIZE: i64 = 100;
+        let mut after_account_id = None;
+        let mut repaired = 0_u64;
+        loop {
+            let account_ids = sqlx::query_scalar::<_, i64>(
+                "SELECT account.id FROM accounts account \
+                 LEFT JOIN account_stats stats ON stats.account_id = account.id \
+                 WHERE stats.id IS NULL AND ($1::bigint IS NULL OR account.id > $1) \
+                 ORDER BY account.id LIMIT $2",
+            )
+            .bind(after_account_id)
+            .bind(BATCH_SIZE)
+            .fetch_all(&self.pool)
+            .await?;
+            let Some(last_account_id) = account_ids.last().copied() else {
+                break;
+            };
+            repaired += self
+                .repair_account_stats_for_accounts(&account_ids, false)
+                .await?;
+            after_account_id = Some(last_account_id);
+        }
+        Ok(repaired)
+    }
+
+    async fn repair_account_stats_for_accounts(
+        &self,
+        account_ids: &[i64],
+        startup_deadline: bool,
+    ) -> Result<u64, WriteError> {
+        let account_ids = sqlx::query_scalar::<_, i64>(
+            "SELECT account.id FROM accounts account \
+             LEFT JOIN account_stats stats ON stats.account_id = account.id \
+             WHERE account.id = ANY($1) AND stats.id IS NULL ORDER BY account.id",
+        )
+        .bind(account_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut repaired = 0_u64;
+        for account_id in account_ids {
+            // Keep each counter row lock in its own short transaction. Locking the
+            // account first matches ordinary account writes and prevents an FK /
+            // unique-key lock inversion with a concurrent initializer.
+            let mut transaction = self.pool.begin().await?;
+            if startup_deadline {
+                sqlx::query("SET LOCAL lock_timeout = '1s'")
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query("SET LOCAL statement_timeout = '2s'")
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            let account_exists =
+                sqlx::query_scalar::<_, i64>("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
+                    .bind(account_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?
+                    .is_some();
+            if !account_exists {
+                transaction.rollback().await?;
+                continue;
+            }
+            repaired += u64::from(
+                initialize_account_stats_if_missing(&mut transaction, account_id)
+                    .await?
+                    .inserted,
+            );
+            transaction.commit().await?;
+        }
+        Ok(repaired)
+    }
+
     /// Recomputes an account's denormalized status and relationship counters.
     ///
     /// # Errors
@@ -2659,16 +2898,7 @@ impl WriteRepository {
             |domain| format!("{account_username}@{domain}"),
         );
 
-        let counts: (i64, i64, i64, Option<NaiveDateTime>) = sqlx::query_as(
-            "SELECT \
-                 (SELECT count(*) FROM statuses WHERE account_id = $1 AND deleted_at IS NULL AND visibility <> 3), \
-                 (SELECT count(*) FROM follows WHERE account_id = $1), \
-                 (SELECT count(*) FROM follows WHERE target_account_id = $1), \
-                  (SELECT max(created_at) FROM statuses WHERE account_id = $1 AND deleted_at IS NULL AND visibility <> 3)",
-        )
-        .bind(account_id)
-        .fetch_one(&mut *transaction)
-        .await?;
+        let counts = account_stats_snapshot(&mut transaction, account_id).await?;
         sqlx::query(
             "UPDATE status_stats stats SET replies_count = ( \
                  SELECT count(*) FROM statuses reply \
@@ -3344,14 +3574,7 @@ impl WriteRepository {
             true,
         )
         .await?;
-        sqlx::query(
-            "INSERT INTO account_stats (account_id, created_at, updated_at)
-             VALUES ($1, clock_timestamp(), clock_timestamp())
-             ON CONFLICT (account_id) DO NOTHING",
-        )
-        .bind(account_id)
-        .execute(&mut *transaction)
-        .await?;
+        ensure_account_stats_after_mutation(&mut transaction, account_id).await?;
         transaction.commit().await?;
         Ok(account_id)
     }
@@ -3663,10 +3886,34 @@ impl WriteRepository {
             .bind(account_id)
             .execute(&mut *transaction)
             .await?;
-        for (follow_id, source_account_id, target_account_id, ..) in follows {
-            decrement_follow_counts(&mut transaction, source_account_id, target_account_id).await?;
-            delete_activity_notifications(&mut transaction, target_account_id, follow_id, "Follow")
-                .await?;
+        let mut relationship_deltas = HashMap::new();
+        for (_, source_account_id, target_account_id, ..) in &follows {
+            add_account_stats_delta(
+                &mut relationship_deltas,
+                *source_account_id,
+                AccountStatsDelta {
+                    following: -1,
+                    ..AccountStatsDelta::default()
+                },
+            );
+            add_account_stats_delta(
+                &mut relationship_deltas,
+                *target_account_id,
+                AccountStatsDelta {
+                    followers: -1,
+                    ..AccountStatsDelta::default()
+                },
+            );
+        }
+        apply_account_stats_deltas(&mut transaction, relationship_deltas).await?;
+        for (follow_id, _, target_account_id, ..) in &follows {
+            delete_activity_notifications(
+                &mut transaction,
+                *target_account_id,
+                *follow_id,
+                "Follow",
+            )
+            .await?;
         }
         for (request_id, target_account_id) in requests {
             delete_activity_notifications(
@@ -3734,19 +3981,6 @@ impl WriteRepository {
         for status_id in &affected_status_ids {
             record_status_delete_stream_events(&mut transaction, *status_id).await?;
         }
-        for (_, status_account_id, reblog_of_id, in_reply_to_id, visibility) in &affected_statuses {
-            if let Some(reblog_of_id) = reblog_of_id {
-                decrement_reblog_count(&mut transaction, *reblog_of_id).await?;
-                if *status_account_id != account_id && *visibility != 3 {
-                    decrement_account_status_count(&mut transaction, *status_account_id).await?;
-                }
-            } else if *status_account_id == account_id
-                && *visibility < 2
-                && let Some(in_reply_to_id) = in_reply_to_id
-            {
-                decrement_reply_count(&mut transaction, *in_reply_to_id).await?;
-            }
-        }
         if !affected_status_ids.is_empty() {
             sqlx::query(
                 "UPDATE statuses SET deleted_at = COALESCE(deleted_at, clock_timestamp()),
@@ -3755,6 +3989,30 @@ impl WriteRepository {
             .bind(&affected_status_ids)
             .execute(&mut *transaction)
             .await?;
+        }
+        let mut status_deltas = HashMap::new();
+        for (_, status_account_id, reblog_of_id, in_reply_to_id, visibility) in &affected_statuses {
+            if let Some(reblog_of_id) = reblog_of_id {
+                decrement_reblog_count(&mut transaction, *reblog_of_id).await?;
+                if *status_account_id != account_id && *visibility != 3 {
+                    add_account_stats_delta(
+                        &mut status_deltas,
+                        *status_account_id,
+                        AccountStatsDelta {
+                            statuses: -1,
+                            ..AccountStatsDelta::default()
+                        },
+                    );
+                }
+            } else if *status_account_id == account_id
+                && *visibility < 2
+                && let Some(in_reply_to_id) = in_reply_to_id
+            {
+                decrement_reply_count(&mut transaction, *in_reply_to_id).await?;
+            }
+        }
+        apply_account_stats_deltas(&mut transaction, status_deltas).await?;
+        if !affected_status_ids.is_empty() {
             remove_statuses_from_account_conversations(&mut transaction, &affected_status_ids)
                 .await?;
             sqlx::query(
@@ -3813,6 +4071,7 @@ impl WriteRepository {
         .bind(account_id)
         .execute(&mut *transaction)
         .await?;
+        ensure_account_stats_after_mutation(&mut transaction, account_id).await?;
         sqlx::query(
             "UPDATE account_stats SET statuses_count = 0, following_count = 0,
                 followers_count = 0, updated_at = clock_timestamp()
@@ -3959,6 +4218,8 @@ impl WriteRepository {
         insert_remote_note_stats(&mut transaction, status_id, &note).await?;
         if visibility != 3 {
             increment_account_status_count(&mut transaction, account_id, note.published_at).await?;
+        } else {
+            ensure_account_stats_after_mutation(&mut transaction, account_id).await?;
         }
         if note.in_reply_to_uri.is_some() && in_reply_to_id.is_none() {
             let thread_job = JobSpec::new(
@@ -4528,6 +4789,12 @@ impl WriteRepository {
                 .bind(&reblog_ids)
                 .fetch_all(&mut *transaction)
                 .await?;
+                let mut status_deltas = HashMap::new();
+                add_account_stats_delta(
+                    &mut status_deltas,
+                    account_id,
+                    AccountStatsDelta::default(),
+                );
                 if !reblogs.is_empty() {
                     sqlx::query(
                         "UPDATE statuses SET deleted_at = clock_timestamp(), updated_at = clock_timestamp()
@@ -4538,8 +4805,14 @@ impl WriteRepository {
                     .await?;
                     for (_, reblog_account_id, reblog_visibility) in &reblogs {
                         if *reblog_visibility != 3 {
-                            decrement_account_status_count(&mut transaction, *reblog_account_id)
-                                .await?;
+                            add_account_stats_delta(
+                                &mut status_deltas,
+                                *reblog_account_id,
+                                AccountStatsDelta {
+                                    statuses: -1,
+                                    ..AccountStatsDelta::default()
+                                },
+                            );
                         }
                         decrement_reblog_count(&mut transaction, status_id).await?;
                     }
@@ -4559,13 +4832,14 @@ impl WriteRepository {
                     .execute(&mut *transaction)
                     .await?;
                     if visibility != 3 {
-                        sqlx::query(
-                            "UPDATE account_stats SET statuses_count = GREATEST(statuses_count - 1, 0),
-                                updated_at = clock_timestamp() WHERE account_id = $1",
-                        )
-                        .bind(account_id)
-                        .execute(&mut *transaction)
-                        .await?;
+                        add_account_stats_delta(
+                            &mut status_deltas,
+                            account_id,
+                            AccountStatsDelta {
+                                statuses: -1,
+                                ..AccountStatsDelta::default()
+                            },
+                        );
                     }
                     if visibility < 2
                         && let Some(in_reply_to_id) = in_reply_to_id
@@ -4573,6 +4847,7 @@ impl WriteRepository {
                         decrement_reply_count(&mut transaction, in_reply_to_id).await?;
                     }
                 }
+                apply_account_stats_deltas(&mut transaction, status_deltas).await?;
                 record_status_delete_stream_events(&mut transaction, status_id).await?;
             }
             let mut affected_status_ids = vec![status_id];
@@ -4887,6 +5162,8 @@ impl WriteRepository {
         .await?;
         if visibility != 3 {
             increment_account_status_count(&mut transaction, account_id, created_at).await?;
+        } else {
+            ensure_account_stats_after_mutation(&mut transaction, account_id).await?;
         }
         increment_reblog_count(&mut transaction, target_status_id).await?;
         if original_account_is_local
@@ -4967,6 +5244,8 @@ impl WriteRepository {
             .await?;
             if visibility != 3 {
                 decrement_account_status_count(&mut transaction, account_id).await?;
+            } else {
+                ensure_account_stats_after_mutation(&mut transaction, account_id).await?;
             }
             decrement_reblog_count(&mut transaction, target_status_id).await?;
             delete_activity_notifications(
@@ -5043,6 +5322,8 @@ impl WriteRepository {
             .await?;
             if visibility != 3 {
                 decrement_account_status_count(&mut transaction, account_id).await?;
+            } else {
+                ensure_account_stats_after_mutation(&mut transaction, account_id).await?;
             }
             decrement_reblog_count(&mut transaction, target_status_id).await?;
             delete_activity_notifications(
@@ -6132,6 +6413,8 @@ impl WriteRepository {
         .await?;
         if visibility != 3 {
             increment_account_status_count(&mut transaction, account_id, status_created_at).await?;
+        } else {
+            ensure_account_stats_after_mutation(&mut transaction, account_id).await?;
         }
         if matches!(visibility, 0 | 1)
             && let Some(in_reply_to_id) = in_reply_to_id
@@ -6674,8 +6957,17 @@ impl WriteRepository {
             .bind(&discarded_status_ids)
             .execute(&mut *transaction)
             .await?;
+        let mut status_deltas = HashMap::new();
+        add_account_stats_delta(&mut status_deltas, account_id, AccountStatsDelta::default());
         if visibility != 3 {
-            decrement_account_status_count(&mut transaction, account_id).await?;
+            add_account_stats_delta(
+                &mut status_deltas,
+                account_id,
+                AccountStatsDelta {
+                    statuses: -1,
+                    ..AccountStatsDelta::default()
+                },
+            );
             if matches!(visibility, 0 | 1)
                 && let Some(in_reply_to_id) = in_reply_to_id
             {
@@ -6687,11 +6979,19 @@ impl WriteRepository {
         } else {
             for (_, reblog_account_id, reblog_visibility) in &reblogs {
                 if *reblog_visibility != 3 {
-                    decrement_account_status_count(&mut transaction, *reblog_account_id).await?;
+                    add_account_stats_delta(
+                        &mut status_deltas,
+                        *reblog_account_id,
+                        AccountStatsDelta {
+                            statuses: -1,
+                            ..AccountStatsDelta::default()
+                        },
+                    );
                 }
                 decrement_reblog_count(&mut transaction, status_id).await?;
             }
         }
+        apply_account_stats_deltas(&mut transaction, status_deltas).await?;
         for reblog_id in local_reblog_ids {
             record_status_delete_distribution(&mut transaction, reblog_id, &[]).await?;
         }
@@ -6753,18 +7053,18 @@ impl WriteRepository {
         origin: Option<&str>,
         limited_federation: bool,
     ) -> Result<FollowWriteOutcome, WriteError> {
-        let (account_id, mut transaction) = self
-            .begin_account_write(authenticated, WRITE_FOLLOWS)
-            .await?;
+        let account_id = write_account(authenticated, WRITE_FOLLOWS)?;
         if account_id == target_account_id {
             return Err(WriteError::NotFound);
         }
+        let mut transaction = self
+            .begin_relationship_account_write(account_id, target_account_id)
+            .await?;
         let (target_local, target_locked, target_unavailable, source_silenced) =
             relationship_target(&mut transaction, account_id, target_account_id).await?;
         if target_unavailable {
             return Err(WriteError::NotFound);
         }
-        lock_relationship(&mut transaction, account_id, target_account_id).await?;
         if following
             && (relationship_is_blocked(&mut transaction, account_id, target_account_id).await?
                 || account_domain_is_blocked(&mut transaction, account_id, target_account_id)
@@ -7020,6 +7320,7 @@ impl WriteRepository {
             )
             .await?;
         }
+        ensure_relationship_account_stats(&mut transaction, account_id, target_account_id).await?;
         transaction.commit().await?;
         Ok(FollowWriteOutcome {
             activity_id,
@@ -7042,6 +7343,15 @@ impl WriteRepository {
             return Err(WriteError::InvalidInput(
                 "remote Follow is missing its activity or object URI",
             ));
+        }
+        let preheal_target = self
+            .local_activitypub_account_id_before_relationship_locks(object_uri, origin)
+            .await?;
+        if let Some(target_account_id) = preheal_target.filter(|id| *id != -99)
+            && delivery_target_account_id.is_none_or(|id| id == -99 || id == target_account_id)
+        {
+            self.preheal_relationship_account_stats(source_account_id, target_account_id)
+                .await?;
         }
         let tombstone_key = follow_tombstone_key(source_account_id, follow_uri);
         let mut transaction = self.pool.begin().await?;
@@ -7131,6 +7441,12 @@ impl WriteRepository {
                 follow_uri,
             )
             .await?;
+            ensure_relationship_account_stats(
+                &mut transaction,
+                source_account_id,
+                target_account_id,
+            )
+            .await?;
             transaction.commit().await?;
             return Ok(Some(RemoteFollowOutcome::Applied(
                 RemoteFollowWriteOutcome {
@@ -7169,6 +7485,12 @@ impl WriteRepository {
                 source_account_id,
                 target_account_id,
                 follow_uri,
+            )
+            .await?;
+            ensure_relationship_account_stats(
+                &mut transaction,
+                source_account_id,
+                target_account_id,
             )
             .await?;
             transaction.commit().await?;
@@ -7220,6 +7542,8 @@ impl WriteRepository {
             ),
         )
         .await?;
+        ensure_relationship_account_stats(&mut transaction, source_account_id, target_account_id)
+            .await?;
         transaction.commit().await?;
         Ok(Some(RemoteFollowOutcome::Applied(
             RemoteFollowWriteOutcome {
@@ -7245,6 +7569,29 @@ impl WriteRepository {
             return Err(WriteError::InvalidInput(
                 "remote Undo object is missing its URI",
             ));
+        }
+        let preheal_target = if let Some(target_uri) = target_uri {
+            self.local_activitypub_account_id_before_relationship_locks(target_uri, origin)
+                .await?
+        } else {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT target_account_id FROM follows \
+                  WHERE account_id = $1 AND uri = $2 \
+                 UNION ALL \
+                SELECT target_account_id FROM follow_requests \
+                  WHERE account_id = $1 AND uri = $2 \
+                 LIMIT 1",
+            )
+            .bind(source_account_id)
+            .bind(follow_uri)
+            .fetch_optional(&self.pool)
+            .await?
+        };
+        if let Some(target_account_id) = preheal_target.filter(|id| *id != -99)
+            && delivery_target_account_id.is_none_or(|id| id == -99 || id == target_account_id)
+        {
+            self.preheal_relationship_account_stats(source_account_id, target_account_id)
+                .await?;
         }
         let tombstone_key = follow_tombstone_key(source_account_id, follow_uri);
         let mut transaction = self.pool.begin().await?;
@@ -7338,6 +7685,12 @@ impl WriteRepository {
                     .await?;
                 }
             }
+            ensure_relationship_account_stats(
+                &mut transaction,
+                source_account_id,
+                target_account_id,
+            )
+            .await?;
         }
         insert_relationship_tombstone(&mut transaction, &tombstone_key, follow_uri).await?;
         transaction.commit().await?;
@@ -7357,6 +7710,15 @@ impl WriteRepository {
             return Err(WriteError::InvalidInput(
                 "remote Block is missing its activity or object URI",
             ));
+        }
+        let preheal_target = self
+            .local_activitypub_account_id_before_relationship_locks(object_uri, origin)
+            .await?;
+        if let Some(target_account_id) = preheal_target.filter(|id| *id != -99)
+            && delivery_target_account_id.is_none_or(|id| id == -99 || id == target_account_id)
+        {
+            self.preheal_relationship_account_stats(source_account_id, target_account_id)
+                .await?;
         }
         let tombstone_key = block_tombstone_key(source_account_id, block_uri);
         let mut transaction = self.pool.begin().await?;
@@ -7520,6 +7882,33 @@ impl WriteRepository {
                 "remote Follow decision is missing its Follow URI",
             ));
         }
+        let preheal_local_account_id = if let Some(local_actor_uri) = local_actor_uri {
+            self.local_activitypub_account_id_before_relationship_locks(local_actor_uri, origin)
+                .await?
+        } else if let Some(delivery_target_account_id) =
+            delivery_target_account_id.filter(|id| *id != -99)
+        {
+            Some(delivery_target_account_id)
+        } else {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT account_id FROM follows \
+                  WHERE target_account_id = $1 AND uri = $2 \
+                 UNION ALL \
+                SELECT account_id FROM follow_requests \
+                  WHERE target_account_id = $1 AND uri = $2 \
+                 LIMIT 1",
+            )
+            .bind(source_account_id)
+            .bind(follow_uri)
+            .fetch_optional(&self.pool)
+            .await?
+        };
+        if let Some(local_account_id) = preheal_local_account_id.filter(|id| *id != -99)
+            && delivery_target_account_id.is_none_or(|id| id == -99 || id == local_account_id)
+        {
+            self.preheal_relationship_account_stats(local_account_id, source_account_id)
+                .await?;
+        }
         let mut transaction = self.pool.begin().await?;
         let source_uri = sqlx::query_scalar::<_, String>(
             "SELECT uri FROM accounts WHERE id = $1 AND domain IS NOT NULL",
@@ -7674,6 +8063,8 @@ impl WriteRepository {
                 .await?;
             }
         }
+        ensure_relationship_account_stats(&mut transaction, local_account_id, source_account_id)
+            .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -7694,13 +8085,13 @@ impl WriteRepository {
         source_account_id: i64,
         origin: Option<&str>,
     ) -> Result<FollowWriteOutcome, WriteError> {
-        let (target_account_id, mut transaction) = self
-            .begin_account_write(authenticated, WRITE_FOLLOWS)
-            .await?;
+        let target_account_id = write_account(authenticated, WRITE_FOLLOWS)?;
         if source_account_id == target_account_id {
             return Err(WriteError::NotFound);
         }
-        lock_relationship(&mut transaction, source_account_id, target_account_id).await?;
+        let mut transaction = self
+            .begin_relationship_account_write(target_account_id, source_account_id)
+            .await?;
         let request = sqlx::query_as::<_, (i64, bool, bool, Option<Vec<String>>, Option<String>)>(
             "SELECT id, show_reblogs, notify, languages, uri FROM follow_requests \
              WHERE account_id = $1 AND target_account_id = $2 FOR UPDATE",
@@ -7820,6 +8211,8 @@ impl WriteRepository {
             &notification_job(target_account_id, "follow", follow_id),
         )
         .await?;
+        ensure_relationship_account_stats(&mut transaction, source_account_id, target_account_id)
+            .await?;
         transaction.commit().await?;
         Ok(FollowWriteOutcome {
             activity_id: Some(follow_id),
@@ -7844,13 +8237,13 @@ impl WriteRepository {
         source_account_id: i64,
         origin: Option<&str>,
     ) -> Result<(), WriteError> {
-        let (target_account_id, mut transaction) = self
-            .begin_account_write(authenticated, WRITE_FOLLOWS)
-            .await?;
+        let target_account_id = write_account(authenticated, WRITE_FOLLOWS)?;
         if source_account_id == target_account_id {
             return Err(WriteError::NotFound);
         }
-        lock_relationship(&mut transaction, source_account_id, target_account_id).await?;
+        let mut transaction = self
+            .begin_relationship_account_write(target_account_id, source_account_id)
+            .await?;
         let (request_id, follow_uri) = sqlx::query_as::<_, (i64, Option<String>)>(
             "DELETE FROM follow_requests WHERE account_id = $1 AND target_account_id = $2 \
              RETURNING id, uri",
@@ -7899,18 +8292,18 @@ impl WriteRepository {
         follower_account_id: i64,
         origin: Option<&str>,
     ) -> Result<(), WriteError> {
-        let (target_account_id, mut transaction) = self
-            .begin_account_write(authenticated, WRITE_FOLLOWS)
-            .await?;
+        let target_account_id = write_account(authenticated, WRITE_FOLLOWS)?;
         if follower_account_id == target_account_id {
             return Err(WriteError::NotFound);
         }
+        let mut transaction = self
+            .begin_relationship_account_write(target_account_id, follower_account_id)
+            .await?;
         let (_, _, follower_unavailable, _) =
             relationship_target(&mut transaction, target_account_id, follower_account_id).await?;
         if follower_unavailable {
             return Err(WriteError::NotFound);
         }
-        lock_relationship(&mut transaction, follower_account_id, target_account_id).await?;
         let removed = sqlx::query_as::<_, (i64, Option<String>)>(
             "DELETE FROM follows WHERE account_id = $1 AND target_account_id = $2 \
              RETURNING id, uri",
@@ -7965,18 +8358,18 @@ impl WriteRepository {
         blocking: bool,
         origin: Option<&str>,
     ) -> Result<(), WriteError> {
-        let (account_id, mut transaction) = self
-            .begin_account_write(authenticated, WRITE_BLOCKS)
-            .await?;
+        let account_id = write_account(authenticated, WRITE_BLOCKS)?;
         if account_id == target_account_id {
             return Ok(());
         }
+        let mut transaction = self
+            .begin_relationship_account_write(account_id, target_account_id)
+            .await?;
         let (target_local, _, target_unavailable, _) =
             relationship_target(&mut transaction, account_id, target_account_id).await?;
         if target_unavailable {
             return Err(WriteError::NotFound);
         }
-        lock_relationship(&mut transaction, account_id, target_account_id).await?;
         let remote_delivery = match (origin, target_local) {
             (Some(origin), false) => {
                 remote_relationship_delivery(
@@ -8146,17 +8539,18 @@ impl WriteRepository {
         hide_notifications: Option<bool>,
         duration: Option<i64>,
     ) -> Result<(), WriteError> {
-        let (account_id, mut transaction) =
-            self.begin_account_write(authenticated, WRITE_MUTES).await?;
+        let account_id = write_account(authenticated, WRITE_MUTES)?;
         if account_id == target_account_id {
             return Err(WriteError::NotFound);
         }
+        let mut transaction = self
+            .begin_relationship_account_write(account_id, target_account_id)
+            .await?;
         let (_, _, target_unavailable, _) =
             relationship_target(&mut transaction, account_id, target_account_id).await?;
         if target_unavailable {
             return Err(WriteError::NotFound);
         }
-        lock_relationship(&mut transaction, account_id, target_account_id).await?;
         let hide_notifications = hide_notifications.unwrap_or(true);
         if muting && hide_notifications {
             sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -15734,9 +16128,28 @@ async fn remove_follow_relationships(
     .bind(target_account_id)
     .execute(&mut **transaction)
     .await?;
-    for (follow_id, source_account_id, followed_account_id) in follows {
-        decrement_follow_counts(transaction, source_account_id, followed_account_id).await?;
-        delete_activity_notifications(transaction, followed_account_id, follow_id, "Follow")
+    let mut relationship_deltas = HashMap::new();
+    for (_, source_account_id, followed_account_id) in &follows {
+        add_account_stats_delta(
+            &mut relationship_deltas,
+            *source_account_id,
+            AccountStatsDelta {
+                following: -1,
+                ..AccountStatsDelta::default()
+            },
+        );
+        add_account_stats_delta(
+            &mut relationship_deltas,
+            *followed_account_id,
+            AccountStatsDelta {
+                followers: -1,
+                ..AccountStatsDelta::default()
+            },
+        );
+    }
+    apply_account_stats_deltas(transaction, relationship_deltas).await?;
+    for (follow_id, _, followed_account_id) in &follows {
+        delete_activity_notifications(transaction, *followed_account_id, *follow_id, "Follow")
             .await?;
     }
     for (request_id, _source_account_id, followed_account_id) in requests {
@@ -15786,26 +16199,94 @@ async fn update_follow_options(
     Ok(())
 }
 
+#[derive(Clone, Copy, Default)]
+struct AccountStatsDelta {
+    statuses: i64,
+    following: i64,
+    followers: i64,
+    last_status_at: Option<NaiveDateTime>,
+}
+
+fn add_account_stats_delta(
+    deltas: &mut HashMap<i64, AccountStatsDelta>,
+    account_id: i64,
+    delta: AccountStatsDelta,
+) {
+    let total = deltas.entry(account_id).or_default();
+    total.statuses += delta.statuses;
+    total.following += delta.following;
+    total.followers += delta.followers;
+    total.last_status_at = total.last_status_at.max(delta.last_status_at);
+}
+
+async fn apply_account_stats_deltas(
+    transaction: &mut Transaction<'_, Postgres>,
+    deltas: HashMap<i64, AccountStatsDelta>,
+) -> Result<(), WriteError> {
+    let mut deltas = deltas.into_iter().collect::<Vec<_>>();
+    deltas.sort_unstable_by_key(|(account_id, _)| *account_id);
+    for (account_id, delta) in deltas {
+        let initialization = initialize_account_stats_if_missing(transaction, account_id).await?;
+        if initialization.inserted {
+            // Initialization observes this transaction's post-mutation state.
+            continue;
+        }
+        sqlx::query(
+            "UPDATE account_stats SET \
+               statuses_count = GREATEST(statuses_count + $2, 0), \
+               following_count = GREATEST(following_count + $3, 0), \
+               followers_count = GREATEST(followers_count + $4, 0), \
+               last_status_at = CASE WHEN $5::timestamp IS NULL THEN last_status_at \
+                 WHEN last_status_at IS NULL THEN LEAST($5, clock_timestamp()) \
+                 ELSE GREATEST(last_status_at, LEAST($5, clock_timestamp())) END, \
+               updated_at = clock_timestamp() \
+             WHERE account_id = $1",
+        )
+        .bind(account_id)
+        .bind(delta.statuses)
+        .bind(delta.following)
+        .bind(delta.followers)
+        .bind(delta.last_status_at)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn ensure_relationship_account_stats(
+    transaction: &mut Transaction<'_, Postgres>,
+    account_id: i64,
+    target_account_id: i64,
+) -> Result<(), WriteError> {
+    let mut deltas = HashMap::new();
+    add_account_stats_delta(&mut deltas, account_id, AccountStatsDelta::default());
+    add_account_stats_delta(&mut deltas, target_account_id, AccountStatsDelta::default());
+    apply_account_stats_deltas(transaction, deltas).await
+}
+
 async fn increment_follow_counts(
     transaction: &mut Transaction<'_, Postgres>,
     account_id: i64,
     target_account_id: i64,
 ) -> Result<(), WriteError> {
-    sqlx::query(
-        "UPDATE account_stats SET following_count = following_count + 1, \
-         updated_at = clock_timestamp() WHERE account_id = $1",
-    )
-    .bind(account_id)
-    .execute(&mut **transaction)
-    .await?;
-    sqlx::query(
-        "UPDATE account_stats SET followers_count = followers_count + 1, \
-         updated_at = clock_timestamp() WHERE account_id = $1",
-    )
-    .bind(target_account_id)
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
+    let mut deltas = HashMap::new();
+    add_account_stats_delta(
+        &mut deltas,
+        account_id,
+        AccountStatsDelta {
+            following: 1,
+            ..AccountStatsDelta::default()
+        },
+    );
+    add_account_stats_delta(
+        &mut deltas,
+        target_account_id,
+        AccountStatsDelta {
+            followers: 1,
+            ..AccountStatsDelta::default()
+        },
+    );
+    apply_account_stats_deltas(transaction, deltas).await
 }
 
 async fn decrement_follow_counts(
@@ -15813,21 +16294,24 @@ async fn decrement_follow_counts(
     account_id: i64,
     target_account_id: i64,
 ) -> Result<(), WriteError> {
-    sqlx::query(
-        "UPDATE account_stats SET following_count = GREATEST(following_count - 1, 0), \
-         updated_at = clock_timestamp() WHERE account_id = $1",
-    )
-    .bind(account_id)
-    .execute(&mut **transaction)
-    .await?;
-    sqlx::query(
-        "UPDATE account_stats SET followers_count = GREATEST(followers_count - 1, 0), \
-         updated_at = clock_timestamp() WHERE account_id = $1",
-    )
-    .bind(target_account_id)
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
+    let mut deltas = HashMap::new();
+    add_account_stats_delta(
+        &mut deltas,
+        account_id,
+        AccountStatsDelta {
+            following: -1,
+            ..AccountStatsDelta::default()
+        },
+    );
+    add_account_stats_delta(
+        &mut deltas,
+        target_account_id,
+        AccountStatsDelta {
+            followers: -1,
+            ..AccountStatsDelta::default()
+        },
+    );
+    apply_account_stats_deltas(transaction, deltas).await
 }
 
 async fn writable_reply_target(
@@ -16133,7 +16617,7 @@ async fn ensure_account_write_allowed_in(
           WHERE account.id = $1
           ORDER BY account_user.id
           LIMIT 1
-          FOR UPDATE OF account, account_user",
+          FOR NO KEY UPDATE OF account, account_user",
     )
     .bind(account_id)
     .fetch_optional(&mut **transaction)
@@ -16269,42 +16753,99 @@ async fn increment_reblog_count(
     Ok(())
 }
 
-// Callers must already hold the local account row lock acquired by
-// ensure_account_write_allowed_in. This serializes initialization with other
-// local writes, including boosts of different targets. Keep existing counters
-// authoritative; only an absent stats row is seeded from live non-direct posts.
-async fn lock_account_statuses_count(
+struct AccountStatsInitialization {
+    statuses_count: i64,
+    inserted: bool,
+}
+
+const ACCOUNT_STATS_SNAPSHOT_SQL: &str = "\
+    (SELECT count(*) FROM statuses \
+      WHERE account_id = $1 AND deleted_at IS NULL AND visibility <> 3) AS statuses_count, \
+    (SELECT count(*) FROM follows WHERE account_id = $1) AS following_count, \
+    (SELECT count(*) FROM follows WHERE target_account_id = $1) AS followers_count, \
+    (SELECT max(LEAST(created_at, clock_timestamp())) FROM statuses \
+      WHERE account_id = $1 AND deleted_at IS NULL AND visibility <> 3) AS last_status_at";
+
+async fn account_stats_snapshot(
     transaction: &mut Transaction<'_, Postgres>,
     account_id: i64,
-) -> Result<i64, WriteError> {
+) -> Result<(i64, i64, i64, Option<NaiveDateTime>), WriteError> {
+    let query = format!("SELECT {ACCOUNT_STATS_SNAPSHOT_SQL}");
+    Ok(sqlx::query_as(&query)
+        .bind(account_id)
+        .fetch_one(&mut **transaction)
+        .await?)
+}
+
+// Existing counters remain authoritative. The unique account_id conflict makes
+// concurrent initializers preserve the winner's snapshot and all later deltas.
+async fn initialize_account_stats_if_missing(
+    transaction: &mut Transaction<'_, Postgres>,
+    account_id: i64,
+) -> Result<AccountStatsInitialization, WriteError> {
     const LOCK_COUNT: &str =
         "SELECT statuses_count FROM account_stats WHERE account_id = $1 FOR UPDATE";
-    if let Some(count) = sqlx::query_scalar::<_, i64>(LOCK_COUNT)
+    if let Some(statuses_count) = sqlx::query_scalar::<_, i64>(LOCK_COUNT)
         .bind(account_id)
         .fetch_optional(&mut **transaction)
         .await?
     {
-        return Ok(count);
+        return Ok(AccountStatsInitialization {
+            statuses_count,
+            inserted: false,
+        });
     }
-    sqlx::query(
+
+    // Keep the live snapshot and insert in one PostgreSQL statement. This makes
+    // the inserted baseline correspond to one MVCC snapshot; a concurrent winner
+    // remains authoritative and its caller applies its own normal delta.
+    let insert = format!(
         "INSERT INTO account_stats (account_id, statuses_count, last_status_at, \
-                                   following_count, followers_count, created_at, updated_at) \
-         SELECT $1, count(*), max(LEAST(created_at, clock_timestamp())), \
-                (SELECT count(*) FROM follows WHERE account_id = $1), \
-                (SELECT count(*) FROM follows WHERE target_account_id = $1), \
+                                     following_count, followers_count, created_at, updated_at) \
+         SELECT account.id, snapshot.statuses_count, snapshot.last_status_at, \
+                snapshot.following_count, snapshot.followers_count, \
                 clock_timestamp(), clock_timestamp() \
-           FROM statuses WHERE account_id = $1 AND deleted_at IS NULL AND visibility <> 3 \
-         ON CONFLICT (account_id) DO NOTHING",
-    )
-    .bind(account_id)
-    .execute(&mut **transaction)
-    .await?;
-    // A concurrent initializer may have won the unique-key conflict. Read and
-    // lock its actual row in a new statement; never reset it or hide SQL errors.
-    Ok(sqlx::query_scalar::<_, i64>(LOCK_COUNT)
+         FROM accounts account \
+         CROSS JOIN LATERAL (SELECT {ACCOUNT_STATS_SNAPSHOT_SQL}) snapshot \
+         WHERE account.id = $1 \
+         ON CONFLICT (account_id) DO NOTHING"
+    );
+    let inserted = sqlx::query(&insert)
         .bind(account_id)
-        .fetch_one(&mut **transaction)
-        .await?)
+        .execute(&mut **transaction)
+        .await?
+        .rows_affected()
+        == 1;
+    // A concurrent initializer may have won the unique-key conflict. Read and
+    // lock its actual row in a new statement; never reset it. A concurrently
+    // deleted account legitimately leaves no row to lock.
+    let statuses_count = sqlx::query_scalar::<_, i64>(LOCK_COUNT)
+        .bind(account_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .unwrap_or_default();
+    Ok(AccountStatsInitialization {
+        statuses_count,
+        inserted,
+    })
+}
+
+async fn lock_account_statuses_count(
+    transaction: &mut Transaction<'_, Postgres>,
+    account_id: i64,
+) -> Result<i64, WriteError> {
+    Ok(initialize_account_stats_if_missing(transaction, account_id)
+        .await?
+        .statuses_count)
+}
+
+async fn ensure_account_stats_after_mutation(
+    transaction: &mut Transaction<'_, Postgres>,
+    account_id: i64,
+) -> Result<(), WriteError> {
+    let mut deltas = HashMap::new();
+    add_account_stats_delta(&mut deltas, account_id, AccountStatsDelta::default());
+    apply_account_stats_deltas(transaction, deltas).await
 }
 
 async fn increment_account_status_count(
@@ -16312,34 +16853,33 @@ async fn increment_account_status_count(
     account_id: i64,
     status_created_at: NaiveDateTime,
 ) -> Result<(), WriteError> {
-    sqlx::query(
-        "UPDATE account_stats SET \
-           statuses_count = statuses_count + 1, \
-           last_status_at = CASE WHEN last_status_at IS NULL \
-             THEN LEAST($2, clock_timestamp()) \
-             ELSE GREATEST(last_status_at, LEAST($2, clock_timestamp())) END, \
-           updated_at = clock_timestamp() \
-         WHERE account_id = $1",
-    )
-    .bind(account_id)
-    .bind(status_created_at)
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
+    let mut deltas = HashMap::new();
+    add_account_stats_delta(
+        &mut deltas,
+        account_id,
+        AccountStatsDelta {
+            statuses: 1,
+            last_status_at: Some(status_created_at),
+            ..AccountStatsDelta::default()
+        },
+    );
+    apply_account_stats_deltas(transaction, deltas).await
 }
 
 async fn decrement_account_status_count(
     transaction: &mut Transaction<'_, Postgres>,
     account_id: i64,
 ) -> Result<(), WriteError> {
-    sqlx::query(
-        "UPDATE account_stats SET statuses_count = GREATEST(statuses_count - 1, 0), \
-           updated_at = clock_timestamp() WHERE account_id = $1",
-    )
-    .bind(account_id)
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
+    let mut deltas = HashMap::new();
+    add_account_stats_delta(
+        &mut deltas,
+        account_id,
+        AccountStatsDelta {
+            statuses: -1,
+            ..AccountStatsDelta::default()
+        },
+    );
+    apply_account_stats_deltas(transaction, deltas).await
 }
 
 async fn increment_reply_count(
@@ -17247,30 +17787,6 @@ async fn purge_account_statuses(
             record_status_delete_stream_events(transaction, *status_id).await?;
         }
     }
-    for (_, status_account_id, reblog_of_id, in_reply_to_id, visibility) in &statuses {
-        if *visibility != 3 {
-            decrement_account_status_count(transaction, *status_account_id).await?;
-        }
-        if let Some(reblog_of_id) = reblog_of_id {
-            decrement_reblog_count(transaction, *reblog_of_id).await?;
-        } else if *visibility < 2
-            && let Some(in_reply_to_id) = in_reply_to_id
-        {
-            decrement_reply_count(transaction, *in_reply_to_id).await?;
-        }
-    }
-    for (quoted_status_id, quote_count) in accepted_quote_counts {
-        sqlx::query(
-            "UPDATE status_stats
-                SET quotes_count = GREATEST(0, quotes_count - $2),
-                    updated_at = clock_timestamp()
-              WHERE status_id = $1",
-        )
-        .bind(quoted_status_id)
-        .bind(quote_count)
-        .execute(&mut **transaction)
-        .await?;
-    }
     if !status_ids.is_empty() {
         sqlx::query("DELETE FROM media_attachments WHERE status_id = ANY($1::bigint[])")
             .bind(&status_ids)
@@ -17288,6 +17804,39 @@ async fn purge_account_statuses(
             .bind(&status_ids)
             .execute(&mut **transaction)
             .await?;
+    }
+    let mut status_deltas = HashMap::new();
+    for (_, status_account_id, reblog_of_id, in_reply_to_id, visibility) in &statuses {
+        if *visibility != 3 {
+            add_account_stats_delta(
+                &mut status_deltas,
+                *status_account_id,
+                AccountStatsDelta {
+                    statuses: -1,
+                    ..AccountStatsDelta::default()
+                },
+            );
+        }
+        if let Some(reblog_of_id) = reblog_of_id {
+            decrement_reblog_count(transaction, *reblog_of_id).await?;
+        } else if *visibility < 2
+            && let Some(in_reply_to_id) = in_reply_to_id
+        {
+            decrement_reply_count(transaction, *in_reply_to_id).await?;
+        }
+    }
+    apply_account_stats_deltas(transaction, status_deltas).await?;
+    for (quoted_status_id, quote_count) in accepted_quote_counts {
+        sqlx::query(
+            "UPDATE status_stats
+                SET quotes_count = GREATEST(0, quotes_count - $2),
+                    updated_at = clock_timestamp()
+              WHERE status_id = $1",
+        )
+        .bind(quoted_status_id)
+        .bind(quote_count)
+        .execute(&mut **transaction)
+        .await?;
     }
     Ok(())
 }
@@ -17391,9 +17940,29 @@ async fn purge_account_relationships(
         .bind(account_id)
         .execute(&mut **transaction)
         .await?;
-    for (follow_id, source_account_id, target_account_id, _) in follows {
-        decrement_follow_counts(transaction, source_account_id, target_account_id).await?;
-        delete_activity_notifications(transaction, target_account_id, follow_id, "Follow").await?;
+    let mut relationship_deltas = HashMap::new();
+    for (_, source_account_id, target_account_id, _) in &follows {
+        add_account_stats_delta(
+            &mut relationship_deltas,
+            *source_account_id,
+            AccountStatsDelta {
+                following: -1,
+                ..AccountStatsDelta::default()
+            },
+        );
+        add_account_stats_delta(
+            &mut relationship_deltas,
+            *target_account_id,
+            AccountStatsDelta {
+                followers: -1,
+                ..AccountStatsDelta::default()
+            },
+        );
+    }
+    apply_account_stats_deltas(transaction, relationship_deltas).await?;
+    for (follow_id, _, target_account_id, _) in &follows {
+        delete_activity_notifications(transaction, *target_account_id, *follow_id, "Follow")
+            .await?;
     }
     for (request_id, target_account_id, _) in follow_requests {
         delete_activity_notifications(transaction, target_account_id, request_id, "FollowRequest")
@@ -17593,12 +18162,35 @@ async fn reject_remote_account_follows(
     .bind(remote_account_id)
     .fetch_all(&mut **transaction)
     .await?;
+    let follow_ids = follows
+        .iter()
+        .map(|(follow_id, _, _)| *follow_id)
+        .collect::<Vec<_>>();
+    sqlx::query("DELETE FROM follows WHERE id = ANY($1)")
+        .bind(&follow_ids)
+        .execute(&mut **transaction)
+        .await?;
+    let mut relationship_deltas = HashMap::new();
+    for (_, local_account_id, _) in &follows {
+        add_account_stats_delta(
+            &mut relationship_deltas,
+            remote_account_id,
+            AccountStatsDelta {
+                following: -1,
+                ..AccountStatsDelta::default()
+            },
+        );
+        add_account_stats_delta(
+            &mut relationship_deltas,
+            *local_account_id,
+            AccountStatsDelta {
+                followers: -1,
+                ..AccountStatsDelta::default()
+            },
+        );
+    }
+    apply_account_stats_deltas(transaction, relationship_deltas).await?;
     for (follow_id, local_account_id, follow_uri) in follows {
-        sqlx::query("DELETE FROM follows WHERE id = $1")
-            .bind(follow_id)
-            .execute(&mut **transaction)
-            .await?;
-        decrement_follow_counts(transaction, remote_account_id, local_account_id).await?;
         delete_activity_notifications(transaction, local_account_id, follow_id, "Follow").await?;
         if let Some(follow_uri) = follow_uri
             && let Some(remote_delivery) = remote_relationship_delivery(
