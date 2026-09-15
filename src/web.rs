@@ -125,6 +125,8 @@ const SIGNATURE_FETCH_COOL_OFF: StdDuration = StdDuration::from_mins(5);
 const MAX_SIGNATURE_FETCH_CIRCUITS: usize = 65_536;
 const FRONTEND_ANDROID_ICON_SIZES: &[u16] = &[36, 48, 72, 96, 144, 192, 256, 384, 512];
 const FRONTEND_CACHE: &str = "public, max-age=31536000, immutable";
+const RUSTODON_STYLESHEET_URL: &str = "/rustodon-assets/rustodon-f4604ff644e0.css";
+const RUSTODON_STYLESHEET: &str = include_str!("../assets/rustodon.css");
 
 #[derive(Clone, Copy)]
 enum ActivityPubStatusDocument {
@@ -3028,12 +3030,33 @@ fn frontend_file_response(
     response
 }
 
+async fn rustodon_stylesheet() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/css; charset=utf-8")
+        .body(Body::from(RUSTODON_STYLESHEET))
+        .expect("static stylesheet response headers are valid")
+}
+
+fn frontend_asset_cache_control(target: &str) -> &'static str {
+    let path = target.split_once('?').map_or(target, |(path, _)| path);
+    [(RUSTODON_STYLESHEET_URL, FRONTEND_CACHE)]
+        .into_iter()
+        .find(|(asset, _)| *asset == path)
+        .map_or(FRONTEND_CACHE, |(_, policy)| policy)
+}
+
 async fn frontend_asset_headers(request: Request, next: Next) -> Response<Body> {
+    let target = request
+        .uri()
+        .path_and_query()
+        .map_or(request.uri().path(), |target| target.as_str());
+    let cache_control = frontend_asset_cache_control(target);
     let mut response = next.run(request).await;
     if response.status().is_success() {
         response
             .headers_mut()
-            .insert(CACHE_CONTROL, HeaderValue::from_static(FRONTEND_CACHE));
+            .insert(CACHE_CONTROL, HeaderValue::from_static(cache_control));
     }
     response
 }
@@ -3932,6 +3955,7 @@ pub fn router(state: WebState) -> Router {
         .nest_service("/packs", ServeDir::new(state.frontend.root.join("packs")))
         .layer(middleware::from_fn(frontend_asset_headers));
     let frontend_public_assets = Router::new()
+        .route(RUSTODON_STYLESHEET_URL, get(rustodon_stylesheet))
         .route_service(
             "/badge.png",
             ServeFile::new(state.frontend.root.join("badge.png")),
@@ -9697,11 +9721,7 @@ async fn oauth_authorize(
         Err(OAuthAuthorizationGrantError::Database(_)) => return internal_error(),
     };
     if redirect_uri == "urn:ietf:wg:oauth:2.0:oob" {
-        let html = format!(
-            "<!doctype html><title>Authorization code</title><p>{}</p>",
-            html_escape::encode_text(&grant.code)
-        );
-        return html_response(StatusCode::OK, html);
+        return html_response(StatusCode::OK, oauth_oob_document(&grant.code));
     }
     oauth_authorize_response(
         &redirect,
@@ -9710,6 +9730,18 @@ async fn oauth_authorize(
         None,
         None,
         Some(&grant.code),
+    )
+}
+
+fn oauth_oob_document(code: &str) -> String {
+    let content = format!(
+        "<h1>Authorization code</h1><p>Copy this code into the application:</p><p><code class=\"authorization-code\">{}</code></p>",
+        html_escape::encode_text(code)
+    );
+    rustodon_document(
+        "Authorization code",
+        &content,
+        RustodonDocumentLayout::Compact,
     )
 }
 
@@ -9744,13 +9776,18 @@ fn oauth_consent_response(
     if let Some(csrf_token) = csrf_token {
         fields.push_str(&oauth_hidden_field("csrf_token", csrf_token));
     }
+    let content = format!(
+        "<h1>Authorize {}</h1><p>Requested scopes: {}</p><form method=\"post\" action=\"/oauth/authorize\">{}<div class=\"button-row\"><button class=\"button button--primary\" name=\"approve\" value=\"true\" type=\"submit\">Authorize</button><button class=\"button button--secondary\" name=\"approve\" value=\"false\" type=\"submit\">Deny</button></div></form>",
+        html_escape::encode_text(application_name),
+        html_escape::encode_text(scope),
+        fields
+    );
     html_response(
         StatusCode::OK,
-        format!(
-            "<!doctype html><title>Authorize application</title><main><h1>Authorize {}</h1><p>Requested scopes: {}</p><form method=\"post\" action=\"/oauth/authorize\">{}<button name=\"approve\" value=\"true\" type=\"submit\">Authorize</button><button name=\"approve\" value=\"false\" type=\"submit\">Deny</button></form></main>",
-            html_escape::encode_text(application_name),
-            html_escape::encode_text(scope),
-            fields
+        rustodon_document(
+            "Authorize application",
+            &content,
+            RustodonDocumentLayout::Compact,
         ),
     )
 }
@@ -9837,6 +9874,32 @@ fn oauth_form_post_response(redirect: &Url, fields: &[(&str, &str)]) -> Response
         .headers_mut()
         .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     response
+}
+
+#[derive(Clone, Copy)]
+enum RustodonDocumentLayout<'a> {
+    Compact,
+    Settings { navigation: &'a str },
+}
+
+fn rustodon_document(title: &str, content: &str, layout: RustodonDocumentLayout<'_>) -> String {
+    let title = html_escape::encode_text(title);
+    let (body_class, body) = match layout {
+        RustodonDocumentLayout::Compact => (
+            "rustodon rustodon--compact",
+            format!("<main class=\"rustodon-card\">{content}</main>"),
+        ),
+        RustodonDocumentLayout::Settings { navigation } => (
+            "rustodon rustodon--settings",
+            format!(
+                "<div class=\"settings-layout\"><aside class=\"settings-sidebar\">{navigation}</aside><main class=\"settings-content\">{content}</main></div>"
+            ),
+        ),
+    };
+    let brand = "<header class=\"rustodon-brand\"><a class=\"rustodon-brand__link\" href=\"/\" aria-label=\"Rustodon home\"><span class=\"rustodon-brand__mark\" aria-hidden=\"true\">R</span><span>Rustodon</span></a></header>";
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><title>{title}</title><link rel=\"stylesheet\" href=\"{RUSTODON_STYLESHEET_URL}\" referrerpolicy=\"no-referrer\"></head><body class=\"{body_class}\"><div class=\"rustodon-page\">{brand}{body}</div></body></html>"
+    )
 }
 
 fn html_response(status: StatusCode, body: String) -> Response<Body> {
@@ -9931,7 +9994,7 @@ fn browser_sign_in_document(
     });
     let error = error.map_or_else(String::new, |message| {
         format!(
-            "<p role=\"alert\">{}</p>",
+            "<p class=\"alert\" role=\"alert\">{}</p>",
             html_escape::encode_text(message)
         )
     });
@@ -9941,10 +10004,11 @@ fn browser_sign_in_document(
             html_escape::encode_quoted_attribute(return_to)
         )
     });
-    format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Log in</title></head><body><main><h1>Log in</h1>{error}<form method=\"post\" action=\"/auth/sign_in\"><input type=\"hidden\" name=\"csrf_token\" value=\"{}\">{return_to}<label for=\"email\">Email</label><input id=\"email\" type=\"email\" name=\"user[email]\" value=\"{email}\" autocomplete=\"username\" required><label for=\"password\">Password</label><input id=\"password\" type=\"password\" name=\"user[password]\" autocomplete=\"current-password\" required><label for=\"otp_attempt\">Two-factor or recovery code</label><input id=\"otp_attempt\" type=\"text\" name=\"user[otp_attempt]\" autocomplete=\"one-time-code\"><button type=\"submit\">Log in</button></form><p><a href=\"/auth/password/new\">Forgot your password?</a></p></main></body></html>",
+    let content = format!(
+        "<h1>Log in</h1>{error}<form method=\"post\" action=\"/auth/sign_in\"><input type=\"hidden\" name=\"csrf_token\" value=\"{}\">{return_to}<label for=\"email\">Email</label><input id=\"email\" type=\"email\" name=\"user[email]\" value=\"{email}\" autocomplete=\"username\" required><label for=\"password\">Password</label><input id=\"password\" type=\"password\" name=\"user[password]\" autocomplete=\"current-password\" required><label for=\"otp_attempt\">Two-factor or recovery code</label><input id=\"otp_attempt\" type=\"text\" name=\"user[otp_attempt]\" autocomplete=\"one-time-code\"><button type=\"submit\">Log in</button></form><p><a href=\"/auth/password/new\">Forgot your password?</a></p>",
         html_escape::encode_quoted_attribute(csrf_token),
-    )
+    );
+    rustodon_document("Log in", &content, RustodonDocumentLayout::Compact)
 }
 
 fn hidden_csrf(csrf_token: &str) -> String {
@@ -9977,16 +10041,42 @@ async fn required_browser_session(
     Ok(session)
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SettingsSection {
+    Profile,
+    Appearance,
+    PostingDefaults,
+    Security,
+    DeleteAccount,
+}
+
+impl SettingsSection {
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Profile => "/settings/profile",
+            Self::Appearance => "/settings/preferences/appearance",
+            Self::PostingDefaults => "/settings/preferences/posting_defaults",
+            Self::Security => "/settings/security",
+            Self::DeleteAccount => "/settings/delete",
+        }
+    }
+}
+
 fn browser_settings_page(
     title: &str,
     content: &str,
     csrf_token: &str,
     csrf_cookie: Option<String>,
+    active_section: Option<SettingsSection>,
 ) -> Response<Body> {
-    let title = html_escape::encode_text(title);
-    let navigation = browser_settings_navigation(csrf_token);
-    let body = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{title}</title></head><body><header>{navigation}</header><main><h1>{title}</h1>{content}</main></body></html>"
+    let heading = format!("<h1>{}</h1>{content}", html_escape::encode_text(title));
+    let navigation = browser_settings_navigation(csrf_token, active_section);
+    let body = rustodon_document(
+        title,
+        &heading,
+        RustodonDocumentLayout::Settings {
+            navigation: &navigation,
+        },
     );
     let mut response = html_response(StatusCode::OK, body);
     if let Some(cookie) = csrf_cookie {
@@ -9995,9 +10085,33 @@ fn browser_settings_page(
     response
 }
 
-fn browser_settings_navigation(csrf_token: &str) -> String {
+fn browser_settings_navigation(
+    csrf_token: &str,
+    active_section: Option<SettingsSection>,
+) -> String {
+    let links = [
+        (SettingsSection::Profile, "Profile"),
+        (SettingsSection::Appearance, "Appearance"),
+        (SettingsSection::PostingDefaults, "Posting defaults"),
+        (SettingsSection::Security, "Security"),
+        (SettingsSection::DeleteAccount, "Delete account"),
+    ]
+    .into_iter()
+    .fold(String::new(), |mut navigation, (section, label)| {
+        let href = section.path();
+        let current = if active_section == Some(section) {
+            " aria-current=\"page\""
+        } else {
+            ""
+        };
+        let _ = write!(
+            navigation,
+            "<li><a href=\"{href}\"{current}>{label}</a></li>"
+        );
+        navigation
+    });
     format!(
-        "<nav aria-label=\"Account settings\"><a href=\"/settings/profile\">Profile</a> <a href=\"/settings/preferences/posting_defaults\">Posting defaults</a> <a href=\"/settings/security\">Security</a> <a href=\"/settings/delete\">Delete account</a> <a href=\"/\">Back to Mastodon</a> <form method=\"post\" action=\"/auth/sign_out\">{}<button type=\"submit\">Log out</button></form></nav>",
+        "<nav class=\"settings-nav\" aria-label=\"Account settings\"><ul>{links}</ul><a href=\"/\">Back to Mastodon</a><form method=\"post\" action=\"/auth/sign_out\">{}<button class=\"button button--secondary\" type=\"submit\">Log out</button></form></nav>",
         hidden_csrf(csrf_token),
     )
 }
@@ -10014,10 +10128,11 @@ fn browser_settings_error_response(
         &state.csrf_signing_key,
     );
     let content = format!(
-        "<p role=\"alert\">{}</p><p><a href=\"/settings/profile\">Return to settings</a></p>",
+        "<p class=\"alert\" role=\"alert\">{}</p><p><a href=\"/settings/profile\">Return to settings</a></p>",
         html_escape::encode_text(message)
     );
-    let mut response = browser_settings_page("Settings error", &content, &csrf_token, csrf_cookie);
+    let mut response =
+        browser_settings_page("Settings error", &content, &csrf_token, csrf_cookie, None);
     *response.status_mut() = status;
     response
 }
@@ -10052,6 +10167,7 @@ async fn browser_profile_page(State(state): State<WebState>, headers: HeaderMap)
         &browser_profile_form(&account, &csrf_token),
         &csrf_token,
         csrf_cookie,
+        Some(SettingsSection::Profile),
     )
 }
 
@@ -10141,7 +10257,13 @@ async fn browser_settings_appearance(
         "<p>The pinned Mastodon web client controls appearance settings locally. Rustodon v1 keeps the server-side appearance surface English-only.</p><p>Posting defaults are persisted server-side on the <a href=\"/settings/preferences/posting_defaults\">posting defaults page</a>.</p>{}",
         hidden_csrf(&csrf_token),
     );
-    browser_settings_page("Appearance", &content, &csrf_token, csrf_cookie)
+    browser_settings_page(
+        "Appearance",
+        &content,
+        &csrf_token,
+        csrf_cookie,
+        Some(SettingsSection::Appearance),
+    )
 }
 
 async fn browser_posting_defaults_page(
@@ -10169,6 +10291,7 @@ async fn browser_posting_defaults_page(
         &browser_posting_defaults_form(&state, &preferences, &csrf_token),
         &csrf_token,
         csrf_cookie,
+        Some(SettingsSection::PostingDefaults),
     )
 }
 
@@ -10283,6 +10406,7 @@ async fn browser_two_factor_methods_page(
         &browser_two_factor_methods_form(&user, &csrf_token),
         &csrf_token,
         csrf_cookie,
+        Some(SettingsSection::Security),
     )
 }
 
@@ -10292,15 +10416,19 @@ fn browser_two_factor_methods_form(user: &User, csrf_token: &str) -> String {
         "<p>Your assigned role requires two-factor authentication, so it cannot be disabled here.</p>"
             .to_owned()
     } else {
-        format!(
-            "<section aria-labelledby=\"disable-two-factor\"><h2 id=\"disable-two-factor\">Disable two-factor authentication</h2><form method=\"post\" action=\"/settings/two_factor_authentication_methods/disable\">{}<label for=\"disable_current_password\">Current password</label><input id=\"disable_current_password\" type=\"password\" name=\"current_password\" autocomplete=\"current-password\" required><button type=\"submit\">Disable two-factor authentication</button></form></section>",
-            hidden_csrf(csrf_token),
-        )
+        browser_disable_two_factor_form(csrf_token)
     };
     format!(
         "<p>One-time password authentication is enabled. The login form accepts a six-digit TOTP code or a recovery code.</p><p>{backup_code_count} recovery codes remain.</p><section aria-labelledby=\"recovery-codes\"><h2 id=\"recovery-codes\">Recovery codes</h2><p>Generating new recovery codes invalidates the existing set.</p><form method=\"post\" action=\"/settings/two_factor_authentication/recovery_codes\">{}<label for=\"recovery_codes_current_password\">Current password</label><input id=\"recovery_codes_current_password\" type=\"password\" name=\"current_password\" autocomplete=\"current-password\" required><button type=\"submit\">Regenerate recovery codes</button></form></section>{disable}",
         hidden_csrf(csrf_token),
         disable = disable,
+    )
+}
+
+fn browser_disable_two_factor_form(csrf_token: &str) -> String {
+    format!(
+        "<section class=\"danger-zone\" aria-labelledby=\"disable-two-factor\"><h2 id=\"disable-two-factor\">Disable two-factor authentication</h2><form method=\"post\" action=\"/settings/two_factor_authentication_methods/disable\">{}<label for=\"disable_current_password\">Current password</label><input id=\"disable_current_password\" type=\"password\" name=\"current_password\" autocomplete=\"current-password\" required><button class=\"button button--danger\" type=\"submit\">Disable two-factor authentication</button></form></section>",
+        hidden_csrf(csrf_token),
     )
 }
 
@@ -10666,7 +10794,7 @@ fn browser_otp_setup_page_response(
     );
     let error = error.map_or_else(String::new, |message| {
         format!(
-            "<p role=\"alert\">{}</p>",
+            "<p class=\"alert\" role=\"alert\">{}</p>",
             html_escape::encode_text(message)
         )
     });
@@ -10679,6 +10807,7 @@ fn browser_otp_setup_page_response(
         &content,
         &csrf_token,
         csrf_cookie,
+        Some(SettingsSection::Security),
     );
     *response.status_mut() = status;
     response
@@ -10699,7 +10828,7 @@ fn browser_otp_confirmation_page_response(
     );
     let error = error.map_or_else(String::new, |message| {
         format!(
-            "<p role=\"alert\">{}</p>",
+            "<p class=\"alert\" role=\"alert\">{}</p>",
             html_escape::encode_text(message)
         )
     });
@@ -10716,6 +10845,7 @@ fn browser_otp_confirmation_page_response(
         &content,
         &csrf_token,
         csrf_cookie,
+        Some(SettingsSection::Security),
     );
     *response.status_mut() = status;
     response
@@ -10743,7 +10873,13 @@ fn browser_two_factor_recovery_codes_page(
         "<p><strong>Recovery codes</strong> can be used once each when your authenticator is unavailable. Store them somewhere safe.</p><ol class=\"recovery-codes\">{codes}</ol><p>These codes will not be shown again.</p>{}",
         hidden_csrf(&csrf_token),
     );
-    browser_settings_page("Recovery codes", &content, &csrf_token, csrf_cookie)
+    browser_settings_page(
+        "Recovery codes",
+        &content,
+        &csrf_token,
+        csrf_cookie,
+        Some(SettingsSection::Security),
+    )
 }
 
 fn browser_totp_provisioning_uri(secret: &str, email: &str, issuer: &str) -> String {
@@ -10805,7 +10941,13 @@ async fn browser_security_page(
         html_escape::encode_text(&user.email),
         hidden_csrf(&csrf_token),
     );
-    browser_settings_page("Security", &content, &csrf_token, csrf_cookie)
+    browser_settings_page(
+        "Security",
+        &content,
+        &csrf_token,
+        csrf_cookie,
+        Some(SettingsSection::Security),
+    )
 }
 
 async fn browser_security_update(
@@ -11010,7 +11152,7 @@ fn browser_delete_page_response(
     let (csrf_token, csrf_cookie) = browser_page_csrf(headers, secure, &state.csrf_signing_key);
     let error = error.map_or_else(String::new, |message| {
         format!(
-            "<p role=\"alert\">{}</p>",
+            "<p class=\"alert\" role=\"alert\">{}</p>",
             html_escape::encode_text(message)
         )
     });
@@ -11018,7 +11160,14 @@ fn browser_delete_page_response(
         "{error}<p>Deleting your account is irreversible. Your account will become unavailable immediately and the deletion request will be queued for processing.</p>{}",
         browser_delete_form(user.encrypted_password.is_present(), &csrf_token),
     );
-    let mut response = browser_settings_page("Delete account", &content, &csrf_token, csrf_cookie);
+    let mut response = browser_settings_page(
+        "Delete account",
+        &content,
+        &csrf_token,
+        csrf_cookie,
+        Some(SettingsSection::DeleteAccount),
+    );
+
     *response.status_mut() = status;
     response
 }
@@ -11032,7 +11181,7 @@ fn browser_delete_form(has_password: bool, csrf_token: &str) -> String {
             .to_owned()
     };
     format!(
-        "<form method=\"post\" action=\"/settings/delete\">{}{challenge}<button type=\"submit\">Delete account</button></form>",
+        "<form class=\"danger-zone\" method=\"post\" action=\"/settings/delete\">{}{challenge}<button class=\"button button--danger\" type=\"submit\">Delete account</button></form>",
         hidden_csrf(csrf_token),
     )
 }
@@ -11141,20 +11290,27 @@ fn browser_password_reset_document(
 ) -> String {
     let error = error.map_or_else(String::new, |message| {
         format!(
-            "<p role=\"alert\">{}</p>",
+            "<p class=\"alert\" role=\"alert\">{}</p>",
             html_escape::encode_text(message)
         )
     });
     let csrf_token = html_escape::encode_quoted_attribute(csrf_token);
-    match reset_token {
-        Some(reset_token) => format!(
-            "<!doctype html><title>Choose a new password</title><main><h1>Choose a new password</h1>{error}<form method=\"post\" action=\"/auth/password\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf_token}\"><input type=\"hidden\" name=\"reset_password_token\" value=\"{}\"><label>New password<input type=\"password\" name=\"user[password]\" autocomplete=\"new-password\" required></label><label>Confirm password<input type=\"password\" name=\"user[password_confirmation]\" autocomplete=\"new-password\" required></label><button type=\"submit\">Change password</button></form></main>",
-            html_escape::encode_quoted_attribute(reset_token),
+    let (title, content) = match reset_token {
+        Some(reset_token) => (
+            "Choose a new password",
+            format!(
+                "<h1>Choose a new password</h1>{error}<form method=\"post\" action=\"/auth/password\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf_token}\"><input type=\"hidden\" name=\"reset_password_token\" value=\"{}\"><label>New password<input type=\"password\" name=\"user[password]\" autocomplete=\"new-password\" required></label><label>Confirm password<input type=\"password\" name=\"user[password_confirmation]\" autocomplete=\"new-password\" required></label><button type=\"submit\">Change password</button></form>",
+                html_escape::encode_quoted_attribute(reset_token),
+            ),
         ),
-        None => format!(
-            "<!doctype html><title>Reset password</title><main><h1>Reset password</h1>{error}<p>If the account exists, instructions will be sent.</p><form method=\"post\" action=\"/auth/password\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf_token}\"><label>Email<input type=\"email\" name=\"user[email]\" autocomplete=\"email\" required></label><button type=\"submit\">Send reset instructions</button></form></main>",
+        None => (
+            "Reset password",
+            format!(
+                "<h1>Reset password</h1>{error}<p>If the account exists, instructions will be sent.</p><form method=\"post\" action=\"/auth/password\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf_token}\"><label>Email<input type=\"email\" name=\"user[email]\" autocomplete=\"email\" required></label><button type=\"submit\">Send reset instructions</button></form>"
+            ),
         ),
-    }
+    };
+    rustodon_document(title, &content, RustodonDocumentLayout::Compact)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11213,11 +11369,16 @@ fn browser_confirmation_error_response(
     if !accepts_html(headers) {
         return browser_auth_error_response(status, code);
     }
+    let content = format!(
+        "<h1>Confirmation error</h1><p class=\"alert\" role=\"alert\">{}</p><p><a href=\"/auth/sign_in\">Return to log in</a></p>",
+        html_escape::encode_text(message),
+    );
     html_response(
         status,
-        format!(
-            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Confirmation error</title></head><body><main><h1>Confirmation error</h1><p role=\"alert\">{}</p><p><a href=\"/auth/sign_in\">Return to log in</a></p></main></body></html>",
-            html_escape::encode_text(message),
+        rustodon_document(
+            "Confirmation error",
+            &content,
+            RustodonDocumentLayout::Compact,
         ),
     )
 }
@@ -19121,6 +19282,22 @@ mod tests {
         assert!(sign_in.contains(
             "name=\"return_to\" value=\"/oauth/authorize?client_id=fixture&amp;state=state\""
         ));
+        let reset = browser_password_reset_document(
+            "csrf\"value",
+            Some("reset<&token"),
+            Some("expired <token>"),
+        );
+        for document in [&sign_in, &reset] {
+            assert!(document.contains("<html lang=\"en\">"));
+            assert!(document.contains("href=\"/rustodon-assets/rustodon-"));
+            assert!(document.contains("referrerpolicy=\"no-referrer\""));
+            assert!(document.contains("class=\"rustodon-brand\""));
+            assert!(document.contains("<body class=\"rustodon rustodon--compact\">"));
+        }
+        assert!(sign_in.contains("<p class=\"alert\" role=\"alert\">"));
+        assert!(reset.contains("action=\"/auth/password\""));
+        assert!(reset.contains("name=\"reset_password_token\" value=\"reset&lt;&amp;token\""));
+        assert!(reset.contains("name=\"user[password_confirmation]\""));
 
         assert_eq!(
             hidden_csrf("csrf\"value"),
@@ -19132,6 +19309,168 @@ mod tests {
         );
         assert!(options.contains("value=\"private\" selected"));
         assert!(!options.contains("value=\"public\" selected"));
+    }
+
+    #[tokio::test]
+    async fn rustodon_owned_oauth_oob_and_settings_documents_share_the_shell() {
+        let consent = oauth_consent_response(
+            "Fixture <App>",
+            "client<&",
+            "urn:ietf:wg:oauth:2.0:oob",
+            OAuthResponseMode::Query,
+            "read <write>",
+            Some("state<&"),
+            Some("challenge<&"),
+            Some("S256"),
+            Some("csrf<&"),
+        );
+        let consent = axum::body::to_bytes(consent.into_body(), 16 * 1024)
+            .await
+            .expect("OAuth consent body is readable");
+        let consent = String::from_utf8(consent.to_vec()).expect("OAuth consent is UTF-8");
+        assert!(consent.contains("href=\"/rustodon-assets/rustodon-"));
+        assert!(consent.contains("<body class=\"rustodon rustodon--compact\">"));
+        assert!(consent.contains("Authorize Fixture &lt;App&gt;"));
+        assert!(consent.contains("method=\"post\" action=\"/oauth/authorize\""));
+        assert!(consent.contains("name=\"client_id\" value=\"client&lt;&amp;\""));
+        assert!(consent.contains("name=\"approve\" value=\"true\" type=\"submit\""));
+        assert!(consent.contains("button button--secondary"));
+        assert!(consent.contains("name=\"approve\" value=\"false\" type=\"submit\""));
+
+        let oob = oauth_oob_document("code<&");
+        assert!(oob.contains("href=\"/rustodon-assets/rustodon-"));
+        assert!(oob.contains("class=\"authorization-code\">code&lt;&amp;</code>"));
+
+        let settings = browser_settings_page(
+            "Profile",
+            "<form method=\"post\" action=\"/settings/profile\"><input name=\"display_name\" value=\"Alice &amp; Bob\"></form>",
+            "csrf<&",
+            None,
+            Some(SettingsSection::Profile),
+        );
+        let settings = axum::body::to_bytes(settings.into_body(), 16 * 1024)
+            .await
+            .expect("settings body is readable");
+        let settings = String::from_utf8(settings.to_vec()).expect("settings body is UTF-8");
+        assert!(settings.contains("href=\"/rustodon-assets/rustodon-"));
+        assert!(settings.contains("<body class=\"rustodon rustodon--settings\">"));
+        assert!(settings.contains("class=\"settings-layout\""));
+        assert!(settings.contains("href=\"/settings/profile\" aria-current=\"page\""));
+        assert!(settings.contains("method=\"post\" action=\"/settings/profile\""));
+        assert!(settings.contains("name=\"display_name\" value=\"Alice &amp; Bob\""));
+
+        let delete = browser_delete_form(true, "csrf<&");
+        assert!(
+            delete.contains("class=\"danger-zone\" method=\"post\" action=\"/settings/delete\"")
+        );
+        assert!(delete.contains("name=\"csrf_token\" value=\"csrf&lt;&amp;\""));
+        assert!(delete.contains("button button--danger"));
+
+        let disable_two_factor = browser_disable_two_factor_form("csrf<&");
+        assert!(disable_two_factor.contains(
+            "method=\"post\" action=\"/settings/two_factor_authentication_methods/disable\""
+        ));
+        assert!(disable_two_factor.contains("class=\"danger-zone\""));
+        assert!(disable_two_factor.contains("button button--danger"));
+    }
+
+    #[tokio::test]
+    async fn rustodon_stylesheet_route_and_responsive_contract_are_stable() {
+        for contract in [
+            "#181820",
+            "#21212c",
+            "#3a3a50",
+            "#5638cc",
+            "--secondary-hover:",
+            "--secondary-hover: #d8d8e5",
+            "--secondary-hover-text: #27272f",
+            ":focus-visible",
+            "@media (prefers-color-scheme: light)",
+            "@media (max-width: 700px)",
+            "@media (prefers-reduced-motion: reduce)",
+            ".button--secondary",
+            ".button--danger",
+            "button,\n.button",
+            ".alert",
+            ".authorization-code",
+            ".settings-content code",
+            ".recovery-codes",
+            ".rustodon-brand",
+            ".settings-layout",
+            "label > input:not([type=\"checkbox\"])",
+            ".settings-content fieldset > div",
+            ".danger-zone > :first-child",
+            "overflow-wrap: anywhere",
+        ] {
+            assert!(RUSTODON_STYLESHEET.contains(contract), "missing {contract}");
+        }
+        assert!(!RUSTODON_STYLESHEET.contains("overflow-x: hidden"));
+        assert!(!RUSTODON_STYLESHEET.contains("http://"));
+        assert!(!RUSTODON_STYLESHEET.contains("https://"));
+
+        let document = browser_sign_in_document("csrf", None, None, None);
+        let stylesheet = document
+            .split_once("<link rel=\"stylesheet\" href=\"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(href, _)| href)
+            .expect("shared shell has a stylesheet link");
+        assert!(stylesheet.starts_with("/rustodon-assets/rustodon-"));
+        assert!(document.contains(&format!(
+            "href=\"{stylesheet}\" referrerpolicy=\"no-referrer\""
+        )));
+        let hash = stylesheet
+            .strip_prefix("/rustodon-assets/rustodon-")
+            .and_then(|name| name.strip_suffix(".css"))
+            .expect("stylesheet URL has a content hash");
+        let expected_hash = Sha256::digest(RUSTODON_STYLESHEET.as_bytes())
+            .iter()
+            .take(6)
+            .fold(String::new(), |mut encoded, byte| {
+                let _ = write!(encoded, "{byte:02x}");
+                encoded
+            });
+        assert_eq!(hash, expected_hash);
+        assert_eq!(frontend_asset_cache_control(stylesheet), FRONTEND_CACHE);
+        assert_eq!(
+            frontend_asset_cache_control(&format!("{stylesheet}?source=oauth&state=secret")),
+            FRONTEND_CACHE
+        );
+        assert_eq!(
+            frontend_asset_cache_control("/packs/app.css"),
+            FRONTEND_CACHE
+        );
+
+        let response = rustodon_stylesheet().await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "text/css; charset=utf-8");
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("stylesheet body is readable");
+        assert_eq!(body.as_ref(), RUSTODON_STYLESHEET.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn oauth_form_post_document_keeps_its_specialized_transport_boundary() {
+        let redirect = Url::parse("https://client.invalid/callback").expect("redirect is valid");
+        let response =
+            oauth_form_post_response(&redirect, &[("code", "code<&"), ("state", "state\"")]);
+        let policy = response.headers()["content-security-policy"]
+            .to_str()
+            .expect("form_post CSP is text");
+        assert!(policy.contains("form-action https://client.invalid"));
+        assert!(policy.contains("script-src 'sha256-"));
+        assert!(!policy.contains("style-src"));
+        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("form_post body is readable");
+        let body = String::from_utf8(body.to_vec()).expect("form_post body is UTF-8");
+        assert_eq!(
+            body,
+            "<!doctype html><meta charset=\"utf-8\"><title>Authorization response</title><form method=\"post\" action=\"https://client.invalid/callback\"><input type=\"hidden\" name=\"code\" value=\"code&lt;&amp;\"><input type=\"hidden\" name=\"state\" value=\"state&quot;\"><noscript><button type=\"submit\">Continue</button></noscript></form><script>document.forms[0].submit();</script>"
+        );
+        assert!(!body.contains("/rustodon-assets/rustodon-"));
+        assert!(!body.contains("class=\"rustodon"));
     }
 
     #[test]
@@ -19284,6 +19623,9 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).expect("confirmation error is UTF-8");
         assert!(body.contains("The confirmation link is invalid or has expired."));
         assert!(body.contains("/auth/sign_in"));
+        assert!(body.contains("href=\"/rustodon-assets/rustodon-"));
+        assert!(body.contains("<body class=\"rustodon rustodon--compact\">"));
+        assert!(body.contains("class=\"alert\" role=\"alert\""));
     }
 
     #[test]
@@ -20527,10 +20869,17 @@ mod tests {
 
     #[test]
     fn browser_settings_navigation_exposes_a_csrf_protected_logout_form() {
-        let navigation = browser_settings_navigation("csrf<&");
+        let navigation =
+            browser_settings_navigation("csrf<&", Some(SettingsSection::PostingDefaults));
         assert!(navigation.contains("method=\"post\" action=\"/auth/sign_out\""));
         assert!(navigation.contains("name=\"csrf_token\" value=\"csrf&lt;&amp;\""));
+        assert!(navigation.contains("button button--secondary"));
         assert!(navigation.contains("type=\"submit\">Log out</button>"));
+        assert!(
+            navigation
+                .contains("href=\"/settings/preferences/posting_defaults\" aria-current=\"page\"")
+        );
+        assert_eq!(navigation.matches("aria-current=\"page\"").count(), 1);
     }
 
     #[test]

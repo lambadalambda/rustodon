@@ -1,0 +1,473 @@
+:root {
+  color-scheme: dark light;
+  --background: #181820;
+  --surface: #21212c;
+  --surface-raised: #2b2b3c;
+  --border: #3a3a50;
+  --control-border: #686880;
+  --text: #f5f5f6;
+  --muted: #aaaabd;
+  --accent: #5638cc;
+  --accent-hover: #9b8af4;
+  --button-primary: #5638cc;
+  --button-primary-hover: #694ee6;
+  --secondary-hover: #3a3a50;
+  --secondary-hover-text: #fff;
+  --danger: #c8324b;
+  --danger-hover: #a9283e;
+  --focus: #9b8af4;
+  --shadow: 0 10px 32px rgb(0 0 0 / 32%);
+  font-family: Roboto, -apple-system, BlinkMacSystemFont, "Segoe UI", Oxygen, Ubuntu,
+    Cantarell, "Helvetica Neue", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  max-width: 100%;
+  min-width: 0;
+}
+
+body.rustodon {
+  min-height: 100vh;
+  background: var(--background);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.rustodon--compact {
+  display: grid;
+  place-items: center;
+  padding: 32px 20px;
+}
+
+.rustodon-page {
+  width: 100%;
+  min-width: 0;
+}
+
+.rustodon--compact .rustodon-page {
+  display: grid;
+  justify-items: center;
+  gap: 16px;
+}
+
+.rustodon-brand {
+  display: flex;
+  width: min(100%, 1060px);
+  min-width: 0;
+  margin: 0 auto;
+}
+
+.rustodon-brand__link {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  text-decoration: none;
+}
+
+.rustodon-brand__mark {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 20px;
+  font-weight: 800;
+  box-shadow: 0 4px 14px rgb(86 56 204 / 35%);
+}
+
+.rustodon-card {
+  width: min(100%, 460px);
+  padding: 32px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+h1,
+h2,
+p {
+  overflow-wrap: anywhere;
+}
+
+h1 {
+  margin: 0 0 24px;
+  font-size: 26px;
+  line-height: 1.25;
+}
+
+h2 {
+  margin: 28px 0 12px;
+  font-size: 19px;
+  line-height: 1.3;
+}
+
+p {
+  margin: 0 0 18px;
+}
+
+a {
+  color: var(--accent-hover);
+  text-underline-offset: 2px;
+}
+
+a:hover {
+  color: var(--text);
+}
+
+form {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  margin: 20px 0;
+}
+
+label,
+legend {
+  color: var(--text);
+  font-weight: 600;
+}
+
+label:has(input[type="checkbox"]) {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  font-weight: 400;
+}
+
+input:not([type="hidden"]):not([type="checkbox"]),
+select,
+textarea {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--control-border);
+  border-radius: 4px;
+  background: var(--background);
+  color: var(--text);
+  font: inherit;
+}
+
+label > input:not([type="checkbox"]),
+label > select,
+label > textarea {
+  margin-top: 6px;
+  font-weight: 400;
+}
+
+.settings-content fieldset > div {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+}
+
+textarea {
+  min-height: 112px;
+  resize: vertical;
+}
+
+select {
+  min-height: 42px;
+}
+
+input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+}
+
+input[type="file"] {
+  padding: 6px;
+}
+
+input[type="file"]::file-selector-button {
+  margin-right: 10px;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 3px;
+  background: var(--surface-raised);
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+}
+
+fieldset {
+  display: grid;
+  min-width: 0;
+  margin: 10px 0;
+  padding: 18px;
+  gap: 10px;
+  border: 1px solid var(--control-border);
+  border-radius: 6px;
+}
+
+legend {
+  padding: 0 6px;
+}
+
+button,
+.button {
+  justify-self: start;
+  min-height: 40px;
+  padding: 9px 18px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: var(--button-primary);
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  line-height: 1.2;
+  text-decoration: none;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+button:hover,
+.button:hover {
+  background: var(--button-primary-hover);
+  color: #fff;
+}
+
+.button--secondary {
+  border-color: var(--control-border);
+  background: transparent;
+  color: var(--text);
+}
+
+.button--secondary:hover {
+  background: var(--secondary-hover);
+  color: var(--secondary-hover-text);
+}
+
+.button--danger {
+  background: var(--danger);
+}
+
+.button--danger:hover {
+  background: var(--danger-hover);
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.alert {
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--danger) 65%, var(--border));
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--danger) 16%, var(--surface));
+  color: var(--text);
+}
+
+.danger-zone {
+  margin-top: 28px;
+  padding: 18px;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+}
+
+.danger-zone > :first-child {
+  margin-top: 0;
+}
+
+code,
+samp,
+pre,
+.recovery-codes {
+  max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+code,
+samp {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.authorization-code,
+.settings-content code,
+.settings-content samp,
+.recovery-codes samp {
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: var(--surface-raised);
+}
+
+.authorization-code {
+  display: block;
+  font-size: 17px;
+  text-align: center;
+}
+
+.recovery-codes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 20px;
+  padding-left: 28px;
+}
+
+.rustodon--settings .rustodon-brand {
+  padding: 32px 24px 0;
+}
+
+.settings-layout {
+  display: grid;
+  grid-template-columns: minmax(190px, 240px) minmax(0, 760px);
+  justify-content: center;
+  gap: 24px;
+  width: min(100%, 1060px);
+  margin: 0 auto;
+  padding: 16px 24px 40px;
+}
+
+.settings-sidebar,
+.settings-content {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.settings-sidebar {
+  align-self: start;
+  position: sticky;
+  top: 24px;
+  padding: 10px;
+}
+
+.settings-nav ul {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  gap: 3px;
+  list-style: none;
+}
+
+.settings-nav a {
+  display: block;
+  padding: 10px 12px;
+  border-radius: 4px;
+  color: var(--muted);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.settings-nav a:hover,
+.settings-nav a[aria-current="page"] {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.settings-nav a[aria-current="page"] {
+  box-shadow: inset 3px 0 var(--accent);
+}
+
+.settings-nav form {
+  margin: 8px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.settings-nav button {
+  width: 100%;
+  justify-self: stretch;
+}
+
+.settings-content {
+  padding: 32px;
+  box-shadow: var(--shadow);
+}
+
+.settings-content section:not(.danger-zone) {
+  padding-top: 1px;
+  border-top: 1px solid var(--border);
+}
+
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --background: #f5f5f8;
+    --surface: #fff;
+    --surface-raised: #e5e5ee;
+    --border: #c3c3d1;
+    --control-border: #7d7d92;
+    --text: #27272f;
+    --muted: #5b5b6e;
+    --accent: #5638cc;
+    --accent-hover: #4528b4;
+    --button-primary: #5638cc;
+    --button-primary-hover: #4528b4;
+    --secondary-hover: #d8d8e5;
+    --secondary-hover-text: #27272f;
+    --focus: #5638cc;
+    --shadow: 0 8px 28px rgb(39 39 47 / 14%);
+  }
+}
+
+@media (max-width: 700px) {
+  .rustodon--compact {
+    place-items: start center;
+    padding: 16px;
+  }
+
+  .rustodon--settings .rustodon-brand {
+    padding: 16px 16px 0;
+  }
+
+  .rustodon-card,
+  .settings-content {
+    padding: 22px 18px;
+  }
+
+  .settings-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
+    padding: 16px;
+  }
+
+  .settings-sidebar {
+    position: static;
+  }
+
+  .settings-nav ul {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .recovery-codes {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
