@@ -13515,7 +13515,7 @@ async fn streaming(
     uri: Uri,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
-    let auth_headers = streaming_auth_headers(&headers, query.as_deref());
+    let (auth_headers, websocket_protocol) = streaming_credentials(&headers, query.as_deref());
     let authenticated = match state
         .authenticator
         .authenticate(&auth_headers, NO_SCOPE)
@@ -13554,6 +13554,11 @@ async fn streaming(
     let scopes = authenticated.scopes().clone();
     let initial_stream = streaming_query_parameter(query.as_deref(), "stream")
         .or_else(|| streaming_path_stream(uri.path()).map(str::to_owned));
+    let websocket = if let Some(protocol) = websocket_protocol {
+        websocket.protocols([protocol])
+    } else {
+        websocket
+    };
     websocket.on_upgrade(move |socket| {
         streaming_connection(
             socket,
@@ -13569,28 +13574,30 @@ async fn streaming(
     })
 }
 
-fn streaming_auth_headers(headers: &HeaderMap, query: Option<&str>) -> HeaderMap {
+fn streaming_credentials(headers: &HeaderMap, query: Option<&str>) -> (HeaderMap, Option<String>) {
     if headers.contains_key(AUTHORIZATION) {
-        return headers.clone();
+        return (headers.clone(), None);
     }
-    let token = streaming_query_parameter(query, "access_token")
-        .filter(|token| !token.is_empty())
-        .or_else(|| {
-            headers
-                .get(SEC_WEBSOCKET_PROTOCOL)
-                .and_then(|value| value.to_str().ok())
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-        });
-    let Some(token) = token else {
-        return headers.clone();
+    let query_token =
+        streaming_query_parameter(query, "access_token").filter(|token| !token.is_empty());
+    let protocol = if query_token.is_none() {
+        headers
+            .get(SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    let Some(token) = query_token.or_else(|| protocol.clone()) else {
+        return (headers.clone(), None);
     };
     let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}")) else {
-        return headers.clone();
+        return (headers.clone(), None);
     };
     let mut headers = headers.clone();
     headers.insert(AUTHORIZATION, value);
-    headers
+    (headers, protocol)
 }
 
 fn streaming_query_parameter(query: Option<&str>, name: &str) -> Option<String> {
@@ -20342,23 +20349,29 @@ mod tests {
             SEC_WEBSOCKET_PROTOCOL,
             HeaderValue::from_static("protocol-token"),
         );
-        assert_eq!(
-            streaming_auth_headers(&subprotocol, None)[AUTHORIZATION],
-            "Bearer protocol-token"
-        );
+        let (protocol_headers, protocol) = streaming_credentials(&subprotocol, None);
+        assert_eq!(protocol_headers[AUTHORIZATION], "Bearer protocol-token");
+        assert_eq!(protocol.as_deref(), Some("protocol-token"));
 
-        let query = streaming_auth_headers(&subprotocol, Some("access_token=query%2Btoken"));
-        assert_eq!(query[AUTHORIZATION], "Bearer query+token");
+        let (query_headers, query_protocol) =
+            streaming_credentials(&subprotocol, Some("access_token=query%2Btoken"));
+        assert_eq!(query_headers[AUTHORIZATION], "Bearer query+token");
+        assert_eq!(query_protocol, None);
+
+        let (empty_query_headers, empty_query_protocol) =
+            streaming_credentials(&subprotocol, Some("access_token="));
+        assert_eq!(empty_query_headers[AUTHORIZATION], "Bearer protocol-token");
+        assert_eq!(empty_query_protocol.as_deref(), Some("protocol-token"));
 
         let mut explicit = subprotocol.clone();
         explicit.insert(
             AUTHORIZATION,
             HeaderValue::from_static("Bearer explicit-token"),
         );
-        assert_eq!(
-            streaming_auth_headers(&explicit, Some("access_token=query-token"))[AUTHORIZATION],
-            "Bearer explicit-token"
-        );
+        let (explicit_headers, explicit_protocol) =
+            streaming_credentials(&explicit, Some("access_token=query-token"));
+        assert_eq!(explicit_headers[AUTHORIZATION], "Bearer explicit-token");
+        assert_eq!(explicit_protocol, None);
     }
 
     #[test]

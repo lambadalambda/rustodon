@@ -1183,6 +1183,13 @@ EOF
     cargo test --locked --test operational_schema \
       stream_cursor_does_not_skip_inflight_commits \
       -- --ignored --exact --nocapture
+  require_ignored_tests exact --test streaming \
+    websocket_protocol_token_is_echoed_in_handshake
+  RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
+  RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+    cargo test --locked --test streaming \
+      websocket_protocol_token_is_echoed_in_handshake \
+      -- --ignored --exact --nocapture
   RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
   RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
     cargo test --locked --test streaming \

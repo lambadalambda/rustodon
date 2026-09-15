@@ -33,3 +33,36 @@ The Mastodon frontend repeatedly fails to connect to the Rustodon WebSocket endp
 - Bearer-header and query-token handshakes already upgrade successfully. The
   failure is therefore WebSocket subprotocol negotiation, not Caddy routing or
   general token validity.
+
+## Implementation
+
+- Added a focused handshake regression against the frontend's public
+  `/api/v1/streaming/` route using the fixture OAuth token as the sole requested
+  WebSocket protocol. The test subscribes to the user stream and receives an
+  expected event over that connection, then verifies a query-token control
+  upgrades without a `Sec-WebSocket-Protocol` response.
+- A single streaming credential-selection helper now returns both the synthesized
+  authentication headers and the optional protocol to select, keeping explicit
+  Bearer > non-empty query token > protocol-token precedence atomic. The handler
+  selects that exact offered token only when protocol-token authentication won;
+  repeated authentication, scopes, token identity, and stream authorization are
+  unchanged.
+- Registered the focused regression in the operational-schema integration lane;
+  the issue remains open pending public deployment/browser verification.
+
+## Verification
+
+- Red: the focused ignored fixture test failed before the product change with
+  `Protocol(SecWebSocketSubProtocolError(NoSubProtocol))`, proving the HTTP 101
+  response omitted the protocol expected by the client.
+- Green: `cargo test --locked --test streaming
+  websocket_protocol_token_is_echoed_in_handshake -- --ignored --exact
+  --nocapture` passed in a disposable Linux/PostgreSQL fixture (`1 passed`),
+  including a protocol-authenticated subscription/event delivery and a
+  query-token upgrade with no selected protocol.
+- `cargo test --locked --lib
+  web::tests::streaming_authentication_accepts_pinned_token_locations -- --exact
+  --nocapture` passed in Linux (`1 passed`), asserting explicit Bearer > non-empty
+  query > protocol precedence, empty-query fallback, and no selected protocol
+  when a distinct offered protocol loses to query authentication.
+- `cargo fmt --check` and `git diff --check` passed.

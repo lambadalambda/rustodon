@@ -14,7 +14,10 @@ use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time::{Duration, timeout};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Message, client::IntoClientRequest, http::header::SEC_WEBSOCKET_PROTOCOL},
+};
 use url::Url;
 
 const ACCESS_TOKEN: &str = "fixture-bearer-token-v4-6-5";
@@ -27,6 +30,121 @@ const REVOKED_STREAM_TOKEN: &str = "fixture-stream-revoked-token-v4-6-5";
 const ACTIVE_STREAM_TOKEN: &str = "fixture-stream-active-token-v4-6-5";
 const REVOKED_STREAM_TOKEN_ID: i64 = 9_000_000_001;
 const ACTIVE_STREAM_TOKEN_ID: i64 = 9_000_000_002;
+
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+#[allow(clippy::too_many_lines)]
+async fn websocket_protocol_token_is_echoed_in_handshake() -> Result<(), Box<dyn std::error::Error>>
+{
+    let read_url = std::env::var("RUSTODON_OPERATIONAL_DATABASE_URL")?;
+    let write_url = std::env::var("RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL")?;
+    let repository = Repository::connect(&read_url).await?;
+    let read_pool = PgPool::connect(&read_url).await?;
+    let write_pool = PgPool::connect(&write_url).await?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let media_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("streaming-media-protocol-{}", std::process::id()));
+    std::fs::create_dir_all(&media_root)?;
+    let state = WebState::new(
+        repository,
+        Url::parse(ORIGIN)?,
+        "fixture-v4-6-5.rustodon.invalid",
+        "/system",
+        media_root.clone(),
+        InstanceRuntimeConfig {
+            domain: "fixture-v4-6-5.rustodon.invalid".to_owned(),
+            version: "4.6.5".to_owned(),
+            source_url: "https://github.com/mastodon/mastodon".to_owned(),
+            streaming_api: "wss://fixture-v4-6-5.rustodon.invalid".to_owned(),
+            vapid_public_key: None,
+            thumbnail_url: String::new(),
+            thumbnail_description: String::new(),
+            thumbnail_blurhash: None,
+            thumbnail_versions: None,
+            icons: Vec::new(),
+            languages: vec!["en".to_owned()],
+            active_month: 0,
+            active_halfyear: 0,
+            translation_enabled: false,
+            limited_federation: false,
+            single_user_mode: false,
+            terms_of_service_url: None,
+            sso_signup_url: None,
+            wrapstodon: None,
+        },
+        Vec::new(),
+        vec![format!("127.0.0.1:{}", address.port())],
+    )?
+    .with_queue(Queue::new(read_pool));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router(state))
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    let mut request = format!("ws://{address}/api/v1/streaming/").into_client_request()?;
+    request
+        .headers_mut()
+        .insert(SEC_WEBSOCKET_PROTOCOL, ACCESS_TOKEN.parse()?);
+    let (mut socket, response) = connect_async(request).await?;
+    assert_eq!(
+        response
+            .headers()
+            .get(SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|value| value.to_str().ok()),
+        Some(ACCESS_TOKEN)
+    );
+
+    socket
+        .send(Message::Text(
+            json!({"type": "subscribe", "stream": "user"})
+                .to_string()
+                .into(),
+        ))
+        .await?;
+    let logical_key = event_logical_key(ACCOUNT_ID, "delete", 42, Utc::now().timestamp_micros());
+    let mut transaction = write_pool.begin().await?;
+    let event_id =
+        record_stream_event_in(&mut transaction, ACCOUNT_ID, "delete", 42, &logical_key).await?;
+    transaction.commit().await?;
+    let message = timeout(Duration::from_secs(5), socket.next())
+        .await?
+        .ok_or_else(|| std::io::Error::other("protocol-token stream closed before event"))??;
+    let Message::Text(message) = message else {
+        return Err(
+            std::io::Error::other("protocol-token stream returned a non-text event").into(),
+        );
+    };
+    let envelope: serde_json::Value = serde_json::from_str(message.as_ref())?;
+    assert_eq!(envelope["stream"], json!(["user"]));
+    assert_eq!(envelope["event"], "delete");
+    assert_eq!(envelope["payload"], "42");
+    socket.close(None).await?;
+
+    let query_endpoint = format!("ws://{address}/api/v1/streaming/?access_token={ACCESS_TOKEN}");
+    let (mut query_socket, query_response) = connect_async(query_endpoint).await?;
+    assert_eq!(query_response.status().as_u16(), 101);
+    assert!(
+        !query_response
+            .headers()
+            .contains_key(SEC_WEBSOCKET_PROTOCOL)
+    );
+    query_socket.close(None).await?;
+
+    sqlx::query("DELETE FROM rustodon.outbox_events WHERE id = $1")
+        .bind(event_id)
+        .execute(&write_pool)
+        .await?;
+    let _ = shutdown_tx.send(());
+    server.await??;
+    std::fs::remove_dir_all(media_root)?;
+    Ok(())
+}
 
 #[tokio::test]
 #[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
