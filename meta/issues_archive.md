@@ -93,3 +93,4 @@
 - [x] [Implement the test audit action plan](issues/implement-test-audit-plan.md)
 - [x] [Refresh public documentation and publish the repository](issues/refresh-public-documentation-and-publish-repository.md)
 - [x] [Make public documentation environment-neutral](issues/make-public-documentation-environment-neutral.md)
+- [x] [Style Rustodon-owned HTML surfaces](issues/style-rustodon-owned-html-surfaces.md)
