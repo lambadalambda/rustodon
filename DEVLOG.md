@@ -2,6 +2,50 @@
 
 ## 2026-09-16
 
+- Added all nine timeline WebSocket subscriptions used by the bundled Mastodon
+  frontend, including parameterized hashtag/list envelopes, exact raw hashtag wire
+  casing, compatible subscription errors, REST-selector-backed public/tag/list
+  membership filtering, and create/edit/delete projection from audience-independent
+  transactional events. Each connection captures its committed cursor before any
+  subscriptions; the first authorized subscription retains that lower boundary to
+  close the initial socket/subscribe race, while later multiplexed subscriptions use
+  a fresh per-command cursor so they do not prepend creates already represented by
+  their REST pages. Each authorized timeline subscription captures a second upper
+  cursor after authorization and replays through it, so creates racing the actual
+  subscribe boundary are not lost. Replay retains bounded historical suffixes of up
+  to 128 route-relevant deletes and 128 non-creating membership/edit transitions,
+  while returning every event in the finite subscribe handoff window. Historical
+  wire-level creates are omitted, including `status.update` route entries;
+  idempotent edits and actual deletes still replay across reconnects to close
+  disconnect gaps. Structural route filtering happens
+  before these per-class limits, so unrelated public, hashtag, or list traffic cannot
+  displace a recoverable event. The subscription baseline then skips those same rows
+  during live polling. The bundled frontend's ID-based timeline/status reducers make
+  repeated creates and updates visibly idempotent; this replay is required for hashtag
+  timelines, which have no REST `fillGaps` hook. Lifecycle events retain authoritative
+  structural public, hashtag, locality, media, language, canonical tag, and exact list
+  routing facts,
+  including hard deletion, suspension, domain moderation, and purge transitions.
+  Before-snapshot membership stays authoritative across moderation changes, while
+  suspension and remote hard deletion fan out user-stream deletes to followers,
+  followed-tag viewers, and non-silent mention recipients before availability or
+  relationship rows disappear. Stream polling is lock-free while writers remain
+  serialized. Large lifecycle and purge transactions stage immutable stream events
+  as transaction-private, non-dispatchable outbox rows in bounded Rust batches while
+  collecting pre-delete routing facts, then take the global writer-order lock only
+  for their deterministic terminal `INSERT ... SELECT` immediately before commit;
+  staging rows are deleted in that same transaction. Ordinary status creates, edits,
+  boosts, and remote-media reconciliations likewise collect or stage their global and
+  recipient fan-out before taking the ordering lock at the terminal flush. Retention
+  pruning does not take that lock, and dedicated partial indexes keep stream history
+  separate from normal pending outbox dispatch.
+- Added parser/envelope/scope and all-nine delete-routing unit coverage, pinned
+  frontend/server protocol and reducer-idempotence contracts, restored-WebSocket
+  fresh-replay/race/reconnect coverage, and isolated operational replay-bound,
+  retention/contention, commit-order, and index regressions. Restored PostgreSQL,
+  worker, WebSocket, and browser fixture lanes are deferred to the final combined
+  Podman sweep.
+
 - Added insert-only self-healing for missing `account_stats` rows using the existing
   reconciliation rules. Writer-backed web startup repairs one bounded account before
   serving reads and attempts at most 24 additional one-account background batches;

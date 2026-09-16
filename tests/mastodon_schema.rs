@@ -8,7 +8,7 @@ use rustodon::jobs::{
     ACCOUNT_DELETION_DELAY_DAYS, ACTIVITYPUB_ACCOUNT_DELETE_JOB_KIND,
     ACTIVITYPUB_ACCOUNT_UPDATE_JOB_KIND, ACTIVITYPUB_DELIVERY_JOB_KIND,
     ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND, JobSpec, Lane, MASTODON_ACCOUNT_PURGE_JOB_KIND,
-    MASTODON_DOMAIN_BLOCK_JOB_KIND, NOTIFICATION_CREATE_JOB_KIND, Queue,
+    MASTODON_DOMAIN_BLOCK_JOB_KIND, NOTIFICATION_CREATE_JOB_KIND, Queue, record_stream_event_in,
 };
 use rustodon::mastodon::rest::{
     AccountListKind, AccountListOptions, AccountStatusesOptions, FollowCollectionKind,
@@ -4950,7 +4950,7 @@ async fn write_repository_streams_reblog_lifecycle_to_visible_followers()
     .bind(boost_id.to_string())
     .fetch_all(&pool)
     .await?;
-    assert_eq!(update_recipients, vec![ALICE, API_MODERATOR]);
+    assert_eq!(update_recipients, vec![0, ALICE, API_MODERATOR]);
 
     let removed = writer
         .set_reblog(&authenticated, PUBLIC_STATUS, None, false)
@@ -4990,7 +4990,7 @@ async fn write_repository_streams_reblog_lifecycle_to_visible_followers()
     .bind(boost_id.to_string())
     .fetch_all(&pool)
     .await?;
-    assert_eq!(delete_recipients, vec![ALICE, MODERATOR, API_MODERATOR]);
+    assert_eq!(delete_recipients, vec![0, ALICE, MODERATOR, API_MODERATOR]);
 
     let conversation_id: i64 = sqlx::query_scalar(
         "SELECT conversation_id FROM statuses WHERE id = $1 AND conversation_id IS NOT NULL",
@@ -5180,9 +5180,9 @@ async fn write_repository_deletes_reblog_wrappers_from_user_stream() -> Result<(
         .fetch_all(&pool)
         .await?;
         let expected = if *status_id == original.status_id {
-            vec![ALICE, MODERATOR, NEWBIE, API_MODERATOR]
+            vec![0, ALICE, MODERATOR, NEWBIE, API_MODERATOR]
         } else {
-            vec![ALICE, MODERATOR, API_MODERATOR]
+            vec![0, ALICE, MODERATOR, API_MODERATOR]
         };
         assert_eq!(recipients, expected);
     }
@@ -7542,7 +7542,7 @@ async fn write_repository_streams_limited_and_direct_mentions_to_followers()
             .bind(outcome.status_id.to_string())
             .fetch_all(&pool)
             .await?;
-            assert_eq!(recipients, vec![ALICE, MODERATOR]);
+            assert_eq!(recipients, vec![0, ALICE, MODERATOR]);
         }
 
         let silent_status = writer
@@ -7589,7 +7589,7 @@ async fn write_repository_streams_limited_and_direct_mentions_to_followers()
         .bind(silent_status.status_id.to_string())
         .fetch_all(&pool)
         .await?;
-        assert_eq!(silent_recipients, vec![ALICE, MODERATOR]);
+        assert_eq!(silent_recipients, vec![0, ALICE, MODERATOR]);
 
         sqlx::query("UPDATE follows SET languages = ARRAY['en'] WHERE id = 8006")
             .execute(&pool)
@@ -7620,7 +7620,7 @@ async fn write_repository_streams_limited_and_direct_mentions_to_followers()
         .bind(french.status_id.to_string())
         .fetch_all(&pool)
         .await?;
-        assert_eq!(french_recipients, vec![ALICE, API_MODERATOR]);
+        assert_eq!(french_recipients, vec![0, ALICE, API_MODERATOR]);
         writer
             .delete_status(&authenticated, french.status_id, false)
             .await?;
@@ -7638,7 +7638,7 @@ async fn write_repository_streams_limited_and_direct_mentions_to_followers()
         .await?;
         assert_eq!(
             french_delete_recipients,
-            vec![ALICE, MODERATOR, API_MODERATOR]
+            vec![0, ALICE, MODERATOR, API_MODERATOR]
         );
 
         sqlx::query("DELETE FROM mutes WHERE account_id = $1 AND target_account_id = $2")
@@ -7682,7 +7682,7 @@ async fn write_repository_streams_limited_and_direct_mentions_to_followers()
         .bind(muted.status_id.to_string())
         .fetch_all(&pool)
         .await?;
-        assert_eq!(muted_recipients, vec![ALICE, API_MODERATOR]);
+        assert_eq!(muted_recipients, vec![0, ALICE, API_MODERATOR]);
         Ok(())
     }
     .await;
@@ -7776,6 +7776,305 @@ async fn write_repository_streams_limited_and_direct_mentions_to_followers()
     .execute(&pool)
     .await?;
     result
+}
+
+#[tokio::test]
+#[ignore = "starts a restored Mastodon PostgreSQL fixture through the Mise task"]
+#[allow(clippy::too_many_lines)]
+async fn high_fanout_status_write_takes_stream_order_lock_only_at_terminal_flush()
+-> Result<(), Box<dyn Error>> {
+    const FANOUT: i64 = 300;
+    const ACCOUNT_BASE: i64 = 900_000_000_100_000_000;
+    const USER_BASE: i64 = 900_000_000_200_000_000;
+    const FOLLOW_BASE: i64 = 900_000_000_300_000_000;
+    const UNRELATED_OBJECT: i64 = 900_000_000_400_000_000;
+
+    let database_url = database_url();
+    let owner_url = std::env::var("RUSTODON_MASTODON_OWNER_DATABASE_URL")
+        .expect("the Podman fixture task must provide RUSTODON_MASTODON_OWNER_DATABASE_URL");
+    let pool = sqlx::PgPool::connect(&owner_url).await?;
+    let mut migration_connection = PgConnection::connect(&owner_url).await?;
+    migrate(&mut migration_connection).await?;
+    let writer = WriteRepository::connect(&owner_url).await?;
+    let authenticator = BearerAuthenticator::new(Repository::connect(&database_url).await?);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_static("Bearer fixture-bearer-token-v4-6-5"),
+    );
+    let authenticated = authenticator.authenticate(&headers, WRITE_STATUSES).await?;
+    let queue = Queue::new(pool.clone());
+    let cursor = queue.stream_cursor().await?;
+    let before_stats: Value =
+        sqlx::query_scalar("SELECT to_jsonb(stats) FROM account_stats stats WHERE account_id = $1")
+            .bind(ALICE)
+            .fetch_one(&pool)
+            .await?;
+
+    sqlx::query(
+        "DROP TRIGGER IF EXISTS block_staged_status_stream_for_test ON rustodon.outbox_events",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("DROP FUNCTION IF EXISTS rustodon.block_staged_status_stream_for_test()")
+        .execute(&pool)
+        .await?;
+    sqlx::query("DROP TABLE IF EXISTS rustodon.status_stream_fanout_blocker")
+        .execute(&pool)
+        .await?;
+    sqlx::query("CREATE TABLE rustodon.status_stream_fanout_blocker (id integer PRIMARY KEY)")
+        .execute(&pool)
+        .await?;
+    sqlx::query("INSERT INTO rustodon.status_stream_fanout_blocker (id) VALUES (1)")
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "CREATE FUNCTION rustodon.block_staged_status_stream_for_test() \
+         RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+           IF NEW.kind = 'rustodon.mastodon.stream_event.staged' THEN \
+             PERFORM blocker.id FROM rustodon.status_stream_fanout_blocker blocker \
+              WHERE blocker.id = 1 FOR UPDATE; \
+           END IF; \
+           RETURN NEW; \
+         END $$",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER block_staged_status_stream_for_test \
+         BEFORE INSERT ON rustodon.outbox_events FOR EACH ROW \
+         EXECUTE FUNCTION rustodon.block_staged_status_stream_for_test()",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO accounts (id, username, created_at, updated_at) \
+         SELECT $1 + n, 'stream_order_follower_' || n::text, \
+                clock_timestamp(), clock_timestamp() \
+           FROM generate_series(0, $2 - 1) generated(n)",
+    )
+    .bind(ACCOUNT_BASE)
+    .bind(FANOUT)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO users \
+             (id, account_id, email, encrypted_password, approved, confirmed_at, \
+              created_at, updated_at) \
+         SELECT $1 + n, $2 + n, \
+                'stream-order-follower-' || n::text || '@fixture.invalid', '', true, \
+                clock_timestamp(), clock_timestamp(), clock_timestamp() \
+           FROM generate_series(0, $3 - 1) generated(n)",
+    )
+    .bind(USER_BASE)
+    .bind(ACCOUNT_BASE)
+    .bind(FANOUT)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO follows \
+             (id, account_id, target_account_id, show_reblogs, notify, created_at, updated_at) \
+         SELECT $1 + n, $2 + n, $3, true, false, clock_timestamp(), clock_timestamp() \
+           FROM generate_series(0, $4 - 1) generated(n)",
+    )
+    .bind(FOLLOW_BASE)
+    .bind(ACCOUNT_BASE)
+    .bind(ALICE)
+    .bind(FANOUT)
+    .execute(&pool)
+    .await?;
+
+    let unrelated_key = format!("stream:ordinary-status-contention:{}", std::process::id());
+    sqlx::query("DELETE FROM rustodon.outbox_events WHERE logical_key = $1")
+        .bind(&unrelated_key)
+        .execute(&pool)
+        .await?;
+    let mut blocker = pool.begin().await?;
+    sqlx::query("SELECT id FROM rustodon.status_stream_fanout_blocker WHERE id = 1 FOR UPDATE")
+        .fetch_one(&mut *blocker)
+        .await?;
+
+    let status_write = {
+        let writer = writer.clone();
+        let authenticated = authenticated.clone();
+        tokio::spawn(async move {
+            writer
+                .create_status(
+                    &authenticated,
+                    "high fanout stream ordering fixture",
+                    &[],
+                    None,
+                    Some(false),
+                    Some("public"),
+                    Some("en"),
+                    None,
+                    None,
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS ( \
+                   SELECT 1 FROM pg_stat_activity \
+                    WHERE datname = current_database() AND pid <> pg_backend_pid() \
+                      AND query LIKE 'INSERT INTO rustodon.outbox_events%' \
+                      AND wait_event_type = 'Lock')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(false);
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| std::io::Error::other("high-fanout status write did not reach staging"))?;
+    assert!(!status_write.is_finished());
+
+    sqlx::query("DELETE FROM follows WHERE id = $1")
+        .bind(FOLLOW_BASE + FANOUT - 1)
+        .execute(&pool)
+        .await?;
+    let unrelated_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut transaction = pool.begin().await?;
+        let id = record_stream_event_in(
+            &mut transaction,
+            ALICE,
+            "delete",
+            UNRELATED_OBJECT,
+            &unrelated_key,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok::<i64, Box<dyn Error>>(id)
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::other(
+            "high-fanout status write held the global stream ordering lock while staging",
+        )
+    })??;
+    assert!(!status_write.is_finished());
+    blocker.rollback().await?;
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), status_write)
+        .await
+        .map_err(|_| std::io::Error::other("high-fanout status write did not finish"))???;
+    let status_events = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT id, (payload ->> 'account_id')::bigint \
+           FROM rustodon.outbox_events \
+          WHERE kind = $1 AND payload ->> 'event' = 'update' \
+            AND payload ->> 'object_id' = $2 \
+          ORDER BY id",
+    )
+    .bind(STREAM_EVENT_KIND)
+    .bind(outcome.status_id.to_string())
+    .fetch_all(&pool)
+    .await?;
+    assert!(!status_events.is_empty());
+    assert!(
+        status_events.iter().all(|(id, _)| unrelated_id < *id),
+        "terminal status flush must allocate visible IDs after the unrelated writer"
+    );
+    assert_eq!(status_events.first().map(|event| event.1), Some(0));
+    assert!(status_events[1..].iter().all(|event| event.1 != 0));
+    let recipient_ids = status_events[1..]
+        .iter()
+        .map(|event| event.1)
+        .collect::<Vec<_>>();
+    assert!(recipient_ids.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_eq!(
+        recipient_ids
+            .iter()
+            .filter(|id| (ACCOUNT_BASE..ACCOUNT_BASE + FANOUT).contains(id))
+            .count(),
+        FANOUT as usize
+    );
+    assert!(recipient_ids.contains(&(ACCOUNT_BASE + FANOUT - 1)));
+
+    let observed_ids = queue
+        .stream_events_after(cursor, 1_000)
+        .await?
+        .into_iter()
+        .filter(|event| event.object_id == UNRELATED_OBJECT || event.object_id == outcome.status_id)
+        .map(|event| event.id)
+        .collect::<Vec<_>>();
+    let mut expected_ids = vec![unrelated_id];
+    expected_ids.extend(status_events.iter().map(|event| event.0));
+    assert_eq!(observed_ids, expected_ids);
+
+    sqlx::query("DROP TRIGGER block_staged_status_stream_for_test ON rustodon.outbox_events")
+        .execute(&pool)
+        .await?;
+    sqlx::query("DROP FUNCTION rustodon.block_staged_status_stream_for_test()")
+        .execute(&pool)
+        .await?;
+    sqlx::query("DROP TABLE rustodon.status_stream_fanout_blocker")
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM rustodon.outbox_events WHERE logical_key = $1")
+        .bind(&unrelated_key)
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "DELETE FROM rustodon.outbox_events \
+          WHERE payload ->> 'object_id' = $1 \
+             OR payload -> 'arguments' ->> 'status_id' = $1",
+    )
+    .bind(outcome.status_id.to_string())
+    .execute(&pool)
+    .await?;
+    let conversation_id =
+        sqlx::query_scalar::<_, i64>("SELECT conversation_id FROM statuses WHERE id = $1")
+            .bind(outcome.status_id)
+            .fetch_optional(&pool)
+            .await?;
+    sqlx::query("DELETE FROM statuses WHERE id = $1")
+        .bind(outcome.status_id)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM status_stats WHERE status_id = $1")
+        .bind(outcome.status_id)
+        .execute(&pool)
+        .await?;
+    if let Some(conversation_id) = conversation_id {
+        sqlx::query("DELETE FROM conversations WHERE id = $1")
+            .bind(conversation_id)
+            .execute(&pool)
+            .await?;
+    }
+    sqlx::query("DELETE FROM follows WHERE id >= $1 AND id < $2")
+        .bind(FOLLOW_BASE)
+        .bind(FOLLOW_BASE + FANOUT)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM users WHERE id >= $1 AND id < $2")
+        .bind(USER_BASE)
+        .bind(USER_BASE + FANOUT)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM accounts WHERE id >= $1 AND id < $2")
+        .bind(ACCOUNT_BASE)
+        .bind(ACCOUNT_BASE + FANOUT)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM account_stats WHERE account_id = $1")
+        .bind(ALICE)
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO account_stats SELECT * FROM jsonb_populate_record(NULL::account_stats, $1)",
+    )
+    .bind(before_stats)
+    .execute(&pool)
+    .await?;
+    Ok(())
 }
 
 #[tokio::test]

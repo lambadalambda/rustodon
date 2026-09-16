@@ -32,7 +32,7 @@ use rustodon::jobs::{
     MASTODON_ACCOUNT_PURGE_JOB_KIND, MASTODON_DOMAIN_BLOCK_JOB_KIND,
     MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND, NOTIFICATION_CREATE_JOB_KIND,
     NOTIFICATION_UNFILTER_JOB_KIND, Queue, RetryResult, WorkerHeartbeat, enqueue_in,
-    record_outbox_in, record_outbox_once_in,
+    record_outbox_in, record_outbox_once_in, record_stream_event_in,
 };
 use rustodon::mail::{MailConfig, REPORT_JOB_KIND};
 use rustodon::mastodon::rest::InstanceRuntimeConfig;
@@ -8077,7 +8077,10 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail_and_streams_s
     .await?;
     assert_eq!(
         streamed_updates,
-        vec![(BOOSTER, "status.update".to_owned())],
+        vec![
+            (0, "status.update".to_owned()),
+            (BOOSTER, "status.update".to_owned()),
+        ],
         "successful media installation must send the status audience a frontend-compatible update",
     );
     let boost_recipient_updates = sqlx::query_as::<_, (i64, String)>(
@@ -10727,15 +10730,118 @@ async fn domain_purge_job_removes_remote_accounts_and_emoji()
             Some(config),
         )?;
         let executor = WorkerExecutor::new(queue.clone(), handlers, 1, 1)?;
-        assert!(
-            executor
+        let stream_cursor = queue.stream_cursor().await?;
+        let unrelated_stream_key = format!(
+            "stream:domain-purge-contention:{}",
+            std::process::id()
+        );
+        sqlx::query("DELETE FROM rustodon.outbox_events WHERE kind = $1 AND logical_key = $2")
+            .bind(STREAM_EVENT_KIND)
+            .bind(&unrelated_stream_key)
+            .execute(&writer_pool)
+            .await?;
+        let mut emoji_blocker = writer_pool.begin().await?;
+        sqlx::query("SELECT id FROM custom_emojis WHERE id = $1 FOR UPDATE")
+            .bind(EMOJI)
+            .fetch_one(&mut *emoji_blocker)
+            .await?;
+        let purge_executor = executor.clone();
+        let purge = tokio::spawn(async move {
+            purge_executor
                 .process_one(
                     "domain-purge-worker",
                     &[Lane::Maintenance],
                     Duration::seconds(30),
                 )
-                .await?
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM pg_stat_activity
+                          WHERE query LIKE 'DELETE FROM custom_emojis%'
+                            AND wait_event_type = 'Lock'
+                     )",
+                )
+                .fetch_one(&writer_pool)
+                .await
+                .unwrap_or(false);
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .map_err(|_| std::io::Error::other("domain purge did not block on custom emoji"))?;
+        assert!(!purge.is_finished(), "domain purge unexpectedly completed");
+
+        let unrelated_stream_id =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut transaction = writer_pool.begin().await?;
+            let id = record_stream_event_in(
+                &mut transaction,
+                LOCAL_ACCOUNT,
+                "delete",
+                900_000_000_000_000_060,
+                &unrelated_stream_key,
+            )
+            .await?;
+            transaction.commit().await?;
+            Ok::<i64, Box<dyn std::error::Error>>(id)
+        })
+        .await
+        .map_err(|_| {
+            std::io::Error::other(
+                "late-blocked domain purge held the global stream writer-order lock",
+            )
+        })??;
+        assert!(!purge.is_finished(), "domain purge escaped the emoji lock");
+        emoji_blocker.rollback().await?;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), purge)
+                .await
+                .map_err(|_| std::io::Error::other("domain purge did not finish"))???
         );
+        let purge_stream_ids = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM rustodon.outbox_events
+              WHERE kind = $1 AND id > $2
+                AND (payload ->> 'object_id')::bigint = $3
+              ORDER BY id",
+        )
+        .bind(STREAM_EVENT_KIND)
+        .bind(stream_cursor)
+        .bind(STATUS)
+        .fetch_all(&writer_pool)
+        .await?;
+        assert!(
+            !purge_stream_ids.is_empty(),
+            "domain purge emitted no retained status lifecycle event"
+        );
+        assert!(
+            purge_stream_ids
+                .iter()
+                .all(|event_id| unrelated_stream_id < *event_id),
+            "terminal lifecycle flush must preserve commit-visible stream order"
+        );
+        let polled_ids = queue
+            .stream_events_after(stream_cursor, 100)
+            .await?
+            .into_iter()
+            .map(|event| event.id)
+            .filter(|event_id| {
+                *event_id == unrelated_stream_id || purge_stream_ids.contains(event_id)
+            })
+            .collect::<Vec<_>>();
+        let mut expected_ids = vec![unrelated_stream_id];
+        expected_ids.extend_from_slice(&purge_stream_ids);
+        assert_eq!(polled_ids, expected_ids);
+        sqlx::query("DELETE FROM rustodon.outbox_events WHERE kind = $1 AND logical_key = $2")
+            .bind(STREAM_EVENT_KIND)
+            .bind(&unrelated_stream_key)
+            .execute(&writer_pool)
+            .await?;
         let job_error = sqlx::query_scalar::<_, Option<String>>(
             "SELECT last_error FROM rustodon.durable_jobs
               WHERE logical_key = $1",
@@ -10823,13 +10929,32 @@ async fn domain_purge_job_removes_remote_accounts_and_emoji()
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM rustodon.outbox_events
-                  WHERE kind = $1 AND payload ->> 'object_id' = $2",
+                  WHERE kind = $1 AND payload ->> 'object_id' = $2
+                    AND payload ->> 'account_id' = '0'
+                    AND payload ->> 'event' = 'delete'
+                    AND payload -> 'before' IS NOT NULL",
             )
             .bind(STREAM_EVENT_KIND)
             .bind(STATUS.to_string())
             .fetch_one(&writer_pool)
             .await?,
-            0
+            1,
+            "domain purge must retain one authoritative global delete snapshot"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM rustodon.outbox_events
+                  WHERE kind = $1 AND payload ->> 'object_id' = $2
+                    AND payload ->> 'account_id' = $3
+                    AND payload ->> 'event' = 'delete'",
+            )
+            .bind(STREAM_EVENT_KIND)
+            .bind(STATUS.to_string())
+            .bind(LOCAL_ACCOUNT.to_string())
+            .fetch_one(&writer_pool)
+            .await?,
+            1,
+            "remote hard deletion must notify the local follower before removing follows"
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(

@@ -3,7 +3,7 @@ use std::fmt::{self, Write};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection, Postgres, Row, Transaction};
 
-pub const CURRENT_VERSION: i64 = 3;
+pub const CURRENT_VERSION: i64 = 4;
 
 const BOOTSTRAP_SQL: &str = "CREATE SCHEMA rustodon; \
 CREATE TABLE rustodon.schema_migrations ( \
@@ -18,6 +18,7 @@ REVOKE ALL ON TABLE rustodon.schema_migrations FROM PUBLIC";
 const MIGRATION_1_SQL: &str = include_str!("../migrations/rustodon/0001_operational.sql");
 const MIGRATION_2_SQL: &str = include_str!("../migrations/rustodon/0002_rate_limit_windows.sql");
 const MIGRATION_3_SQL: &str = include_str!("../migrations/rustodon/0003_remote_fetch_leases.sql");
+const MIGRATION_4_SQL: &str = include_str!("../migrations/rustodon/0004_stream_outbox_indexes.sql");
 const TABLES: &[&str] = &[
     "domain_health",
     "durable_jobs",
@@ -47,6 +48,8 @@ const INDEXES: &[&str] = &[
     "outbox_events_logical_key_idx",
     "outbox_events_pending_idx",
     "outbox_events_pkey",
+    "outbox_events_stream_created_at_idx",
+    "outbox_events_stream_id_idx",
     "rate_limit_windows_expires_idx",
     "rate_limit_windows_pkey",
     "remote_fetch_leases_expires_idx",
@@ -54,8 +57,8 @@ const INDEXES: &[&str] = &[
     "schema_migrations_pkey",
 ];
 const EXPECTED_CATALOG_SHA256: [u8; 32] = [
-    0x7c, 0x12, 0x0a, 0x36, 0x70, 0x94, 0xdf, 0x1c, 0xe4, 0x32, 0xd2, 0xbb, 0xc8, 0x11, 0x11, 0x0c,
-    0x03, 0x29, 0x34, 0xf9, 0x21, 0x9d, 0x22, 0x75, 0x52, 0x6b, 0x75, 0x2f, 0x12, 0x0c, 0x9b, 0x52,
+    0xf2, 0xc4, 0xc1, 0x37, 0xfd, 0x98, 0xa6, 0x4e, 0x61, 0xa3, 0xa3, 0x79, 0x5c, 0x4d, 0x9f, 0xe1,
+    0x1c, 0x79, 0xb9, 0x74, 0x35, 0x7a, 0x5f, 0xab, 0xe1, 0x4a, 0x4c, 0xb3, 0xe1, 0x0d, 0xae, 0x6e,
 ];
 const CATALOG_QUERY: &str = r#"
 WITH schema_info AS (
@@ -325,7 +328,7 @@ WITH schema_info AS (
     CROSS JOIN schema_info s
    WHERE child.relnamespace = s.oid OR parent.relnamespace = s.oid
   UNION ALL
-  SELECT 'default_acl', d.defaclobjtype || ':' ||
+  SELECT 'default_acl', d.defaclobjtype::text || ':' ||
          CASE WHEN d.defaclrole = role.oid THEN 'CURRENT_USER'
               ELSE 'ROLE:' || pg_catalog.pg_get_userbyid(d.defaclrole) END,
          pg_catalog.jsonb_build_object(
@@ -680,6 +683,10 @@ fn migration(version: i64) -> Option<Migration> {
         3 => Some(Migration {
             version,
             sql: MIGRATION_3_SQL,
+        }),
+        4 => Some(Migration {
+            version,
+            sql: MIGRATION_4_SQL,
         }),
         _ => None,
     }

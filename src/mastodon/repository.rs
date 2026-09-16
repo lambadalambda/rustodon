@@ -187,7 +187,7 @@ use super::rest::{
     notification_type_filter_with_exclusions,
 };
 
-const REST_LIST_TIMELINE_SQL: &str = "WITH authorized AS ( \
+pub(super) const REST_LIST_TIMELINE_SQL: &str = "WITH authorized AS ( \
    SELECT status.*, member.follow_id, member_follow.languages AS follow_languages, \
      member_follow.show_reblogs, source.account_id AS source_account_id, \
      source_author.domain AS source_author_domain, author.domain AS author_domain \
@@ -200,7 +200,7 @@ const REST_LIST_TIMELINE_SQL: &str = "WITH authorized AS ( \
    LEFT JOIN statuses source ON source.id = status.reblog_of_id AND source.deleted_at IS NULL \
    LEFT JOIN accounts source_author ON source_author.id = source.account_id \
    LEFT JOIN accounts viewer ON viewer.id = $1 \
-   WHERE status.deleted_at IS NULL AND author.suspended_at IS NULL \
+   WHERE ($8 OR status.deleted_at IS NULL) AND author.suspended_at IS NULL \
      AND (source.id IS NULL OR source_author.suspended_at IS NULL) \
      AND status.visibility IN (0, 1, 2) \
      AND CASE WHEN status.account_id = $1 THEN true \
@@ -211,8 +211,9 @@ const REST_LIST_TIMELINE_SQL: &str = "WITH authorized AS ( \
            WHERE domain_block.account_id = status.account_id AND domain_block.domain = viewer.domain)) \
        ELSE false END \
  ) SELECT status.id FROM authorized status \
- WHERE (COALESCE(cardinality(status.follow_languages), 0) = 0 OR status.language IS NULL \
-     OR status.language = ANY(status.follow_languages)) \
+ WHERE (COALESCE(cardinality(status.follow_languages), 0) = 0 \
+     OR (CASE WHEN $10 THEN $9::text ELSE status.language END) IS NULL \
+     OR (CASE WHEN $10 THEN $9::text ELSE status.language END) = ANY(status.follow_languages)) \
    AND (NOT status.reply OR (status.in_reply_to_id IS NOT NULL \
      AND status.in_reply_to_account_id IS NOT NULL)) \
    AND (NOT status.reply OR status.in_reply_to_account_id = status.account_id \
@@ -1119,6 +1120,26 @@ impl Repository {
         viewer_account_id: Option<i64>,
         options: &TimelineOptions,
     ) -> sqlx::Result<Vec<i64>> {
+        self.rest_public_timeline_ids_with_overrides(
+            viewer_account_id,
+            options,
+            false,
+            None,
+            None,
+            false,
+        )
+        .await
+    }
+
+    async fn rest_public_timeline_ids_with_overrides(
+        &self,
+        viewer_account_id: Option<i64>,
+        options: &TimelineOptions,
+        include_deleted: bool,
+        had_media: Option<bool>,
+        language: Option<&str>,
+        override_language: bool,
+    ) -> sqlx::Result<Vec<i64>> {
         let ordering = if options.min_id.is_some() {
             "ASC"
         } else {
@@ -1127,14 +1148,14 @@ impl Repository {
         let query = format!(
             "SELECT status.id FROM statuses status \
              JOIN accounts author ON author.id = status.account_id \
-             WHERE status.deleted_at IS NULL AND status.visibility = 0 \
+             WHERE ($9 OR status.deleted_at IS NULL) AND status.visibility = 0 \
                AND author.suspended_at IS NULL AND author.silenced_at IS NULL \
                AND status.reblog_of_id IS NULL \
                AND (status.reply = false OR status.in_reply_to_account_id = status.account_id) \
                AND (NOT $2 OR status.local = true OR status.uri IS NULL) \
                AND (NOT $3 OR status.local = false AND status.uri IS NOT NULL) \
-               AND (NOT $4 OR EXISTS (SELECT 1 FROM media_attachments media \
-                 WHERE media.status_id = status.id)) \
+               AND (NOT $4 OR COALESCE($10::boolean, EXISTS (SELECT 1 FROM media_attachments media \
+                 WHERE media.status_id = status.id))) \
                AND ($1::bigint IS NULL OR ( \
                  NOT EXISTS (SELECT 1 FROM blocks viewer_block WHERE viewer_block.account_id = $1 \
                    AND viewer_block.target_account_id = status.account_id) \
@@ -1146,7 +1167,7 @@ impl Repository {
                    SELECT 1 FROM account_domain_blocks domain_block WHERE domain_block.account_id = $1 \
                      AND domain_block.domain = author.domain)) \
                  AND (NOT EXISTS (SELECT 1 FROM users viewer_user WHERE viewer_user.account_id = $1 \
-                   AND cardinality(viewer_user.chosen_languages) > 0) OR status.language = ANY( \
+                   AND cardinality(viewer_user.chosen_languages) > 0) OR (CASE WHEN $12 THEN $11::text ELSE status.language END) = ANY( \
                      SELECT unnest(viewer_user.chosen_languages) FROM users viewer_user \
                      WHERE viewer_user.account_id = $1)))) \
                AND ($5::bigint IS NULL OR status.id < $5) \
@@ -1163,6 +1184,10 @@ impl Repository {
             .bind(options.min_id)
             .bind(options.since_id)
             .bind(options.limit.clamp(0, 40))
+            .bind(include_deleted)
+            .bind(had_media)
+            .bind(language)
+            .bind(override_language)
             .fetch_all(&self.pool)
             .await?;
         if options.min_id.is_some() {
@@ -1176,6 +1201,26 @@ impl Repository {
         tag_name: &str,
         viewer_account_id: Option<i64>,
         options: &TagTimelineOptions,
+    ) -> sqlx::Result<Vec<i64>> {
+        self.rest_tag_timeline_ids_with_overrides(
+            tag_name,
+            viewer_account_id,
+            options,
+            false,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn rest_tag_timeline_ids_with_overrides(
+        &self,
+        tag_name: &str,
+        viewer_account_id: Option<i64>,
+        options: &TagTimelineOptions,
+        include_deleted: bool,
+        tag_matches: Option<bool>,
+        had_media: Option<bool>,
     ) -> sqlx::Result<Vec<i64>> {
         let tag_name = normalize_hashtag(tag_name);
         if !sqlx::query_scalar::<_, bool>(
@@ -1221,10 +1266,10 @@ impl Repository {
         let query = format!(
             "SELECT status.id FROM statuses status \
              JOIN accounts author ON author.id = status.account_id \
-             WHERE status.deleted_at IS NULL AND status.visibility = 0 \
+             WHERE ($12 OR status.deleted_at IS NULL) AND status.visibility = 0 \
                AND author.suspended_at IS NULL AND author.silenced_at IS NULL \
-               AND EXISTS (SELECT 1 FROM statuses_tags status_tag JOIN tags tag ON tag.id = status_tag.tag_id \
-                 WHERE status_tag.status_id = status.id AND lower(tag.name) = ANY($2)) \
+               AND COALESCE($13::boolean, EXISTS (SELECT 1 FROM statuses_tags status_tag JOIN tags tag ON tag.id = status_tag.tag_id \
+                 WHERE status_tag.status_id = status.id AND lower(tag.name) = ANY($2))) \
                AND NOT EXISTS (SELECT 1 FROM unnest($3::text[]) required(name) \
                  JOIN tags required_tag ON lower(required_tag.name) = required.name WHERE NOT EXISTS ( \
                  SELECT 1 FROM statuses_tags status_tag JOIN tags tag ON tag.id = status_tag.tag_id \
@@ -1233,8 +1278,8 @@ impl Repository {
                  WHERE status_tag.status_id = status.id AND lower(tag.name) = ANY($4)) \
                AND (NOT $5 OR status.local = true OR status.uri IS NULL) \
                AND (NOT $6 OR status.local = false AND status.uri IS NOT NULL) \
-               AND (NOT $7 OR EXISTS (SELECT 1 FROM media_attachments media \
-                 WHERE media.status_id = status.id)) \
+               AND (NOT $7 OR COALESCE($14::boolean, EXISTS (SELECT 1 FROM media_attachments media \
+                 WHERE media.status_id = status.id))) \
                AND ($1::bigint IS NULL OR ( \
                  NOT EXISTS (SELECT 1 FROM blocks viewer_block WHERE viewer_block.account_id = $1 \
                    AND viewer_block.target_account_id = status.account_id) \
@@ -1261,6 +1306,9 @@ impl Repository {
             .bind(options.page.min_id)
             .bind(options.page.since_id)
             .bind(options.page.limit.clamp(0, 40))
+            .bind(include_deleted)
+            .bind(tag_matches)
+            .bind(had_media)
             .fetch_all(&self.pool)
             .await?;
         if options.page.min_id.is_some() {
@@ -1407,6 +1455,19 @@ impl Repository {
         list_id: i64,
         options: &TimelineOptions,
     ) -> sqlx::Result<Option<Vec<i64>>> {
+        self.rest_list_timeline_ids_with_overrides(account_id, list_id, options, false, None, false)
+            .await
+    }
+
+    async fn rest_list_timeline_ids_with_overrides(
+        &self,
+        account_id: i64,
+        list_id: i64,
+        options: &TimelineOptions,
+        include_deleted: bool,
+        language: Option<&str>,
+        override_language: bool,
+    ) -> sqlx::Result<Option<Vec<i64>>> {
         let Some(replies_policy) = sqlx::query_scalar::<_, i32>(
             "SELECT replies_policy FROM lists WHERE id = $1 AND account_id = $2",
         )
@@ -1431,6 +1492,9 @@ impl Repository {
             .bind(options.min_id)
             .bind(options.since_id)
             .bind(options.limit.clamp(0, 40))
+            .bind(include_deleted)
+            .bind(language)
+            .bind(override_language)
             .fetch_all(&self.pool)
             .await?;
         if options.min_id.is_some() {
@@ -1449,6 +1513,135 @@ impl Repository {
             .bind(account_id)
             .fetch_one(&self.pool)
             .await
+    }
+
+    pub(crate) async fn stream_public_language_allowed(
+        &self,
+        viewer_account_id: i64,
+        language: Option<&str>,
+    ) -> sqlx::Result<bool> {
+        sqlx::query_scalar(
+            "SELECT NOT EXISTS (SELECT 1 FROM users WHERE account_id = $1 \
+                     AND cardinality(chosen_languages) > 0) \
+                 OR $2::text = ANY(SELECT unnest(chosen_languages) FROM users \
+                                    WHERE account_id = $1)",
+        )
+        .bind(viewer_account_id)
+        .bind(language)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn stream_public_timeline_contains(
+        &self,
+        viewer_account_id: i64,
+        status_id: i64,
+        mut options: TimelineOptions,
+        include_deleted: bool,
+        had_media: Option<bool>,
+        language: Option<&str>,
+        override_language: bool,
+    ) -> sqlx::Result<bool> {
+        options.max_id = status_id.checked_add(1);
+        options.min_id = None;
+        options.since_id = status_id.checked_sub(1);
+        options.limit = 1;
+        Ok(self
+            .rest_public_timeline_ids_with_overrides(
+                Some(viewer_account_id),
+                &options,
+                include_deleted,
+                had_media,
+                language,
+                override_language,
+            )
+            .await?
+            .contains(&status_id))
+    }
+
+    pub(crate) async fn stream_tag_timeline_contains(
+        &self,
+        viewer_account_id: i64,
+        status_id: i64,
+        tag: &str,
+        mut options: TimelineOptions,
+        include_deleted: bool,
+        tag_matches: Option<bool>,
+        had_media: Option<bool>,
+    ) -> sqlx::Result<bool> {
+        options.max_id = status_id.checked_add(1);
+        options.min_id = None;
+        options.since_id = status_id.checked_sub(1);
+        options.limit = 1;
+        Ok(self
+            .rest_tag_timeline_ids_with_overrides(
+                tag,
+                Some(viewer_account_id),
+                &TagTimelineOptions {
+                    page: options,
+                    any: Vec::new(),
+                    all: Vec::new(),
+                    none: Vec::new(),
+                },
+                include_deleted,
+                tag_matches,
+                had_media,
+            )
+            .await?
+            .contains(&status_id))
+    }
+
+    /// Re-evaluates current list policy for a retained status. `None` means the status row has
+    /// already been hard-deleted, in which case a durable route snapshot is the only safe source.
+    pub(crate) async fn stream_list_timeline_contains(
+        &self,
+        account_id: i64,
+        list_id: i64,
+        status_id: i64,
+        include_deleted: bool,
+        language: Option<&str>,
+    ) -> sqlx::Result<Option<bool>> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *transaction)
+            .await?;
+        let status_exists =
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM statuses WHERE id = $1)")
+                .bind(status_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        if !status_exists {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        let Some(replies_policy) = sqlx::query_scalar::<_, i32>(
+            "SELECT replies_policy FROM lists WHERE id = $1 AND account_id = $2",
+        )
+        .bind(list_id)
+        .bind(account_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        else {
+            transaction.commit().await?;
+            return Ok(Some(false));
+        };
+        let query = REST_LIST_TIMELINE_SQL.replace("{ordering}", "DESC");
+        let matched = sqlx::query_scalar::<_, i64>(&query)
+            .bind(account_id)
+            .bind(list_id)
+            .bind(replies_policy)
+            .bind(status_id.checked_add(1))
+            .bind(Option::<i64>::None)
+            .bind(status_id.checked_sub(1))
+            .bind(1_i64)
+            .bind(include_deleted)
+            .bind(language)
+            .bind(true)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .is_some_and(|id| id == status_id);
+        transaction.commit().await?;
+        Ok(Some(matched))
     }
 
     pub(crate) async fn rest_saved_status_rows(

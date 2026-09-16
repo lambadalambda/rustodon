@@ -4,7 +4,11 @@ use std::sync::Arc;
 use chrono::{Duration as ChronoDuration, NaiveDateTime, Utc};
 use http::HeaderMap;
 use http::header::{AUTHORIZATION, HeaderValue};
-use rustodon::jobs::{JobSpec, Lane, Queue, record_stream_event_in};
+#[cfg(feature = "test-support")]
+use rustodon::jobs::StreamEventStagingProbe;
+use rustodon::jobs::{
+    JobSpec, Lane, Queue, record_global_stream_transition_in, record_stream_event_in,
+};
 use rustodon::mastodon::{
     BearerAuthenticator, IdempotencyKey, Repository, WRITE_STATUSES, WriteError, WriteOptions,
     WriteOutcome, WriteRepository,
@@ -12,6 +16,7 @@ use rustodon::mastodon::{
 use rustodon::operational_schema::{
     CURRENT_VERSION, MigrationError, MigrationRecord, migrate, migration_plan,
 };
+use rustodon::streaming::{StreamName, Subscription, TimelineRouteSnapshot};
 use sqlx::{Connection, PgConnection, PgPool};
 use tokio::sync::Barrier;
 use tokio::time::{Duration, timeout};
@@ -29,9 +34,9 @@ const TABLES: &[&str] = &[
 
 #[test]
 fn migration_plan_requires_an_exact_known_prefix() {
-    assert_eq!(migration_plan(&[]).unwrap(), vec![1, 2, 3]);
+    assert_eq!(migration_plan(&[]).unwrap(), vec![1, 2, 3, 4]);
     let current = vec![MigrationRecord::known(1).expect("migration 1 exists")];
-    assert_eq!(migration_plan(&current).unwrap(), vec![2, 3]);
+    assert_eq!(migration_plan(&current).unwrap(), vec![2, 3, 4]);
 
     let unknown = vec![MigrationRecord {
         version: CURRENT_VERSION + 1,
@@ -39,7 +44,7 @@ fn migration_plan_requires_an_exact_known_prefix() {
     }];
     assert!(matches!(
         migration_plan(&unknown),
-        Err(MigrationError::UnknownVersion(4))
+        Err(MigrationError::UnknownVersion(5))
     ));
 
     let wrong_checksum = vec![MigrationRecord {
@@ -355,8 +360,8 @@ async fn operational_write_composition_is_atomic_and_idempotent()
 
 #[tokio::test]
 #[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
-async fn stream_events_are_replayable_and_not_dispatchable()
--> Result<(), Box<dyn std::error::Error>> {
+async fn stream_events_are_retained_and_not_dispatchable() -> Result<(), Box<dyn std::error::Error>>
+{
     let url = std::env::var("RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL")?;
     let pool = sqlx::PgPool::connect(&url).await?;
     let queue = Queue::new(pool.clone());
@@ -385,16 +390,542 @@ async fn stream_events_are_replayable_and_not_dispatchable()
 
     queue.dispatch_outbox(100).await?;
     assert!(
-        !sqlx::query_scalar::<_, bool>(
+        sqlx::query_scalar::<_, bool>(
             "SELECT dispatched_at IS NOT NULL FROM rustodon.outbox_events WHERE id = $1",
         )
         .bind(first)
         .fetch_one(&pool)
         .await?
     );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM rustodon.durable_jobs WHERE kind = $1 AND logical_key = $2",
+        )
+        .bind(rustodon::streaming::STREAM_EVENT_KIND)
+        .bind(logical_key)
+        .fetch_one(&pool)
+        .await?,
+        0
+    );
 
     sqlx::query("DELETE FROM rustodon.outbox_events WHERE id = $1")
         .bind(first)
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+async fn stream_history_is_durable_and_bounded_without_pruning_other_outbox_kinds()
+-> Result<(), Box<dyn std::error::Error>> {
+    let url = std::env::var("RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL")?;
+    let pool = sqlx::PgPool::connect(&url).await?;
+    let queue = Queue::new(pool.clone());
+    let prefix = format!("stream:retention:{}", std::process::id());
+    sqlx::query("DELETE FROM rustodon.outbox_events WHERE logical_key LIKE $1")
+        .bind(format!("{prefix}%"))
+        .execute(&pool)
+        .await?;
+
+    let mut ids = Vec::new();
+    for index in 0..4_i64 {
+        let mut transaction = pool.begin().await?;
+        ids.push(
+            record_stream_event_in(
+                &mut transaction,
+                101,
+                "update",
+                900_100_000 + index,
+                &format!("{prefix}:stream:{index}"),
+            )
+            .await?,
+        );
+        transaction.commit().await?;
+    }
+    sqlx::query(
+        "UPDATE rustodon.outbox_events SET created_at = clock_timestamp() - INTERVAL '2 hours' \
+         WHERE id = $1",
+    )
+    .bind(ids[0])
+    .execute(&pool)
+    .await?;
+    let ordinary_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload) \
+         VALUES ('retention-test', $1, '{}'::jsonb) RETURNING id",
+    )
+    .bind(format!("{prefix}:ordinary"))
+    .fetch_one(&pool)
+    .await?;
+
+    let retained_cursor = queue
+        .prune_stream_history_with_limits(ChronoDuration::hours(1), 2)
+        .await?;
+    let retained = queue.stream_events_after(retained_cursor, 10_000).await?;
+    assert_eq!(
+        retained
+            .iter()
+            .filter(|event| ids.contains(&event.id))
+            .map(|event| event.id)
+            .collect::<Vec<_>>(),
+        ids[2..]
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM rustodon.outbox_events WHERE id = $1)",
+        )
+        .bind(ordinary_id)
+        .fetch_one(&pool)
+        .await?
+    );
+
+    sqlx::query("DELETE FROM rustodon.outbox_events WHERE logical_key LIKE $1")
+        .bind(format!("{prefix}%"))
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+async fn timeline_replay_is_bounded_by_event_class_and_commit_cursor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let url = std::env::var("RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL")?;
+    let pool = PgPool::connect(&url).await?;
+    let queue = Queue::new(pool.clone());
+    let prefix = format!("stream:replay:{}", std::process::id());
+    sqlx::query("DELETE FROM rustodon.outbox_events WHERE logical_key LIKE $1")
+        .bind(format!("{prefix}%"))
+        .execute(&pool)
+        .await?;
+    let snapshot = TimelineRouteSnapshot {
+        public: true,
+        hashtag: true,
+        local: true,
+        had_media: false,
+        language: Some("en".to_owned()),
+        tags: vec!["replay".to_owned()],
+        lists: Vec::new(),
+    };
+    let mut inserted = Vec::new();
+    for index in 0..3_i64 {
+        let mut transaction = pool.begin().await?;
+        inserted.push(
+            record_global_stream_transition_in(
+                &mut transaction,
+                "update",
+                901_000_000 + index,
+                &format!("{prefix}:update:{index}"),
+                None,
+                Some(&snapshot),
+            )
+            .await?,
+        );
+        transaction.commit().await?;
+    }
+    for index in 0..3_i64 {
+        let event = if index == 2 {
+            "delete"
+        } else {
+            "status.update"
+        };
+        let mut transaction = pool.begin().await?;
+        inserted.push(
+            record_global_stream_transition_in(
+                &mut transaction,
+                event,
+                902_000_000 + index,
+                &format!("{prefix}:transition:{index}"),
+                Some(&snapshot),
+                (event != "delete").then_some(&snapshot),
+            )
+            .await?,
+        );
+        transaction.commit().await?;
+    }
+    let through = queue.stream_cursor().await?;
+    let mut transaction = pool.begin().await?;
+    let excluded_account_event = record_stream_event_in(
+        &mut transaction,
+        101,
+        "delete",
+        903_000_000,
+        &format!("{prefix}:account"),
+    )
+    .await?;
+    transaction.commit().await?;
+
+    let replay = queue
+        .stream_replay_events_with_limits(through, 2, 1)
+        .await?;
+    assert_eq!(
+        replay.iter().map(|event| event.id).collect::<Vec<_>>(),
+        vec![inserted[2], inserted[4], inserted[5]],
+    );
+    assert!(replay.iter().all(|event| event.account_id == 0));
+    assert!(replay.iter().all(|event| event.id <= through));
+    assert!(
+        !replay
+            .iter()
+            .any(|event| event.id == excluded_account_event)
+    );
+
+    let unrelated_snapshot = TimelineRouteSnapshot {
+        tags: vec!["unrelated".to_owned()],
+        ..snapshot.clone()
+    };
+    let mut transaction = pool.begin().await?;
+    for index in 0..41_i64 {
+        record_global_stream_transition_in(
+            &mut transaction,
+            "update",
+            903_100_000 + index,
+            &format!("{prefix}:unrelated-update:{index}"),
+            None,
+            Some(&unrelated_snapshot),
+        )
+        .await?;
+    }
+    for index in 0..129_i64 {
+        record_global_stream_transition_in(
+            &mut transaction,
+            "status.update",
+            903_200_000 + index,
+            &format!("{prefix}:unrelated-transition:{index}"),
+            Some(&unrelated_snapshot),
+            Some(&unrelated_snapshot),
+        )
+        .await?;
+    }
+    let mut relevant_updates = Vec::new();
+    for index in 0..41_i64 {
+        relevant_updates.push(
+            record_global_stream_transition_in(
+                &mut transaction,
+                "update",
+                903_300_000 + index,
+                &format!("{prefix}:relevant-update:{index}"),
+                None,
+                Some(&snapshot),
+            )
+            .await?,
+        );
+    }
+    let mut relevant_transitions = Vec::new();
+    for index in 0..129_i64 {
+        relevant_transitions.push(
+            record_global_stream_transition_in(
+                &mut transaction,
+                "status.update",
+                903_400_000 + index,
+                &format!("{prefix}:relevant-transition:{index}"),
+                Some(&snapshot),
+                Some(&snapshot),
+            )
+            .await?,
+        );
+    }
+    transaction.commit().await?;
+    let route_replay = queue
+        .stream_replay_events_for_subscription(
+            queue.stream_cursor().await?,
+            0,
+            &Subscription::new(StreamName::Hashtag, Some("RePlay".to_owned())),
+            101,
+        )
+        .await?;
+    assert!(
+        route_replay.iter().any(|event| event.id == inserted[5]),
+        "a route-relevant delete was evicted by later edits and creates"
+    );
+    let expected_updates = inserted[..3]
+        .iter()
+        .chain(&relevant_updates)
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        route_replay
+            .iter()
+            .filter(|event| event.event == "update")
+            .map(|event| event.id)
+            .collect::<Vec<_>>(),
+        expected_updates,
+        "every create after the subscribe boundary must survive the handoff"
+    );
+    let expected_transitions = inserted[3..5]
+        .iter()
+        .chain(&relevant_transitions)
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        route_replay
+            .iter()
+            .filter(|event| event.event == "status.update")
+            .map(|event| event.id)
+            .collect::<Vec<_>>(),
+        expected_transitions,
+        "every edit after the subscribe boundary must survive the handoff"
+    );
+    let hidden_snapshot = TimelineRouteSnapshot {
+        tags: vec!["elsewhere".to_owned()],
+        ..snapshot.clone()
+    };
+    let mut transaction = pool.begin().await?;
+    let historical_route_entry = record_global_stream_transition_in(
+        &mut transaction,
+        "status.update",
+        903_500_000,
+        &format!("{prefix}:historical-route-entry"),
+        Some(&hidden_snapshot),
+        Some(&snapshot),
+    )
+    .await?;
+    transaction.commit().await?;
+    let freshness_boundary = queue.stream_cursor().await?;
+    let fresh_replay = queue
+        .stream_replay_events_for_subscription(
+            freshness_boundary,
+            freshness_boundary,
+            &Subscription::new(StreamName::Hashtag, Some("RePlay".to_owned())),
+            101,
+        )
+        .await?;
+    assert!(
+        !fresh_replay
+            .iter()
+            .any(|event| event.id == historical_route_entry),
+        "a historical route entry that becomes a wire create must not be replayed"
+    );
+    assert!(
+        fresh_replay
+            .iter()
+            .any(|event| event.id == relevant_transitions[128]),
+        "a historical idempotent edit must remain replayable"
+    );
+    assert!(
+        fresh_replay.iter().any(|event| event.id == inserted[5]),
+        "a historical actual delete must remain replayable"
+    );
+
+    let mut transaction = pool.begin().await?;
+    let racing_route_entry = record_global_stream_transition_in(
+        &mut transaction,
+        "status.update",
+        903_500_001,
+        &format!("{prefix}:racing-route-entry"),
+        Some(&hidden_snapshot),
+        Some(&snapshot),
+    )
+    .await?;
+    transaction.commit().await?;
+    let replay_through = queue.stream_cursor().await?;
+    let subscribe_boundary_replay = queue
+        .stream_replay_events_for_subscription(
+            replay_through,
+            freshness_boundary,
+            &Subscription::new(StreamName::Hashtag, Some("RePlay".to_owned())),
+            101,
+        )
+        .await?;
+    assert!(
+        subscribe_boundary_replay
+            .iter()
+            .any(|event| event.id == racing_route_entry),
+        "a route entry racing the actual subscribe boundary must not be lost"
+    );
+
+    let pruned_window_replay = queue
+        .stream_replay_events_for_subscription(
+            0,
+            replay_through,
+            &Subscription::new(StreamName::Hashtag, Some("RePlay".to_owned())),
+            101,
+        )
+        .await?;
+    assert!(
+        pruned_window_replay.is_empty(),
+        "pruning every retained row between connect and subscribe must leave an empty replay window"
+    );
+    let subscribe_race_replay = queue
+        .stream_replay_events_for_subscription(
+            replay_through,
+            relevant_updates[39],
+            &Subscription::new(StreamName::Hashtag, Some("RePlay".to_owned())),
+            101,
+        )
+        .await?;
+    assert_eq!(
+        subscribe_race_replay
+            .iter()
+            .filter(|event| event.event == "update")
+            .map(|event| event.id)
+            .collect::<Vec<_>>(),
+        relevant_updates[40..],
+        "only creates committed after the connection cursor close the subscribe race"
+    );
+    assert!(route_replay.iter().all(|event| {
+        event
+            .before
+            .as_ref()
+            .or(event.after.as_ref())
+            .is_some_and(|snapshot| snapshot.tags.iter().any(|tag| tag == "replay"))
+    }));
+
+    sqlx::query("DELETE FROM rustodon.outbox_events WHERE logical_key LIKE $1")
+        .bind(format!("{prefix}%"))
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+async fn retention_pruning_does_not_hold_the_stream_writer_order_lock()
+-> Result<(), Box<dyn std::error::Error>> {
+    let url = std::env::var("RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL")?;
+    let pool = PgPool::connect(&url).await?;
+    let queue = Queue::new(pool.clone());
+    let prefix = format!("stream:prune-contention:{}", std::process::id());
+    let old_key = format!("{prefix}:old");
+    let writer_key = format!("{prefix}:writer");
+    sqlx::query("DELETE FROM rustodon.outbox_events WHERE logical_key LIKE $1")
+        .bind(format!("{prefix}%"))
+        .execute(&pool)
+        .await?;
+    let mut transaction = pool.begin().await?;
+    let old_id =
+        record_stream_event_in(&mut transaction, 101, "delete", 904_000_001, &old_key).await?;
+    transaction.commit().await?;
+    sqlx::query(
+        "UPDATE rustodon.outbox_events SET created_at = clock_timestamp() - INTERVAL '2 hours' \
+         WHERE id = $1",
+    )
+    .bind(old_id)
+    .execute(&pool)
+    .await?;
+
+    let mut blocker = pool.begin().await?;
+    sqlx::query("SELECT id FROM rustodon.outbox_events WHERE id = $1 FOR UPDATE")
+        .bind(old_id)
+        .fetch_one(&mut *blocker)
+        .await?;
+    let prune = {
+        let queue = queue.clone();
+        tokio::spawn(async move {
+            queue
+                .prune_stream_history_with_limits(ChronoDuration::hours(1), 20_000)
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !prune.is_finished(),
+        "prune did not reach the blocked old row"
+    );
+
+    let writer = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let mut transaction = pool.begin().await?;
+            let id =
+                record_stream_event_in(&mut transaction, 101, "delete", 904_000_002, &writer_key)
+                    .await?;
+            transaction.commit().await?;
+            Ok::<i64, rustodon::jobs::JobError>(id)
+        })
+    };
+    let writer_id = timeout(Duration::from_secs(5), writer).await???;
+    assert!(writer_id > old_id);
+    blocker.rollback().await?;
+    timeout(Duration::from_secs(5), prune).await???;
+
+    sqlx::query("DELETE FROM rustodon.outbox_events WHERE logical_key LIKE $1")
+        .bind(format!("{prefix}%"))
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+async fn staged_stream_flush_is_bounded_ordered_and_does_not_lock_early()
+-> Result<(), Box<dyn std::error::Error>> {
+    const FIRST_OBJECT: i64 = 905_000_000;
+    const EVENT_COUNT: i64 = 513;
+    const UNRELATED_OBJECT: i64 = 905_999_999;
+
+    let url = std::env::var("RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL")?;
+    let pool = PgPool::connect(&url).await?;
+    let queue = Queue::new(pool.clone());
+    let prefix = format!("stream:staged-flush:{}", std::process::id());
+    sqlx::query("DELETE FROM rustodon.outbox_events WHERE logical_key LIKE $1")
+        .bind(format!("{prefix}%"))
+        .execute(&pool)
+        .await?;
+    let cursor = queue.stream_cursor().await?;
+    let mut transaction = pool.begin().await?;
+    let mut staged = StreamEventStagingProbe::new();
+    for index in 0..300_i64 {
+        staged.push(
+            101,
+            "delete",
+            FIRST_OBJECT + index,
+            &format!("{prefix}:event:{index}"),
+        )?;
+    }
+    staged.stage(&mut transaction).await?;
+    for index in 300..EVENT_COUNT {
+        staged.push(
+            101,
+            "delete",
+            FIRST_OBJECT + index,
+            &format!("{prefix}:event:{index}"),
+        )?;
+    }
+    staged.push(
+        101,
+        "delete",
+        FIRST_OBJECT + 200,
+        &format!("{prefix}:event:200"),
+    )?;
+    staged.stage(&mut transaction).await?;
+
+    let unrelated_key = format!("{prefix}:unrelated");
+    let unrelated_id = timeout(Duration::from_secs(5), async {
+        let mut writer = pool.begin().await?;
+        let id =
+            record_stream_event_in(&mut writer, 101, "delete", UNRELATED_OBJECT, &unrelated_key)
+                .await?;
+        writer.commit().await?;
+        Ok::<i64, rustodon::jobs::JobError>(id)
+    })
+    .await??;
+
+    staged.flush(&mut transaction).await?;
+    transaction.commit().await?;
+    let events = queue.stream_events_after(cursor, 1_000).await?;
+    let relevant = events
+        .into_iter()
+        .filter(|event| {
+            event.object_id == UNRELATED_OBJECT
+                || (FIRST_OBJECT..FIRST_OBJECT + EVENT_COUNT).contains(&event.object_id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(relevant.len(), EVENT_COUNT as usize + 1);
+    assert_eq!(relevant[0].id, unrelated_id);
+    assert_eq!(relevant[0].object_id, UNRELATED_OBJECT);
+    assert_eq!(
+        relevant[1..]
+            .iter()
+            .map(|event| event.object_id)
+            .collect::<Vec<_>>(),
+        (FIRST_OBJECT..FIRST_OBJECT + EVENT_COUNT).collect::<Vec<_>>(),
+        "multiple staged chunks must flush in insertion order and deduplicate logical keys"
+    );
+
+    sqlx::query("DELETE FROM rustodon.outbox_events WHERE logical_key LIKE $1")
+        .bind(format!("{prefix}%"))
         .execute(&pool)
         .await?;
     Ok(())
@@ -428,7 +959,7 @@ async fn stream_cursor_does_not_skip_inflight_commits() -> Result<(), Box<dyn st
     .await?;
 
     let reader_barrier = Arc::new(Barrier::new(2));
-    let reader = {
+    let mut reader = {
         let barrier = Arc::clone(&reader_barrier);
         let queue = queue.clone();
         tokio::spawn(async move {
@@ -452,19 +983,20 @@ async fn stream_cursor_does_not_skip_inflight_commits() -> Result<(), Box<dyn st
     };
     reader_barrier.wait().await;
     writer_barrier.wait().await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    let reader_events = timeout(Duration::from_secs(5), &mut reader).await??;
     assert!(
-        !reader.is_finished(),
-        "a stream reader must wait for an in-flight stream transaction"
+        reader_events?
+            .iter()
+            .all(|event| event.object_id != 900_000_001),
+        "a lock-free stream reader must not observe an uncommitted event"
     );
+    tokio::time::sleep(Duration::from_millis(250)).await;
     assert!(
         !second.is_finished(),
         "a later stream writer must wait for the earlier transaction to commit"
     );
 
     first_transaction.commit().await?;
-    let reader_events = timeout(Duration::from_secs(5), reader).await??;
-    reader_events?;
     let second_result = timeout(Duration::from_secs(5), second).await??;
     let second_id = second_result?;
     let events = queue.stream_events_after(cursor, 10).await?;
@@ -763,6 +1295,22 @@ async fn assert_schema(connection: &mut PgConnection) -> Result<(), sqlx::Error>
         .fetch_one(&mut *connection)
         .await?,
         CURRENT_VERSION
+    );
+    let stream_indexes = sqlx::query_scalar::<_, String>(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname = 'rustodon' \
+           AND indexname IN ('outbox_events_pending_idx', \
+             'outbox_events_stream_created_at_idx', 'outbox_events_stream_id_idx') \
+         ORDER BY indexname",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+    assert_eq!(
+        stream_indexes,
+        vec![
+            "CREATE INDEX outbox_events_pending_idx ON rustodon.outbox_events USING btree (id) WHERE ((dispatched_at IS NULL) AND (kind <> 'rustodon.mastodon.stream_event'::text))",
+            "CREATE INDEX outbox_events_stream_created_at_idx ON rustodon.outbox_events USING btree (kind, created_at) WHERE (kind = 'rustodon.mastodon.stream_event'::text)",
+            "CREATE INDEX outbox_events_stream_id_idx ON rustodon.outbox_events USING btree (kind, id) WHERE (kind = 'rustodon.mastodon.stream_event'::text)",
+        ]
     );
     Ok(())
 }

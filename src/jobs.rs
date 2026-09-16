@@ -13,7 +13,11 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::time::Duration as StdDuration;
 
-use crate::streaming::{STREAM_EVENT_KIND, StreamEvent};
+use crate::streaming::{
+    STREAM_EVENT_KIND, STREAM_HISTORY_MAX_AGE_HOURS, STREAM_HISTORY_MAX_EVENTS,
+    STREAM_REPLAY_TRANSITION_EVENTS, STREAM_REPLAY_UPDATE_EVENTS, StreamEvent, StreamName,
+    Subscription, TimelineRouteSnapshot,
+};
 
 const DEFAULT_MAX_ATTEMPTS: i32 = 25;
 const MAX_ERROR_BYTES: usize = 4 * 1024;
@@ -44,6 +48,7 @@ pub const ACCOUNT_DELETION_DELAY_DAYS: i64 = 30;
 pub const MASTODON_DOMAIN_PURGE_JOB_KIND: &str = "rustodon.mastodon.purge_domain";
 pub const LOCAL_MEDIA_CLEANUP_JOB_KIND: &str = "rustodon.mastodon.cleanup_local_media";
 const STREAM_EVENT_ORDERING_LOCK_KEY: &str = "rustodon.mastodon.stream_event.commit_order";
+const STREAM_EVENT_STAGING_KIND: &str = "rustodon.mastodon.stream_event.staged";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Lane {
@@ -766,10 +771,10 @@ impl Queue {
         let rows = sqlx::query(
             "SELECT event.id, event.kind, event.logical_key, event.payload \
               FROM rustodon.outbox_events event WHERE event.dispatched_at IS NULL \
-                AND event.kind <> $1 \
+                AND event.kind <> 'rustodon.mastodon.stream_event' \
                 AND NOT EXISTS ( \
                   SELECT 1 FROM rustodon.outbox_events previous \
-                   WHERE event.kind = $2 AND previous.kind = event.kind \
+                   WHERE event.kind = $1 AND previous.kind = event.kind \
                      AND previous.dispatched_at IS NULL AND previous.id < event.id \
                      AND previous.payload #>> '{arguments,source_account_id}' = \
                          event.payload #>> '{arguments,source_account_id}' \
@@ -780,9 +785,8 @@ impl Queue {
                    SELECT 1 FROM rustodon.durable_jobs job \
                    WHERE job.kind = event.kind AND job.logical_key = event.logical_key \
                     AND job.dead_at IS NULL)) \
-                ORDER BY event.id FOR UPDATE OF event SKIP LOCKED LIMIT $3",
+                ORDER BY event.id FOR UPDATE OF event SKIP LOCKED LIMIT $2",
         )
-        .bind(STREAM_EVENT_KIND)
         .bind(ACTIVITYPUB_DELIVERY_JOB_KIND)
         .bind(limit)
         .fetch_all(&mut *transaction)
@@ -850,17 +854,74 @@ impl Queue {
     ///
     /// Returns an error when `PostgreSQL` cannot read the stream-event table.
     pub async fn stream_cursor(&self) -> Result<i64, JobError> {
-        let mut transaction = self.pool.begin().await?;
-        lock_stream_event_order(&mut transaction).await?;
-        let cursor = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT max(id) FROM rustodon.outbox_events WHERE kind = $1",
+        Ok(sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT max(id) FROM rustodon.outbox_events \
+             WHERE kind = 'rustodon.mastodon.stream_event'",
         )
-        .bind(STREAM_EVENT_KIND)
-        .fetch_one(&mut *transaction)
+        .fetch_one(&self.pool)
         .await?
-        .unwrap_or_default();
+        .unwrap_or_default())
+    }
+
+    /// Prunes retained stream events to the configured age and count bounds and returns the cursor
+    /// immediately before the oldest retained event. Retention covers bounded replay for new and
+    /// reconnected timeline subscriptions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when PostgreSQL cannot lock or prune the stream-event table.
+    pub async fn prune_stream_history(&self) -> Result<i64, JobError> {
+        self.prune_stream_history_with_limits(
+            Duration::hours(STREAM_HISTORY_MAX_AGE_HOURS),
+            STREAM_HISTORY_MAX_EVENTS,
+        )
+        .await
+    }
+
+    /// Prunes stream history with explicit bounds. This is public so isolated operational-schema
+    /// tests can exercise retention with small deterministic limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for non-positive bounds or when PostgreSQL rejects the prune.
+    pub async fn prune_stream_history_with_limits(
+        &self,
+        max_age: Duration,
+        max_events: i64,
+    ) -> Result<i64, JobError> {
+        if max_age <= Duration::zero() || max_events <= 0 {
+            return Err(JobError::InvalidInput(
+                "stream history age and event limit must be positive",
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM rustodon.outbox_events \
+              WHERE kind = 'rustodon.mastodon.stream_event' \
+                AND created_at < clock_timestamp() \
+                  - make_interval(secs => $1::double precision / 1000)",
+        )
+        .bind(max_age.num_milliseconds())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "DELETE FROM rustodon.outbox_events \
+              WHERE kind = 'rustodon.mastodon.stream_event' AND id <= COALESCE(( \
+                SELECT id FROM rustodon.outbox_events \
+                 WHERE kind = 'rustodon.mastodon.stream_event' \
+                 ORDER BY id DESC OFFSET $1 LIMIT 1), -1)",
+        )
+        .bind(max_events)
+        .execute(&mut *transaction)
+        .await?;
+        let oldest = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT min(id) FROM rustodon.outbox_events \
+             WHERE kind = 'rustodon.mastodon.stream_event'",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
         transaction.commit().await?;
-        Ok(cursor)
+        Ok(oldest.map_or(0, |id| id.saturating_sub(1)))
     }
 
     /// Reads immutable stream events after a cursor without consuming them.
@@ -878,32 +939,203 @@ impl Queue {
                 "stream cursor must be non-negative and limit must be positive",
             ));
         }
-        let mut transaction = self.pool.begin().await?;
-        lock_stream_event_order(&mut transaction).await?;
         let rows = sqlx::query(
             "SELECT id, (payload ->> 'account_id')::bigint AS account_id, \
                     payload ->> 'event' AS event, \
-                    (payload ->> 'object_id')::bigint AS object_id \
+                    (payload ->> 'object_id')::bigint AS object_id, \
+                    payload -> 'before' AS before, payload -> 'after' AS after \
                FROM rustodon.outbox_events \
-              WHERE kind = $1 AND id > $2 \
-              ORDER BY id LIMIT $3",
+              WHERE kind = 'rustodon.mastodon.stream_event' AND id > $1 \
+              ORDER BY id LIMIT $2",
         )
-        .bind(STREAM_EVENT_KIND)
         .bind(cursor)
         .bind(limit)
-        .fetch_all(&mut *transaction)
+        .fetch_all(&self.pool)
         .await?;
-        transaction.commit().await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(StreamEvent {
-                    id: row.try_get("id")?,
-                    account_id: row.try_get("account_id")?,
-                    event: row.try_get("event")?,
-                    object_id: row.try_get("object_id")?,
-                })
-            })
-            .collect()
+        rows.into_iter().map(stream_event_from_row).collect()
+    }
+
+    /// Returns a bounded retained suffix for a newly established timeline subscription.
+    ///
+    /// Lifecycle transitions are retained separately from create/update frames so a busy create
+    /// stream cannot evict a recent delete. Results are merged back into durable event order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid bounds or when PostgreSQL rejects the read.
+    pub async fn stream_replay_events(&self, through: i64) -> Result<Vec<StreamEvent>, JobError> {
+        self.stream_replay_events_with_limits(
+            through,
+            STREAM_REPLAY_TRANSITION_EVENTS,
+            STREAM_REPLAY_UPDATE_EVENTS,
+        )
+        .await
+    }
+
+    /// Returns route-relevant retained events for one newly authorized timeline subscription.
+    ///
+    /// Structural route filtering happens before each historical event-class limit, preventing
+    /// unrelated public, hashtag, or list traffic from evicting a recoverable event. Historical
+    /// deletes and non-creating transitions have their own reserve so a burst of edits cannot
+    /// displace deletes. Every event committed after `create_after` is returned without a
+    /// per-class cap to make the subscribe handoff lossless. Historical durable events whose route
+    /// transition would create a wire-level `update` are omitted; idempotent edits and actual
+    /// deletes remain replayable for reconnect convergence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid bounds or when PostgreSQL rejects the read.
+    pub async fn stream_replay_events_for_subscription(
+        &self,
+        through: i64,
+        create_after: i64,
+        subscription: &Subscription,
+        account_id: i64,
+    ) -> Result<Vec<StreamEvent>, JobError> {
+        if through < 0 || create_after < 0 || account_id <= 0 || !subscription.is_timeline() {
+            return Err(JobError::InvalidInput(
+                "timeline replay requires non-negative cursors, a positive account, and a timeline subscription",
+            ));
+        }
+        let stream = subscription.stream();
+        let parameter = subscription.parameter().unwrap_or("");
+        let local = matches!(
+            stream,
+            StreamName::PublicLocal | StreamName::PublicLocalMedia | StreamName::HashtagLocal
+        );
+        let remote = matches!(
+            stream,
+            StreamName::PublicRemote | StreamName::PublicRemoteMedia
+        );
+        let media = matches!(
+            stream,
+            StreamName::PublicMedia | StreamName::PublicLocalMedia | StreamName::PublicRemoteMedia
+        );
+        let rows = sqlx::query(
+            "WITH memberships AS ( \
+               SELECT event.id, event.payload, \
+                      COALESCE(bool_or(route.route_matches) \
+                        FILTER (WHERE route.position = 'before'), false) AS before_matches, \
+                      COALESCE(bool_or(route.route_matches) \
+                        FILTER (WHERE route.position = 'after'), false) AS after_matches \
+                 FROM rustodon.outbox_events event \
+                 CROSS JOIN LATERAL ( \
+                   SELECT candidate.position, candidate.snapshot IS NOT NULL AND ( \
+                     ($3 = 'public' AND COALESCE((candidate.snapshot ->> 'public')::boolean, false) \
+                       AND (NOT $4 OR COALESCE((candidate.snapshot ->> 'local')::boolean, false)) \
+                       AND (NOT $5 OR NOT COALESCE((candidate.snapshot ->> 'local')::boolean, false)) \
+                       AND (NOT $6 OR COALESCE((candidate.snapshot ->> 'had_media')::boolean, false))) \
+                     OR ($3 = 'hashtag' \
+                       AND COALESCE((candidate.snapshot ->> 'hashtag')::boolean, false) \
+                       AND (NOT $4 OR COALESCE((candidate.snapshot ->> 'local')::boolean, false)) \
+                       AND COALESCE(candidate.snapshot -> 'tags', '[]'::jsonb) ? $7) \
+                     OR ($3 = 'list' AND COALESCE(candidate.snapshot -> 'lists', '[]'::jsonb) \
+                       @> jsonb_build_array(jsonb_build_object( \
+                         'account_id', $9::bigint, 'list_id', $8::bigint))) \
+                   ) AS route_matches \
+                     FROM (VALUES ('before', event.payload -> 'before'), \
+                                  ('after', event.payload -> 'after')) \
+                       candidate(position, snapshot) \
+                 ) route \
+                WHERE event.kind = 'rustodon.mastodon.stream_event' AND event.id <= $1 \
+                  AND event.payload ->> 'account_id' = '0' \
+                GROUP BY event.id, event.payload \
+             ), candidates AS ( \
+               SELECT id, payload, before_matches, after_matches FROM memberships \
+                WHERE before_matches OR after_matches \
+             ), selected AS ( \
+               SELECT id FROM candidates WHERE id > $10 \
+               UNION \
+               SELECT id FROM (SELECT id FROM candidates \
+                                WHERE id <= $10 AND payload ->> 'event' = 'delete' \
+                                ORDER BY id DESC LIMIT $2) deletes \
+               UNION \
+               SELECT id FROM (SELECT id FROM candidates \
+                                WHERE id <= $10 \
+                                  AND payload ->> 'event' NOT IN ('update', 'delete') \
+                                  AND (before_matches OR NOT after_matches) \
+                                ORDER BY id DESC LIMIT $2) transitions \
+             ) \
+             SELECT event.id, (event.payload ->> 'account_id')::bigint AS account_id, \
+                    event.payload ->> 'event' AS event, \
+                    (event.payload ->> 'object_id')::bigint AS object_id, \
+                    event.payload -> 'before' AS before, event.payload -> 'after' AS after \
+               FROM rustodon.outbox_events event JOIN selected ON selected.id = event.id \
+              ORDER BY event.id",
+        )
+        .bind(through)
+        .bind(STREAM_REPLAY_TRANSITION_EVENTS)
+        .bind(match stream {
+            StreamName::Public
+            | StreamName::PublicMedia
+            | StreamName::PublicLocal
+            | StreamName::PublicLocalMedia
+            | StreamName::PublicRemote
+            | StreamName::PublicRemoteMedia => "public",
+            StreamName::Hashtag | StreamName::HashtagLocal => "hashtag",
+            StreamName::List => "list",
+            StreamName::User | StreamName::UserNotification | StreamName::Direct => unreachable!(),
+        })
+        .bind(local)
+        .bind(remote)
+        .bind(media)
+        .bind(parameter)
+        .bind(parameter.parse::<i64>().unwrap_or(0))
+        .bind(account_id)
+        .bind(create_after)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(stream_event_from_row).collect()
+    }
+
+    /// Reads retained timeline replay events with explicit limits for integration tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid bounds or when PostgreSQL rejects the read.
+    pub async fn stream_replay_events_with_limits(
+        &self,
+        through: i64,
+        transition_limit: i64,
+        update_limit: i64,
+    ) -> Result<Vec<StreamEvent>, JobError> {
+        if through < 0 || transition_limit <= 0 || update_limit <= 0 {
+            return Err(JobError::InvalidInput(
+                "stream replay cursor must be non-negative and limits must be positive",
+            ));
+        }
+        let rows = sqlx::query(
+            "WITH selected AS ( \
+               SELECT id FROM ( \
+                 SELECT id FROM rustodon.outbox_events \
+                  WHERE kind = 'rustodon.mastodon.stream_event' AND id <= $1 \
+                    AND payload ->> 'account_id' = '0' \
+                    AND payload ->> 'event' <> 'update' \
+                  ORDER BY id DESC LIMIT $2 \
+               ) transitions \
+               UNION \
+               SELECT id FROM ( \
+                 SELECT id FROM rustodon.outbox_events \
+                  WHERE kind = 'rustodon.mastodon.stream_event' AND id <= $1 \
+                    AND payload ->> 'account_id' = '0' \
+                    AND payload ->> 'event' = 'update' \
+                  ORDER BY id DESC LIMIT $3 \
+               ) updates \
+             ) \
+             SELECT event.id, (event.payload ->> 'account_id')::bigint AS account_id, \
+                    event.payload ->> 'event' AS event, \
+                    (event.payload ->> 'object_id')::bigint AS object_id, \
+                    event.payload -> 'before' AS before, event.payload -> 'after' AS after \
+               FROM rustodon.outbox_events event \
+               JOIN selected ON selected.id = event.id \
+              ORDER BY event.id",
+        )
+        .bind(through)
+        .bind(transition_limit)
+        .bind(update_limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(stream_event_from_row).collect()
     }
 
     /// Upserts a worker or scheduler heartbeat.
@@ -1320,8 +1552,8 @@ pub async fn record_outbox_once_in(
 
 /// Records one immutable Mastodon stream event in the application transaction.
 ///
-/// Stream rows intentionally remain pending in `outbox_events`; the durable-job dispatcher excludes
-/// [`STREAM_EVENT_KIND`] so polling never consumes or rewrites them.
+/// Stream rows are marked dispatched when inserted and use dedicated partial indexes. The
+/// durable-job dispatcher also excludes [`STREAM_EVENT_KIND`], so it never consumes them.
 ///
 /// # Errors
 ///
@@ -1333,9 +1565,197 @@ pub async fn record_stream_event_in(
     object_id: i64,
     logical_key: &str,
 ) -> Result<i64, JobError> {
-    if account_id <= 0 || object_id == 0 {
+    if account_id <= 0 {
         return Err(JobError::InvalidInput(
-            "stream event account ID must be positive and object ID must be non-zero",
+            "stream event account ID must be positive",
+        ));
+    }
+    record_stream_event_for_audience_in(
+        transaction,
+        account_id,
+        event,
+        object_id,
+        logical_key,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Records one audience-independent status lifecycle event using its current routing facts.
+/// Production mutation paths should use [`record_global_stream_transition_in`] when facts changed.
+///
+/// # Errors
+///
+/// Returns an error for invalid event metadata or a rejected database operation.
+pub async fn record_global_stream_event_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    event: &str,
+    object_id: i64,
+    logical_key: &str,
+) -> Result<i64, JobError> {
+    let (had_media, language, public, hashtag, local) =
+        sqlx::query_as::<_, (bool, Option<String>, bool, bool, bool)>(
+            "SELECT EXISTS (SELECT 1 FROM media_attachments WHERE status_id = status.id), \
+                status.language, \
+                status.visibility = 0 AND author.suspended_at IS NULL \
+                  AND author.silenced_at IS NULL AND status.reblog_of_id IS NULL \
+                  AND (NOT status.reply OR status.in_reply_to_account_id = status.account_id), \
+                status.visibility = 0 AND author.suspended_at IS NULL \
+                  AND author.silenced_at IS NULL, \
+                status.local OR status.uri IS NULL \
+           FROM statuses status JOIN accounts author ON author.id = status.account_id \
+          WHERE status.id = $1",
+        )
+        .bind(object_id)
+        .fetch_one(&mut **transaction)
+        .await?;
+    let tags = sqlx::query_scalar::<_, String>(
+        "SELECT lower(tag.name) FROM statuses_tags status_tag \
+         JOIN tags tag ON tag.id = status_tag.tag_id WHERE status_tag.status_id = $1 \
+         ORDER BY lower(tag.name)",
+    )
+    .bind(object_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let snapshot = TimelineRouteSnapshot {
+        public,
+        hashtag,
+        local,
+        had_media,
+        language,
+        tags,
+        lists: Vec::new(),
+    };
+    let (before, after) = match event {
+        "update" => (None, Some(snapshot)),
+        "delete" => (Some(snapshot), None),
+        _ => (Some(snapshot.clone()), Some(snapshot)),
+    };
+    record_global_stream_transition_in(
+        transaction,
+        event,
+        object_id,
+        logical_key,
+        before.as_ref(),
+        after.as_ref(),
+    )
+    .await
+}
+
+/// Records one audience-independent status lifecycle transition.
+///
+/// # Errors
+///
+/// Returns an error for invalid event metadata or a rejected database operation.
+pub async fn record_global_stream_transition_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    event: &str,
+    object_id: i64,
+    logical_key: &str,
+    before: Option<&TimelineRouteSnapshot>,
+    after: Option<&TimelineRouteSnapshot>,
+) -> Result<i64, JobError> {
+    record_stream_event_for_audience_in(
+        transaction,
+        0,
+        event,
+        object_id,
+        logical_key,
+        before,
+        after,
+    )
+    .await
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingStreamEvent {
+    account_id: i64,
+    event: String,
+    object_id: i64,
+    logical_key: String,
+    before: Option<TimelineRouteSnapshot>,
+    after: Option<TimelineRouteSnapshot>,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default)]
+pub struct StreamEventStagingProbe {
+    events: Vec<PendingStreamEvent>,
+}
+
+#[cfg(feature = "test-support")]
+impl StreamEventStagingProbe {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds one event to the probe buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the event metadata is invalid.
+    pub fn push(
+        &mut self,
+        account_id: i64,
+        event: &str,
+        object_id: i64,
+        logical_key: &str,
+    ) -> Result<(), JobError> {
+        self.events.push(pending_stream_event(
+            account_id,
+            event,
+            object_id,
+            logical_key,
+            None,
+            None,
+        )?);
+        Ok(())
+    }
+
+    /// Moves the current batch to transaction-local PostgreSQL staging without taking the global
+    /// stream writer-order lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when PostgreSQL rejects staging.
+    pub async fn stage(
+        &mut self,
+        transaction: &mut Transaction<'_, Postgres>,
+    ) -> Result<(), JobError> {
+        stage_stream_events_in(transaction, &mut self.events).await
+    }
+
+    /// Performs the terminal ordered flush under the global stream writer-order lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when PostgreSQL rejects the flush.
+    pub async fn flush(
+        &mut self,
+        transaction: &mut Transaction<'_, Postgres>,
+    ) -> Result<(), JobError> {
+        flush_staged_stream_events_in(transaction, &mut self.events).await
+    }
+}
+
+pub(crate) fn pending_stream_event(
+    account_id: i64,
+    event: &str,
+    object_id: i64,
+    logical_key: &str,
+    before: Option<&TimelineRouteSnapshot>,
+    after: Option<&TimelineRouteSnapshot>,
+) -> Result<PendingStreamEvent, JobError> {
+    if account_id < 0 {
+        return Err(JobError::InvalidInput(
+            "stream event account ID must be non-negative",
+        ));
+    }
+    if object_id == 0 {
+        return Err(JobError::InvalidInput(
+            "stream event object ID must be non-zero",
         ));
     }
     if !(1..=128).contains(&event.len()) {
@@ -1348,19 +1768,128 @@ pub async fn record_stream_event_in(
             "stream event logical key must contain 1-1024 bytes",
         ));
     }
+    Ok(PendingStreamEvent {
+        account_id,
+        event: event.to_owned(),
+        object_id,
+        logical_key: logical_key.to_owned(),
+        before: before.cloned(),
+        after: after.cloned(),
+    })
+}
+
+const PENDING_STREAM_EVENT_STAGE_SIZE: usize = 256;
+
+pub(crate) async fn stage_stream_events_if_large_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    events: &mut Vec<PendingStreamEvent>,
+) -> Result<(), JobError> {
+    if events.len() >= PENDING_STREAM_EVENT_STAGE_SIZE {
+        stage_stream_events_in(transaction, events).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn stage_stream_events_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    events: &mut Vec<PendingStreamEvent>,
+) -> Result<(), JobError> {
+    for event in events.drain(..) {
+        sqlx::query(
+            "INSERT INTO rustodon.outbox_events \
+                 (kind, logical_key, payload, dispatched_at) \
+             VALUES ($1, $2, $3, clock_timestamp()) \
+             ON CONFLICT (kind, logical_key) WHERE logical_key IS NOT NULL DO NOTHING",
+        )
+        .bind(STREAM_EVENT_STAGING_KIND)
+        .bind(&event.logical_key)
+        .bind(stream_event_payload(&event))
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn has_staged_stream_events_in(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<bool, JobError> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM rustodon.outbox_events WHERE kind = $1)",
+    )
+    .bind(STREAM_EVENT_STAGING_KIND)
+    .fetch_one(&mut **transaction)
+    .await?)
+}
+
+pub(crate) async fn flush_staged_stream_events_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    events: &mut Vec<PendingStreamEvent>,
+) -> Result<(), JobError> {
+    stage_stream_events_in(transaction, events).await?;
+    if !has_staged_stream_events_in(transaction).await? {
+        return Ok(());
+    }
     lock_stream_event_order(transaction).await?;
-    let payload = json!({
-        "account_id": account_id,
-        "event": event,
-        "object_id": object_id,
-    });
+    sqlx::query(
+        "INSERT INTO rustodon.outbox_events \
+             (kind, logical_key, payload, dispatched_at) \
+         SELECT $1, logical_key, payload, clock_timestamp() \
+           FROM rustodon.outbox_events WHERE kind = $2 ORDER BY id \
+         ON CONFLICT (kind, logical_key) WHERE logical_key IS NOT NULL DO NOTHING",
+    )
+    .bind(STREAM_EVENT_KIND)
+    .bind(STREAM_EVENT_STAGING_KIND)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query("DELETE FROM rustodon.outbox_events WHERE kind = $1")
+        .bind(STREAM_EVENT_STAGING_KIND)
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn flush_stream_events_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    events: &mut Vec<PendingStreamEvent>,
+) -> Result<Vec<i64>, JobError> {
+    if has_staged_stream_events_in(transaction).await? {
+        flush_staged_stream_events_in(transaction, events).await?;
+        return Ok(Vec::new());
+    }
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
+    lock_stream_event_order(transaction).await?;
+    let mut ids = Vec::with_capacity(events.len());
+    for event in events.drain(..) {
+        ids.push(insert_pending_stream_event_in(transaction, &event).await?);
+    }
+    Ok(ids)
+}
+
+fn stream_event_payload(event: &PendingStreamEvent) -> Value {
+    json!({
+        "account_id": event.account_id,
+        "event": event.event,
+        "object_id": event.object_id,
+        "before": event.before,
+        "after": event.after,
+    })
+}
+
+async fn insert_pending_stream_event_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    event: &PendingStreamEvent,
+) -> Result<i64, JobError> {
+    let payload = stream_event_payload(event);
     if let Some(id) = sqlx::query_scalar::<_, i64>(
-        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload) \
-          VALUES ($1, $2, $3) ON CONFLICT (kind, logical_key) WHERE logical_key IS NOT NULL \
+        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload, dispatched_at) \
+          VALUES ($1, $2, $3, clock_timestamp()) \
+          ON CONFLICT (kind, logical_key) WHERE logical_key IS NOT NULL \
           DO NOTHING RETURNING id",
     )
     .bind(STREAM_EVENT_KIND)
-    .bind(logical_key)
+    .bind(&event.logical_key)
     .bind(payload)
     .fetch_optional(&mut **transaction)
     .await?
@@ -1371,9 +1900,51 @@ pub async fn record_stream_event_in(
         "SELECT id FROM rustodon.outbox_events WHERE kind = $1 AND logical_key = $2",
     )
     .bind(STREAM_EVENT_KIND)
-    .bind(logical_key)
+    .bind(&event.logical_key)
     .fetch_one(&mut **transaction)
     .await?)
+}
+
+async fn record_stream_event_for_audience_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    account_id: i64,
+    event: &str,
+    object_id: i64,
+    logical_key: &str,
+    before: Option<&TimelineRouteSnapshot>,
+    after: Option<&TimelineRouteSnapshot>,
+) -> Result<i64, JobError> {
+    let mut events = vec![pending_stream_event(
+        account_id,
+        event,
+        object_id,
+        logical_key,
+        before,
+        after,
+    )?];
+    flush_stream_events_in(transaction, &mut events)
+        .await?
+        .pop()
+        .ok_or(JobError::InvalidData("stream event batch was empty"))
+}
+
+fn stream_event_from_row(row: sqlx::postgres::PgRow) -> Result<StreamEvent, JobError> {
+    let decode_snapshot = |column| -> Result<Option<TimelineRouteSnapshot>, JobError> {
+        let value = row.try_get::<Option<Value>, _>(column)?;
+        value
+            .filter(|value| !value.is_null())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| JobError::InvalidData("stream route snapshot is invalid"))
+    };
+    Ok(StreamEvent {
+        id: row.try_get("id")?,
+        account_id: row.try_get("account_id")?,
+        event: row.try_get("event")?,
+        object_id: row.try_get("object_id")?,
+        before: decode_snapshot("before")?,
+        after: decode_snapshot("after")?,
+    })
 }
 
 async fn lock_stream_event_order(

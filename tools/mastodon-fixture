@@ -1142,6 +1142,12 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
 GRANT SELECT ON TABLE rustodon.schema_migrations TO $WORKER_RUNTIME;
 GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq
   TO $WORKER_RUNTIME;
+DROP INDEX rustodon.outbox_events_stream_created_at_idx;
+DROP INDEX rustodon.outbox_events_stream_id_idx;
+DROP INDEX rustodon.outbox_events_pending_idx;
+CREATE INDEX outbox_events_pending_idx ON rustodon.outbox_events (id)
+  WHERE dispatched_at IS NULL;
+DELETE FROM rustodon.schema_migrations WHERE version = 4;
 DROP TABLE rustodon.remote_fetch_leases;
 DELETE FROM rustodon.schema_migrations WHERE version = 3;
 EOF
@@ -1178,18 +1184,40 @@ EOF
       -- --ignored --exact --nocapture
   RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
     cargo test --locked --test operational_schema \
-      stream_events_are_replayable_and_not_dispatchable \
+      stream_events_are_retained_and_not_dispatchable \
+      -- --ignored --exact --nocapture
+  RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+    cargo test --locked --test operational_schema \
+      stream_history_is_durable_and_bounded_without_pruning_other_outbox_kinds \
+      -- --ignored --exact --nocapture
+  RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+    cargo test --locked --test operational_schema \
+      timeline_replay_is_bounded_by_event_class_and_commit_cursor \
+      -- --ignored --exact --nocapture
+  RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+    cargo test --locked --test operational_schema \
+      retention_pruning_does_not_hold_the_stream_writer_order_lock \
+      -- --ignored --exact --nocapture
+  RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+    cargo test --locked --features test-support --test operational_schema \
+      staged_stream_flush_is_bounded_ordered_and_does_not_lock_early \
       -- --ignored --exact --nocapture
   RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
     cargo test --locked --test operational_schema \
       stream_cursor_does_not_skip_inflight_commits \
       -- --ignored --exact --nocapture
   require_ignored_tests exact --test streaming \
-    websocket_protocol_token_is_echoed_in_handshake
+    websocket_protocol_token_is_echoed_in_handshake \
+    websocket_timeline_replay_recovers_all_nine_routes_without_duplicates
   RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
   RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
     cargo test --locked --test streaming \
       websocket_protocol_token_is_echoed_in_handshake \
+      -- --ignored --exact --nocapture
+  RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
+  RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+    cargo test --locked --test streaming \
+      websocket_timeline_replay_recovers_all_nine_routes_without_duplicates \
       -- --ignored --exact --nocapture
   RUSTODON_OPERATIONAL_DATABASE_URL="$database_url" \
   RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \

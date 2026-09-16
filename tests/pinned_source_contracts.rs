@@ -193,3 +193,131 @@ fn pinned_rails_uri_only_create_contract_dereferences_before_materializing_notes
         );
     }
 }
+
+#[test]
+#[ignore = "requires the read-only pinned Mastodon source checkout"]
+fn pinned_timeline_stream_protocol_covers_every_bundled_channel_and_lifecycle() {
+    let source = mastodon_source();
+    let frontend = read(&source.join("app/javascript/mastodon/actions/streaming.js"));
+    for evidence in [
+        "`public:local${onlyMedia ? ':media' : ''}`",
+        "`public${onlyRemote ? ':remote' : ''}${onlyMedia ? ':media' : ''}`",
+        "`hashtag${onlyLocal ? ':local' : ''}`",
+        "{ tag: tagName }",
+        "'list', { list: listId }",
+        "case 'update':",
+        "case 'status.update':",
+        "case 'delete':",
+        "fillPublicTimelineGaps",
+        "fillCommunityTimelineGaps",
+        "fillListTimelineGaps",
+    ] {
+        assert!(
+            frontend.contains(evidence),
+            "pinned frontend streaming contract drifted: {evidence}"
+        );
+    }
+
+    for evidence in [
+        "dispatch(updateTimeline(timelineId, JSON.parse(data.payload), { accept: options.accept, bogusQuotePolicy }))",
+        "dispatch(updateStatus(JSON.parse(data.payload), { bogusQuotePolicy }))",
+        "dispatch(deleteFromTimelines(data.payload))",
+    ] {
+        assert!(
+            frontend.contains(evidence),
+            "pinned streaming reducer dispatch drifted: {evidence}"
+        );
+    }
+    let timeline_actions = read(&source.join("app/javascript/mastodon/actions/timelines.js"));
+    for evidence in [
+        "export const TIMELINE_UPDATE  = 'TIMELINE_UPDATE'",
+        "dispatch(importFetchedStatus(status, { bogusQuotePolicy }))",
+        "type: TIMELINE_UPDATE",
+        "dispatch(timelineDelete({ statusId: id, accountId, references, reblogOf }))",
+    ] {
+        assert!(
+            timeline_actions.contains(evidence),
+            "pinned timeline action/reducer chain drifted: {evidence}"
+        );
+    }
+    let status_actions = read(&source.join("app/javascript/mastodon/actions/statuses.js"));
+    assert!(status_actions.contains(
+        "export const updateStatus = (status, { bogusQuotePolicy }) => dispatch =>\n  dispatch(importFetchedStatus(status, { bogusQuotePolicy }))"
+    ));
+    let importer = read(&source.join("app/javascript/mastodon/actions/importer/index.js"));
+    assert!(importer.contains("export const STATUS_IMPORT   = 'STATUS_IMPORT'"));
+    assert!(importer.contains("return { type: STATUS_IMPORT, status }"));
+    let typed_timeline_actions =
+        read(&source.join("app/javascript/mastodon/actions/timelines_typed.ts"));
+    assert!(typed_timeline_actions.contains("}>('timelines/delete')"));
+
+    let timelines = read(&source.join("app/javascript/mastodon/reducers/timelines.js"));
+    assert!(
+        !timelines.contains("STATUS_IMPORT"),
+        "status.update imports must not remove the status from another open timeline"
+    );
+    assert!(
+        timelines.contains("state.keySeq().forEach(timeline =>"),
+        "delete remains intentionally global across open timelines"
+    );
+    for evidence in [
+        "case TIMELINE_UPDATE:",
+        "timelineDelete.match(action)",
+        "pendingItems'], ImmutableList()).includes(status.get('id'))",
+        "items'], ImmutableList()).includes(status.get('id'))",
+        "const includesId = ids.includes(status.get('id'))",
+        "const helper = list => list.filterNot(item => item === id)",
+    ] {
+        assert!(
+            timelines.contains(evidence),
+            "pinned timeline replay idempotence drifted: {evidence}"
+        );
+    }
+    let statuses = read(&source.join("app/javascript/mastodon/reducers/statuses.js"));
+    assert!(statuses.contains("case STATUS_IMPORT:"));
+    assert!(statuses.contains("state.set(status.id, fromJS(status))"));
+    assert!(statuses.contains("return state.delete(id)"));
+    let hashtag_connection = frontend
+        .split("export const connectHashtagStream")
+        .nth(1)
+        .and_then(|source| source.split("export const connectDirectStream").next())
+        .expect("pinned hashtag stream function");
+    assert!(hashtag_connection.contains("{ tag: tagName }, { accept })"));
+    assert!(
+        !hashtag_connection.contains("fillGaps"),
+        "hashtag reconnect unexpectedly gained REST gap filling; retained replay contract changed"
+    );
+
+    let client = read(&source.join("app/javascript/mastodon/stream.js"));
+    assert!(client.contains("params.tag === streamIdentifier"));
+    assert!(client.contains("params.list === streamIdentifier"));
+    assert!(client.contains("type: 'subscribe'"));
+    assert!(client.contains("type: 'unsubscribe'"));
+
+    let server = read(&source.join("streaming/index.js"));
+    for channel in [
+        "case 'public':",
+        "case 'public:media':",
+        "case 'public:local':",
+        "case 'public:local:media':",
+        "case 'public:remote':",
+        "case 'public:remote:media':",
+        "case 'hashtag':",
+        "case 'hashtag:local':",
+        "case 'list':",
+    ] {
+        assert!(server.contains(channel), "pinned server omitted {channel}");
+    }
+    for error in [
+        "Missing tag name parameter",
+        "Missing list name parameter",
+        "Not authorized to stream this list",
+        "Unknown stream type",
+        "Access token does not have the required scopes",
+    ] {
+        assert!(
+            server.contains(error),
+            "pinned server error drifted: {error}"
+        );
+    }
+}

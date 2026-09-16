@@ -31,7 +31,7 @@ use crate::jobs::{
     LOCAL_MEDIA_CLEANUP_JOB_KIND, Lane, MASTODON_ACCOUNT_PURGE_JOB_KIND,
     MASTODON_DOMAIN_BLOCK_JOB_KIND, MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND,
     NOTIFICATION_CREATE_JOB_KIND, NOTIFICATION_UNFILTER_JOB_KIND, Queue, WorkerHeartbeat,
-    record_outbox_once_in, record_stream_event_in,
+    flush_stream_events_in, record_outbox_once_in, record_stream_event_in,
 };
 use crate::mail::MailRuntime;
 use crate::mastodon::activitypub_inbox::{
@@ -4123,6 +4123,7 @@ async fn process_activitypub_media(
     let persisted = writer
         .with_remote_domain_locks(&account_domain, || async {
             let mut transaction = pool.begin().await?;
+            let mut pending_stream_events = Vec::new();
             let current = sqlx::query_as::<_, (String, Option<String>, Option<String>, bool)>(
                 "SELECT media.remote_url, media.file_file_name, account.domain,
                         status.deleted_at IS NULL
@@ -4204,8 +4205,9 @@ async fn process_activitypub_media(
                 transaction.commit().await?;
                 return Ok(false);
             };
-            WriteRepository::record_remote_media_installed_stream_events_in(
+            WriteRepository::collect_remote_media_installed_stream_events_in(
                 &mut transaction,
+                &mut pending_stream_events,
                 status_id,
                 media_id,
             )
@@ -4221,10 +4223,26 @@ async fn process_activitypub_media(
                     "injected ambiguous metadata commit failure".to_owned(),
                 ))
             } else {
+                if let Err(error) =
+                    flush_stream_events_in(&mut transaction, &mut pending_stream_events).await
+                {
+                    WrittenMediaFiles::new(&media_root, written_paths.clone()).cleanup();
+                    let _ = transaction.rollback().await;
+                    return Err(error.into());
+                }
                 transaction.commit().await
             };
             #[cfg(not(feature = "test-support"))]
-            let commit_result = transaction.commit().await;
+            let commit_result = {
+                if let Err(error) =
+                    flush_stream_events_in(&mut transaction, &mut pending_stream_events).await
+                {
+                    WrittenMediaFiles::new(&media_root, written_paths.clone()).cleanup();
+                    let _ = transaction.rollback().await;
+                    return Err(error.into());
+                }
+                transaction.commit().await
+            };
             #[cfg(feature = "test-support")]
             let commit_result = if commit_result.is_ok() && media_root.take_commit_after_fault() {
                 Err(sqlx::Error::Protocol(
@@ -5894,12 +5912,14 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
             })?;
         }
     }
+    let maintenance_queue = queue.clone();
     handlers.register(
         "rustodon.maintenance.prune",
         Lane::Maintenance,
         ResourceClass::None,
         move |_job| {
             let pool = pool.clone();
+            let maintenance_queue = maintenance_queue.clone();
             async move {
                 sqlx::raw_sql(
                     "DELETE FROM rustodon.idempotency_keys WHERE expires_at <= clock_timestamp(); \
@@ -5926,6 +5946,10 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
                 .execute(&pool)
                 .await
                 .map_err(|_| HandlerFailure::retry("operational cleanup failed"))?;
+                maintenance_queue
+                    .prune_stream_history()
+                    .await
+                    .map_err(|_| HandlerFailure::retry("stream history cleanup failed"))?;
                 Ok(())
             }
         },

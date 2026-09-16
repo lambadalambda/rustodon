@@ -43,6 +43,7 @@ use super::policy::{
     status_reblog_access,
 };
 use super::records::{BrowserLoginUser, DomainBlock, Marker, MediaAttachment, NotificationPolicy};
+use super::repository::normalize_hashtag;
 use super::rest::{HtmlFormatter, RenderedHtml};
 use super::types::{AccountIdScheme, SecretText, StatusVisibility};
 use crate::crypto::ActiveRecordEncryptionConfig;
@@ -53,15 +54,16 @@ use crate::jobs::{
     ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND, ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND, JobError,
     JobSpec, LOCAL_MEDIA_CLEANUP_JOB_KIND, Lane, MASTODON_ACCOUNT_PURGE_JOB_KIND,
     MASTODON_DOMAIN_BLOCK_JOB_KIND, MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND,
-    NOTIFICATION_CREATE_JOB_KIND, NOTIFICATION_UNFILTER_JOB_KIND, record_outbox_in,
-    record_outbox_once_in, record_stream_event_in,
+    NOTIFICATION_CREATE_JOB_KIND, NOTIFICATION_UNFILTER_JOB_KIND, PendingStreamEvent,
+    flush_staged_stream_events_in, flush_stream_events_in, pending_stream_event, record_outbox_in,
+    record_outbox_once_in, record_stream_event_in, stage_stream_events_if_large_in,
 };
 use crate::mail::report_job;
 use crate::paperclip::{PaperclipAttachment, PaperclipMetadata, rails_blank};
 use crate::remote::{RemoteActor, canonical_remote_domain, canonical_remote_host};
 use crate::streaming::{
-    STATUS_UPDATE_NOTIFICATION_EVENT, SYSTEM_KILL_EVENT, TOKEN_KILL_EVENT, event_logical_key,
-    media_event_logical_key,
+    STATUS_UPDATE_NOTIFICATION_EVENT, SYSTEM_KILL_EVENT, TOKEN_KILL_EVENT, TimelineListRoute,
+    TimelineRouteSnapshot, event_logical_key, global_event_logical_key, media_event_logical_key,
 };
 
 use super::activitypub;
@@ -1052,16 +1054,41 @@ impl WriteRepository {
         remote_media_allowed_in_transaction(transaction, domain, limited_federation).await
     }
 
-    /// Records frontend reconciliation events in the transaction that installs remote media.
-    pub(crate) async fn record_remote_media_installed_stream_events_in(
+    /// Collects frontend reconciliation events in the transaction that installs remote media.
+    pub(crate) async fn collect_remote_media_installed_stream_events_in(
         transaction: &mut Transaction<'_, Postgres>,
+        pending: &mut Vec<PendingStreamEvent>,
         status_id: i64,
         media_id: i64,
     ) -> Result<(), WriteError> {
         let key = StreamEventLogicalKey::Media(media_id);
-        record_status_stream_events_with_key(transaction, status_id, "status.update", key).await?;
-        record_status_update_notification_stream_events_with_key(transaction, status_id, key)
-            .await?;
+        let after = status_timeline_snapshot(transaction, status_id).await?;
+        let mut before = after.clone();
+        before.had_media = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM media_attachments \
+             WHERE status_id = $1 AND id <> $2)",
+        )
+        .bind(status_id)
+        .bind(media_id)
+        .fetch_one(&mut **transaction)
+        .await?;
+        collect_status_stream_transition(
+            transaction,
+            pending,
+            status_id,
+            "status.update",
+            key,
+            Some(before),
+            Some(after),
+        )
+        .await?;
+        collect_status_update_notification_stream_events_with_key(
+            transaction,
+            pending,
+            status_id,
+            key,
+        )
+        .await?;
         let wrapper_ids = sqlx::query_scalar::<_, i64>(
             "SELECT id FROM statuses
               WHERE reblog_of_id = $1 AND deleted_at IS NULL
@@ -1071,8 +1098,14 @@ impl WriteRepository {
         .fetch_all(&mut **transaction)
         .await?;
         for wrapper_id in wrapper_ids {
-            record_status_stream_events_with_key(transaction, wrapper_id, "status.update", key)
-                .await?;
+            collect_status_stream_events_with_key(
+                transaction,
+                pending,
+                wrapper_id,
+                "status.update",
+                key,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1673,6 +1706,7 @@ impl WriteRepository {
             1_i64 << 10
         };
         let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
         lock_account_scope(&mut transaction, account_id).await?;
         let Some(actor_position) =
             authorized_admin_account(&mut transaction, acting_account_id, permission_mask).await?
@@ -1864,26 +1898,56 @@ impl WriteRepository {
             None
         };
 
+        let transition_at =
+            sqlx::query_scalar::<_, NaiveDateTime>("SELECT clock_timestamp()::timestamp")
+                .fetch_one(&mut *transaction)
+                .await?;
+        if suspended {
+            collect_account_timeline_transition(
+                &mut transaction,
+                &mut pending_stream_events,
+                account_id,
+                "delete",
+                transition_at.and_utc().timestamp_micros(),
+            )
+            .await?;
+        }
         let (domain, updated_at) = if suspended {
             sqlx::query_as::<_, (Option<String>, NaiveDateTime)>(
-                "UPDATE accounts SET suspended_at = clock_timestamp(), suspension_origin = 0, \
-                    updated_at = clock_timestamp() WHERE id = $1 RETURNING domain, updated_at",
+                "UPDATE accounts SET suspended_at = $2, suspension_origin = 0, \
+                    updated_at = $2 WHERE id = $1 RETURNING domain, updated_at",
             )
             .bind(account_id)
+            .bind(transition_at)
             .fetch_one(&mut *transaction)
             .await?
         } else {
             sqlx::query_as::<_, (Option<String>, NaiveDateTime)>(
                 "UPDATE accounts SET suspended_at = NULL, suspension_origin = NULL, \
-                    updated_at = clock_timestamp() WHERE id = $1 RETURNING domain, updated_at",
+                    updated_at = $2 WHERE id = $1 RETURNING domain, updated_at",
             )
             .bind(account_id)
+            .bind(transition_at)
             .fetch_one(&mut *transaction)
             .await?
         };
+        if !suspended {
+            collect_account_timeline_transition(
+                &mut transaction,
+                &mut pending_stream_events,
+                account_id,
+                "update",
+                transition_at.and_utc().timestamp_micros(),
+            )
+            .await?;
+        }
         if domain.is_none() {
             if suspended {
-                record_account_kill_stream_event(&mut transaction, account_id, updated_at).await?;
+                collect_account_kill_stream_event(
+                    &mut pending_stream_events,
+                    account_id,
+                    updated_at,
+                )?;
             }
             record_outbox_in(
                 &mut transaction,
@@ -1911,6 +1975,7 @@ impl WriteRepository {
             None,
         )
         .await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -1935,6 +2000,7 @@ impl WriteRepository {
             return Err(WriteError::InvalidInput("account actor URI is required"));
         }
         let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
         lock_account_scope(&mut transaction, account_id).await?;
         let Some((domain, suspended_at)) =
             sqlx::query_as::<_, (Option<String>, Option<NaiveDateTime>)>(
@@ -1981,14 +2047,27 @@ impl WriteRepository {
         .bind(account_id)
         .fetch_one(&mut *transaction)
         .await?;
+        let transition_at =
+            sqlx::query_scalar::<_, NaiveDateTime>("SELECT clock_timestamp()::timestamp")
+                .fetch_one(&mut *transaction)
+                .await?;
+        collect_account_timeline_transition(
+            &mut transaction,
+            &mut pending_stream_events,
+            account_id,
+            "delete",
+            transition_at.and_utc().timestamp_micros(),
+        )
+        .await?;
         let updated_at = sqlx::query_scalar::<_, NaiveDateTime>(
-            "UPDATE accounts SET suspended_at = clock_timestamp(), suspension_origin = 0, \
-             updated_at = clock_timestamp() WHERE id = $1 RETURNING updated_at",
+            "UPDATE accounts SET suspended_at = $2, suspension_origin = 0, \
+             updated_at = $2 WHERE id = $1 RETURNING updated_at",
         )
         .bind(account_id)
+        .bind(transition_at)
         .fetch_one(&mut *transaction)
         .await?;
-        record_account_kill_stream_event(&mut transaction, account_id, updated_at).await?;
+        collect_account_kill_stream_event(&mut pending_stream_events, account_id, updated_at)?;
         sqlx::query(
             "DELETE FROM rustodon.outbox_events \
              WHERE kind = $1 AND dispatched_at IS NULL \
@@ -2004,6 +2083,7 @@ impl WriteRepository {
             &account_purge_job(account_id, deletion_request_id, deletion_created_at, None),
         )
         .await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -2027,6 +2107,7 @@ impl WriteRepository {
         origin: Option<&str>,
     ) -> Result<AccountPurgeOutcome, WriteError> {
         let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
         let Some((domain, suspended_at)) =
             sqlx::query_as::<_, (Option<String>, Option<NaiveDateTime>)>(
                 "SELECT domain, suspended_at FROM accounts WHERE id = $1 AND id <> -99 FOR UPDATE",
@@ -2082,7 +2163,14 @@ impl WriteRepository {
         let protected_status_ids = protected_status_ids(&mut transaction, account_id).await?;
         purge_account_user(&mut transaction, account_id).await?;
         purge_account_profile(&mut transaction, account_id).await?;
-        purge_account_statuses(&mut transaction, account_id, &protected_status_ids, true).await?;
+        purge_account_statuses(
+            &mut transaction,
+            &mut pending_stream_events,
+            account_id,
+            &protected_status_ids,
+            true,
+        )
+        .await?;
         purge_account_mentions(&mut transaction, account_id, &protected_status_ids).await?;
         purge_account_media(&mut transaction, account_id, &protected_status_ids).await?;
         purge_account_relationships(&mut transaction, account_id).await?;
@@ -2101,6 +2189,7 @@ impl WriteRepository {
             .bind(account_id)
             .execute(&mut *transaction)
             .await?;
+        flush_staged_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(AccountPurgeOutcome::Purged)
     }
@@ -2196,6 +2285,7 @@ impl WriteRepository {
         }
         let domain = normalize_domain_block_domain(domain)?;
         let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
         if authorized_admin_account(&mut transaction, acting_account_id, 1_i64 << 5)
             .await?
             .is_none()
@@ -2230,6 +2320,25 @@ impl WriteRepository {
         let exact_existing = existing.filter(|(_, existing_domain, _, _, _, _)| {
             existing_domain.eq_ignore_ascii_case(&domain)
         });
+        let policy_account_ids = if matches!(severity, 0 | 1) {
+            let policy_domain = domain_policy_hostname(&domain);
+            sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM accounts WHERE domain IS NOT NULL \
+                   AND (lower(trim(trailing '.' FROM (CASE WHEN left(domain, 1) = '[' \
+                            THEN split_part(domain, ']', 1) || ']' ELSE split_part(domain, ':', 1) END))) = lower($1) \
+                     OR lower(trim(trailing '.' FROM (CASE WHEN left(domain, 1) = '[' \
+                            THEN split_part(domain, ']', 1) || ']' ELSE split_part(domain, ':', 1) END))) LIKE '%.' || lower($1)) \
+                 ORDER BY id",
+            )
+            .bind(&policy_domain)
+            .fetch_all(&mut *transaction)
+            .await?
+        } else {
+            Vec::new()
+        };
+        let policy_status_ids =
+            timeline_status_ids_for_accounts(&mut transaction, &policy_account_ids).await?;
+        let policy_before = status_timeline_snapshots(&mut transaction, &policy_status_ids).await?;
         let (domain_block_id, created_at, updated_at, action) = if let Some((
             id,
             _,
@@ -2268,6 +2377,20 @@ impl WriteRepository {
             (id, created_at, updated_at, "create")
         };
         apply_domain_account_restrictions(&mut transaction, &domain, severity, created_at).await?;
+        if !policy_status_ids.is_empty() {
+            let policy_after =
+                status_timeline_snapshots(&mut transaction, &policy_status_ids).await?;
+            collect_timeline_snapshot_transitions(
+                &mut transaction,
+                &mut pending_stream_events,
+                "status.update",
+                &format!("domain-block:{domain_block_id}"),
+                updated_at.and_utc().timestamp_micros(),
+                &policy_before,
+                &policy_after,
+            )
+            .await?;
+        }
         let severance_event_id = if severity == 1 {
             Some(
                 sqlx::query_scalar::<_, i64>(
@@ -2300,6 +2423,7 @@ impl WriteRepository {
             None,
         )
         .await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(domain_block_id)
     }
@@ -2347,6 +2471,7 @@ impl WriteRepository {
     /// cannot commit atomically.
     pub(crate) async fn process_domain_purge_job(&self, domain: &str) -> Result<(), WriteError> {
         let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
         sqlx::query(
             "UPDATE relationship_severance_events
                  SET purged = true, updated_at = clock_timestamp()
@@ -2364,7 +2489,7 @@ impl WriteRepository {
         .fetch_all(&mut *transaction)
         .await?;
         for account_id in account_ids {
-            purge_remote_account(&mut transaction, account_id).await?;
+            purge_remote_account(&mut transaction, &mut pending_stream_events, account_id).await?;
         }
         sqlx::query(
             "DELETE FROM custom_emojis WHERE domain IS NOT NULL AND lower(domain) = lower($1)",
@@ -2372,6 +2497,7 @@ impl WriteRepository {
         .bind(domain)
         .execute(&mut *transaction)
         .await?;
+        flush_staged_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         sqlx::query("SELECT public.rustodon_refresh_instances()")
             .execute(&self.pool)
@@ -2715,6 +2841,7 @@ impl WriteRepository {
     ) -> Result<(), WriteError> {
         let domain = normalize_domain_block_domain(domain)?;
         let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
         if authorized_admin_account(&mut transaction, acting_account_id, 1_i64 << 5)
             .await?
             .is_none()
@@ -2730,7 +2857,37 @@ impl WriteRepository {
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(WriteError::NotFound)?;
+        let policy_domain = domain_policy_hostname(&domain);
+        let account_ids = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM accounts WHERE domain IS NOT NULL \
+               AND (lower(trim(trailing '.' FROM (CASE WHEN left(domain, 1) = '[' \
+                        THEN split_part(domain, ']', 1) || ']' ELSE split_part(domain, ':', 1) END))) = lower($1) \
+                 OR lower(trim(trailing '.' FROM (CASE WHEN left(domain, 1) = '[' \
+                        THEN split_part(domain, ']', 1) || ']' ELSE split_part(domain, ':', 1) END))) LIKE '%.' || lower($1)) \
+               AND (silenced_at = $2 OR suspended_at = $2) ORDER BY id",
+        )
+        .bind(&policy_domain)
+        .bind(created_at)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let status_ids = timeline_status_ids_for_accounts(&mut transaction, &account_ids).await?;
+        let before = status_timeline_snapshots(&mut transaction, &status_ids).await?;
         clear_domain_owned_account_restrictions(&mut transaction, &domain, created_at).await?;
+        let after = status_timeline_snapshots(&mut transaction, &status_ids).await?;
+        let transition_at =
+            sqlx::query_scalar::<_, NaiveDateTime>("SELECT clock_timestamp()::timestamp")
+                .fetch_one(&mut *transaction)
+                .await?;
+        collect_timeline_snapshot_transitions(
+            &mut transaction,
+            &mut pending_stream_events,
+            "status.update",
+            &format!("domain-unblock:{domain_block_id}"),
+            transition_at.and_utc().timestamp_micros(),
+            &before,
+            &after,
+        )
+        .await?;
         sqlx::query("DELETE FROM domain_blocks WHERE id = $1")
             .bind(domain_block_id)
             .execute(&mut *transaction)
@@ -2745,6 +2902,7 @@ impl WriteRepository {
             None,
         )
         .await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -3638,6 +3796,7 @@ impl WriteRepository {
             .map_err(|_| WriteError::InvalidInput("remote actor image URI is invalid"))?;
 
         let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
         let account =
             sqlx::query_as::<_, (Option<String>, String, Option<NaiveDateTime>, Option<i32>)>(
                 "SELECT domain, uri, suspended_at, suspension_origin
@@ -3655,6 +3814,35 @@ impl WriteRepository {
             || (suspended_at.is_some() && suspension_origin != Some(1))
         {
             return Ok(());
+        }
+        let route_status_ids = if suspended != suspended_at.is_some() {
+            account_timeline_status_ids(&mut transaction, account_id).await?
+        } else {
+            Vec::new()
+        };
+        let route_before = status_timeline_snapshots(&mut transaction, &route_status_ids).await?;
+        let route_version = if route_status_ids.is_empty() {
+            None
+        } else {
+            Some(
+                sqlx::query_scalar::<_, NaiveDateTime>("SELECT clock_timestamp()::timestamp")
+                    .fetch_one(&mut *transaction)
+                    .await?
+                    .and_utc()
+                    .timestamp_micros(),
+            )
+        };
+        if suspended && let Some(version) = route_version {
+            for status_id in &route_status_ids {
+                collect_status_lifecycle_recipient_stream_events(
+                    &mut transaction,
+                    &mut pending_stream_events,
+                    *status_id,
+                    "delete",
+                    StreamEventLogicalKey::Version(version),
+                )
+                .await?;
+            }
         }
         upsert_remote_emojis(
             &mut transaction,
@@ -3732,6 +3920,33 @@ impl WriteRepository {
             false,
         )
         .await?;
+        if let Some(route_version) = route_version {
+            let route_after =
+                status_timeline_snapshots(&mut transaction, &route_status_ids).await?;
+            if !suspended {
+                for status_id in &route_status_ids {
+                    collect_status_lifecycle_recipient_stream_events(
+                        &mut transaction,
+                        &mut pending_stream_events,
+                        *status_id,
+                        "update",
+                        StreamEventLogicalKey::Version(route_version),
+                    )
+                    .await?;
+                }
+            }
+            collect_timeline_snapshot_transitions(
+                &mut transaction,
+                &mut pending_stream_events,
+                "status.update",
+                &format!("remote-actor:{account_id}"),
+                route_version,
+                &route_before,
+                &route_after,
+            )
+            .await?;
+        }
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -3746,6 +3961,7 @@ impl WriteRepository {
         expected_suspended_at: Option<NaiveDateTime>,
     ) -> Result<(), WriteError> {
         let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
         let account = sqlx::query_as::<_, (Option<String>, String, Option<NaiveDateTime>)>(
             "SELECT domain, uri, suspended_at FROM accounts WHERE id = $1 FOR UPDATE",
         )
@@ -3761,6 +3977,9 @@ impl WriteRepository {
         {
             return Ok(());
         }
+        let route_status_ids = account_timeline_status_ids(&mut transaction, account_id).await?;
+        let mut route_snapshots =
+            status_timeline_snapshots(&mut transaction, &route_status_ids).await?;
 
         let follows = sqlx::query_as::<
             _,
@@ -3788,6 +4007,16 @@ impl WriteRepository {
         .bind(account_id)
         .fetch_all(&mut *transaction)
         .await?;
+        for status_id in &route_status_ids {
+            collect_status_lifecycle_recipient_stream_events(
+                &mut transaction,
+                &mut pending_stream_events,
+                *status_id,
+                "delete",
+                StreamEventLogicalKey::Version(0),
+            )
+            .await?;
+        }
         let requests = sqlx::query_as::<_, (i64, i64)>(
             "SELECT id, target_account_id FROM follow_requests
               WHERE account_id = $1 OR target_account_id = $1
@@ -3979,7 +4208,15 @@ impl WriteRepository {
         )
         .await?;
         for status_id in &affected_status_ids {
-            record_status_delete_stream_events(&mut transaction, *status_id).await?;
+            if let Some(snapshot) = route_snapshots.remove(status_id) {
+                collect_status_delete_stream_events_with_snapshot(
+                    &mut transaction,
+                    &mut pending_stream_events,
+                    *status_id,
+                    snapshot,
+                )
+                .await?;
+            }
         }
         if !affected_status_ids.is_empty() {
             sqlx::query(
@@ -4080,6 +4317,7 @@ impl WriteRepository {
         .bind(account_id)
         .execute(&mut *transaction)
         .await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -4095,6 +4333,7 @@ impl WriteRepository {
     ) -> Result<Option<RemoteNoteWriteOutcome>, WriteError> {
         let note = RemoteNoteData::parse(object, actor_uri)?;
         let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
         lock_remote_note(&mut transaction, &note.uri).await?;
         let account = sqlx::query_as::<_, (Option<String>, String, String, Option<NaiveDateTime>)>(
             "SELECT domain, uri, followers_url, suspended_at FROM accounts
@@ -4241,13 +4480,15 @@ impl WriteRepository {
             )
             .await?;
         }
-        record_status_stream_events(
+        collect_status_stream_events(
             &mut transaction,
+            &mut pending_stream_events,
             status_id,
             "update",
             note.published_at.and_utc().timestamp_micros(),
         )
         .await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(Some(RemoteNoteWriteOutcome {
             status_id,
@@ -4544,6 +4785,7 @@ impl WriteRepository {
     ) -> Result<Option<RemoteNoteWriteOutcome>, WriteError> {
         let note = RemoteNoteData::parse(object, actor_uri)?;
         let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
         lock_remote_note(&mut transaction, &note.uri).await?;
         if !same_remote_note_host(actor_uri, &note.uri)? {
             return Err(WriteError::InvalidInput(
@@ -4616,6 +4858,7 @@ impl WriteRepository {
             Url::parse(origin).map_err(|_| WriteError::InvalidInput("local origin is invalid"))?;
         let formatter =
             HtmlFormatter::new(&html_origin, html_origin.host_str().unwrap_or_default());
+        let route_before = status_timeline_snapshot(&mut transaction, status_id).await?;
         let before = remote_note_edit_projection(&mut transaction, status_id, &formatter).await?;
         upsert_remote_emojis(
             &mut transaction,
@@ -4683,10 +4926,12 @@ impl WriteRepository {
             )
             .await?;
         }
-        // Reconcile metadata (including mentions and their notifications) even
-        // when rendered content is unchanged. Only meaningful edits advance the
-        // edit version and broadcast update effects.
-        if remote_note_edit_projection(&mut transaction, status_id, &formatter).await? == before {
+        let projection_changed =
+            remote_note_edit_projection(&mut transaction, status_id, &formatter).await? != before;
+        let route_after = status_timeline_snapshot(&mut transaction, status_id).await?;
+        // Route-only edits (for example hashtag or language changes) still need a timeline
+        // transition even when the rendered status projection is byte-for-byte unchanged.
+        if !projection_changed && route_after == route_before {
             transaction.commit().await?;
             return Ok(None);
         }
@@ -4701,19 +4946,24 @@ impl WriteRepository {
             note.updated_at.and_utc().timestamp_micros(),
         )
         .await?;
-        record_status_stream_events(
+        collect_status_stream_transition(
             &mut transaction,
+            &mut pending_stream_events,
             status_id,
             "status.update",
-            note.updated_at.and_utc().timestamp_micros(),
+            StreamEventLogicalKey::Version(note.updated_at.and_utc().timestamp_micros()),
+            Some(route_before),
+            Some(route_after),
         )
         .await?;
-        record_status_update_notification_stream_events(
+        collect_status_update_notification_stream_events(
             &mut transaction,
+            &mut pending_stream_events,
             status_id,
             note.updated_at.and_utc().timestamp_micros(),
         )
         .await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(Some(RemoteNoteWriteOutcome {
             status_id,
@@ -4730,6 +4980,7 @@ impl WriteRepository {
         atom_uri: Option<&str>,
     ) -> Result<(), WriteError> {
         let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
         lock_remote_note(&mut transaction, object_uri).await?;
         let account = sqlx::query_as::<_, (Option<String>, String, Option<NaiveDateTime>)>(
             "SELECT domain, uri, suspended_at FROM accounts WHERE id = $1 FOR UPDATE",
@@ -4817,7 +5068,12 @@ impl WriteRepository {
                         decrement_reblog_count(&mut transaction, status_id).await?;
                     }
                     for (reblog_id, _, _) in &reblogs {
-                        record_status_delete_stream_events(&mut transaction, *reblog_id).await?;
+                        collect_status_delete_stream_events(
+                            &mut transaction,
+                            &mut pending_stream_events,
+                            *reblog_id,
+                        )
+                        .await?;
                     }
                 }
                 for reblog_id in local_reblog_ids {
@@ -4848,7 +5104,12 @@ impl WriteRepository {
                     }
                 }
                 apply_account_stats_deltas(&mut transaction, status_deltas).await?;
-                record_status_delete_stream_events(&mut transaction, status_id).await?;
+                collect_status_delete_stream_events(
+                    &mut transaction,
+                    &mut pending_stream_events,
+                    status_id,
+                )
+                .await?;
             }
             let mut affected_status_ids = vec![status_id];
             affected_status_ids.extend(
@@ -4873,6 +5134,7 @@ impl WriteRepository {
         if let Some(atom_uri) = atom_uri.filter(|value| *value != object_uri) {
             insert_remote_note_tombstone(&mut transaction, account_id, atom_uri).await?;
         }
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -5041,6 +5303,7 @@ impl WriteRepository {
         origin: &str,
     ) -> Result<Option<RemoteInteractionWriteOutcome>, WriteError> {
         let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
         lock_remote_interaction(&mut transaction, activity_uri).await?;
         if !same_remote_note_host(actor_uri, activity_uri)? {
             return Err(WriteError::InvalidInput(
@@ -5180,13 +5443,15 @@ impl WriteRepository {
             )
             .await?;
         }
-        record_status_stream_events(
+        collect_status_stream_events(
             &mut transaction,
+            &mut pending_stream_events,
             boost_id,
             "update",
             created_at.and_utc().timestamp_micros(),
         )
         .await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(Some(RemoteInteractionWriteOutcome {
             activity_id: boost_id,
@@ -5203,6 +5468,7 @@ impl WriteRepository {
         origin: &str,
     ) -> Result<(), WriteError> {
         let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
         lock_remote_interaction(&mut transaction, activity_uri).await?;
         if !same_remote_note_host(actor_uri, activity_uri)? {
             return Err(WriteError::InvalidInput(
@@ -5255,9 +5521,15 @@ impl WriteRepository {
                 "Status",
             )
             .await?;
-            record_status_delete_stream_events(&mut transaction, boost_id).await?;
+            collect_status_delete_stream_events(
+                &mut transaction,
+                &mut pending_stream_events,
+                boost_id,
+            )
+            .await?;
         }
         insert_remote_note_tombstone(&mut transaction, account_id, activity_uri).await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -5269,6 +5541,7 @@ impl WriteRepository {
         activity_uri: &str,
     ) -> Result<(), WriteError> {
         let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
         lock_remote_interaction(&mut transaction, activity_uri).await?;
         if !same_remote_note_host(actor_uri, activity_uri)? {
             return Err(WriteError::InvalidInput(
@@ -5333,9 +5606,15 @@ impl WriteRepository {
                 "Status",
             )
             .await?;
-            record_status_delete_stream_events(&mut transaction, boost_id).await?;
+            collect_status_delete_stream_events(
+                &mut transaction,
+                &mut pending_stream_events,
+                boost_id,
+            )
+            .await?;
         }
         insert_remote_note_tombstone(&mut transaction, account_id, activity_uri).await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -6065,6 +6344,7 @@ impl WriteRepository {
         let (_, mut transaction) = self
             .begin_account_write(authenticated, WRITE_STATUSES)
             .await?;
+        let mut pending_stream_events = Vec::new();
         let (target_status_id, recipient_account_id, target_visibility) =
             reblog_target(&mut transaction, requested_status_id).await?;
         let (viewer_blocks_author, author_blocks_viewer) = sqlx::query_as::<_, (bool, bool)>(
@@ -6206,13 +6486,15 @@ impl WriteRepository {
             &notification_job(recipient_account_id, NOTIFICATION_REBLOG, status_id),
         )
         .await?;
-        record_status_stream_events(
+        collect_status_stream_events(
             &mut transaction,
+            &mut pending_stream_events,
             status_id,
             "update",
             created_at.and_utc().timestamp_micros(),
         )
         .await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(ReblogWriteOutcome {
             status_id,
@@ -6269,6 +6551,7 @@ impl WriteRepository {
         let (account_id, mut transaction) = self
             .begin_account_write(authenticated, WRITE_STATUSES)
             .await?;
+        let mut pending_stream_events = Vec::new();
         let application_id = authenticated.application_id();
         let media_ids = unique_media_ids(media_ids);
         validate_idempotency(idempotency)?;
@@ -6445,13 +6728,15 @@ impl WriteRepository {
         )
         .logical_key(format!("activitypub:status:{status_id}"));
         record_outbox_in(&mut transaction, &status_distribution_job).await?;
-        record_status_stream_events(
+        collect_status_stream_events(
             &mut transaction,
+            &mut pending_stream_events,
             status_id,
             "update",
             status_created_at.and_utc().timestamp_micros(),
         )
         .await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(StatusWriteOutcome { status_id })
     }
@@ -6466,6 +6751,7 @@ impl WriteRepository {
         let (account_id, mut transaction) = self
             .begin_account_write(authenticated, WRITE_STATUSES)
             .await?;
+        let mut pending_stream_events = Vec::new();
         let (
             current_text,
             current_spoiler_text,
@@ -6497,6 +6783,7 @@ impl WriteRepository {
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(WriteError::NotFound)?;
+        let timeline_before = status_timeline_snapshot(&mut transaction, status_id).await?;
         let quote_id = sqlx::query_scalar::<_, i64>(
             "SELECT id FROM quotes WHERE status_id = $1 ORDER BY id LIMIT 1",
         )
@@ -6714,19 +7001,25 @@ impl WriteRepository {
             edited_at.and_utc().timestamp_micros()
         ));
         record_outbox_in(&mut transaction, &status_update_job).await?;
-        record_status_stream_events(
+        let timeline_after = status_timeline_snapshot(&mut transaction, status_id).await?;
+        collect_status_stream_transition(
             &mut transaction,
+            &mut pending_stream_events,
             status_id,
             "status.update",
-            edited_at.and_utc().timestamp_micros(),
+            StreamEventLogicalKey::Version(edited_at.and_utc().timestamp_micros()),
+            Some(timeline_before),
+            Some(timeline_after),
         )
         .await?;
-        record_status_update_notification_stream_events(
+        collect_status_update_notification_stream_events(
             &mut transaction,
+            &mut pending_stream_events,
             status_id,
             edited_at.and_utc().timestamp_micros(),
         )
         .await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -6804,6 +7097,7 @@ impl WriteRepository {
         require_active_owner: bool,
     ) -> Result<Vec<MediaAttachment>, WriteError> {
         let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
         if require_active_owner {
             ensure_account_write_allowed_in(&mut transaction, account_id).await?;
         }
@@ -6849,6 +7143,14 @@ impl WriteRepository {
         } else {
             Vec::new()
         };
+        let timeline_before = status_timeline_snapshot(&mut transaction, status_id).await?;
+        let mut reblog_timeline_before = HashMap::new();
+        for (reblog_id, _, _) in &reblogs {
+            reblog_timeline_before.insert(
+                *reblog_id,
+                status_timeline_snapshot(&mut transaction, *reblog_id).await?,
+            );
+        }
         let reblog_ids = reblogs
             .iter()
             .map(|(reblog_id, _, _)| *reblog_id)
@@ -6998,9 +7300,23 @@ impl WriteRepository {
         record_status_delete_distribution(&mut transaction, status_id, &remote_recipient_ids)
             .await?;
         for (reblog_id, _, _) in &reblogs {
-            record_status_delete_stream_events(&mut transaction, *reblog_id).await?;
+            collect_status_delete_stream_events_with_snapshot(
+                &mut transaction,
+                &mut pending_stream_events,
+                *reblog_id,
+                reblog_timeline_before
+                    .remove(reblog_id)
+                    .expect("locked reblog has a route snapshot"),
+            )
+            .await?;
         }
-        record_status_delete_stream_events(&mut transaction, status_id).await?;
+        collect_status_delete_stream_events_with_snapshot(
+            &mut transaction,
+            &mut pending_stream_events,
+            status_id,
+            timeline_before,
+        )
+        .await?;
         if let Some(audit_account_id) = audit_account_id {
             sqlx::query(
                  "INSERT INTO admin_action_logs ( \
@@ -7014,6 +7330,7 @@ impl WriteRepository {
             .execute(&mut *transaction)
             .await?;
         }
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(removed_attachments)
     }
@@ -15175,8 +15492,8 @@ async fn record_status_update_notifications(
     Ok(())
 }
 
-async fn record_account_kill_stream_event(
-    transaction: &mut Transaction<'_, Postgres>,
+fn collect_account_kill_stream_event(
+    pending: &mut Vec<PendingStreamEvent>,
     account_id: i64,
     updated_at: NaiveDateTime,
 ) -> Result<(), WriteError> {
@@ -15186,14 +15503,14 @@ async fn record_account_kill_stream_event(
         account_id,
         updated_at.and_utc().timestamp_micros(),
     );
-    record_stream_event_in(
-        transaction,
+    pending.push(pending_stream_event(
         account_id,
         SYSTEM_KILL_EVENT,
         account_id,
         &logical_key,
-    )
-    .await?;
+        None,
+        None,
+    )?);
     Ok(())
 }
 
@@ -15310,33 +15627,389 @@ impl StreamEventLogicalKey {
             }
         }
     }
+
+    fn for_global(self, event: &str, object_id: i64) -> String {
+        match self {
+            Self::Version(version) => global_event_logical_key(event, object_id, version),
+            Self::Media(media_id) => {
+                format!("stream:global:{event}:{object_id}:media:{media_id}")
+            }
+        }
+    }
 }
 
-async fn record_status_stream_events(
+async fn account_timeline_status_ids(
     transaction: &mut Transaction<'_, Postgres>,
+    account_id: i64,
+) -> Result<Vec<i64>, WriteError> {
+    timeline_status_ids_for_accounts(transaction, &[account_id]).await
+}
+
+async fn timeline_status_ids_for_accounts(
+    transaction: &mut Transaction<'_, Postgres>,
+    account_ids: &[i64],
+) -> Result<Vec<i64>, WriteError> {
+    if account_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(sqlx::query_scalar(
+        "WITH RECURSIVE affected(id) AS ( \
+           SELECT id FROM statuses WHERE account_id = ANY($1::bigint[]) AND deleted_at IS NULL \
+           UNION \
+           SELECT child.id FROM statuses child JOIN affected parent \
+             ON parent.id = child.reblog_of_id WHERE child.deleted_at IS NULL \
+         ) SELECT id FROM affected ORDER BY id",
+    )
+    .bind(account_ids)
+    .fetch_all(&mut **transaction)
+    .await?)
+}
+
+async fn collect_timeline_snapshot_transitions(
+    transaction: &mut Transaction<'_, Postgres>,
+    pending: &mut Vec<PendingStreamEvent>,
+    event: &str,
+    context: &str,
+    version: i64,
+    before: &HashMap<i64, TimelineRouteSnapshot>,
+    after: &HashMap<i64, TimelineRouteSnapshot>,
+) -> Result<(), WriteError> {
+    let mut status_ids = before
+        .keys()
+        .chain(after.keys())
+        .copied()
+        .collect::<Vec<_>>();
+    status_ids.sort_unstable();
+    status_ids.dedup();
+    for status_id in status_ids {
+        let before = before.get(&status_id);
+        let after = after.get(&status_id);
+        if before == after {
+            continue;
+        }
+        let key = format!("stream:global:{event}:{status_id}:{context}:{version}");
+        pending.push(pending_stream_event(
+            0, event, status_id, &key, before, after,
+        )?);
+        stage_stream_events_if_large_in(transaction, pending).await?;
+    }
+    Ok(())
+}
+
+async fn collect_account_timeline_transition(
+    transaction: &mut Transaction<'_, Postgres>,
+    pending: &mut Vec<PendingStreamEvent>,
+    account_id: i64,
+    event: &str,
+    version: i64,
+) -> Result<(), WriteError> {
+    let status_ids = account_timeline_status_ids(transaction, account_id).await?;
+    let mut snapshots = status_timeline_snapshots(transaction, &status_ids).await?;
+    for status_id in status_ids {
+        let Some(snapshot) = snapshots.remove(&status_id) else {
+            continue;
+        };
+        let (before, after) = if event == "delete" {
+            (Some(&snapshot), None)
+        } else {
+            (None, Some(&snapshot))
+        };
+        let key =
+            format!("stream:global:{event}:{status_id}:account:{account_id}:lifecycle:{version}");
+        pending.push(pending_stream_event(
+            0, event, status_id, &key, before, after,
+        )?);
+        stage_stream_events_if_large_in(transaction, pending).await?;
+        collect_status_lifecycle_recipient_stream_events(
+            transaction,
+            pending,
+            status_id,
+            event,
+            StreamEventLogicalKey::Version(version),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn status_timeline_snapshot(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_id: i64,
+) -> Result<TimelineRouteSnapshot, WriteError> {
+    status_timeline_snapshots(transaction, &[status_id])
+        .await?
+        .remove(&status_id)
+        .ok_or(WriteError::NotFound)
+}
+
+async fn status_timeline_snapshots(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_ids: &[i64],
+) -> Result<HashMap<i64, TimelineRouteSnapshot>, WriteError> {
+    let mut snapshots = HashMap::new();
+    for chunk in status_ids.chunks(128) {
+        let rows = sqlx::query_as::<_, (i64, bool, Option<String>, bool, bool, bool)>(
+            "SELECT status.id, \
+                    EXISTS (SELECT 1 FROM media_attachments media WHERE media.status_id = status.id), \
+                    status.language, \
+                    status.visibility = 0 AND author.suspended_at IS NULL \
+                      AND author.silenced_at IS NULL AND status.reblog_of_id IS NULL \
+                      AND (NOT status.reply OR status.in_reply_to_account_id = status.account_id), \
+                    status.visibility = 0 AND author.suspended_at IS NULL \
+                      AND author.silenced_at IS NULL, \
+                    status.local OR status.uri IS NULL \
+               FROM statuses status JOIN accounts author ON author.id = status.account_id \
+              WHERE status.id = ANY($1::bigint[]) ORDER BY status.id",
+        )
+        .bind(chunk)
+        .fetch_all(&mut **transaction)
+        .await?;
+        for (status_id, had_media, language, public, hashtag, local) in rows {
+            snapshots.insert(
+                status_id,
+                TimelineRouteSnapshot {
+                    public,
+                    hashtag,
+                    local,
+                    had_media,
+                    language,
+                    tags: Vec::new(),
+                    lists: Vec::new(),
+                },
+            );
+        }
+        let tags = sqlx::query_as::<_, (i64, String)>(
+            "SELECT status_tag.status_id, tag.name FROM statuses_tags status_tag \
+             JOIN tags tag ON tag.id = status_tag.tag_id \
+             WHERE status_tag.status_id = ANY($1::bigint[]) \
+             ORDER BY status_tag.status_id, lower(tag.name), tag.id",
+        )
+        .bind(chunk)
+        .fetch_all(&mut **transaction)
+        .await?;
+        for (status_id, tag) in tags {
+            if let Some(snapshot) = snapshots.get_mut(&status_id) {
+                snapshot.tags.push(normalize_hashtag(&tag));
+            }
+        }
+        let lists = sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT DISTINCT status.id, list.account_id, list.id \
+               FROM statuses status \
+               JOIN accounts author ON author.id = status.account_id \
+               JOIN list_accounts member ON member.account_id = status.account_id \
+               JOIN lists list ON list.id = member.list_id \
+                 AND (member.follow_id IS NOT NULL OR status.account_id = list.account_id) \
+               LEFT JOIN follows member_follow ON member_follow.id = member.follow_id \
+               LEFT JOIN statuses source ON source.id = status.reblog_of_id \
+                 AND source.deleted_at IS NULL \
+               LEFT JOIN accounts source_author ON source_author.id = source.account_id \
+               LEFT JOIN accounts viewer ON viewer.id = list.account_id \
+              WHERE status.id = ANY($1::bigint[]) \
+                AND author.suspended_at IS NULL \
+                AND (source.id IS NULL OR source_author.suspended_at IS NULL) \
+                AND status.visibility IN (0, 1, 2) \
+                AND CASE WHEN status.account_id = list.account_id THEN true \
+                  WHEN status.visibility = 2 THEN member_follow.id IS NOT NULL \
+                  WHEN status.visibility IN (0, 1) THEN NOT EXISTS ( \
+                    SELECT 1 FROM blocks author_block \
+                     WHERE author_block.account_id = status.account_id \
+                       AND author_block.target_account_id = list.account_id) \
+                    AND (viewer.domain IS NULL OR NOT EXISTS ( \
+                      SELECT 1 FROM account_domain_blocks domain_block \
+                       WHERE domain_block.account_id = status.account_id \
+                         AND domain_block.domain = viewer.domain)) \
+                  ELSE false END \
+                AND (COALESCE(cardinality(member_follow.languages), 0) = 0 \
+                  OR status.language IS NULL OR status.language = ANY(member_follow.languages)) \
+                AND (NOT status.reply OR (status.in_reply_to_id IS NOT NULL \
+                  AND status.in_reply_to_account_id IS NOT NULL)) \
+                AND (NOT status.reply OR status.in_reply_to_account_id = status.account_id \
+                  OR status.in_reply_to_account_id = list.account_id \
+                  OR (list.replies_policy = 0 AND EXISTS ( \
+                    SELECT 1 FROM list_accounts reply_member \
+                     WHERE reply_member.list_id = list.id \
+                       AND reply_member.account_id = status.in_reply_to_account_id)) \
+                  OR (list.replies_policy = 1 AND EXISTS ( \
+                    SELECT 1 FROM follows reply_follow \
+                     WHERE reply_follow.account_id = list.account_id \
+                       AND reply_follow.target_account_id = status.in_reply_to_account_id))) \
+                AND (status.account_id = list.account_id OR status.reblog_of_id IS NULL OR ( \
+                  source.account_id IS NOT NULL AND member_follow.show_reblogs)) \
+                AND (status.account_id = list.account_id OR NOT EXISTS ( \
+                  SELECT 1 FROM blocks viewer_block \
+                   WHERE viewer_block.account_id = list.account_id \
+                     AND viewer_block.target_account_id = status.account_id)) \
+                AND (status.account_id = list.account_id OR NOT EXISTS ( \
+                  SELECT 1 FROM blocks author_block \
+                   WHERE author_block.account_id = status.account_id \
+                     AND author_block.target_account_id = list.account_id)) \
+                AND (status.account_id = list.account_id OR NOT EXISTS ( \
+                  SELECT 1 FROM mutes viewer_mute \
+                   WHERE viewer_mute.account_id = list.account_id \
+                     AND viewer_mute.target_account_id = status.account_id)) \
+                AND (status.account_id = list.account_id OR NOT EXISTS ( \
+                  SELECT 1 FROM mentions mention \
+                   WHERE mention.status_id IN (status.id, status.reblog_of_id) \
+                     AND NOT mention.silent AND (EXISTS ( \
+                       SELECT 1 FROM blocks mention_block \
+                        WHERE mention_block.account_id = list.account_id \
+                          AND mention_block.target_account_id = mention.account_id) \
+                     OR EXISTS (SELECT 1 FROM mutes mention_mute \
+                        WHERE mention_mute.account_id = list.account_id \
+                          AND mention_mute.target_account_id = mention.account_id)))) \
+                AND (status.account_id = list.account_id OR source.account_id IS NULL OR ( \
+                  NOT EXISTS (SELECT 1 FROM blocks source_block \
+                    WHERE source_block.account_id = list.account_id \
+                      AND source_block.target_account_id = source.account_id) \
+                  AND NOT EXISTS (SELECT 1 FROM mutes source_mute \
+                    WHERE source_mute.account_id = list.account_id \
+                      AND source_mute.target_account_id = source.account_id) \
+                  AND NOT EXISTS (SELECT 1 FROM blocks source_author_block \
+                    WHERE source_author_block.account_id = source.account_id \
+                      AND source_author_block.target_account_id = list.account_id) \
+                  AND (source_author.domain IS NULL OR NOT EXISTS ( \
+                    SELECT 1 FROM account_domain_blocks source_domain_block \
+                     WHERE source_domain_block.account_id = list.account_id \
+                       AND source_domain_block.domain = source_author.domain)))) \
+                AND (status.account_id = list.account_id OR author.domain IS NULL OR NOT EXISTS ( \
+                  SELECT 1 FROM account_domain_blocks domain_block \
+                   WHERE domain_block.account_id = list.account_id \
+                     AND domain_block.domain = author.domain)) \
+              ORDER BY status.id, list.account_id, list.id",
+        )
+        .bind(chunk)
+        .fetch_all(&mut **transaction)
+        .await?;
+        for (status_id, account_id, list_id) in lists {
+            if let Some(snapshot) = snapshots.get_mut(&status_id) {
+                snapshot.lists.push(TimelineListRoute {
+                    account_id,
+                    list_id,
+                });
+            }
+        }
+    }
+    for snapshot in snapshots.values_mut() {
+        snapshot.tags.sort();
+        snapshot.tags.dedup();
+        snapshot.lists.dedup();
+    }
+    Ok(snapshots)
+}
+
+async fn collect_status_stream_transition(
+    transaction: &mut Transaction<'_, Postgres>,
+    pending: &mut Vec<PendingStreamEvent>,
+    status_id: i64,
+    event: &str,
+    key: StreamEventLogicalKey,
+    before: Option<TimelineRouteSnapshot>,
+    after: Option<TimelineRouteSnapshot>,
+) -> Result<(), WriteError> {
+    let global_key = key.for_global(event, status_id);
+    pending.push(pending_stream_event(
+        0,
+        event,
+        status_id,
+        &global_key,
+        before.as_ref(),
+        after.as_ref(),
+    )?);
+    stage_stream_events_if_large_in(transaction, pending).await?;
+    collect_status_recipient_stream_events(transaction, pending, status_id, event, key).await
+}
+
+async fn collect_status_stream_events(
+    transaction: &mut Transaction<'_, Postgres>,
+    pending: &mut Vec<PendingStreamEvent>,
     status_id: i64,
     event: &str,
     version: i64,
 ) -> Result<(), WriteError> {
-    record_status_stream_events_with_key(
+    let snapshot = status_timeline_snapshot(transaction, status_id).await?;
+    let (before, after) = match event {
+        "update" => (None, Some(snapshot)),
+        "delete" => (Some(snapshot), None),
+        _ => (Some(snapshot.clone()), Some(snapshot)),
+    };
+    collect_status_stream_transition(
         transaction,
+        pending,
         status_id,
         event,
         StreamEventLogicalKey::Version(version),
+        before,
+        after,
     )
     .await
 }
 
 #[allow(clippy::too_many_lines)]
-async fn record_status_stream_events_with_key(
+async fn collect_status_stream_events_with_key(
     transaction: &mut Transaction<'_, Postgres>,
+    pending: &mut Vec<PendingStreamEvent>,
+    status_id: i64,
+    event: &str,
+    key: StreamEventLogicalKey,
+) -> Result<(), WriteError> {
+    let snapshot = status_timeline_snapshot(transaction, status_id).await?;
+    let (before, after) = match event {
+        "update" => (None, Some(snapshot)),
+        "delete" => (Some(snapshot), None),
+        _ => (Some(snapshot.clone()), Some(snapshot)),
+    };
+    collect_status_stream_transition(transaction, pending, status_id, event, key, before, after)
+        .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn collect_status_lifecycle_recipient_stream_events(
+    transaction: &mut Transaction<'_, Postgres>,
+    pending: &mut Vec<PendingStreamEvent>,
+    status_id: i64,
+    event: &str,
+    key: StreamEventLogicalKey,
+) -> Result<(), WriteError> {
+    collect_status_recipient_stream_events(transaction, pending, status_id, event, key).await?;
+    let recipients = sqlx::query_scalar::<_, i64>(
+        "SELECT DISTINCT mention.account_id
+           FROM mentions mention
+           JOIN accounts recipient ON recipient.id = mention.account_id
+            AND recipient.domain IS NULL AND recipient.suspended_at IS NULL
+           JOIN users recipient_user ON recipient_user.account_id = recipient.id
+            AND recipient_user.disabled IS FALSE
+          WHERE mention.status_id = $1 AND mention.silent IS FALSE
+          ORDER BY mention.account_id",
+    )
+    .bind(status_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for account_id in recipients {
+        let logical_key = key.for_recipient(account_id, event, status_id);
+        pending.push(pending_stream_event(
+            account_id,
+            event,
+            status_id,
+            &logical_key,
+            None,
+            None,
+        )?);
+        stage_stream_events_if_large_in(transaction, pending).await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn collect_status_recipient_stream_events(
+    transaction: &mut Transaction<'_, Postgres>,
+    pending: &mut Vec<PendingStreamEvent>,
     status_id: i64,
     event: &str,
     key: StreamEventLogicalKey,
 ) -> Result<(), WriteError> {
     let deleting = event == "delete";
     // The tag-follow UNION mirrors rest_home_timeline_ids' hashtag branch, including
-    // its policy exclusions. Delete callers have already tombstoned the status, but
+    // its policy exclusions. Delete callers may have already tombstoned the status, but
     // retain its tags; only that tombstone check is relaxed for hashtag recipients.
     let recipients = sqlx::query_scalar::<_, i64>(
         "WITH recipients AS ( \
@@ -15433,7 +16106,7 @@ async fn record_status_stream_events_with_key(
                 AND recipient_user.disabled IS FALSE \
               WHERE status.id = $1 AND ($2 OR status.deleted_at IS NULL) \
                 AND status.visibility = 0 AND status.reblog_of_id IS NULL \
-                AND author.suspended_at IS NULL AND author.silenced_at IS NULL \
+                AND ($2 OR (author.suspended_at IS NULL AND author.silenced_at IS NULL)) \
                 AND NOT EXISTS (SELECT 1 FROM blocks blocked_by \
                   WHERE blocked_by.account_id = status.account_id \
                     AND blocked_by.target_account_id = tag_follow.account_id) \
@@ -15462,7 +16135,15 @@ async fn record_status_stream_events_with_key(
     .await?;
     for account_id in recipients {
         let logical_key = key.for_recipient(account_id, event, status_id);
-        record_stream_event_in(transaction, account_id, event, status_id, &logical_key).await?;
+        pending.push(pending_stream_event(
+            account_id,
+            event,
+            status_id,
+            &logical_key,
+            None,
+            None,
+        )?);
+        stage_stream_events_if_large_in(transaction, pending).await?;
     }
     Ok(())
 }
@@ -15471,7 +16152,39 @@ async fn record_status_delete_stream_events(
     transaction: &mut Transaction<'_, Postgres>,
     status_id: i64,
 ) -> Result<(), WriteError> {
-    record_status_stream_events(transaction, status_id, "delete", 0).await?;
+    let mut pending = Vec::new();
+    collect_status_delete_stream_events(transaction, &mut pending, status_id).await?;
+    flush_stream_events_in(transaction, &mut pending).await?;
+    Ok(())
+}
+
+async fn collect_status_delete_stream_events(
+    transaction: &mut Transaction<'_, Postgres>,
+    pending: &mut Vec<PendingStreamEvent>,
+    status_id: i64,
+) -> Result<(), WriteError> {
+    let before = status_timeline_snapshot(transaction, status_id).await?;
+    collect_status_delete_stream_events_with_snapshot(transaction, pending, status_id, before).await
+}
+
+async fn collect_status_delete_stream_events_with_snapshot(
+    transaction: &mut Transaction<'_, Postgres>,
+    pending: &mut Vec<PendingStreamEvent>,
+    status_id: i64,
+    before: TimelineRouteSnapshot,
+) -> Result<(), WriteError> {
+    let key = StreamEventLogicalKey::Version(0);
+    let global_key = key.for_global("delete", status_id);
+    pending.push(pending_stream_event(
+        0,
+        "delete",
+        status_id,
+        &global_key,
+        Some(&before),
+        None,
+    )?);
+    stage_stream_events_if_large_in(transaction, pending).await?;
+    collect_status_recipient_stream_events(transaction, pending, status_id, "delete", key).await?;
     let recipients = sqlx::query_scalar::<_, i64>(
         "SELECT DISTINCT mention.account_id
            FROM mentions mention
@@ -15487,26 +16200,37 @@ async fn record_status_delete_stream_events(
     .await?;
     for account_id in recipients {
         let logical_key = event_logical_key(account_id, "delete", status_id, 0);
-        record_stream_event_in(transaction, account_id, "delete", status_id, &logical_key).await?;
+        pending.push(pending_stream_event(
+            account_id,
+            "delete",
+            status_id,
+            &logical_key,
+            None,
+            None,
+        )?);
+        stage_stream_events_if_large_in(transaction, pending).await?;
     }
     Ok(())
 }
 
-async fn record_status_update_notification_stream_events(
+async fn collect_status_update_notification_stream_events(
     transaction: &mut Transaction<'_, Postgres>,
+    pending: &mut Vec<PendingStreamEvent>,
     status_id: i64,
     version: i64,
 ) -> Result<(), WriteError> {
-    record_status_update_notification_stream_events_with_key(
+    collect_status_update_notification_stream_events_with_key(
         transaction,
+        pending,
         status_id,
         StreamEventLogicalKey::Version(version),
     )
     .await
 }
 
-async fn record_status_update_notification_stream_events_with_key(
+async fn collect_status_update_notification_stream_events_with_key(
     transaction: &mut Transaction<'_, Postgres>,
+    pending: &mut Vec<PendingStreamEvent>,
     status_id: i64,
     key: StreamEventLogicalKey,
 ) -> Result<(), WriteError> {
@@ -15526,14 +16250,15 @@ async fn record_status_update_notification_stream_events_with_key(
     for account_id in recipients {
         let logical_key =
             key.for_recipient(account_id, STATUS_UPDATE_NOTIFICATION_EVENT, status_id);
-        record_stream_event_in(
-            transaction,
+        pending.push(pending_stream_event(
             account_id,
             STATUS_UPDATE_NOTIFICATION_EVENT,
             status_id,
             &logical_key,
-        )
-        .await?;
+            None,
+            None,
+        )?);
+        stage_stream_events_if_large_in(transaction, pending).await?;
     }
     Ok(())
 }
@@ -17316,6 +18041,7 @@ async fn protected_status_ids(
 
 async fn purge_remote_account(
     transaction: &mut Transaction<'_, Postgres>,
+    pending_stream_events: &mut Vec<PendingStreamEvent>,
     account_id: i64,
 ) -> Result<(), WriteError> {
     let is_remote = sqlx::query_scalar::<_, bool>(
@@ -17332,7 +18058,7 @@ async fn purge_remote_account(
         .await?;
     cancel_pending_account_job(transaction, ACTIVITYPUB_ACCOUNT_DELETE_JOB_KIND, account_id)
         .await?;
-    purge_account_statuses(transaction, account_id, &[], false).await?;
+    purge_account_statuses(transaction, pending_stream_events, account_id, &[], true).await?;
     purge_account_mentions(transaction, account_id, &[]).await?;
     purge_account_media(transaction, account_id, &[]).await?;
     purge_account_relationships(transaction, account_id).await?;
@@ -17719,6 +18445,7 @@ async fn domain_media_metadata(
 #[allow(clippy::too_many_lines)]
 async fn purge_account_statuses(
     transaction: &mut Transaction<'_, Postgres>,
+    pending_stream_events: &mut Vec<PendingStreamEvent>,
     account_id: i64,
     protected_status_ids: &[i64],
     emit_stream_events: bool,
@@ -17752,6 +18479,11 @@ async fn purge_account_statuses(
         .iter()
         .map(|(status_id, ..)| *status_id)
         .collect::<Vec<_>>();
+    let mut timeline_snapshots = if emit_stream_events {
+        status_timeline_snapshots(transaction, &status_ids).await?
+    } else {
+        HashMap::new()
+    };
     let accepted_quote_targets = sqlx::query_scalar::<_, i64>(
         "SELECT quoted_status_id FROM quotes
            WHERE status_id = ANY($1::bigint[])
@@ -17783,8 +18515,14 @@ async fn purge_account_statuses(
     remove_statuses_from_account_conversations(transaction, &status_ids).await?;
     for status_id in &status_ids {
         cancel_status_outbox(transaction, *status_id).await?;
-        if emit_stream_events {
-            record_status_delete_stream_events(transaction, *status_id).await?;
+        if emit_stream_events && let Some(snapshot) = timeline_snapshots.remove(status_id) {
+            collect_status_delete_stream_events_with_snapshot(
+                transaction,
+                pending_stream_events,
+                *status_id,
+                snapshot,
+            )
+            .await?;
         }
     }
     if !status_ids.is_empty() {
