@@ -60,16 +60,16 @@ use crate::mastodon::{
     MediaAttachmentCreate, MediaAttachmentUpdate, MediaFocus, NO_SCOPE, NotificationPolicy,
     NotificationPolicyUpdate, OAUTH_CONFIGURED_SCOPES, OAuthAuthenticationError,
     OAuthAuthorizationCodeError, OAuthAuthorizationGrantError, OAuthClientCredentialsError,
-    OAuthError, OAuthResourceOwner, OAuthScopes, OAuthTokenRevocationError, PROFILE, READ_ACCOUNTS,
-    READ_BLOCKS, READ_BOOKMARKS, READ_COLLECTIONS, READ_FAVOURITES, READ_FILTERS, READ_FOLLOWS,
-    READ_LISTS, READ_MUTES, READ_NOTIFICATIONS, READ_SEARCH, READ_STATUSES, REPORT_RATE_LIMIT,
-    Repository, RequiredScopes, StatusMediaAttributeUpdate, StatusUpdate, TwoFactorVerification,
-    User, VERIFY_CREDENTIALS, WRITE_ACCOUNTS, WRITE_BLOCKS, WRITE_BOOKMARKS, WRITE_CONVERSATIONS,
-    WRITE_FAVOURITES, WRITE_FOLLOWS, WRITE_MEDIA, WRITE_MUTES, WRITE_NOTIFICATIONS, WRITE_REPORTS,
-    WRITE_STATUSES, WriteError, WriteRepository,
+    OAuthError, OAuthResourceOwner, OAuthScopes, OAuthTokenRevocationError, PROFILE, PollCreate,
+    READ_ACCOUNTS, READ_BLOCKS, READ_BOOKMARKS, READ_COLLECTIONS, READ_FAVOURITES, READ_FILTERS,
+    READ_FOLLOWS, READ_LISTS, READ_MUTES, READ_NOTIFICATIONS, READ_SEARCH, READ_STATUSES,
+    REPORT_RATE_LIMIT, Repository, RequiredScopes, StatusMediaAttributeUpdate, StatusUpdate,
+    TwoFactorVerification, User, VERIFY_CREDENTIALS, WRITE_ACCOUNTS, WRITE_BLOCKS, WRITE_BOOKMARKS,
+    WRITE_CONVERSATIONS, WRITE_FAVOURITES, WRITE_FOLLOWS, WRITE_MEDIA, WRITE_MUTES,
+    WRITE_NOTIFICATIONS, WRITE_REPORTS, WRITE_STATUSES, WriteError, WriteRepository,
     activitypub::{self, ACTIVITY_JSON, JRD_JSON},
-    random_auth_token, random_totp_secret, signature_key_id, verify_http_signature,
-    verify_password, verify_two_factor,
+    equals_or_includes, random_auth_token, random_totp_secret, signature_key_id,
+    verify_http_signature, verify_password, verify_two_factor,
 };
 use crate::paperclip::{
     PaperclipAttachment, PaperclipMetadata, PaperclipRoot, PreparedAccountMedia,
@@ -78,7 +78,7 @@ use crate::paperclip::{
 };
 use crate::remote::{
     RemoteAccountResolver, RemoteFetchError, canonical_remote_domain,
-    canonical_remote_domain_from_url, valid_remote_username,
+    canonical_remote_domain_from_url, supported_activitypub_context, valid_remote_username,
 };
 use crate::remote::{RemoteFetchLimits, RemoteFetcher};
 use crate::secret::SecretString;
@@ -1428,6 +1428,20 @@ pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
         None,
         Private
     ),
+    route!(
+        "/api/v1/polls/{id}",
+        Implemented,
+        ApiAuthentication::Optional(READ_STATUSES.as_slice()),
+        None,
+        Anonymous
+    ),
+    post_route!(
+        "/api/v1/polls/{id}/votes",
+        Implemented,
+        ApiAuthentication::Required(WRITE_STATUSES.as_slice()),
+        None,
+        Private
+    ),
     post_route!(
         "/api/v1/reports",
         Implemented,
@@ -2168,6 +2182,16 @@ pub const V1_REQUIRED_API_ROUTES: &[(&str, ApiMethod, ApiRouteSupport)] = &[
     ),
     (
         "/api/v1/statuses",
+        ApiMethod::Post,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/polls/{id}",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/polls/{id}/votes",
         ApiMethod::Post,
         ApiRouteSupport::Implemented,
     ),
@@ -3557,6 +3581,8 @@ pub fn router(state: WebState) -> Router {
         )
         .route("/api/v1/markers", get(markers).post(marker_update))
         .route("/api/v1/statuses", post(status_create))
+        .route("/api/v1/polls/{id}", get(poll_show))
+        .route("/api/v1/polls/{id}/votes", post(poll_vote))
         .route("/api/v1/reports", post(report_create))
         .route("/api/v1/media", post(media_create_v1))
         .route(
@@ -3779,6 +3805,8 @@ pub fn router(state: WebState) -> Router {
         )
         .route("/api/v1/markers/", get(markers).post(marker_update))
         .route("/api/v1/statuses/", post(status_create))
+        .route("/api/v1/polls/{id}/", get(poll_show))
+        .route("/api/v1/polls/{id}/votes/", post(poll_vote))
         .route("/api/v1/reports/", post(report_create))
         .route("/api/v1/media/", post(media_create_v1))
         .route(
@@ -4649,16 +4677,20 @@ fn activitypub_inbox_delivery_logical_key(
     let Some(delivery_target_account_id) = delivery_target_account_id else {
         return logical_key.to_owned();
     };
-    let kind = activity.get("type").and_then(serde_json::Value::as_str);
     let object = activity.get("object");
-    let is_note_write = matches!(kind, Some("Create"))
-        && object.is_some_and(serde_json::Value::is_string)
-        || matches!(kind, Some("Create" | "Update" | "Delete"))
+    let is_create = equals_or_includes(activity.get("type"), "Create");
+    let is_write = ["Create", "Update", "Delete"]
+        .into_iter()
+        .any(|kind| equals_or_includes(activity.get("type"), kind));
+    let is_note_write = is_create && object.is_some_and(serde_json::Value::is_string)
+        || is_write
             && object
                 .and_then(serde_json::Value::as_object)
-                .and_then(|object| object.get("type"))
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|kind| matches!(kind, "Note" | "Tombstone"));
+                .is_some_and(|object| {
+                    ["Note", "Question", "Tombstone"]
+                        .into_iter()
+                        .any(|kind| equals_or_includes(object.get("type"), kind))
+                });
     if is_note_write {
         format!("{logical_key}:delivery:{delivery_target_account_id}")
     } else {
@@ -5951,7 +5983,7 @@ async fn federation_note_value(
     else {
         return Err(());
     };
-    Ok(activitypub::note(
+    let mut object = activitypub::note(
         &state.origin,
         &state.local_domain,
         status,
@@ -5970,7 +6002,17 @@ async fn federation_note_value(
         replies,
         favourites_count,
         reblogs_count,
-    ))
+    );
+    if let Some(poll_id) = status.poll_id {
+        let poll = state
+            .repository
+            .poll(poll_id)
+            .await
+            .map_err(|_| ())?
+            .ok_or(())?;
+        object = activitypub::question(object, &poll, Utc::now().naive_utc());
+    }
+    Ok(object)
 }
 
 async fn activitypub_status_counts(state: &WebState, status_id: i64) -> Result<(i64, i64), ()> {
@@ -6279,81 +6321,10 @@ async fn federation_outbox_response(
     for status in statuses {
         let note = match state.repository.account(status.account_id).await {
             Ok(Some(status_account)) => {
-                let media = match state.repository.media_attachments(status.id).await {
-                    Ok(media) => media,
-                    Err(_) => return internal_error(),
-                };
-                let mention_rows = match state.repository.mentions(status.id).await {
-                    Ok(mention_rows) => mention_rows,
-                    Err(_) => return internal_error(),
-                };
-                let mut mentions = Vec::new();
-                for mention in mention_rows {
-                    if !mention.silent {
-                        match state.repository.account(mention.account_id).await {
-                            Ok(Some(target)) => mentions.push((mention, target)),
-                            Ok(None) | Err(_) => return internal_error(),
-                        }
-                    }
+                match federation_note_value(state, &status, &status_account).await {
+                    Ok(note) => note,
+                    Err(()) => return internal_error(),
                 }
-                let hashtags = match state.repository.rest_status_tag_rows(&[status.id]).await {
-                    Ok(rows) => rows
-                        .into_iter()
-                        .map(|row| (row.name.clone(), row.display_name.unwrap_or(row.name)))
-                        .collect::<Vec<_>>(),
-                    Err(_) => return internal_error(),
-                };
-                let quoted_link = match activitypub_quote_url(state, status.id).await {
-                    Ok(quoted_link) => quoted_link,
-                    Err(()) => return internal_error(),
-                };
-                let quoted_identifier = match activitypub_quote_uri(state, status.id).await {
-                    Ok(quoted_identifier) => quoted_identifier,
-                    Err(()) => return internal_error(),
-                };
-                let quote_authorization =
-                    match activitypub_quote_authorization(state, status.id).await {
-                        Ok(quote_authorization) => quote_authorization,
-                        Err(()) => return internal_error(),
-                    };
-                let (favourites_count, reblogs_count) =
-                    match activitypub_status_counts(state, status.id).await {
-                        Ok(counts) => counts,
-                        Err(()) => return internal_error(),
-                    };
-                let emojis = match state.repository.activitypub_status_emojis(status.id).await {
-                    Ok(emojis) => emojis,
-                    Err(_) => return internal_error(),
-                };
-                let replies = match activitypub_replies(state, &status_account, &status).await {
-                    Ok(replies) => replies,
-                    Err(()) => return internal_error(),
-                };
-                let (in_reply_to_url, in_reply_to_atom_uri, conversation) =
-                    match activitypub_note_metadata(state, &status).await {
-                        Ok(metadata) => metadata,
-                        Err(()) => return internal_error(),
-                    };
-                activitypub::note(
-                    &state.origin,
-                    &state.local_domain,
-                    &status,
-                    &status_account,
-                    &state.media_root_url,
-                    &media,
-                    &mentions,
-                    &hashtags,
-                    &emojis,
-                    quoted_link.as_deref(),
-                    in_reply_to_url.as_deref(),
-                    in_reply_to_atom_uri.as_deref(),
-                    conversation.as_deref(),
-                    quoted_identifier.as_deref(),
-                    quote_authorization.as_deref(),
-                    replies,
-                    favourites_count,
-                    reblogs_count,
-                )
             }
             Ok(None) | Err(_) => return internal_error(),
         };
@@ -12425,6 +12396,9 @@ async fn marker_update(
         Err(WriteError::Unauthorized) => {
             return error_response(StatusCode::UNAUTHORIZED, "Unauthorized");
         }
+        Err(WriteError::Forbidden) => {
+            return error_response(StatusCode::FORBIDDEN, "This action is not allowed");
+        }
         Err(WriteError::InvalidInput(_)) => {
             return error_response(StatusCode::BAD_REQUEST, "Invalid marker parameters");
         }
@@ -12611,6 +12585,10 @@ async fn status_create(
     let Ok(media_ids) = status_media_ids(&rack) else {
         return error_response(StatusCode::BAD_REQUEST, "Invalid media_ids");
     };
+    let poll = match status_poll(&rack) {
+        Ok(poll) => poll,
+        Err(error) => return status_saved_write_error(&error),
+    };
     let Ok(spoiler_text) = parameter("spoiler_text") else {
         return error_response(StatusCode::BAD_REQUEST, "Invalid spoiler_text");
     };
@@ -12648,6 +12626,7 @@ async fn status_create(
             quote_approval_policy.as_deref(),
             sensitive,
             in_reply_to_id,
+            poll.as_ref(),
         )
     });
     let idempotency_scope = status_idempotency_scope(owner);
@@ -12686,6 +12665,7 @@ async fn status_create(
             language.as_deref(),
             quote_approval_policy.as_deref(),
             in_reply_to_id,
+            poll.as_ref(),
             idempotency,
         )
         .await
@@ -12806,6 +12786,7 @@ fn status_idempotency_fingerprint(
     quote_approval_policy: Option<&str>,
     sensitive: Option<bool>,
     in_reply_to_id: Option<i64>,
+    poll: Option<&PollCreate>,
 ) -> [u8; 32] {
     let reply_id = in_reply_to_id.map(|id| id.to_string());
     let values = [
@@ -12830,7 +12811,101 @@ fn status_idempotency_fingerprint(
         digest.update(media_id.to_string().as_bytes());
         digest.update([0]);
     }
+    digest.update(b"poll");
+    digest.update([0]);
+    if let Some(poll) = poll {
+        digest.update(poll.expires_in.to_string().as_bytes());
+        digest.update([0]);
+        digest.update([u8::from(poll.multiple), u8::from(poll.hide_totals)]);
+        digest.update([0]);
+        for option in &poll.options {
+            digest.update(option.as_bytes());
+            digest.update([0]);
+        }
+    }
     digest.finalize().into()
+}
+
+fn ruby_string_to_i(value: &str) -> i64 {
+    let value = value.trim_start();
+    let (negative, digits) = match value.as_bytes().first() {
+        Some(b'-') => (true, &value[1..]),
+        Some(b'+') => (false, &value[1..]),
+        _ => (false, value),
+    };
+    digits
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .fold(0_i64, |number, digit| {
+            if negative {
+                number
+                    .saturating_mul(10)
+                    .saturating_sub(i64::from(digit - b'0'))
+            } else {
+                number
+                    .saturating_mul(10)
+                    .saturating_add(i64::from(digit - b'0'))
+            }
+        })
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn ruby_json_number_to_i(value: &serde_json::Number) -> i64 {
+    value.as_i64().unwrap_or_else(|| {
+        value.as_u64().map_or_else(
+            || {
+                let value = value.as_f64().unwrap_or(0.0).trunc();
+                if value >= i64::MAX as f64 {
+                    i64::MAX
+                } else if value <= i64::MIN as f64 {
+                    i64::MIN
+                } else {
+                    value as i64
+                }
+            },
+            |value| i64::try_from(value).unwrap_or(i64::MAX),
+        )
+    })
+}
+
+fn poll_expires_in(value: Option<&RackValue>) -> Result<i64, WriteError> {
+    match value {
+        None | Some(RackValue::Null) => Err(WriteError::Validation("Expires at can't be blank")),
+        Some(RackValue::Scalar(value)) if value.trim().is_empty() => {
+            Err(WriteError::Validation("Expires at can't be blank"))
+        }
+        Some(RackValue::Scalar(value)) => Ok(ruby_string_to_i(value)),
+        Some(RackValue::Number(value)) => Ok(ruby_json_number_to_i(value)),
+        Some(_) => Err(WriteError::InvalidInput("Invalid poll expires_in")),
+    }
+}
+
+fn status_poll(parameters: &RackParameters) -> Result<Option<PollCreate>, WriteError> {
+    let Some(value) = parameters.get("poll") else {
+        return Ok(None);
+    };
+    if matches!(value, RackValue::Null) {
+        return Ok(None);
+    }
+    let RackValue::Object(fields) = value else {
+        return Err(WriteError::InvalidInput("Invalid poll"));
+    };
+    let options = match fields.get("options") {
+        Some(RackValue::Array(values)) => values
+            .iter()
+            .map(|value| match value {
+                RackValue::Scalar(value) => Ok(value.clone()),
+                _ => Err(WriteError::InvalidInput("Invalid poll options")),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err(WriteError::InvalidInput("Invalid poll options")),
+    };
+    let expires_in = poll_expires_in(fields.get("expires_in"))?;
+    let multiple = fields.get("multiple").is_some_and(boolean_value);
+    let hide_totals = fields.get("hide_totals").is_some_and(boolean_value);
+    crate::mastodon::prepare_local_poll(&options, expires_in, multiple, hide_totals)
+        .map(Some)
+        .map_err(WriteError::Validation)
 }
 
 fn status_media_ids(parameters: &RackParameters) -> Result<Vec<i64>, ()> {
@@ -13377,6 +13452,9 @@ fn media_upload_error(error: crate::paperclip::MediaAttachmentError) -> Response
 fn media_write_error(error: &WriteError) -> Response<Body> {
     match error {
         WriteError::Unauthorized => error_response(StatusCode::UNAUTHORIZED, "Unauthorized"),
+        WriteError::Forbidden => {
+            error_response(StatusCode::FORBIDDEN, "This action is not allowed")
+        }
         WriteError::NotFound => record_not_found(),
         WriteError::Validation(message) => {
             error_response(StatusCode::UNPROCESSABLE_ENTITY, message)
@@ -13396,6 +13474,9 @@ fn media_write_error(error: &WriteError) -> Response<Body> {
 fn report_write_error(error: &WriteError) -> Response<Body> {
     match error {
         WriteError::Unauthorized => error_response(StatusCode::UNAUTHORIZED, "Unauthorized"),
+        WriteError::Forbidden => {
+            error_response(StatusCode::FORBIDDEN, "This action is not allowed")
+        }
         WriteError::NotFound => record_not_found(),
         WriteError::Validation(message) => {
             error_response(StatusCode::UNPROCESSABLE_ENTITY, message)
@@ -13889,6 +13970,7 @@ fn subscription_create_after(
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn streaming_subscribe(
     socket: &mut WebSocket,
     state: &WebState,
@@ -14652,6 +14734,9 @@ fn conversation_write_error(error: &WriteError) -> Response<Body> {
     match error {
         WriteError::NotFound => record_not_found(),
         WriteError::Unauthorized => error_response(StatusCode::UNAUTHORIZED, "Unauthorized"),
+        WriteError::Forbidden => {
+            error_response(StatusCode::FORBIDDEN, "This action is not allowed")
+        }
         WriteError::InvalidInput(_) => {
             error_response(StatusCode::BAD_REQUEST, "Invalid conversation parameters")
         }
@@ -17947,9 +18032,12 @@ fn status_saved_write_error(error: &WriteError) -> Response<Body> {
     match error {
         WriteError::NotFound => record_not_found(),
         WriteError::Unauthorized => error_response(StatusCode::UNAUTHORIZED, "Unauthorized"),
+        WriteError::Forbidden => {
+            error_response(StatusCode::FORBIDDEN, "This action is not allowed")
+        }
         WriteError::InvalidInput(message) => error_response(StatusCode::BAD_REQUEST, message),
-        WriteError::Validation(message) => {
-            error_response(StatusCode::UNPROCESSABLE_ENTITY, message)
+        WriteError::Validation(_) => {
+            error_response(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string())
         }
         WriteError::Conflict => error_response(
             StatusCode::CONFLICT,
@@ -17960,6 +18048,229 @@ fn status_saved_write_error(error: &WriteError) -> Response<Body> {
         | WriteError::Job(_)
         | WriteError::Filesystem(_) => internal_error(),
     }
+}
+
+fn remote_poll_refresh_document_is_supported(object: &serde_json::Value, status_uri: &str) -> bool {
+    supported_activitypub_context(object.get("@context"))
+        && object.get("id").and_then(serde_json::Value::as_str) == Some(status_uri)
+        && (equals_or_includes(object.get("type"), "Question")
+            || equals_or_includes(object.get("type"), "Note"))
+}
+
+async fn refresh_remote_poll(state: &WebState, poll_id: i64, viewer_account_id: i64) -> bool {
+    let Ok(Some((
+        author_id,
+        actor_uri,
+        status_uri,
+        last_fetched_at,
+        expires_at,
+        expected_lock_version,
+    ))) = state.repository.remote_poll_refresh_target(poll_id).await
+    else {
+        return false;
+    };
+    let now = Utc::now().naive_utc();
+    if last_fetched_at.is_some_and(|last| {
+        last >= now - ChronoDuration::minutes(1)
+            || expires_at.is_some_and(|expires_at| last >= expires_at)
+    }) {
+        return false;
+    }
+    let Ok(target) = Url::parse(&status_uri) else {
+        return false;
+    };
+    let Ok(domain) = canonical_remote_domain_from_url(&target) else {
+        return false;
+    };
+    if !state
+        .repository
+        .remote_domain_allowed(&domain, state.instance_runtime.limited_federation)
+        .await
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let Ok(Some(signer_account)) = state.repository.account(viewer_account_id).await else {
+        return false;
+    };
+    if signer_account.domain.is_some() {
+        return false;
+    }
+    let Some(private_key) = signer_account
+        .private_key
+        .as_ref()
+        .filter(|key| key.is_present())
+    else {
+        return false;
+    };
+    let key_id = format!(
+        "{}#main-key",
+        activitypub::actor_url(&state.origin, &signer_account)
+    );
+    let signer = HttpSignatureSigner {
+        key_id: &key_id,
+        private_key_pem: private_key.as_str(),
+    };
+    let Ok(response) = state
+        .remote_fetcher
+        .get_signed(
+            target,
+            &[
+                ACTIVITY_JSON,
+                "application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
+            ],
+            &signer,
+        )
+        .await
+    else {
+        return false;
+    };
+    let Ok(object) = serde_json::from_slice::<serde_json::Value>(&response.body) else {
+        return false;
+    };
+    if !remote_poll_refresh_document_is_supported(&object, &status_uri) {
+        return false;
+    }
+    let Some(writer) = state.write_repository.as_ref() else {
+        return false;
+    };
+    writer
+        .apply_signed_remote_poll_refresh(
+            author_id,
+            &actor_uri,
+            &object,
+            state.origin.as_str(),
+            poll_id,
+            expected_lock_version,
+        )
+        .await
+        .is_ok()
+}
+
+async fn poll_show(State(state): State<WebState>, uri: Uri, headers: HeaderMap) -> Response<Body> {
+    let viewer = match optional_viewer(&state, &headers, READ_STATUSES).await {
+        Ok(viewer) => viewer,
+        Err(response) => return response,
+    };
+    let Some((_, poll_id)) = uri_path_id(&uri, 4) else {
+        return not_found();
+    };
+    let mut poll = match state.loader(viewer).authorized_poll(poll_id).await {
+        Ok(Some(poll)) => poll,
+        Ok(None) => return not_found(),
+        Err(_) => return internal_error(),
+    };
+    if let Some(viewer_account_id) = viewer
+        && refresh_remote_poll(&state, poll_id, viewer_account_id).await
+    {
+        poll = match state.loader(viewer).authorized_poll(poll_id).await {
+            Ok(Some(poll)) => poll,
+            Ok(None) => return not_found(),
+            Err(_) => return internal_error(),
+        };
+    }
+    serde_json::to_vec(&state.serializer().poll(&poll)).map_or_else(
+        |_| internal_error(),
+        |body| json_response(StatusCode::OK, body),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PollVoteChoicesError {
+    Missing,
+    Invalid,
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn poll_vote_number(value: &serde_json::Number) -> Result<i32, PollVoteChoicesError> {
+    if let Some(value) = value.as_i64() {
+        return value.try_into().map_err(|_| PollVoteChoicesError::Invalid);
+    }
+    if let Some(value) = value.as_u64() {
+        return value.try_into().map_err(|_| PollVoteChoicesError::Invalid);
+    }
+    let value = value.as_f64().ok_or(PollVoteChoicesError::Invalid)?;
+    let truncated = value.trunc();
+    if !value.is_finite() || truncated < f64::from(i32::MIN) || truncated > f64::from(i32::MAX) {
+        return Err(PollVoteChoicesError::Invalid);
+    }
+    Ok(truncated as i32)
+}
+
+fn poll_vote_choices(parameters: &RackParameters) -> Result<Vec<i32>, PollVoteChoicesError> {
+    let values = match parameters.get("choices") {
+        None | Some(RackValue::Null) => return Err(PollVoteChoicesError::Missing),
+        Some(RackValue::Array(values)) if values.is_empty() => {
+            return Err(PollVoteChoicesError::Missing);
+        }
+        Some(RackValue::Array(values)) => values,
+        Some(_) => return Err(PollVoteChoicesError::Invalid),
+    };
+    values
+        .iter()
+        .map(|value| match value {
+            RackValue::Scalar(value) => value
+                .trim()
+                .parse::<i32>()
+                .map_err(|_| PollVoteChoicesError::Invalid),
+            RackValue::Number(value) => poll_vote_number(value),
+            _ => Err(PollVoteChoicesError::Invalid),
+        })
+        .collect()
+}
+
+async fn poll_vote(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_STATUSES).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let owner = match authenticated.require_user() {
+        Ok(owner) => owner.account_id(),
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    let Some((_, poll_id)) = uri_path_id(&uri, 4) else {
+        return record_not_found();
+    };
+    match state.loader(Some(owner)).authorized_poll(poll_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    }
+    let choices = match poll_vote_choices(&rack) {
+        Ok(choices) => choices,
+        Err(PollVoteChoicesError::Missing) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "param is missing or the value is empty or invalid: choices",
+            );
+        }
+        Err(PollVoteChoicesError::Invalid) => {
+            return error_response(StatusCode::BAD_REQUEST, "Invalid choices");
+        }
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    if let Err(error) = writer
+        .vote_poll(&authenticated, poll_id, &choices, state.origin.as_str())
+        .await
+    {
+        return status_saved_write_error(&error);
+    }
+    let poll = match state.loader(Some(owner)).authorized_poll(poll_id).await {
+        Ok(Some(poll)) => poll,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    serde_json::to_vec(&state.serializer().poll(&poll)).map_or_else(
+        |_| internal_error(),
+        |body| json_response(StatusCode::OK, body),
+    )
 }
 
 async fn status_show(
@@ -19598,6 +19909,7 @@ mod tests {
         ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_REQUEST_HEADERS,
         ACCESS_CONTROL_REQUEST_METHOD, ORIGIN,
     };
+    use serde_json::json;
 
     use super::*;
 
@@ -20406,6 +20718,28 @@ mod tests {
     }
 
     #[test]
+    fn question_inbox_keys_preserve_personal_delivery_targets_for_type_arrays() {
+        let activity = serde_json::json!({
+            "id": "https://remote.example/activities/question-42",
+            "type": ["Create"],
+            "actor": "https://remote.example/users/alice",
+            "object": {
+                "id": "https://remote.example/statuses/42",
+                "type": ["Question"]
+            }
+        });
+        let base = activitypub_inbox_logical_key(
+            &activity,
+            br#"{"id":"ignored"}"#,
+            "https://remote.example/users/alice",
+        );
+        assert_ne!(
+            activitypub_inbox_delivery_logical_key(&activity, &base, Some(7)),
+            activitypub_inbox_delivery_logical_key(&activity, &base, Some(8)),
+        );
+    }
+
+    #[test]
     fn activitypub_inbox_activity_ids_are_scoped_to_the_verified_actor() {
         let alice = serde_json::json!({
             "id": "https://remote.example/activities/42",
@@ -20451,6 +20785,137 @@ mod tests {
     }
 
     #[test]
+    fn poll_request_parser_uses_rails_expiry_coercion_for_form_and_json() {
+        let form = RackParameters::parse(
+            "poll[options][]=Tea&poll[options][]=Coffee&poll[expires_in]=%20%20%2B300junk&poll[multiple]=true",
+        )
+        .expect("valid form poll");
+        let poll = status_poll(&form)
+            .expect("form poll should parse")
+            .expect("form poll should be present");
+        assert_eq!(poll.options, ["Tea", "Coffee"]);
+        assert_eq!(poll.expires_in, 300);
+        assert!(poll.multiple);
+
+        let json = RackParameters::from_json(&json!({
+            "poll": {
+                "options": ["Tea", "Coffee"],
+                "expires_in": 300.9,
+                "hide_totals": true
+            }
+        }));
+        let poll = status_poll(&json)
+            .expect("JSON poll should parse")
+            .expect("JSON poll should be present");
+        assert_eq!(poll.expires_in, 300);
+        assert!(poll.hide_totals);
+
+        for value in ["abc", "+", "299junk", "-300xyz"] {
+            let parameters = RackParameters::from_json(&json!({
+                "poll": { "options": ["Tea", "Coffee"], "expires_in": value }
+            }));
+            assert!(matches!(
+                status_poll(&parameters),
+                Err(WriteError::Validation("Expires at is too soon"))
+            ));
+        }
+        for value in [json!(null), json!(""), json!("   ")] {
+            let parameters = RackParameters::from_json(&json!({
+                "poll": { "options": ["Tea", "Coffee"], "expires_in": value }
+            }));
+            assert!(matches!(
+                status_poll(&parameters),
+                Err(WriteError::Validation("Expires at can't be blank"))
+            ));
+        }
+        let malformed = RackParameters::from_json(&json!({
+            "poll": { "options": ["Tea", "Coffee"], "expires_in": true }
+        }));
+        assert!(matches!(
+            status_poll(&malformed),
+            Err(WriteError::InvalidInput("Invalid poll expires_in"))
+        ));
+    }
+
+    #[test]
+    fn signed_poll_refresh_requires_supported_json_ld_status_objects() {
+        let status_uri = "https://remote.example/statuses/1";
+        for status_type in [json!("Question"), json!("Note"), json!(["Object", "Note"])] {
+            let valid = json!({
+                "@context": [
+                    "https://www.w3.org/ns/activitystreams",
+                    {"votersCount": "http://joinmastodon.org/ns#votersCount"}
+                ],
+                "id": status_uri,
+                "type": status_type
+            });
+            assert!(remote_poll_refresh_document_is_supported(
+                &valid, status_uri
+            ));
+        }
+
+        for invalid in [
+            json!({"id": status_uri, "type": "Question"}),
+            json!({"@context": "https://example.invalid/context", "id": status_uri, "type": "Question"}),
+            json!({"@context": {"as": "https://www.w3.org/ns/activitystreams#"}, "id": status_uri, "type": "Note"}),
+            json!({"@context": "https://www.w3.org/ns/activitystreams", "id": "https://remote.example/statuses/2", "type": "Question"}),
+            json!({"@context": "https://www.w3.org/ns/activitystreams", "id": status_uri, "type": "Person"}),
+        ] {
+            assert!(!remote_poll_refresh_document_is_supported(
+                &invalid, status_uri
+            ));
+        }
+    }
+
+    #[test]
+    fn poll_vote_request_parser_matches_ruby_integer_coercion() {
+        let form = RackParameters::parse(
+            "choices[]=%20%2B1%20&choices[]=-2&choices[]=2147483647&choices[]=-2147483648",
+        )
+        .expect("valid choices form");
+        assert_eq!(
+            poll_vote_choices(&form),
+            Ok(vec![1, -2, i32::MAX, i32::MIN])
+        );
+        let json = RackParameters::from_json(&json!({
+            "choices": [0, 1.9, -2.9, 2_147_483_647.9, -2_147_483_648.9]
+        }));
+        assert_eq!(
+            poll_vote_choices(&json),
+            Ok(vec![0, 1, -2, i32::MAX, i32::MIN])
+        );
+
+        for value in [json!(null), json!([])] {
+            let parameters = RackParameters::from_json(&json!({ "choices": value }));
+            assert_eq!(
+                poll_vote_choices(&parameters),
+                Err(PollVoteChoicesError::Missing)
+            );
+        }
+        assert_eq!(
+            poll_vote_choices(&RackParameters::default()),
+            Err(PollVoteChoicesError::Missing)
+        );
+        for value in [
+            json!("0"),
+            json!(["1.5"]),
+            json!(["nope"]),
+            json!([true]),
+            json!([null]),
+            json!([2_147_483_648_i64]),
+            json!([-2_147_483_649_i64]),
+            json!([2_147_483_648.0]),
+            json!([-2_147_483_649.0]),
+        ] {
+            let parameters = RackParameters::from_json(&json!({ "choices": value }));
+            assert_eq!(
+                poll_vote_choices(&parameters),
+                Err(PollVoteChoicesError::Invalid)
+            );
+        }
+    }
+
+    #[test]
     fn status_idempotency_binds_account_and_reply_target() {
         let base = status_idempotency_fingerprint(
             "fixture status",
@@ -20460,6 +20925,7 @@ mod tests {
             Some("en"),
             None,
             Some(false),
+            None,
             None,
         );
         let reply = status_idempotency_fingerprint(
@@ -20471,6 +20937,7 @@ mod tests {
             None,
             Some(false),
             Some(42),
+            None,
         );
         let trimmed = status_idempotency_fingerprint(
             " fixture status ",
@@ -20481,9 +20948,50 @@ mod tests {
             None,
             Some(false),
             None,
+            None,
         );
         assert_ne!(base, reply);
         assert_eq!(base, trimmed);
+        let poll = PollCreate {
+            options: vec!["Tea".to_owned(), "Coffee".to_owned()],
+            expires_in: 300,
+            multiple: false,
+            hide_totals: false,
+        };
+        let poll_fingerprint = |poll: &PollCreate| {
+            status_idempotency_fingerprint(
+                "fixture status",
+                &[],
+                None,
+                Some("public"),
+                Some("en"),
+                None,
+                Some(false),
+                None,
+                Some(poll),
+            )
+        };
+        assert_ne!(base, poll_fingerprint(&poll));
+        for changed in [
+            PollCreate {
+                options: vec!["Tea".to_owned(), "Water".to_owned()],
+                ..poll.clone()
+            },
+            PollCreate {
+                expires_in: 301,
+                ..poll.clone()
+            },
+            PollCreate {
+                multiple: true,
+                ..poll.clone()
+            },
+            PollCreate {
+                hide_totals: true,
+                ..poll.clone()
+            },
+        ] {
+            assert_ne!(poll_fingerprint(&poll), poll_fingerprint(&changed));
+        }
         assert_ne!(
             base,
             status_idempotency_fingerprint(
@@ -20494,6 +21002,7 @@ mod tests {
                 Some("en"),
                 Some("nobody"),
                 Some(false),
+                None,
                 None,
             )
         );
@@ -20724,7 +21233,7 @@ mod tests {
 
     #[test]
     fn api_route_inventory_is_unique_and_declares_protocol_contracts() {
-        assert_eq!(API_ROUTE_INVENTORY.len(), 119);
+        assert_eq!(API_ROUTE_INVENTORY.len(), 121);
         assert_eq!(REST_BODY_LIMIT_BYTES, 103_809_024);
         assert_eq!(
             API_ROUTE_INVENTORY
@@ -20811,7 +21320,7 @@ mod tests {
                 .iter()
                 .filter(|route| route.method == ApiMethod::Post)
                 .count(),
-            35
+            36
         );
         assert!(api_route("/api/v1/markers").is_some());
     }

@@ -26,6 +26,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
 use sqlx::{Connection, Postgres, Transaction};
+use unicode_segmentation::UnicodeSegmentation;
 use url::Url;
 
 use super::auth::{
@@ -55,8 +56,11 @@ use crate::jobs::{
     JobSpec, LOCAL_MEDIA_CLEANUP_JOB_KIND, Lane, MASTODON_ACCOUNT_PURGE_JOB_KIND,
     MASTODON_DOMAIN_BLOCK_JOB_KIND, MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND,
     NOTIFICATION_CREATE_JOB_KIND, NOTIFICATION_UNFILTER_JOB_KIND, PendingStreamEvent,
-    flush_staged_stream_events_in, flush_stream_events_in, pending_stream_event, record_outbox_in,
-    record_outbox_once_in, record_stream_event_in, stage_stream_events_if_large_in,
+    PollExpirationEffectOutcome, PollExpirationIntentKind, flush_staged_stream_events_in,
+    flush_stream_events_in, pending_stream_event, poll_expiration_activation_in,
+    poll_expiration_effect_in, poll_expiration_generation, poll_expiration_is_historical,
+    poll_expiration_job, record_outbox_in, record_outbox_once_in, record_poll_expiration_effect_in,
+    record_stream_event_in, stage_stream_events_if_large_in,
 };
 use crate::mail::report_job;
 use crate::paperclip::{PaperclipAttachment, PaperclipMetadata, rails_blank};
@@ -68,6 +72,7 @@ use crate::streaming::{
 
 use super::activitypub;
 use super::activitypub_inbox::parse_note_emojis;
+use super::equals_or_includes;
 const MODERATION_PERMISSION_MASK: i64 = (1_i64 << 2)
     | (1_i64 << 3)
     | (1_i64 << 4)
@@ -510,6 +515,26 @@ pub struct StatusWriteOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PollCreate {
+    pub options: Vec<String>,
+    pub expires_in: i64,
+    pub multiple: bool,
+    pub hide_totals: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemotePollVoteOutcome {
+    Consumed,
+    NotPollVote,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PollVoteWriteOutcome {
+    pub poll_id: i64,
+    pub status_id: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteNoteWriteOutcome {
     pub status_id: i64,
     pub mention_ids: Vec<(i64, i64)>,
@@ -569,6 +594,7 @@ pub enum WriteError {
     InvalidInput(&'static str),
     NotFound,
     Unauthorized,
+    Forbidden,
     RateLimited,
     Validation(&'static str),
 }
@@ -585,6 +611,7 @@ impl fmt::Display for WriteError {
             Self::InvalidInput(message) => formatter.write_str(message),
             Self::NotFound => formatter.write_str("Mastodon write target was not found"),
             Self::Unauthorized => formatter.write_str("Mastodon write authorization is required"),
+            Self::Forbidden => formatter.write_str("This action is not allowed"),
             Self::RateLimited => formatter.write_str("Mastodon report rate limit exceeded"),
             Self::Validation(message) => write!(formatter, "Validation failed: {message}"),
         }
@@ -601,6 +628,7 @@ impl std::error::Error for WriteError {
             | Self::InvalidInput(_)
             | Self::NotFound
             | Self::Unauthorized
+            | Self::Forbidden
             | Self::RateLimited
             | Self::Validation(_) => None,
         }
@@ -638,6 +666,56 @@ pub struct WriteRepository {
 
 fn two_factor_attempt_is_rate_limited(failures: i64) -> bool {
     failures.saturating_add(1) >= MAX_TWO_FACTOR_ATTEMPTS_PER_HOUR
+}
+
+/// Validates and normalizes a local poll definition.
+///
+/// # Errors
+///
+/// Returns an error when option counts, lengths, or expiration bounds are invalid.
+pub fn prepare_local_poll(
+    options: &[String],
+    expires_in: i64,
+    multiple: bool,
+    hide_totals: bool,
+) -> Result<PollCreate, &'static str> {
+    let options = options
+        .iter()
+        .map(|option| option.trim())
+        .filter(|option| !option.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if options.len() < 2 {
+        return Err("Options must have more than one item");
+    }
+    if options.len() > 4 {
+        return Err("Options can't contain more than 4 items");
+    }
+    if options
+        .iter()
+        .any(|option| option.graphemes(true).count() > 50)
+    {
+        return Err("Options cannot be longer than 50 characters each");
+    }
+    if options
+        .iter()
+        .enumerate()
+        .any(|(index, option)| options[..index].iter().any(|candidate| candidate == option))
+    {
+        return Err("Options contain duplicate items");
+    }
+    if expires_in < 300 {
+        return Err("Expires at is too soon");
+    }
+    if expires_in > 2_629_746 {
+        return Err("Expires at is too far into the future");
+    }
+    Ok(PollCreate {
+        options,
+        expires_in,
+        multiple,
+        hide_totals,
+    })
 }
 
 #[allow(clippy::missing_errors_doc)]
@@ -3815,10 +3893,10 @@ impl WriteRepository {
         {
             return Ok(());
         }
-        let route_status_ids = if suspended != suspended_at.is_some() {
-            account_timeline_status_ids(&mut transaction, account_id).await?
-        } else {
+        let route_status_ids = if suspended == suspended_at.is_some() {
             Vec::new()
+        } else {
+            account_timeline_status_ids(&mut transaction, account_id).await?
         };
         let route_before = status_timeline_snapshots(&mut transaction, &route_status_ids).await?;
         let route_version = if route_status_ids.is_empty() {
@@ -4401,6 +4479,18 @@ impl WriteRepository {
             conversation_id,
         )
         .await?;
+        if let Some(poll) = note.poll.as_ref() {
+            upsert_remote_poll(
+                &mut transaction,
+                status_id,
+                account_id,
+                poll,
+                true,
+                false,
+                false,
+            )
+            .await?;
+        }
         if visibility < 2
             && let Some(in_reply_to_id) = in_reply_to_id
         {
@@ -4455,10 +4545,10 @@ impl WriteRepository {
         };
         update_remote_note_tags(&mut transaction, status_id, &note.hashtags).await?;
         insert_remote_note_stats(&mut transaction, status_id, &note).await?;
-        if visibility != 3 {
-            increment_account_status_count(&mut transaction, account_id, note.published_at).await?;
-        } else {
+        if visibility == 3 {
             ensure_account_stats_after_mutation(&mut transaction, account_id).await?;
+        } else {
+            increment_account_status_count(&mut transaction, account_id, note.published_at).await?;
         }
         if note.in_reply_to_uri.is_some() && in_reply_to_id.is_none() {
             let thread_job = JobSpec::new(
@@ -4774,7 +4864,6 @@ impl WriteRepository {
         Ok(true)
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn apply_remote_note_update(
         &self,
         account_id: i64,
@@ -4782,6 +4871,73 @@ impl WriteRepository {
         object: &Value,
         delivery_target_account_id: Option<i64>,
         origin: &str,
+    ) -> Result<Option<RemoteNoteWriteOutcome>, WriteError> {
+        self.apply_remote_note_update_with_authority(
+            account_id,
+            actor_uri,
+            object,
+            delivery_target_account_id,
+            origin,
+            RemoteUpdateAuthority::Inbox,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn apply_signed_remote_poll_refresh(
+        &self,
+        account_id: i64,
+        actor_uri: &str,
+        object: &Value,
+        origin: &str,
+        expected_poll_id: i64,
+        expected_poll_lock_version: i32,
+    ) -> Result<Option<RemoteNoteWriteOutcome>, WriteError> {
+        self.apply_remote_note_update_with_authority(
+            account_id,
+            actor_uri,
+            object,
+            None,
+            origin,
+            RemoteUpdateAuthority::SignedRefresh,
+            Some((expected_poll_id, expected_poll_lock_version)),
+        )
+        .await
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn apply_signed_remote_poll_refresh_for_test(
+        &self,
+        account_id: i64,
+        actor_uri: &str,
+        object: &Value,
+        origin: &str,
+        expected_poll_id: i64,
+        expected_poll_lock_version: i32,
+    ) -> Result<Option<RemoteNoteWriteOutcome>, WriteError> {
+        self.apply_signed_remote_poll_refresh(
+            account_id,
+            actor_uri,
+            object,
+            origin,
+            expected_poll_id,
+            expected_poll_lock_version,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
+    async fn apply_remote_note_update_with_authority(
+        &self,
+        account_id: i64,
+        actor_uri: &str,
+        object: &Value,
+        delivery_target_account_id: Option<i64>,
+        origin: &str,
+        authority: RemoteUpdateAuthority,
+        expected_poll: Option<(i64, i32)>,
     ) -> Result<Option<RemoteNoteWriteOutcome>, WriteError> {
         let note = RemoteNoteData::parse(object, actor_uri)?;
         let mut transaction = self.pool.begin().await?;
@@ -4844,16 +5000,104 @@ impl WriteRepository {
             transaction.commit().await?;
             return Ok(None);
         }
+        if let Some((expected_poll_id, expected_lock_version)) = expected_poll {
+            let matching_poll_id = sqlx::query_scalar::<_, i64>(
+                "SELECT id FROM polls \
+                 WHERE id = $1 AND status_id = $2 AND lock_version = $3 FOR UPDATE",
+            )
+            .bind(expected_poll_id)
+            .bind(status_id)
+            .bind(expected_lock_version)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if matching_poll_id != Some(expected_poll_id) {
+                transaction.commit().await?;
+                return Err(WriteError::Conflict);
+            }
+        }
         if note.edited_at.is_none() {
+            // Unsolicited inbox objects cannot roll an explicitly versioned status back. A
+            // directly signed poll refresh is authoritative only for unchanged poll shape/tallies.
+            if current_edited_at.is_some() && authority == RemoteUpdateAuthority::Inbox {
+                transaction.commit().await?;
+                return Ok(None);
+            }
+            let poll_reconcile =
+                if authority == RemoteUpdateAuthority::SignedRefresh && note.poll.is_none() {
+                    RemotePollReconcile::Unchanged
+                } else {
+                    reconcile_remote_poll(
+                        &mut transaction,
+                        status_id,
+                        account_id,
+                        note.poll.as_ref(),
+                        false,
+                        authority.rejects_tally_regression(),
+                        authority.claims_freshness(),
+                    )
+                    .await?
+                };
             update_remote_note_stats(&mut transaction, status_id, &note).await?;
+            if let RemotePollReconcile::Tally(updated_at) = poll_reconcile {
+                collect_status_stream_events(
+                    &mut transaction,
+                    &mut pending_stream_events,
+                    status_id,
+                    "status.update",
+                    updated_at.and_utc().timestamp_micros(),
+                )
+                .await?;
+                flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
+            }
             transaction.commit().await?;
             return Ok(None);
         }
         let current_version = current_edited_at.unwrap_or(current_created_at);
-        if note.updated_at <= current_version {
+        if note.updated_at < current_version {
             transaction.commit().await?;
             return Ok(None);
         }
+        if note.updated_at == current_version {
+            let poll_reconcile =
+                if authority == RemoteUpdateAuthority::SignedRefresh && note.poll.is_none() {
+                    RemotePollReconcile::Unchanged
+                } else {
+                    reconcile_remote_poll(
+                        &mut transaction,
+                        status_id,
+                        account_id,
+                        note.poll.as_ref(),
+                        false,
+                        authority.rejects_tally_regression(),
+                        authority.claims_freshness(),
+                    )
+                    .await?
+                };
+            update_remote_note_stats(&mut transaction, status_id, &note).await?;
+            if let RemotePollReconcile::Tally(updated_at) = poll_reconcile {
+                collect_status_stream_events(
+                    &mut transaction,
+                    &mut pending_stream_events,
+                    status_id,
+                    "status.update",
+                    updated_at.and_utc().timestamp_micros(),
+                )
+                .await?;
+                flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
+            }
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        let poll_reconcile = reconcile_remote_poll(
+            &mut transaction,
+            status_id,
+            account_id,
+            note.poll.as_ref(),
+            true,
+            authority.rejects_tally_regression(),
+            authority.claims_freshness(),
+        )
+        .await?;
         let html_origin =
             Url::parse(origin).map_err(|_| WriteError::InvalidInput("local origin is invalid"))?;
         let formatter =
@@ -4931,7 +5175,21 @@ impl WriteRepository {
         let route_after = status_timeline_snapshot(&mut transaction, status_id).await?;
         // Route-only edits (for example hashtag or language changes) still need a timeline
         // transition even when the rendered status projection is byte-for-byte unchanged.
-        if !projection_changed && route_after == route_before {
+        let meaningful_update = projection_changed
+            || route_after != route_before
+            || poll_reconcile == RemotePollReconcile::Significant;
+        if !meaningful_update {
+            if let RemotePollReconcile::Tally(updated_at) = poll_reconcile {
+                collect_status_stream_events(
+                    &mut transaction,
+                    &mut pending_stream_events,
+                    status_id,
+                    "status.update",
+                    updated_at.and_utc().timestamp_micros(),
+                )
+                .await?;
+                flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
+            }
             transaction.commit().await?;
             return Ok(None);
         }
@@ -5423,10 +5681,10 @@ impl WriteRepository {
         .bind(boost_id)
         .execute(&mut *transaction)
         .await?;
-        if visibility != 3 {
-            increment_account_status_count(&mut transaction, account_id, created_at).await?;
-        } else {
+        if visibility == 3 {
             ensure_account_stats_after_mutation(&mut transaction, account_id).await?;
+        } else {
+            increment_account_status_count(&mut transaction, account_id, created_at).await?;
         }
         increment_reblog_count(&mut transaction, target_status_id).await?;
         if original_account_is_local
@@ -5508,10 +5766,10 @@ impl WriteRepository {
             .bind(boost_id)
             .execute(&mut *transaction)
             .await?;
-            if visibility != 3 {
-                decrement_account_status_count(&mut transaction, account_id).await?;
-            } else {
+            if visibility == 3 {
                 ensure_account_stats_after_mutation(&mut transaction, account_id).await?;
+            } else {
+                decrement_account_status_count(&mut transaction, account_id).await?;
             }
             decrement_reblog_count(&mut transaction, target_status_id).await?;
             delete_activity_notifications(
@@ -5593,10 +5851,10 @@ impl WriteRepository {
             .bind(boost_id)
             .execute(&mut *transaction)
             .await?;
-            if visibility != 3 {
-                decrement_account_status_count(&mut transaction, account_id).await?;
-            } else {
+            if visibility == 3 {
                 ensure_account_stats_after_mutation(&mut transaction, account_id).await?;
+            } else {
+                decrement_account_status_count(&mut transaction, account_id).await?;
             }
             decrement_reblog_count(&mut transaction, target_status_id).await?;
             delete_activity_notifications(
@@ -6529,6 +6787,38 @@ impl WriteRepository {
             language,
             None,
             in_reply_to_id,
+            None,
+            idempotency,
+        )
+        .await
+    }
+
+    /// Creates a status with an optional poll using the same transactional write path as the REST API.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_status_with_poll(
+        &self,
+        authenticated: &AuthenticatedBearer,
+        text: &str,
+        media_ids: &[i64],
+        spoiler_text: Option<&str>,
+        sensitive: Option<bool>,
+        visibility: Option<&str>,
+        language: Option<&str>,
+        in_reply_to_id: Option<i64>,
+        poll: Option<&PollCreate>,
+        idempotency: Option<IdempotencyKey<'_>>,
+    ) -> Result<StatusWriteOutcome, WriteError> {
+        self.create_status_with_quote_policy(
+            authenticated,
+            text,
+            media_ids,
+            spoiler_text,
+            sensitive,
+            visibility,
+            language,
+            None,
+            in_reply_to_id,
+            poll,
             idempotency,
         )
         .await
@@ -6546,8 +6836,20 @@ impl WriteRepository {
         language: Option<&str>,
         quote_approval_policy: Option<&str>,
         in_reply_to_id: Option<i64>,
+        poll: Option<&PollCreate>,
         idempotency: Option<IdempotencyKey<'_>>,
     ) -> Result<StatusWriteOutcome, WriteError> {
+        let poll = poll
+            .map(|poll| {
+                prepare_local_poll(
+                    &poll.options,
+                    poll.expires_in,
+                    poll.multiple,
+                    poll.hide_totals,
+                )
+                .map_err(WriteError::Validation)
+            })
+            .transpose()?;
         let (account_id, mut transaction) = self
             .begin_account_write(authenticated, WRITE_STATUSES)
             .await?;
@@ -6630,6 +6932,37 @@ impl WriteRepository {
         .bind(quote_approval_policy)
         .fetch_one(&mut *transaction)
         .await?;
+        if let Some(poll) = poll {
+            let (poll_id, expires_at) = sqlx::query_as::<_, (i64, NaiveDateTime)>(
+                "INSERT INTO polls (account_id, status_id, options, cached_tallies, votes_count, \
+                    voters_count, multiple, hide_totals, expires_at, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, 0, 0, $5, $6, \
+                    clock_timestamp() + make_interval(secs => $7::double precision), \
+                    clock_timestamp(), clock_timestamp()) RETURNING id, expires_at",
+            )
+            .bind(account_id)
+            .bind(status_id)
+            .bind(&poll.options)
+            .bind(vec![0_i64; poll.options.len()])
+            .bind(poll.multiple)
+            .bind(poll.hide_totals)
+            .bind(poll.expires_in)
+            .fetch_one(&mut *transaction)
+            .await?;
+            sqlx::query("UPDATE statuses SET poll_id = $1 WHERE id = $2")
+                .bind(poll_id)
+                .bind(status_id)
+                .execute(&mut *transaction)
+                .await?;
+            let expires_at = expires_at.and_utc();
+            let expiration_job = poll_expiration_job(
+                poll_id,
+                expires_at,
+                PollExpirationIntentKind::Initial,
+                expires_at,
+            );
+            record_outbox_once_in(&mut transaction, &expiration_job).await?;
+        }
         if reply_target.is_none() {
             let conversation_id = sqlx::query_scalar::<_, i64>(
                 "INSERT INTO conversations (created_at, parent_account_id, parent_status_id, updated_at, uri) \
@@ -6694,10 +7027,10 @@ impl WriteRepository {
         .bind(status_id)
         .execute(&mut *transaction)
         .await?;
-        if visibility != 3 {
-            increment_account_status_count(&mut transaction, account_id, status_created_at).await?;
-        } else {
+        if visibility == 3 {
             ensure_account_stats_after_mutation(&mut transaction, account_id).await?;
+        } else {
+            increment_account_status_count(&mut transaction, account_id, status_created_at).await?;
         }
         if matches!(visibility, 0 | 1)
             && let Some(in_reply_to_id) = in_reply_to_id
@@ -6739,6 +7072,486 @@ impl WriteRepository {
         flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
         Ok(StatusWriteOutcome { status_id })
+    }
+
+    /// Casts one all-or-nothing ballot while holding a transaction-scoped voter lock.
+    #[allow(clippy::similar_names, clippy::too_many_lines)]
+    pub async fn vote_poll(
+        &self,
+        authenticated: &AuthenticatedBearer,
+        poll_id: i64,
+        choices: &[i32],
+        origin: &str,
+    ) -> Result<PollVoteWriteOutcome, WriteError> {
+        let (account_id, mut transaction) = self
+            .begin_account_write(authenticated, WRITE_STATUSES)
+            .await?;
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock( \
+               pg_catalog.hashtext('rustodon:poll_vote:' || $1::text || ':' || $2::text))",
+        )
+        .bind(poll_id)
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await?;
+        let Some((status_id, poll_account_id)) = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT status.id, poll.account_id FROM polls poll \
+             JOIN statuses status ON status.id = poll.status_id AND status.deleted_at IS NULL \
+             WHERE poll.id = $1 FOR SHARE OF status",
+        )
+        .bind(poll_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        else {
+            return Err(WriteError::NotFound);
+        };
+        authorize_poll_vote(&mut transaction, account_id, status_id, poll_account_id).await?;
+        let Some((
+            status_id,
+            poll_account_id,
+            options,
+            mut tallies,
+            votes_count,
+            voters_count,
+            multiple,
+            hide_totals,
+            expires_at,
+            author_domain,
+        )) = sqlx::query_as::<
+            _,
+            (
+                i64,
+                i64,
+                Vec<String>,
+                Vec<i64>,
+                i64,
+                Option<i64>,
+                bool,
+                bool,
+                Option<NaiveDateTime>,
+                Option<String>,
+            ),
+        >(
+            "SELECT poll.status_id, poll.account_id, poll.options, poll.cached_tallies, \
+                    poll.votes_count, poll.voters_count, poll.multiple, poll.hide_totals, \
+                    poll.expires_at, author.domain \
+                 FROM polls poll \
+                 JOIN statuses status ON status.id = poll.status_id AND status.deleted_at IS NULL \
+                 JOIN accounts author ON author.id = poll.account_id \
+                 WHERE poll.id = $1 AND poll.status_id = $2 FOR UPDATE OF poll",
+        )
+        .bind(poll_id)
+        .bind(status_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        else {
+            return Err(WriteError::NotFound);
+        };
+        if choices.is_empty() {
+            transaction.commit().await?;
+            return Ok(PollVoteWriteOutcome { poll_id, status_id });
+        }
+        let now = sqlx::query_scalar::<_, NaiveDateTime>("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await?;
+        if expires_at.is_some_and(|expires_at| expires_at <= now) {
+            return Err(WriteError::Validation("The poll has already ended"));
+        }
+        let mut existing = sqlx::query_scalar::<_, i32>(
+            "SELECT choice FROM poll_votes WHERE poll_id = $1 AND account_id = $2 ORDER BY id",
+        )
+        .bind(poll_id)
+        .bind(account_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let first_ballot = existing.is_empty();
+        for &choice in choices {
+            let Ok(index) = usize::try_from(choice) else {
+                return Err(WriteError::Validation(
+                    "The chosen vote option does not exist",
+                ));
+            };
+            if index >= options.len() {
+                return Err(WriteError::Validation(
+                    "The chosen vote option does not exist",
+                ));
+            }
+            if account_id == poll_account_id {
+                return Err(WriteError::Validation("You cannot vote in your own polls"));
+            }
+            if (!multiple && !existing.is_empty()) || (multiple && existing.contains(&choice)) {
+                return Err(WriteError::Validation(
+                    "You have already voted on this poll",
+                ));
+            }
+            existing.push(choice);
+        }
+        let remote_delivery = if author_domain.is_some() {
+            remote_status_delivery(&mut transaction, account_id, status_id, origin).await?
+        } else {
+            None
+        };
+        if tallies.len() < options.len() {
+            tallies.resize(options.len(), 0);
+        }
+        let mut inserted_votes = Vec::with_capacity(choices.len());
+        for &choice in choices {
+            let vote_id = sqlx::query_scalar::<_, i64>(
+                "INSERT INTO poll_votes (account_id, poll_id, choice, uri, created_at, updated_at) \
+                 VALUES ($1, $2, $3, NULL, clock_timestamp(), clock_timestamp()) RETURNING id",
+            )
+            .bind(account_id)
+            .bind(poll_id)
+            .bind(choice)
+            .fetch_one(&mut *transaction)
+            .await?;
+            inserted_votes.push((vote_id, choice));
+            let index = usize::try_from(choice)
+                .map_err(|_| WriteError::Validation("The chosen vote option does not exist"))?;
+            tallies[index] = tallies[index].saturating_add(1);
+        }
+        let updated_at = sqlx::query_scalar::<_, NaiveDateTime>(
+            "UPDATE polls SET cached_tallies = $2, votes_count = $3, voters_count = $4, \
+                lock_version = lock_version + 1, updated_at = clock_timestamp() \
+             WHERE id = $1 RETURNING updated_at",
+        )
+        .bind(poll_id)
+        .bind(&tallies)
+        .bind(votes_count.saturating_add(i64::try_from(choices.len()).unwrap_or(i64::MAX)))
+        .bind(voters_count.map(|count| count.saturating_add(i64::from(first_ballot))))
+        .fetch_one(&mut *transaction)
+        .await?;
+        if let Some(delivery) = remote_delivery.as_ref() {
+            for &(vote_id, choice) in &inserted_votes {
+                let option = &options[usize::try_from(choice).map_err(|_| {
+                    WriteError::Validation("The chosen vote option does not exist")
+                })?];
+                record_remote_poll_vote_delivery(
+                    &mut transaction,
+                    account_id,
+                    delivery,
+                    vote_id,
+                    option,
+                )
+                .await?;
+            }
+            if let Some(expires_at) = expires_at {
+                let expires_at = expires_at.and_utc();
+                let expiration_job = poll_expiration_job(
+                    poll_id,
+                    expires_at,
+                    PollExpirationIntentKind::Reschedule,
+                    expires_at + ChronoDuration::minutes(5),
+                );
+                record_outbox_once_in(&mut transaction, &expiration_job).await?;
+            }
+        }
+        if author_domain.is_none() && !hide_totals {
+            record_poll_update_distribution(&mut transaction, poll_id, status_id, updated_at)
+                .await?;
+        }
+        let mut pending_stream_events = Vec::new();
+        collect_status_stream_events(
+            &mut transaction,
+            &mut pending_stream_events,
+            status_id,
+            "status.update",
+            updated_at.and_utc().timestamp_micros(),
+        )
+        .await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
+        transaction.commit().await?;
+        Ok(PollVoteWriteOutcome { poll_id, status_id })
+    }
+
+    /// Applies an `ActivityPub` Note-shaped vote to a locally authored Question.
+    ///
+    /// Returns `NotPollVote` when the reply is not addressed to a local poll. Parsed vote
+    /// candidates that fail signer or poll authorization checks are consumed fail-closed.
+    /// Expired matching votes are also consumed without creating a status or vote.
+    #[allow(clippy::similar_names, clippy::too_many_lines)]
+    pub async fn apply_remote_poll_vote(
+        &self,
+        account_id: i64,
+        actor_uri: &str,
+        vote_uri: &str,
+        question_uri: &str,
+        option: &str,
+        origin: &str,
+    ) -> Result<RemotePollVoteOutcome, WriteError> {
+        let mut transaction = self.pool.begin().await?;
+        if !same_remote_note_host(actor_uri, vote_uri)?
+            || !remote_interaction_actor_matches(&mut transaction, account_id, actor_uri, true)
+                .await?
+        {
+            transaction.commit().await?;
+            return Ok(RemotePollVoteOutcome::Consumed);
+        }
+        let origin = origin.trim_end_matches('/');
+        let Some((poll_id, status_id, poll_account_id)) =
+            sqlx::query_as::<_, (i64, i64, i64)>(
+                "SELECT poll.id, status.id, poll.account_id FROM polls poll \
+                 JOIN statuses status ON status.id = poll.status_id AND status.deleted_at IS NULL \
+                 JOIN accounts author ON author.id = status.account_id AND author.domain IS NULL \
+                 WHERE status.uri = $1 OR status.url = $1 \
+                    OR $1 = $2 || '/actor/statuses/' || status.id::text \
+                    OR $1 = $2 || '/@' || author.username || '/' || status.id::text \
+                    OR $1 = $2 || '/users/' || author.username || '/statuses/' || status.id::text \
+                    OR $1 = $2 || '/ap/users/' || author.id::text || '/statuses/' || status.id::text \
+                 ORDER BY status.id LIMIT 1",
+            )
+            .bind(question_uri)
+            .bind(origin)
+            .fetch_optional(&mut *transaction)
+            .await?
+        else {
+            transaction.commit().await?;
+            return Ok(RemotePollVoteOutcome::NotPollVote);
+        };
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock( \
+               pg_catalog.hashtext('rustodon:poll_vote:' || $1::text || ':' || $2::text))",
+        )
+        .bind(poll_id)
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await?;
+        let target_still_active = sqlx::query_scalar::<_, i64>(
+            "SELECT status.id FROM polls poll \
+             JOIN statuses status ON status.id = poll.status_id AND status.deleted_at IS NULL \
+             WHERE poll.id = $1 AND status.id = $2 AND poll.account_id = $3 \
+             FOR SHARE OF status",
+        )
+        .bind(poll_id)
+        .bind(status_id)
+        .bind(poll_account_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .is_some();
+        if !target_still_active {
+            transaction.commit().await?;
+            return Ok(RemotePollVoteOutcome::Consumed);
+        }
+        if let Err(error) =
+            authorize_poll_vote(&mut transaction, account_id, status_id, poll_account_id).await
+        {
+            return match error {
+                WriteError::NotFound | WriteError::Forbidden => {
+                    transaction.commit().await?;
+                    Ok(RemotePollVoteOutcome::Consumed)
+                }
+                error => Err(error),
+            };
+        }
+        let Some((options, mut tallies, votes_count, voters_count, multiple, hide_totals, expires_at)) =
+            sqlx::query_as::<
+                _,
+                (
+                    Vec<String>,
+                    Vec<i64>,
+                    i64,
+                    Option<i64>,
+                    bool,
+                    bool,
+                    Option<NaiveDateTime>,
+                ),
+            >(
+                "SELECT options, cached_tallies, votes_count, voters_count, multiple, hide_totals, expires_at \
+                 FROM polls WHERE id = $1 FOR UPDATE",
+            )
+            .bind(poll_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+        else {
+            transaction.commit().await?;
+            return Ok(RemotePollVoteOutcome::Consumed);
+        };
+        let Some(choice) = options.iter().position(|candidate| candidate == option) else {
+            transaction.commit().await?;
+            return Ok(RemotePollVoteOutcome::NotPollVote);
+        };
+        let choice = i32::try_from(choice)
+            .map_err(|_| WriteError::InvalidInput("remote poll choice is invalid"))?;
+        if sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM poll_votes WHERE poll_id = $1 AND account_id = $2 AND uri = $3)",
+        )
+        .bind(poll_id)
+        .bind(account_id)
+        .bind(vote_uri)
+        .fetch_one(&mut *transaction)
+        .await?
+        {
+            transaction.commit().await?;
+            return Ok(RemotePollVoteOutcome::Consumed);
+        }
+        let now = sqlx::query_scalar::<_, NaiveDateTime>("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await?;
+        if expires_at.is_some_and(|expires_at| expires_at <= now) {
+            transaction.commit().await?;
+            return Ok(RemotePollVoteOutcome::Consumed);
+        }
+        let existing = sqlx::query_scalar::<_, i32>(
+            "SELECT choice FROM poll_votes WHERE poll_id = $1 AND account_id = $2 ORDER BY id",
+        )
+        .bind(poll_id)
+        .bind(account_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        if (!multiple && !existing.is_empty()) || existing.contains(&choice) {
+            transaction.commit().await?;
+            return Ok(RemotePollVoteOutcome::Consumed);
+        }
+        if tallies.len() < options.len() {
+            tallies.resize(options.len(), 0);
+        }
+        sqlx::query(
+            "INSERT INTO poll_votes (account_id, poll_id, choice, uri, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, clock_timestamp(), clock_timestamp())",
+        )
+        .bind(account_id)
+        .bind(poll_id)
+        .bind(choice)
+        .bind(vote_uri)
+        .execute(&mut *transaction)
+        .await?;
+        let index = usize::try_from(choice)
+            .map_err(|_| WriteError::InvalidInput("remote poll choice is invalid"))?;
+        tallies[index] = tallies[index].saturating_add(1);
+        let updated_at = sqlx::query_scalar::<_, NaiveDateTime>(
+            "UPDATE polls SET cached_tallies = $2, votes_count = $3, voters_count = $4, \
+                lock_version = lock_version + 1, updated_at = clock_timestamp() \
+             WHERE id = $1 RETURNING updated_at",
+        )
+        .bind(poll_id)
+        .bind(&tallies)
+        .bind(votes_count.saturating_add(1))
+        .bind(voters_count.map(|count| count.saturating_add(i64::from(existing.is_empty()))))
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !hide_totals {
+            record_poll_update_distribution(&mut transaction, poll_id, status_id, updated_at)
+                .await?;
+        }
+        let mut pending_stream_events = Vec::new();
+        collect_status_stream_events(
+            &mut transaction,
+            &mut pending_stream_events,
+            status_id,
+            "status.update",
+            updated_at.and_utc().timestamp_micros(),
+        )
+        .await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
+        transaction.commit().await?;
+        Ok(RemotePollVoteOutcome::Consumed)
+    }
+
+    /// Expires the poll's current generation. Intended for direct administrative and test use;
+    /// durable workers should pass their scheduled generation to [`Self::expire_poll_generation`].
+    pub async fn expire_poll(&self, poll_id: i64) -> Result<(), WriteError> {
+        self.expire_poll_generation(poll_id, None).await
+    }
+
+    /// Updates one existing remote poll expiration through the production reconciliation path in
+    /// disposable fixtures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the poll is absent or the transactional update fails.
+    #[cfg(feature = "test-support")]
+    pub async fn update_remote_poll_expiration_for_test(
+        &self,
+        status_id: i64,
+        expires_at: Option<DateTime<Utc>>,
+        replacement_tallies: Option<Vec<i64>>,
+    ) -> Result<(), WriteError> {
+        let mut transaction = self.pool.begin().await?;
+        let (account_id, options, tallies, voters_count, multiple) =
+            sqlx::query_as::<_, (i64, Vec<String>, Vec<i64>, Option<i64>, bool)>(
+                "SELECT account_id, options, cached_tallies, voters_count, multiple \
+             FROM polls WHERE status_id = $1",
+            )
+            .bind(status_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(WriteError::NotFound)?;
+        let poll = RemotePollData {
+            options,
+            tallies: replacement_tallies.unwrap_or(tallies),
+            multiple,
+            expires_at: expires_at.map(|expires_at| expires_at.naive_utc()),
+            voters_count,
+        };
+        upsert_remote_poll(
+            &mut transaction,
+            status_id,
+            account_id,
+            &poll,
+            true,
+            false,
+            false,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn expire_poll_generation(
+        &self,
+        poll_id: i64,
+        expected_generation: Option<i64>,
+    ) -> Result<(), WriteError> {
+        let mut transaction = self.pool.begin().await?;
+        let Some(status_id) = sqlx::query_scalar::<_, i64>(
+            "SELECT status.id FROM polls poll \
+             JOIN statuses status ON status.id = poll.status_id AND status.deleted_at IS NULL \
+             WHERE poll.id = $1 FOR SHARE OF status",
+        )
+        .bind(poll_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        else {
+            transaction.commit().await?;
+            return Ok(());
+        };
+        let Some((owner_id, owner_domain, expires_at, _updated_at)) =
+            sqlx::query_as::<_, (i64, Option<String>, Option<NaiveDateTime>, NaiveDateTime)>(
+                "SELECT poll.account_id, account.domain, poll.expires_at, poll.updated_at \
+                 FROM polls poll JOIN accounts account ON account.id = poll.account_id \
+                 WHERE poll.id = $1 AND poll.status_id = $2 FOR UPDATE OF poll",
+            )
+            .bind(poll_id)
+            .bind(status_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+        else {
+            transaction.commit().await?;
+            return Ok(());
+        };
+        let Some(expires_at) = expires_at.map(|value| value.and_utc()) else {
+            transaction.commit().await?;
+            return Ok(());
+        };
+        let generation = poll_expiration_generation(expires_at);
+        if expected_generation.is_some_and(|expected| expected != generation) {
+            transaction.commit().await?;
+            return Ok(());
+        }
+        let activation = poll_expiration_activation_in(&mut transaction).await?;
+        finalize_poll_expiration_generation_in(
+            &mut transaction,
+            poll_id,
+            status_id,
+            owner_id,
+            owner_domain.is_none(),
+            expires_at,
+            activation,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -6987,13 +7800,22 @@ impl WriteRepository {
             edited_at.and_utc().timestamp_micros(),
         )
         .await?;
+        let poll_updated_at = sqlx::query_scalar::<_, NaiveDateTime>(
+            "SELECT updated_at FROM polls WHERE status_id = $1 ORDER BY id LIMIT 1",
+        )
+        .bind(status_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
         let status_update_job = JobSpec::new(
             Lane::Push,
             ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
             json!({
                 "status_id": status_id,
                 "activity_type": "Update",
-                "edited_at_micros": edited_at.and_utc().timestamp_micros()
+                "update_kind": "status",
+                "update_version_micros": edited_at.and_utc().timestamp_micros(),
+                "edited_at_micros": edited_at.and_utc().timestamp_micros(),
+                "poll_updated_at_micros": poll_updated_at.map(|value| value.and_utc().timestamp_micros())
             }),
         )
         .logical_key(format!(
@@ -12240,6 +13062,38 @@ struct RemoteNoteData {
     attachments: Vec<RemoteNoteAttachment>,
     favourites_count: Option<i64>,
     reblogs_count: Option<i64>,
+    poll: Option<RemotePollData>,
+}
+
+struct RemotePollData {
+    options: Vec<String>,
+    tallies: Vec<i64>,
+    multiple: bool,
+    expires_at: Option<NaiveDateTime>,
+    voters_count: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteUpdateAuthority {
+    Inbox,
+    SignedRefresh,
+}
+
+impl RemoteUpdateAuthority {
+    const fn rejects_tally_regression(self) -> bool {
+        matches!(self, Self::Inbox)
+    }
+
+    const fn claims_freshness(self) -> bool {
+        matches!(self, Self::SignedRefresh)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemotePollReconcile {
+    Unchanged,
+    Tally(NaiveDateTime),
+    Significant,
 }
 
 struct RemoteNoteAudience {
@@ -12261,8 +13115,12 @@ impl RemoteNoteData {
         let object = object
             .as_object()
             .ok_or(WriteError::InvalidInput("remote Note object is invalid"))?;
-        if object.get("type").and_then(Value::as_str) != Some("Note") {
-            return Err(WriteError::InvalidInput("remote object is not a Note"));
+        let is_note = equals_or_includes(object.get("type"), "Note");
+        let is_question = equals_or_includes(object.get("type"), "Question");
+        if !is_note && !is_question {
+            return Err(WriteError::InvalidInput(
+                "remote object is not a Note or Question",
+            ));
         }
         let uri = remote_note_uri(object.get("id"))?
             .ok_or(WriteError::InvalidInput("remote Note object has no ID"))?;
@@ -12340,8 +13198,79 @@ impl RemoteNoteData {
             attachments: remote_note_attachments(object.get("attachment")),
             favourites_count: remote_note_interaction_count(object, "likes", "favouritesCount")?,
             reblogs_count: remote_note_interaction_count(object, "shares", "reblogsCount")?,
+            poll: is_question.then(|| remote_poll_data(object)).transpose()?,
         })
     }
+}
+
+fn remote_poll_data(object: &serde_json::Map<String, Value>) -> Result<RemotePollData, WriteError> {
+    let (multiple, values) = if let Some(Value::Array(values)) = object.get("anyOf") {
+        (true, values)
+    } else if let Some(Value::Array(values)) = object.get("oneOf") {
+        (false, values)
+    } else {
+        return Err(WriteError::InvalidInput(
+            "remote Question options are invalid",
+        ));
+    };
+    let mut options = Vec::new();
+    let mut tallies = Vec::new();
+    for value in values.iter().take(500) {
+        let option = value.as_object().ok_or(WriteError::InvalidInput(
+            "remote Question option is invalid",
+        ))?;
+        if let Some(title) = option
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|title| !title.trim().is_empty())
+            .or_else(|| {
+                option
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .filter(|title| !title.trim().is_empty())
+            })
+        {
+            options.push(title.to_owned());
+        }
+        tallies.push(
+            option
+                .get("replies")
+                .and_then(Value::as_object)
+                .and_then(|replies| replies.get("totalItems"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                .max(0),
+        );
+    }
+    if options.is_empty() {
+        return Err(WriteError::InvalidInput(
+            "remote Question options are empty",
+        ));
+    }
+    let closed = object.get("closed");
+    let expires_at = match closed {
+        Some(Value::String(value)) => DateTime::parse_from_rfc3339(value)
+            .ok()
+            .map(|value| value.naive_utc()),
+        Some(Value::Bool(true) | Value::Number(_) | Value::Array(_) | Value::Object(_)) => {
+            Some(Utc::now().naive_utc())
+        }
+        None | Some(Value::Null | Value::Bool(false)) => object
+            .get("endTime")
+            .and_then(Value::as_str)
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.naive_utc()),
+    };
+    Ok(RemotePollData {
+        options,
+        tallies,
+        multiple,
+        expires_at,
+        voters_count: object
+            .get("votersCount")
+            .and_then(Value::as_i64)
+            .map(|count| count.max(0)),
+    })
 }
 
 async fn upsert_remote_emojis(
@@ -12935,6 +13864,465 @@ async fn insert_remote_note(
     .bind(note.edited_at)
     .fetch_one(&mut **transaction)
     .await?)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn finalize_poll_expiration_generation_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    poll_id: i64,
+    status_id: i64,
+    owner_id: i64,
+    owner_is_local: bool,
+    expires_at: DateTime<Utc>,
+    activation: DateTime<Utc>,
+) -> Result<(), WriteError> {
+    let generation = poll_expiration_generation(expires_at);
+    if poll_expiration_effect_in(transaction, poll_id, generation)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    if poll_expiration_is_historical(expires_at, activation) {
+        record_poll_expiration_effect_in(
+            transaction,
+            poll_id,
+            generation,
+            PollExpirationEffectOutcome::HistoricalBaseline,
+        )
+        .await?;
+        return Ok(());
+    }
+    let now = sqlx::query_scalar::<_, DateTime<Utc>>("SELECT clock_timestamp()")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if expires_at > now {
+        let expiration_job = poll_expiration_job(
+            poll_id,
+            expires_at,
+            PollExpirationIntentKind::Reschedule,
+            expires_at + ChronoDuration::minutes(5),
+        );
+        record_outbox_once_in(transaction, &expiration_job).await?;
+        return Ok(());
+    }
+    sqlx::query(
+        "WITH recipients AS ( \
+            SELECT DISTINCT vote.account_id \
+              FROM poll_votes vote \
+              JOIN accounts voter ON voter.id = vote.account_id AND voter.domain IS NULL \
+             WHERE vote.poll_id = $1 \
+            UNION SELECT $2::bigint WHERE $3::boolean) \
+         INSERT INTO rustodon.outbox_events (kind, logical_key, payload) \
+         SELECT $4, format('notification:poll:%s:%s', account_id, $1), \
+                jsonb_build_object( \
+                    'lane', 'core', \
+                    'arguments', jsonb_build_object( \
+                        'recipient_account_id', account_id, \
+                        'activity_type', 'poll', \
+                        'activity_id', $1, \
+                        'silenced', false), \
+                    'run_at', $5::text, \
+                    'max_attempts', 25) \
+           FROM recipients \
+         ON CONFLICT (kind, logical_key) WHERE logical_key IS NOT NULL DO NOTHING",
+    )
+    .bind(poll_id)
+    .bind(owner_id)
+    .bind(owner_is_local)
+    .bind(NOTIFICATION_CREATE_JOB_KIND)
+    .bind(now.to_rfc3339())
+    .execute(&mut **transaction)
+    .await?;
+    if owner_is_local {
+        let final_key = format!("activitypub:poll:{poll_id}:expired");
+        let already_recorded = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM rustodon.outbox_events \
+             WHERE kind = $1 AND logical_key = $2)",
+        )
+        .bind(ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND)
+        .bind(&final_key)
+        .fetch_one(&mut **transaction)
+        .await?;
+        if !already_recorded {
+            let updated_at = sqlx::query_scalar::<_, NaiveDateTime>(
+                "UPDATE polls SET lock_version = lock_version + 1, \
+                 updated_at = clock_timestamp() WHERE id = $1 RETURNING updated_at",
+            )
+            .bind(poll_id)
+            .fetch_one(&mut **transaction)
+            .await?;
+            let edited_at = status_federation_version(transaction, status_id).await?;
+            let update_job = JobSpec::new(
+                Lane::Push,
+                ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
+                json!({
+                    "status_id": status_id,
+                    "activity_type": "Update",
+                    "update_kind": "poll",
+                    "update_version_micros": updated_at.and_utc().timestamp_micros(),
+                    "edited_at_micros": edited_at.and_utc().timestamp_micros(),
+                    "poll_updated_at_micros": updated_at.and_utc().timestamp_micros()
+                }),
+            )
+            .logical_key(final_key);
+            record_outbox_once_in(transaction, &update_job).await?;
+        }
+    }
+    record_poll_expiration_effect_in(
+        transaction,
+        poll_id,
+        generation,
+        PollExpirationEffectOutcome::EffectsEnqueued,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn reconcile_remote_poll(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_id: i64,
+    account_id: i64,
+    poll: Option<&RemotePollData>,
+    allow_significant_changes: bool,
+    reject_tally_regression: bool,
+    mark_fetched: bool,
+) -> Result<RemotePollReconcile, WriteError> {
+    if let Some(poll) = poll {
+        return upsert_remote_poll(
+            transaction,
+            status_id,
+            account_id,
+            poll,
+            allow_significant_changes,
+            reject_tally_regression,
+            mark_fetched,
+        )
+        .await;
+    }
+    if !allow_significant_changes {
+        return Ok(RemotePollReconcile::Unchanged);
+    }
+    let poll_ids = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM polls WHERE status_id = $1 ORDER BY id FOR UPDATE",
+    )
+    .bind(status_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if poll_ids.is_empty() {
+        return Ok(RemotePollReconcile::Unchanged);
+    }
+    sqlx::query("UPDATE statuses SET poll_id = NULL WHERE id = $1")
+        .bind(status_id)
+        .execute(&mut **transaction)
+        .await?;
+    sqlx::query("DELETE FROM notifications WHERE activity_type = 'Poll' AND activity_id = ANY($1)")
+        .bind(&poll_ids)
+        .execute(&mut **transaction)
+        .await?;
+    sqlx::query("DELETE FROM poll_votes WHERE poll_id = ANY($1)")
+        .bind(&poll_ids)
+        .execute(&mut **transaction)
+        .await?;
+    sqlx::query("DELETE FROM polls WHERE id = ANY($1)")
+        .bind(&poll_ids)
+        .execute(&mut **transaction)
+        .await?;
+    Ok(RemotePollReconcile::Significant)
+}
+
+fn remote_poll_votes_count(poll: &RemotePollData) -> Result<i64, WriteError> {
+    poll.tallies
+        .iter()
+        .try_fold(0_i64, |total, tally| total.checked_add(*tally))
+        .ok_or(WriteError::InvalidInput(
+            "remote poll vote count is invalid",
+        ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemotePollExpirationChange {
+    None,
+    Reschedule,
+    Suppress,
+}
+
+fn remote_poll_previous_expiration_is_due_change(
+    has_surviving_local_votes: bool,
+    incoming: Option<NaiveDateTime>,
+    previous: Option<NaiveDateTime>,
+    database_now: NaiveDateTime,
+) -> bool {
+    has_surviving_local_votes
+        && incoming != previous
+        && previous.is_some_and(|expires_at| expires_at <= database_now)
+}
+
+fn remote_poll_expiration_change(
+    has_surviving_local_votes: bool,
+    incoming: Option<NaiveDateTime>,
+    previous: Option<NaiveDateTime>,
+    database_now: NaiveDateTime,
+) -> RemotePollExpirationChange {
+    if !has_surviving_local_votes || incoming == previous {
+        return RemotePollExpirationChange::None;
+    }
+    if previous.is_some_and(|expires_at| expires_at <= database_now) {
+        return RemotePollExpirationChange::Suppress;
+    }
+    if incoming.is_some() {
+        RemotePollExpirationChange::Reschedule
+    } else {
+        RemotePollExpirationChange::None
+    }
+}
+
+#[allow(clippy::similar_names)]
+fn remote_poll_tallies_are_monotonic(
+    cached_tallies: &[i64],
+    cached_votes_count: i64,
+    cached_voters_count: Option<i64>,
+    poll: &RemotePollData,
+    incoming_votes_count: i64,
+) -> bool {
+    cached_tallies.len() == poll.tallies.len()
+        && cached_tallies
+            .iter()
+            .zip(&poll.tallies)
+            .all(|(cached, incoming)| incoming >= cached)
+        && incoming_votes_count >= cached_votes_count
+        && match (cached_voters_count, poll.voters_count) {
+            (Some(cached), Some(incoming)) => incoming >= cached,
+            (Some(_), None) => false,
+            _ => true,
+        }
+}
+
+#[allow(clippy::similar_names, clippy::too_many_lines)]
+async fn upsert_remote_poll(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_id: i64,
+    account_id: i64,
+    poll: &RemotePollData,
+    allow_significant_changes: bool,
+    reject_tally_regression: bool,
+    mark_fetched: bool,
+) -> Result<RemotePollReconcile, WriteError> {
+    let existing = sqlx::query_as::<
+        _,
+        (
+            i64,
+            Vec<String>,
+            Vec<i64>,
+            i64,
+            Option<i64>,
+            bool,
+            Option<NaiveDateTime>,
+        ),
+    >(
+        "SELECT poll.id, poll.options, poll.cached_tallies, poll.votes_count,
+                poll.voters_count, poll.multiple, poll.expires_at
+           FROM polls poll WHERE poll.status_id = $1 FOR UPDATE",
+    )
+    .bind(status_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let mut expiration_reschedule = None;
+    let mut expiration_suppression = None;
+    let mut expiration_activation = None;
+    let (poll_id, outcome) = if let Some((
+        poll_id,
+        options,
+        cached_tallies,
+        votes_count,
+        voters_count,
+        multiple,
+        previous_expiry,
+    )) = existing
+    {
+        let shape_changed = options != poll.options || multiple != poll.multiple;
+        if shape_changed && !allow_significant_changes {
+            return Ok(RemotePollReconcile::Unchanged);
+        }
+        let incoming_votes_count = remote_poll_votes_count(poll)?;
+        if reject_tally_regression
+            && !shape_changed
+            && !remote_poll_tallies_are_monotonic(
+                &cached_tallies,
+                votes_count,
+                voters_count,
+                poll,
+                incoming_votes_count,
+            )
+        {
+            return Ok(RemotePollReconcile::Unchanged);
+        }
+        if !shape_changed
+            && cached_tallies == poll.tallies
+            && votes_count == incoming_votes_count
+            && voters_count == poll.voters_count
+            && previous_expiry == poll.expires_at
+        {
+            if mark_fetched {
+                // Signed refresh freshness is transport metadata, not a semantic poll version.
+                sqlx::query("UPDATE polls SET last_fetched_at = clock_timestamp() WHERE id = $1")
+                    .bind(poll_id)
+                    .execute(&mut **transaction)
+                    .await?;
+            }
+            return Ok(RemotePollReconcile::Unchanged);
+        }
+        let expiration_clock =
+            sqlx::query_scalar::<_, NaiveDateTime>("SELECT clock_timestamp()::timestamp")
+                .fetch_one(&mut **transaction)
+                .await?;
+        let has_local_votes = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS ( \
+                SELECT 1 FROM poll_votes vote \
+                JOIN accounts voter ON voter.id = vote.account_id \
+                WHERE vote.poll_id = $1 AND voter.domain IS NULL)",
+        )
+        .bind(poll_id)
+        .fetch_one(&mut **transaction)
+        .await?;
+        let has_surviving_local_votes = has_local_votes && !shape_changed;
+        if remote_poll_previous_expiration_is_due_change(
+            has_surviving_local_votes,
+            poll.expires_at,
+            previous_expiry,
+            expiration_clock,
+        ) {
+            let activation = poll_expiration_activation_in(transaction).await?;
+            expiration_activation = Some(activation);
+            let previous_expiry = previous_expiry
+                .expect("a due remote poll expiration change has a previous expiration")
+                .and_utc();
+            finalize_poll_expiration_generation_in(
+                transaction,
+                poll_id,
+                status_id,
+                account_id,
+                false,
+                previous_expiry,
+                activation,
+            )
+            .await?;
+        }
+        match remote_poll_expiration_change(
+            has_surviving_local_votes,
+            poll.expires_at,
+            previous_expiry,
+            expiration_clock,
+        ) {
+            RemotePollExpirationChange::None => {}
+            RemotePollExpirationChange::Reschedule => expiration_reschedule = poll.expires_at,
+            RemotePollExpirationChange::Suppress => expiration_suppression = poll.expires_at,
+        }
+        if shape_changed {
+            sqlx::query("DELETE FROM poll_votes WHERE poll_id = $1")
+                .bind(poll_id)
+                .execute(&mut **transaction)
+                .await?;
+        }
+        let reset_tallies = vec![0_i64; poll.options.len()];
+        let tallies = if shape_changed {
+            reset_tallies.as_slice()
+        } else {
+            poll.tallies.as_slice()
+        };
+        let next_votes_count = if shape_changed {
+            0
+        } else {
+            incoming_votes_count
+        };
+        let next_voters_count = if shape_changed {
+            Some(0)
+        } else {
+            poll.voters_count
+        };
+        let updated_at = sqlx::query_scalar::<_, NaiveDateTime>(
+            "UPDATE polls SET options = $2, cached_tallies = $3, votes_count = $4, \
+                voters_count = $5, multiple = $6, expires_at = $7, \
+                last_fetched_at = CASE WHEN $8 THEN clock_timestamp() ELSE last_fetched_at END, \
+                lock_version = lock_version + 1, updated_at = clock_timestamp() WHERE id = $1 \
+                RETURNING updated_at",
+        )
+        .bind(poll_id)
+        .bind(&poll.options)
+        .bind(tallies)
+        .bind(next_votes_count)
+        .bind(next_voters_count)
+        .bind(poll.multiple)
+        .bind(poll.expires_at)
+        .bind(mark_fetched)
+        .fetch_one(&mut **transaction)
+        .await?;
+        let outcome = if shape_changed {
+            RemotePollReconcile::Significant
+        } else {
+            RemotePollReconcile::Tally(updated_at)
+        };
+        (poll_id, outcome)
+    } else {
+        if !allow_significant_changes {
+            return Ok(RemotePollReconcile::Unchanged);
+        }
+        let poll_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO polls (account_id, status_id, options, cached_tallies, votes_count, \
+                voters_count, multiple, hide_totals, expires_at, last_fetched_at, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, false, $8, \
+                CASE WHEN $9 THEN clock_timestamp() END, clock_timestamp(), clock_timestamp()) \
+             RETURNING id",
+        )
+        .bind(account_id)
+        .bind(status_id)
+        .bind(&poll.options)
+        .bind(&poll.tallies)
+        .bind(remote_poll_votes_count(poll)?)
+        .bind(poll.voters_count)
+        .bind(poll.multiple)
+        .bind(poll.expires_at)
+        .bind(mark_fetched)
+        .fetch_one(&mut **transaction)
+        .await?;
+        (poll_id, RemotePollReconcile::Significant)
+    };
+    sqlx::query("UPDATE statuses SET poll_id = $2 WHERE id = $1")
+        .bind(status_id)
+        .bind(poll_id)
+        .execute(&mut **transaction)
+        .await?;
+    if let Some(expires_at) = expiration_suppression {
+        let expires_at = expires_at.and_utc();
+        let generation = poll_expiration_generation(expires_at);
+        let activation = if let Some(activation) = expiration_activation {
+            activation
+        } else {
+            poll_expiration_activation_in(transaction).await?
+        };
+        let outcome = if poll_expiration_is_historical(expires_at, activation) {
+            PollExpirationEffectOutcome::HistoricalBaseline
+        } else {
+            PollExpirationEffectOutcome::RemotePastExpirySuppressed
+        };
+        if poll_expiration_effect_in(transaction, poll_id, generation)
+            .await?
+            .is_none()
+        {
+            record_poll_expiration_effect_in(transaction, poll_id, generation, outcome).await?;
+        }
+    }
+    if let Some(expires_at) = expiration_reschedule {
+        let expires_at = expires_at.and_utc();
+        let expiration_job = poll_expiration_job(
+            poll_id,
+            expires_at,
+            PollExpirationIntentKind::Reschedule,
+            expires_at + ChronoDuration::minutes(5),
+        );
+        record_outbox_once_in(transaction, &expiration_job).await?;
+    }
+    Ok(outcome)
 }
 
 async fn insert_remote_note_media(
@@ -14243,7 +15631,8 @@ async fn insert_status_edit(
         "INSERT INTO status_edits ( \
            account_id, created_at, media_descriptions, ordered_media_attachment_ids, \
            poll_options, quote_id, sensitive, spoiler_text, status_id, text, updated_at) \
-         VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9, clock_timestamp())",
+         VALUES ($1, $2, $3, $4, (SELECT options FROM polls WHERE status_id = $8 ORDER BY id LIMIT 1), \
+                 $5, $6, $7, $8, $9, clock_timestamp())",
     )
     .bind(account_id)
     .bind(created_at)
@@ -15022,6 +16411,112 @@ fn local_undo_announce_activity_uri(source_uri: &str, status_id: i64) -> String 
     format!("{source_uri}#announces/{status_id}/undo")
 }
 
+async fn status_federation_version(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_id: i64,
+) -> Result<NaiveDateTime, WriteError> {
+    sqlx::query_scalar::<_, NaiveDateTime>(
+        "SELECT COALESCE(edited_at, updated_at) FROM statuses \
+         WHERE id = $1 AND deleted_at IS NULL FOR SHARE",
+    )
+    .bind(status_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(WriteError::NotFound)
+}
+
+async fn record_poll_update_distribution(
+    transaction: &mut Transaction<'_, Postgres>,
+    poll_id: i64,
+    status_id: i64,
+    updated_at: NaiveDateTime,
+) -> Result<(), WriteError> {
+    let base_logical_key = format!("activitypub:poll:{poll_id}:update");
+    let pending_outbox = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM rustodon.outbox_events
+          WHERE kind = $1 AND dispatched_at IS NULL
+            AND (logical_key = $2 OR logical_key LIKE $2 || ':after:%')
+          ORDER BY id LIMIT 1 FOR UPDATE",
+    )
+    .bind(ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND)
+    .bind(&base_logical_key)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if pending_outbox.is_some() {
+        return Ok(());
+    }
+    // Lock queued work against dispatcher claiming. A queued worker will read the just-committed
+    // tally. A worker that is already leased may have serialized the prior tally, so retain one
+    // follow-up keyed to that durable job rather than dropping the racing vote.
+    let active_jobs = sqlx::query_as::<_, (i64, bool)>(
+        "SELECT id, lease_owner IS NOT NULL AND lease_expires_at > clock_timestamp()
+           FROM rustodon.durable_jobs
+          WHERE kind = $1 AND dead_at IS NULL
+            AND (logical_key = $2 OR logical_key LIKE $2 || ':after:%')
+          ORDER BY id FOR SHARE",
+    )
+    .bind(ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND)
+    .bind(&base_logical_key)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if active_jobs.iter().any(|(_, leased)| !leased) {
+        return Ok(());
+    }
+    let logical_key = active_jobs.last().map_or_else(
+        || base_logical_key.clone(),
+        |(job_id, _)| format!("{base_logical_key}:after:{job_id}"),
+    );
+    let edited_at = status_federation_version(transaction, status_id).await?;
+    let update_job = JobSpec::new(
+        Lane::Push,
+        ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
+        json!({
+            "status_id": status_id,
+            "activity_type": "Update",
+            "update_kind": "poll",
+            "update_version_micros": updated_at.and_utc().timestamp_micros(),
+            "edited_at_micros": edited_at.and_utc().timestamp_micros(),
+            "poll_updated_at_micros": updated_at.and_utc().timestamp_micros()
+        }),
+    )
+    .logical_key(logical_key)
+    .run_at(Utc::now() + ChronoDuration::minutes(3));
+    record_outbox_in(transaction, &update_job).await?;
+    Ok(())
+}
+
+async fn record_remote_poll_vote_delivery(
+    transaction: &mut Transaction<'_, Postgres>,
+    source_account_id: i64,
+    delivery_target: &RemoteStatusDelivery,
+    vote_id: i64,
+    option: &str,
+) -> Result<(), WriteError> {
+    let vote_uri = format!("{}#votes/{vote_id}", delivery_target.source_uri);
+    let delivery = JobSpec::new(
+        Lane::Push,
+        ACTIVITYPUB_DELIVERY_JOB_KIND,
+        json!({
+            "source_account_id": source_account_id,
+            "inbox_url": delivery_target.inbox_url,
+            "remote_domain": delivery_target.domain,
+            "body": activitypub::vote_with_uris(
+                &vote_uri,
+                &delivery_target.source_uri,
+                &delivery_target.target_uri,
+                &delivery_target.target_actor_uri,
+                option,
+            )
+        }),
+    )
+    .logical_key(format!(
+        "activitypub:vote:{vote_id}:{}",
+        delivery_target.inbox_url
+    ));
+    record_outbox_once_in(transaction, &delivery).await?;
+    Ok(())
+}
+
 async fn record_remote_like_delivery(
     transaction: &mut Transaction<'_, Postgres>,
     source_account_id: i64,
@@ -15742,6 +17237,7 @@ async fn status_timeline_snapshot(
         .ok_or(WriteError::NotFound)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn status_timeline_snapshots(
     transaction: &mut Transaction<'_, Postgres>,
     status_ids: &[i64],
@@ -17037,6 +18533,30 @@ async fn decrement_follow_counts(
         },
     );
     apply_account_stats_deltas(transaction, deltas).await
+}
+
+async fn authorize_poll_vote(
+    transaction: &mut Transaction<'_, Postgres>,
+    viewer_account_id: i64,
+    status_id: i64,
+    poll_account_id: i64,
+) -> Result<(), WriteError> {
+    // Keep one authorization path for REST and verified inbox votes. Visibility intentionally
+    // returns NotFound; Mastodon's PollPolicy then adds the symmetric account-block restriction.
+    writable_reply_target(transaction, viewer_account_id, status_id).await?;
+    let either_account_blocks_the_other = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM blocks \
+           WHERE (account_id = $1 AND target_account_id = $2) \
+              OR (account_id = $2 AND target_account_id = $1))",
+    )
+    .bind(viewer_account_id)
+    .bind(poll_account_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if either_account_blocks_the_other {
+        return Err(WriteError::Forbidden);
+    }
+    Ok(())
 }
 
 async fn writable_reply_target(
@@ -18612,6 +20132,7 @@ async fn purge_account_media(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn purge_account_relationships(
     transaction: &mut Transaction<'_, Postgres>,
     account_id: i64,
@@ -19236,19 +20757,22 @@ async fn clear_domain_media(
 mod tests {
     use super::{
         NotificationPolicyDecision, NotificationPolicyFacts, OAuthApplicationRegistration,
-        RemoteNoteAudience, RemoteNoteData, WriteError, canonical_email_hash,
-        canonical_oauth_scopes, devise_token_digest, domain_block_is_stricter, local_object_tag_id,
+        RemoteNoteAudience, RemoteNoteData, RemotePollData, RemotePollExpirationChange,
+        RemoteUpdateAuthority, WriteError, canonical_email_hash, canonical_oauth_scopes,
+        devise_token_digest, domain_block_is_stricter, local_object_tag_id,
         normalize_domain_block_domain, normalize_status_language, notification_policy_decision,
         notification_policy_decision_for_type, oauth_grant_pkce_is_valid, oauth_pkce_matches,
-        parse_user_active_days, password_reset_digest, quote_approval_policy_for_status,
-        random_urlsafe_base64, remote_actor_account_id, remote_domain_lock_scopes,
-        remote_emoji_update_decision, remote_note_attachments, remote_note_object_is_too_old,
-        remote_note_visibility, report_category_value, report_email_enabled,
+        parse_user_active_days, password_reset_digest, prepare_local_poll,
+        quote_approval_policy_for_status, random_urlsafe_base64, remote_actor_account_id,
+        remote_domain_lock_scopes, remote_emoji_update_decision, remote_note_attachments,
+        remote_note_object_is_too_old, remote_note_visibility, remote_poll_expiration_change,
+        remote_poll_previous_expiration_is_due_change, remote_poll_tallies_are_monotonic,
+        remote_poll_votes_count, report_category_value, report_email_enabled,
         report_uri_matches_domain, status_mention_candidates, two_factor_attempt_is_rate_limited,
         validate_local_password, validate_oauth_application_registration,
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use chrono::NaiveDateTime;
+    use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
     use serde_json::json;
     use sha2::{Digest, Sha256};
 
@@ -20008,6 +21532,198 @@ mod tests {
             Some(10_000)
         );
         assert_eq!(truncated[0].blurhash, None);
+    }
+
+    #[test]
+    fn local_poll_normalization_matches_mastodon_bounds() {
+        let poll = prepare_local_poll(
+            &["  first  ".to_owned(), String::new(), " second".to_owned()],
+            300,
+            true,
+            true,
+        )
+        .expect("bounded poll");
+        assert_eq!(poll.options, ["first", "second"]);
+        assert_eq!(poll.expires_in, 300);
+        assert!(poll.multiple);
+        assert!(poll.hide_totals);
+
+        assert_eq!(
+            prepare_local_poll(&["one".into()], 300, false, false)
+                .expect_err("one option is invalid"),
+            "Options must have more than one item"
+        );
+        assert_eq!(
+            prepare_local_poll(&["same".into(), "same".into()], 300, false, false)
+                .expect_err("duplicates are invalid"),
+            "Options contain duplicate items"
+        );
+        assert_eq!(
+            prepare_local_poll(&["one".into(), "two".into()], 299, false, false)
+                .expect_err("short expiry is invalid"),
+            "Expires at is too soon"
+        );
+        assert_eq!(
+            prepare_local_poll(&["one".into(), "two".into()], 2_629_747, false, false)
+                .expect_err("long expiry is invalid"),
+            "Expires at is too far into the future"
+        );
+    }
+
+    #[test]
+    fn local_poll_option_limit_counts_grapheme_clusters() {
+        let joined = "e\u{301}".repeat(50);
+        assert!(prepare_local_poll(&[joined.clone(), "other".into()], 300, false, false).is_ok());
+        assert_eq!(
+            prepare_local_poll(&[format!("{joined}x"), "other".into()], 300, false, false)
+                .expect_err("51 graphemes are invalid"),
+            "Options cannot be longer than 50 characters each"
+        );
+    }
+
+    #[test]
+    fn remote_question_parser_accepts_type_arrays_and_tolerates_partial_poll_metadata() {
+        let actor = "https://remote.example/users/alice";
+        let object = json!({
+            "id": "https://remote.example/statuses/1",
+            "type": ["Question"],
+            "attributedTo": actor,
+            "content": "<p>Choose</p>",
+            "published": "2026-08-25T12:00:00Z",
+            "endTime": "not-a-timestamp",
+            "oneOf": [
+                {"type": "Note", "replies": {"totalItems": 4}},
+                {"type": "Note", "name": "Tea", "replies": {"totalItems": 2}},
+                {"type": "Note", "content": "Coffee", "replies": {"totalItems": 1}}
+            ]
+        });
+        let note = RemoteNoteData::parse(&object, actor)
+            .expect("Mastodon-compatible partial Question metadata should parse");
+        let poll = note.poll.expect("Question should project a poll");
+        assert_eq!(poll.options, ["Tea", "Coffee"]);
+        assert_eq!(poll.tallies, [4, 2, 1]);
+        assert_eq!(poll.expires_at, None);
+    }
+
+    #[test]
+    fn remote_past_expiry_changes_finalize_before_suppressing_replacements() {
+        let now = DateTime::<Utc>::UNIX_EPOCH.naive_utc();
+        let past = now - ChronoDuration::days(1);
+        let earlier = past - ChronoDuration::hours(1);
+        let future = now + ChronoDuration::days(1);
+
+        for incoming in [Some(future), Some(earlier), None] {
+            assert!(remote_poll_previous_expiration_is_due_change(
+                true,
+                incoming,
+                Some(past),
+                now,
+            ));
+            assert_eq!(
+                remote_poll_expiration_change(true, incoming, Some(past), now),
+                RemotePollExpirationChange::Suppress,
+                "a due previous generation is finalized before applying Mastodon's anti-retrigger suppression"
+            );
+        }
+        assert_eq!(
+            remote_poll_expiration_change(true, Some(past), Some(past), now),
+            RemotePollExpirationChange::None,
+            "same-generation tally refreshes do not change expiration work"
+        );
+        assert_eq!(
+            remote_poll_expiration_change(true, Some(past), None, now),
+            RemotePollExpirationChange::Reschedule
+        );
+        assert_eq!(
+            remote_poll_expiration_change(
+                true,
+                Some(future - ChronoDuration::hours(1)),
+                Some(future),
+                now,
+            ),
+            RemotePollExpirationChange::Reschedule
+        );
+        assert_eq!(
+            remote_poll_expiration_change(
+                true,
+                Some(future + ChronoDuration::hours(1)),
+                Some(future),
+                now,
+            ),
+            RemotePollExpirationChange::Reschedule,
+            "every changed present future expiry gets an exact-generation schedule"
+        );
+        assert!(!remote_poll_previous_expiration_is_due_change(
+            false,
+            Some(future),
+            Some(past),
+            now,
+        ));
+        assert_eq!(
+            remote_poll_expiration_change(false, Some(future), Some(past), now),
+            RemotePollExpirationChange::None
+        );
+    }
+
+    #[test]
+    fn signed_refresh_is_authoritative_but_inbox_poll_tallies_are_monotonic() {
+        assert!(RemoteUpdateAuthority::Inbox.rejects_tally_regression());
+        assert!(!RemoteUpdateAuthority::Inbox.claims_freshness());
+        assert!(!RemoteUpdateAuthority::SignedRefresh.rejects_tally_regression());
+        assert!(RemoteUpdateAuthority::SignedRefresh.claims_freshness());
+
+        let poll = |tallies, voters_count| RemotePollData {
+            options: vec!["one".into(), "two".into()],
+            tallies,
+            multiple: false,
+            expires_at: None,
+            voters_count,
+        };
+        assert!(remote_poll_tallies_are_monotonic(
+            &[2, 1],
+            3,
+            Some(3),
+            &poll(vec![2, 2], Some(4)),
+            4,
+        ));
+        assert!(!remote_poll_tallies_are_monotonic(
+            &[2, 1],
+            3,
+            Some(3),
+            &poll(vec![1, 3], Some(4)),
+            4,
+        ));
+        assert!(!remote_poll_tallies_are_monotonic(
+            &[2, 1, 1],
+            4,
+            Some(4),
+            &poll(vec![3, 1], Some(4)),
+            4,
+        ));
+        assert!(!remote_poll_tallies_are_monotonic(
+            &[2, 1],
+            3,
+            Some(3),
+            &poll(vec![2, 2], None),
+            4,
+        ));
+    }
+
+    #[test]
+    fn remote_poll_vote_count_rejects_bigint_overflow() {
+        let poll = RemotePollData {
+            options: vec!["one".into(), "two".into()],
+            tallies: vec![i64::MAX, 1],
+            multiple: false,
+            expires_at: None,
+            voters_count: None,
+        };
+        assert!(matches!(
+            remote_poll_votes_count(&poll),
+            Err(WriteError::InvalidInput(
+                "remote poll vote count is invalid"
+            ))
+        ));
     }
 
     #[test]

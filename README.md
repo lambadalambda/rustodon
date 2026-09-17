@@ -46,10 +46,10 @@ state.
 - Existing local Paperclip media layout and a controlled Mastodon-to-Rustodon
   cutover with rollback compatibility.
 
-Object storage, Elasticsearch, open registration, SSO providers, active polls,
-scheduled posts, quote creation, relays, advanced federation extensions, and the
-full Mastodon administration surface are deferred. Existing unsupported data is
-preserved or rejected by preflight rather than silently discarded.
+Object storage, Elasticsearch, open registration, SSO providers, scheduled posts,
+quote creation, relays, advanced federation extensions, and the full Mastodon
+administration surface are deferred. Existing unsupported data is preserved or
+rejected by preflight rather than silently discarded.
 
 ## Documentation
 

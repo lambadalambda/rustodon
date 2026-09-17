@@ -40,15 +40,24 @@ case "$*" in
       open|pushstate)
         if [ "${6:-}" != --init-script ]; then
           case "${6:-}" in
-            "$BROWSER_TEST_BASE_URL"|"$BROWSER_TEST_BASE_URL/"*) ;;
+            "$BROWSER_TEST_BASE_URL"|"$BROWSER_TEST_BASE_URL/"*)
+              case "${6:-}" in
+                */@alice/123456789) [ -f "$BROWSER_TEST_SESSION.voter" ] || exit 92 ;;
+              esac
+              ;;
             *) printf '%s\n' 'navigation must retain the fixture origin and protocol' >&2; exit 90 ;;
           esac
         fi
         ;;
       cookies)
         if [ "${6:-}" = set ]; then
-          [ "$#" -eq 12 ] && [ "$9" = --url ] && [ "${10}" = "$BROWSER_TEST_BASE_URL/" ] &&
+          [ "$#" -eq 12 ] && [ "$7" = _mastodon_session ] &&
+            { [ "$8" = browser-session ] || [ "$8" = voter-session ]; } &&
+            [ "$9" = --url ] && [ "${10}" = "$BROWSER_TEST_BASE_URL/" ] &&
             [ "${11}" = --path ] && [ "${12}" = / ] || exit 91
+          if [ "$8" = voter-session ]; then
+            : > "$BROWSER_TEST_SESSION.voter"
+          fi
         fi
         ;;
     esac
@@ -66,7 +75,8 @@ case "$*" in
     fi
     if [ "$5" = open ] && [ "${6:-}" = --init-script ]; then
       [ "$#" -eq 7 ] && [ ! -e "$BROWSER_TEST_SESSION.init" ] || exit 77
-      [ -f "$7" ] && [ "$(stat -c '%a' "$7")" = 600 ] || exit 78
+      mode=$(stat -c '%a' "$7" 2>/dev/null || stat -f '%Lp' "$7")
+      [ -f "$7" ] && [ "$mode" = 600 ] || exit 78
       printf '%s\n' "$7" > "$BROWSER_TEST_SESSION.init"
       if [ "${BROWSER_TEST_CAPTURE_JS:-false}" = true ]; then
         cp "$7" "$BROWSER_TEST_JS/api-init.js"
@@ -118,7 +128,7 @@ case "$*" in
   *' eval '*rustodon-smoke:*)
     checkpoint=$(printf '%s\n' "$*" | sed -n 's/.*\/\* rustodon-smoke: \([a-z-]*\) \*\/.*/\1/p')
     case "$checkpoint" in
-      api-observer-ready|settings-ui-ready|settings-leading-observed|settings-trailing-observed|settings-reload-persisted|api-responses-acceptable) ;;
+      api-observer-ready|settings-ui-ready|settings-leading-observed|settings-trailing-observed|settings-reload-persisted|poll-compose-ready|poll-created|poll-voted|poll-refreshed|api-responses-acceptable) ;;
       *) printf 'unknown smoke checkpoint: %s\n' "$checkpoint" >&2; exit 71 ;;
     esac
     printf '%s\n' "$checkpoint" >> "$BROWSER_TEST_EVENTS"
@@ -152,11 +162,19 @@ case "$*" in
     printf '%s\n' toggle-boosts >> "$BROWSER_TEST_EVENTS" ;;
   *' click label[for="setting-toggle-home_timeline-shows-reply"]')
     printf '%s\n' toggle-replies >> "$BROWSER_TEST_EVENTS" ;;
+  *' click .detailed-status__wrapper .detailed-status .poll li:first-child label.poll__option')
+    : > "$BROWSER_TEST_SESSION.poll-option"
+    printf '%s\n' poll-option >> "$BROWSER_TEST_EVENTS" ;;
+  *' click .detailed-status__wrapper .detailed-status .poll .button.button-secondary')
+    [ -f "$BROWSER_TEST_SESSION.poll-option" ] || exit 93
+    printf '%s\n' poll-vote-submit >> "$BROWSER_TEST_EVENTS" ;;
   *' reload') printf '%s\n' reload >> "$BROWSER_TEST_EVENTS" ;;
   *' click '*) ;;
   'session id --scope worktree --prefix rustodon-browser') printf '%s\n' test-session ;;
   *' get count #mastodon') printf '%s\n' 1 ;;
   *' eval document.body.className') printf '%s\n' app-body ;;
+  *' eval '*"sessionStorage.getItem('rustodon-smoke-poll-status')"*) printf '%s\n' 123456789 ;;
+  *' eval '*"sessionStorage.removeItem('rustodon-smoke-poll-status')"*) printf '%s\n' true ;;
   *' eval '*initial-state*'116844606259201001'*)
     : > "$BROWSER_TEST_SESSION.auth"
     printf '%s\n' true
@@ -198,6 +216,9 @@ dump_header=''
 output=''
 cookie=''
 data=''
+login_email=''
+login_password=''
+login_otp=''
 url=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -205,12 +226,17 @@ while [ "$#" -gt 0 ]; do
     --output) output=$2; shift 2 ;;
     --cookie) cookie=$2; shift 2 ;;
     --data-urlencode)
-      case "$2" in csrf_token=*) data=$2 ;; esac
+      case "$2" in
+        csrf_token=*) data=$2 ;;
+        'user[email]='*) login_email=${2#*=} ;;
+        'user[password]='*) login_password=${2#*=} ;;
+        'user[otp_attempt]='*) login_otp=${2#*=} ;;
+      esac
       shift 2
       ;;
     http://*|https://*) url_count=$((url_count + 1)); url=$1; shift ;;
     --cacert) ca_count=$((ca_count + 1)); ca_file=$2; shift 2 ;;
-    --resolve|--header|--cookie-jar|--write-out|--max-time) shift 2 ;;
+    --resolve|--header|--cookie-jar|--write-out|--max-time|--request) shift 2 ;;
     --disable|-q|--silent|--show-error|--fail) shift ;;
     *) printf '%s\n' 'unexpected curl option (TLS bypass is forbidden)' >&2; exit 87 ;;
   esac
@@ -234,7 +260,12 @@ case "$url:$dump_header:$data" in
   */auth/sign_in:?*:csrf_token=sign-in-rendered)
     printf '%s\n' sign-in >> "$BROWSER_TEST_EVENTS"
     [ "$cookie" = '__Host-csrf_token=sign-in-cookie' ] || exit 81
-    printf '%s\n' 'Set-Cookie: _mastodon_session=browser-session; Path=/; HttpOnly' > "$dump_header"
+    case "$login_email:$login_password:$login_otp" in
+      alice@fixture.invalid:fixture-password:fixture-otp) session=browser-session ;;
+      moderator@fixture.invalid:fixture-voter-password:fixture-voter-otp) session=voter-session ;;
+      *) exit 93 ;;
+    esac
+    printf 'Set-Cookie: _mastodon_session=%s; Path=/; HttpOnly\n' "$session" > "$dump_header"
     printf '%s\n' '302|https://fixture.invalid/'
     ;;
   */settings/profile:?*:)
@@ -252,6 +283,10 @@ case "$url:$dump_header:$data" in
     printf '%s\n' logout-probe >> "$BROWSER_TEST_EVENTS"
     [ "$cookie" = '_mastodon_session=browser-session' ] || exit 84
     printf '%s\n' '302|https://fixture.invalid/auth/sign_in'
+    ;;
+  */api/v1/statuses/123456789::)
+    printf '%s\n' poll-cleanup >> "$BROWSER_TEST_EVENTS"
+    printf '%s\n' 200
     ;;
   *) exit 85 ;;
 esac
@@ -281,15 +316,24 @@ run_smoke() {
   email=''
   password=''
   otp=''
+  voter_password=''
+  voter_otp=''
   if [ "$auth" = true ]; then
     email=alice@fixture.invalid
     password=fixture-password
     otp=fixture-otp
+    voter_password=fixture-voter-password
+    voter_otp=fixture-voter-otp
   fi
   events="$test_root/$case_name.events"
   commands="$test_root/$case_name.commands"
   output="$test_root/$case_name.output"
   curl_calls="$test_root/$case_name.curl-calls"
+  poll_status_capture=''
+  if [ "$auth" = true ]; then
+    poll_status_capture="$test_root/$case_name.poll-status"
+    rm -f "$poll_status_capture"
+  fi
   : > "$events"
   : > "$commands"
   : > "$curl_calls"
@@ -315,6 +359,10 @@ run_smoke() {
     RUSTODON_BROWSER_EMAIL="$email" \
     RUSTODON_BROWSER_PASSWORD="$password" \
     RUSTODON_BROWSER_OTP="$otp" \
+    RUSTODON_BROWSER_VOTER_EMAIL="${email:+moderator@fixture.invalid}" \
+    RUSTODON_BROWSER_VOTER_PASSWORD="$voter_password" \
+    RUSTODON_BROWSER_VOTER_OTP="$voter_otp" \
+    RUSTODON_BROWSER_POLL_STATUS_FILE="$poll_status_capture" \
     RUSTODON_BROWSER_DEBUG=false \
     RUSTODON_BROWSER_RECORD='' \
     RUSTODON_BROWSER_SCREENSHOT='' \
@@ -344,6 +392,7 @@ assert_cleanup() {
 run_smoke authenticated '' true true
 [ "$status" -eq 0 ] || fail_test 'authenticated fixture flow failed'
 grep -q 'browser web-client smoke passed' "$output" || fail_test 'success output missing'
+[ "$(cat "$poll_status_capture")" = 123456789 ] || fail_test 'generated poll status ID was not captured for exact cleanup'
 cat > "$test_root/expected.events" <<'EOF'
 api-observer-ready
 csrf-sign-in
@@ -355,10 +404,19 @@ toggle-replies
 settings-trailing-observed
 reload
 settings-reload-persisted
+poll-compose-ready
+poll-created
 profile-settings
 csrf-logout
 sign-out
 logout-probe
+csrf-sign-in
+sign-in
+poll-option
+poll-vote-submit
+poll-voted
+poll-refreshed
+poll-cleanup
 api-responses-acceptable
 EOF
 if ! cmp -s "$test_root/expected.events" "$events"; then
@@ -373,7 +431,7 @@ for step in session-id network open wait-predicate eval fill cookies close; do
   grep -Fq "browser step: begin $step (limit 20s)" "$output" || fail_test "missing safe start diagnostic: $step"
   grep -Fq "browser step: end $step (exit 0)" "$output" || fail_test "missing safe completion diagnostic: $step"
 done
-if grep -Eq 'alice@fixture.invalid|fixture-password|fixture-otp|browser-session|sign-in-cookie|logout-cookie|sign-in-rendered|logout-rendered|__rustodonSettingsSmoke|host-resolver-rules' "$output"; then
+if grep -Eq 'alice@fixture.invalid|fixture-password|fixture-otp|fixture-voter-password|fixture-voter-otp|browser-session|voter-session|sign-in-cookie|logout-cookie|sign-in-rendered|logout-rendered|__rustodonSettingsSmoke|host-resolver-rules' "$output"; then
   fail_test 'browser progress exposed credentials, cookies, form values, eval source, or launch arguments'
 fi
 
@@ -391,7 +449,7 @@ for pin_case in standard plus slash; do
   run_smoke "tls-authenticated-$pin_case" '' true true "$tls_url" fixture.invalid "$tls_ca" "$pin"
   [ "$status" -eq 0 ] || fail_test "$case_name: valid scoped TLS adapter failed"
   cmp -s "$test_root/expected.events" "$events" || fail_test "$case_name: HTTPS lost the authenticated settings/logout flow"
-  [ "$(wc -l < "$curl_calls" | tr -d ' ')" -eq 5 ] || fail_test "$case_name: must verify CA on all five curl calls"
+  [ "$(wc -l < "$curl_calls" | tr -d ' ')" -eq 8 ] || fail_test "$case_name: must verify CA on all eight curl calls"
   if grep -Fq "$pin" "$output" || grep -Fq "$tls_ca" "$output"; then
     fail_test "$case_name: TLS diagnostics exposed pin or CA path"
   fi
@@ -494,7 +552,8 @@ assert_cleanup
 # This deliberately remains a shell-level contract: the mock does not execute
 # eval JavaScript or claim that true means any real response was inspected.
 for checkpoint in api-observer-ready settings-ui-ready settings-leading-observed \
-  settings-trailing-observed settings-reload-persisted api-responses-acceptable; do
+  settings-trailing-observed settings-reload-persisted poll-compose-ready poll-created \
+  poll-voted poll-refreshed api-responses-acceptable; do
   for result in false empty '"true"' malformed '{"success":true,"data":{"result":true}}' command-error; do
     run_smoke "$checkpoint-$result" "$checkpoint" "$result" true
     [ "$status" -ne 0 ] || fail_test "$case_name: rejected observation was ignored"
@@ -508,7 +567,7 @@ for checkpoint in api-observer-ready settings-ui-ready settings-leading-observed
       esac
       grep -Fq "result=$shape" "$output" || fail_test "$case_name: missing safe result classification"
       case "$checkpoint" in
-        api-observer-ready|api-responses-acceptable)
+        api-observer-ready|poll-*|api-responses-acceptable)
           grep -Fq 'browser API diagnostic:' "$output" || fail_test "$case_name: missing API diagnostic"
           ;;
       esac
@@ -519,7 +578,7 @@ for checkpoint in api-observer-ready settings-ui-ready settings-leading-observed
       [ "$status" -eq 1 ] || fail_test "$case_name: evaluation failure exit changed"
       grep -Fq 'result=eval-error' "$output" || fail_test "$case_name: missing eval-error classification"
       case "$checkpoint" in
-        api-observer-ready|api-responses-acceptable)
+        api-observer-ready|poll-*|api-responses-acceptable)
           grep -Fq "browser smoke failed: $checkpoint evaluation failed" "$output" || fail_test "$case_name: lost evaluation failure"
           grep -Fq 'browser API diagnostic:' "$output" || fail_test "$case_name: missing diagnostic after evaluation error"
           ;;
@@ -636,16 +695,54 @@ for (const file of files) {
 }
 assert.deepEqual([...readiness.keys()].sort(), [
   'initial-app', 'authenticated-app', 'reloaded-app', 'post-logout-app',
-  'home-controls', 'sign-in-form', 'profile-form', 'about-app',
+  'home-controls', 'sign-in-form', 'profile-form', 'poll-composer',
+  'poll-options', 'poll-created', 'poll-vote', 'poll-vote-enabled', 'poll-voted', 'poll-refreshed', 'about-app',
 ].sort(), 'every navigation uses explicit readiness');
 const ready = (label, overrides = {}) => {
-  const fixture = { installed: true, state: 'interactive', present: true, disabled: false,
+  const fixture = { installed: true, state: 'interactive', present: true,
+    disabled: label === 'poll-vote',
+    permalink: 'http://fixture.invalid/@alice/123456789',
+    resources: [{ name: 'http://fixture.invalid/api/v1/polls/1', responseStatus: 200 }],
     path: label === 'about-app' ? '/about' : '/home', ...overrides };
+  const has = selector => fixture.present && (!fixture.selectors || fixture.selectors.includes(selector));
+  const timelineArticle = {
+    textContent: 'Rustodon browser poll lifecycle 1 vote', dataset: { id: '123456789' },
+    querySelector: selector => selector === '.poll' && has('article[data-id]') ? {} : null,
+  };
+  const detailedStatus = {
+    textContent: 'Rustodon browser poll lifecycle 1 vote',
+    querySelector: selector => {
+      if (selector === 'a.detailed-status__datetime') {
+        return has(selector) ? { href: fixture.permalink } : null;
+      }
+      if (!has(selector)) return null;
+      return selector.includes('label.poll__option')
+        ? { getClientRects: () => fixture.labelVisible === false ? [] : [{}] }
+        : { disabled: fixture.disabled };
+    },
+  };
   return vm.runInNewContext(readiness.get(label), {
-    window: { __rustodonApiSmoke: fixture.installed ? {} : undefined },
-    location: { pathname: fixture.path },
-    document: { readyState: fixture.state, querySelector: selector =>
-      fixture.present && (!fixture.selectors || fixture.selectors.includes(selector)) ? { disabled: fixture.disabled } : null },
+    window: {
+      __rustodonApiSmoke: fixture.installed ? {} : undefined,
+      __rustodonPollSmoke: { expectedStatusId: '123456789', pollPath: '/api/v1/polls/1', getBefore: 0 },
+    },
+    location: { pathname: fixture.path, href: 'http://fixture.invalid/home', origin: 'http://fixture.invalid' },
+    performance: { getEntriesByType: () => fixture.present ? fixture.resources : [] },
+    URL,
+    sessionStorage: { setItem: () => {} },
+    document: {
+      readyState: fixture.state,
+      querySelector: selector => {
+        if (selector === 'article[data-id="123456789"]') return fixture.present ? timelineArticle : null;
+        if (selector === '.detailed-status__wrapper .detailed-status') return fixture.present ? detailedStatus : null;
+        return has(selector) ? { disabled: fixture.disabled } : null;
+      },
+      querySelectorAll: selector => has(selector)
+        ? (selector === 'article[data-id]'
+          ? [timelineArticle]
+          : [{}, {}])
+        : [],
+    },
   });
 };
 for (const label of readiness.keys()) {
@@ -658,16 +755,94 @@ assert.equal(ready('sign-in-form', { disabled: true }), false);
 for (const [label, selectors] of [
   ['sign-in-form', ['#email', '#password', '#otp_attempt']],
   ['profile-form', ['form[action="/settings/profile"] #display_name', 'form[action="/settings/profile"] button[type="submit"]']],
+  ['poll-composer', ['.compose-form textarea', '.compose-form__poll-button-icon', '.compose-form__submit button[type="submit"]']],
+  ['poll-options', ['.compose-form__poll .poll__option input']],
+  ['poll-created', ['article[data-id]']],
+  ['poll-vote', ['a.detailed-status__datetime', '.poll li:first-child label.poll__option', '.poll .button.button-secondary']],
+  ['poll-vote-enabled', ['a.detailed-status__datetime', '.poll .button.button-secondary']],
+  ['poll-voted', ['a.detailed-status__datetime', '.poll .poll__voted', '.poll .poll__link']],
+  ['poll-refreshed', ['a.detailed-status__datetime', '.poll .poll__voted']],
 ]) {
   assert.equal(ready(label, { selectors }), true);
   for (const missing of selectors) {
     assert.equal(ready(label, { selectors: selectors.filter(selector => selector !== missing) }), false, `${label}: requires ${missing}`);
   }
 }
+assert.equal(ready('poll-vote', { disabled: false }), false, 'poll readiness requires Vote to start disabled');
+assert.equal(ready('poll-vote', { labelVisible: false }), false, 'poll readiness requires a visible option label');
+assert.equal(ready('poll-vote-enabled', { disabled: true }), false, 'Vote must become enabled after selection');
+for (const label of ['poll-vote', 'poll-vote-enabled', 'poll-voted', 'poll-refreshed']) {
+  assert.equal(ready(label, { permalink: 'http://fixture.invalid/@alice/999' }), false,
+    `${label}: detailed-status datetime must prove the exact status ID`);
+}
+assert.equal(ready('poll-refreshed', { resources: [] }), false, 'poll refresh requires a successful GET resource');
 assert.equal(ready('home-controls', { path: '/about' }), false);
 assert.equal(ready('about-app', { path: '/home' }), false);
 assert.equal(ready('about-app', { selectors: ['#mastodon > :not(noscript)'] }), false, 'stale React shell is not rendered About');
-assert.equal(expanded.size, 6, 'all six browser checkpoint scripts must parse');
+assert.equal(expanded.size, 10, 'all ten browser checkpoint scripts must parse');
+const checkpoint = (label, context) => vm.runInNewContext(expanded.get(label), context);
+assert.equal(checkpoint('poll-compose-ready', {
+  document: { querySelector: selector => selector === '.compose-form__poll__select__value'
+    ? { value: '300' }
+    : selector === '.compose-form__submit button[type=submit]' ? { disabled: false } : null },
+}), true);
+assert.equal(checkpoint('poll-compose-ready', {
+  document: { querySelector: () => null },
+}), false, 'poll composer checkpoint requires duration and submit controls');
+assert.equal(checkpoint('poll-created', {
+  sessionStorage: { getItem: () => '123' },
+  document: { querySelector: selector => selector === 'article[data-id="123"] .poll' ? {} : null },
+}), true);
+assert.equal(checkpoint('poll-created', {
+  sessionStorage: { getItem: () => null }, document: { querySelector: () => ({}) },
+}), false, 'poll creation checkpoint requires the captured status ID');
+const detailedStatus = (textContent, nested) => ({
+  textContent,
+  querySelector: selector => selector === 'a.detailed-status__datetime'
+    ? { href: 'http://fixture.invalid/@alice/123' }
+    : nested(selector),
+});
+const votedStatus = detailedStatus('1 vote', selector =>
+  selector === '.poll .poll__voted' ? {} : null);
+const pollState = {
+  expectedStatusId: '123', votePath: '/api/v1/polls/7/votes', pollPath: '/api/v1/polls/7', getBefore: null,
+};
+const pollResources = [{ name: 'http://fixture.invalid/api/v1/polls/7', responseStatus: 200 }];
+assert.equal(checkpoint('poll-voted', {
+  window: { __rustodonPollSmoke: pollState },
+  document: { querySelector: selector => selector === '.detailed-status__wrapper .detailed-status' ? votedStatus : null },
+  performance: { getEntriesByType: () => pollResources },
+  location: { href: 'http://fixture.invalid/home', origin: 'http://fixture.invalid' }, URL,
+}), true);
+assert.equal(pollState.getBefore, 1);
+assert.equal(checkpoint('poll-voted', {
+  window: { __rustodonPollSmoke: { expectedStatusId: '123' } },
+  document: { querySelector: () => ({ textContent: '0 votes', querySelector: () => null }) },
+  performance: { getEntriesByType: () => [] },
+  location: { href: 'http://fixture.invalid/home', origin: 'http://fixture.invalid' }, URL,
+}), false, 'poll vote checkpoint requires voted state, count, and successful vote path');
+const refreshedState = { expectedStatusId: '123', pollPath: '/api/v1/polls/7', getBefore: 1 };
+const refreshedStatus = detailedStatus('', selector =>
+  selector === '.poll .poll__voted' ? {} : null);
+const refreshContext = resources => ({
+  window: { __rustodonPollSmoke: refreshedState },
+  document: { querySelector: selector => selector === '.detailed-status__wrapper .detailed-status' ? refreshedStatus : null },
+  performance: { getEntriesByType: () => resources },
+  location: { href: 'http://fixture.invalid/home', origin: 'http://fixture.invalid' }, URL,
+});
+assert.equal(checkpoint('poll-refreshed', refreshContext([
+  ...pollResources,
+  { name: 'http://fixture.invalid/api/v1/polls/7', responseStatus: 200 },
+])), true);
+for (const decoy of [
+  { name: 'https://other.invalid/api/v1/polls/7', responseStatus: 200 },
+  { name: 'http://fixture.invalid/api/v1/polls/7?decoy=1', responseStatus: 200 },
+  { name: 'http://fixture.invalid/api/v1/polls/7', responseStatus: 500 },
+  { name: 'http://fixture.invalid/api/v1/polls/8', responseStatus: 200 },
+]) {
+  assert.equal(checkpoint('poll-refreshed', refreshContext([...pollResources, decoy])), false,
+    'cross-origin, query, failed, and different-poll resources must not prove refresh');
+}
 const audit = (entries, supported = true) => vm.runInNewContext(block('api_audit_js'), {
   performance: { getEntriesByType: () => entries },
   PerformanceResourceTiming: { prototype: supported ? { responseStatus: 0 } : {} },
@@ -741,6 +916,8 @@ for (const path of [
   assert.equal(audit([entry(path, 404)]), false, 'diagnostic recognition is not an API exception');
 }
 for (const [path, route] of [
+  ['/api/v1/polls/synthetic-private-id/votes', '/api/v1/polls/:id/votes'],
+  ['/api/v1/polls/synthetic-private-id', '/api/v1/polls/:id'],
   ['/api/v1/annual_reports/synthetic-private-year/state', '/api/v1/annual_reports/:year/state'],
   ['/api/v1/announcements/synthetic-private-id/dismiss', '/api/v1/announcements/:id/dismiss'],
   ['/api/web/push_subscriptions/synthetic-private-id', '/api/web/push_subscriptions/:id'],

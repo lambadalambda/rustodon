@@ -2155,7 +2155,7 @@ fn actor_contains_key(actor: &RemoteActor, references: &[Url], key_id: &Url) -> 
         || references.iter().any(|reference| reference == key_id)
 }
 
-fn supported_activitypub_context(value: Option<&Value>) -> bool {
+pub(crate) fn supported_activitypub_context(value: Option<&Value>) -> bool {
     match value {
         Some(Value::String(value)) => value == "https://www.w3.org/ns/activitystreams",
         Some(Value::Array(values)) => values
@@ -2666,9 +2666,31 @@ mod tests {
     #[cfg(all(debug_assertions, feature = "test-support"))]
     use std::time::Duration as StdDuration;
 
+    use serde_json::json;
     use url::Url;
 
     use super::*;
+
+    #[test]
+    fn activitypub_context_requires_the_activitystreams_term() {
+        assert!(supported_activitypub_context(Some(&json!(
+            "https://www.w3.org/ns/activitystreams"
+        ))));
+        assert!(supported_activitypub_context(Some(&json!([
+            "https://example.invalid/context",
+            "https://www.w3.org/ns/activitystreams",
+            {"toot": "http://joinmastodon.org/ns#"}
+        ]))));
+        for unsupported in [
+            None,
+            Some(json!(null)),
+            Some(json!("https://example.invalid/context")),
+            Some(json!(["https://example.invalid/context"])),
+            Some(json!({"as": "https://www.w3.org/ns/activitystreams#"})),
+        ] {
+            assert!(!supported_activitypub_context(unsupported.as_ref()));
+        }
+    }
 
     #[cfg(all(debug_assertions, feature = "test-support"))]
     fn local_http_response(

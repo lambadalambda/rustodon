@@ -8,6 +8,9 @@ mod profile_media;
 #[path = "workers/lifecycles.rs"]
 mod lifecycles;
 
+#[path = "workers/poll_expirations.rs"]
+mod poll_expirations;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,9 +33,11 @@ use rustodon::jobs::{
     ACTIVITYPUB_NOTE_RESOLVE_JOB_KIND, ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
     ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND, JobError, JobSpec, LOCAL_MEDIA_CLEANUP_JOB_KIND, Lane,
     MASTODON_ACCOUNT_PURGE_JOB_KIND, MASTODON_DOMAIN_BLOCK_JOB_KIND,
-    MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND, NOTIFICATION_CREATE_JOB_KIND,
-    NOTIFICATION_UNFILTER_JOB_KIND, Queue, RetryResult, WorkerHeartbeat, enqueue_in,
-    record_outbox_in, record_outbox_once_in, record_stream_event_in,
+    MASTODON_DOMAIN_PURGE_JOB_KIND, MASTODON_POLL_EXPIRATION_EFFECT_KIND,
+    MASTODON_POLL_EXPIRATION_JOB_KIND, MASTODON_POLL_EXPIRATION_RECONCILE_JOB_KIND,
+    NOTIFICATION_CLEANUP_JOB_KIND, NOTIFICATION_CREATE_JOB_KIND, NOTIFICATION_UNFILTER_JOB_KIND,
+    Queue, RetryResult, WorkerHeartbeat, enqueue_in, record_outbox_in, record_outbox_once_in,
+    record_stream_event_in,
 };
 use rustodon::mail::{MailConfig, REPORT_JOB_KIND};
 use rustodon::mastodon::rest::InstanceRuntimeConfig;
@@ -58,6 +63,13 @@ use rustodon::worker::{
     ActivityPubDeliveryConfig, HandlerFailure, HandlerRegistry, ResourceClass, WorkerError,
     WorkerExecutor, infrastructure_handlers, infrastructure_handlers_with_writer,
     infrastructure_handlers_with_writer_and_mail_and_federation, run_until_shutdown,
+};
+#[cfg(feature = "test-support")]
+use rustodon::worker::{
+    reconcile_poll_expirations_at_startup_for_test,
+    reconcile_poll_expirations_with_exhausted_primary_timeout_for_test,
+    reconcile_poll_expirations_with_exhausted_raw_budget_for_test,
+    reconcile_poll_expirations_with_primary_timeout_for_test,
 };
 use serde_json::{Value, json};
 use sqlx::{Connection, PgConnection, Row, postgres::PgPoolOptions};
@@ -17591,6 +17603,7 @@ async fn runtime_publishes_readiness_and_removes_it_on_graceful_shutdown()
             handlers,
             config,
             "runtime-test".to_owned(),
+            None,
             async move {
                 let _ = shutdown_receiver.await;
             },
@@ -17785,6 +17798,7 @@ async fn runtime_rejects_configured_lanes_without_handlers()
             handlers,
             config,
             "unsupported-lanes".to_owned(),
+            None,
             std::future::pending(),
         )
         .await,
@@ -17838,6 +17852,7 @@ async fn shutdown_deadline_aborts_without_acknowledging_and_returns_failure()
             registry,
             config,
             "shutdown-timeout".to_owned(),
+            None,
             async move {
                 let _ = shutdown_receiver.await;
             },

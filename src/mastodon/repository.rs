@@ -1532,6 +1532,7 @@ impl Repository {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn stream_public_timeline_contains(
         &self,
         viewer_account_id: i64,
@@ -1559,6 +1560,7 @@ impl Repository {
             .contains(&status_id))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn stream_tag_timeline_contains(
         &self,
         viewer_account_id: i64,
@@ -2323,6 +2325,26 @@ impl Repository {
               WHERE remote.inbox_url <> ''
               ORDER BY remote.inbox_url, remote.id",
         )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn activitypub_poll_voter_account_ids(
+        &self,
+        status_id: i64,
+    ) -> sqlx::Result<Vec<i64>> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT vote.account_id
+               FROM polls poll
+               JOIN poll_votes vote ON vote.poll_id = poll.id
+               JOIN accounts account ON account.id = vote.account_id
+              WHERE poll.status_id = $1
+                AND account.domain IS NOT NULL
+                AND account.protocol = 1
+                AND account.suspended_at IS NULL
+              ORDER BY vote.account_id",
+        )
+        .bind(status_id)
         .fetch_all(&self.pool)
         .await
     }
@@ -4243,6 +4265,32 @@ impl Repository {
              FROM polls poll \
              JOIN statuses status ON status.id = poll.status_id AND status.deleted_at IS NULL \
              WHERE poll.id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn remote_poll_refresh_target(
+        &self,
+        id: i64,
+    ) -> sqlx::Result<
+        Option<(
+            i64,
+            String,
+            String,
+            Option<NaiveDateTime>,
+            Option<NaiveDateTime>,
+            i32,
+        )>,
+    > {
+        sqlx::query_as(
+            "SELECT poll.account_id, account.uri, status.uri, poll.last_fetched_at, poll.expires_at, \
+                    poll.lock_version \
+             FROM polls poll JOIN statuses status ON status.id = poll.status_id \
+             JOIN accounts account ON account.id = poll.account_id \
+             WHERE poll.id = $1 AND account.domain IS NOT NULL AND status.deleted_at IS NULL \
+               AND status.uri IS NOT NULL",
         )
         .bind(id)
         .fetch_optional(&self.pool)

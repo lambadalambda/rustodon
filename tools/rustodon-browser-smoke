@@ -12,6 +12,8 @@ usage() {
         'HTTP requires both trust variables to be absent or empty.' \
         'RUSTODON_BROWSER_AUTH=true enables the fixture server-authenticated browser-shell flow.' \
         'RUSTODON_BROWSER_EMAIL, _PASSWORD, and _OTP provide its test credentials.' \
+        'RUSTODON_BROWSER_VOTER_EMAIL, _VOTER_PASSWORD, and _VOTER_OTP provide a second account for poll voting.' \
+        'RUSTODON_BROWSER_POLL_STATUS_FILE may capture the generated fixture status ID for exact cleanup.' \
         'RUSTODON_BROWSER_RECORD may name a WebM recording path.' \
         'RUSTODON_BROWSER_SCREENSHOT may name a PNG screenshot path.'
 }
@@ -34,6 +36,7 @@ fi
 base_url=${1%/}
 host=$2
 auth=${RUSTODON_BROWSER_AUTH:-false}
+poll_status_file=${RUSTODON_BROWSER_POLL_STATUS_FILE:-}
 cookie_jar=''
 header_file=''
 csrf_body=''
@@ -83,9 +86,15 @@ case "$auth" in
         browser_email=${RUSTODON_BROWSER_EMAIL:-}
         browser_password=${RUSTODON_BROWSER_PASSWORD:-}
         browser_otp=${RUSTODON_BROWSER_OTP:-}
+        browser_voter_email=${RUSTODON_BROWSER_VOTER_EMAIL:-}
+        browser_voter_password=${RUSTODON_BROWSER_VOTER_PASSWORD:-}
+        browser_voter_otp=${RUSTODON_BROWSER_VOTER_OTP:-}
         [ -n "$browser_email" ] || fail 'RUSTODON_BROWSER_EMAIL is required when browser auth is enabled'
         [ -n "$browser_password" ] || fail 'RUSTODON_BROWSER_PASSWORD is required when browser auth is enabled'
         [ -n "$browser_otp" ] || fail 'RUSTODON_BROWSER_OTP is required when browser auth is enabled'
+        [ -n "$browser_voter_email" ] || fail 'RUSTODON_BROWSER_VOTER_EMAIL is required when browser auth is enabled'
+        [ -n "$browser_voter_password" ] || fail 'RUSTODON_BROWSER_VOTER_PASSWORD is required when browser auth is enabled'
+        [ -n "$browser_voter_otp" ] || fail 'RUSTODON_BROWSER_VOTER_OTP is required when browser auth is enabled'
         ;;
     *) fail 'RUSTODON_BROWSER_AUTH must be true or false' ;;
 esac
@@ -219,6 +228,8 @@ api_diagnostic_js=$(cat <<'JS'
   ]);
   const routeLabel = path => {
     if (knownPaths.has(path)) return path;
+    if (/^\/api\/v1\/polls\/[^/]+\/votes\/?$/.test(path)) return '/api/v1/polls/:id/votes';
+    if (/^\/api\/v1\/polls\/[^/]+\/?$/.test(path)) return '/api/v1/polls/:id';
     if (/^\/api\/v1\/statuses\/[^/]+\/?$/.test(path)) return '/api/v1/statuses/:id';
     if (/^\/api\/v1\/accounts\/[^/]+\/?$/.test(path)) return '/api/v1/accounts/:id';
     if (/^\/api\/v1\/annual_reports\/[^/]+\/state\/?$/.test(path)) return '/api/v1/annual_reports/:year/state';
@@ -574,7 +585,7 @@ settings_setup_js=$(cat <<'JS'
     target: state.target, document: performance.timeOrigin,
   }));
   // React derives checkbox onChange from click, before native change fires.
-  // Capture the input's click (not the label's) before React can start the PUT.
+  // Capture the input click rather than the label click before React can start the PUT.
   document.addEventListener('click', event => {
     const index = controls.findIndex(nodes => nodes[0] === event.target);
     if (index !== -1) state.changes.push({ index, at: performance.now(), checked: event.target.checked });
@@ -619,12 +630,12 @@ settings_setup_js=$(cat <<'JS'
             if (typeof text === 'string' && text.length <= 4096) response = JSON.parse(text);
           }
           switch (response?.error) {
-            case "Can't verify CSRF token authenticity.": request.errorClass = 'csrf'; break;
+            case "Can\u0027t verify CSRF token authenticity.": request.errorClass = 'csrf'; break;
             case 'This method requires an authenticated user': request.errorClass = 'user'; break;
             case 'data must be an object': request.errorClass = 'data'; break;
           }
         } catch { /* Diagnostic parsing must not interrupt completion tracking. */ }
-        // Yield a task after Axios's completion microtasks/SETTING_SAVE dispatch.
+        // Yield a task after Axios completion microtasks/SETTING_SAVE dispatch.
         setTimeout(() => { request.doneAt = performance.now(); request.done = true; }, 0);
       }, { once: true });
     }
@@ -804,6 +815,33 @@ if [ "$auth" = true ]; then
     audit_api
     exercise_settings_save
 
+    printf '%s\n' 'browser poll: creating poll through composer' >&2
+    browser open "$base_url/home" >/dev/null
+    wait_ready poll-composer "Boolean(document.querySelector('.compose-form textarea') && document.querySelector('.compose-form__poll-button-icon') && document.querySelector('.compose-form__submit button[type=\"submit\"]'))"
+    browser fill '.compose-form textarea' 'Rustodon browser poll lifecycle' >/dev/null
+    browser click '.compose-form__poll-button-icon' >/dev/null
+    wait_ready poll-options "document.querySelectorAll('.compose-form__poll .poll__option input').length >= 2"
+    browser fill '.compose-form__poll .poll__option:nth-child(1) input' 'Tea' >/dev/null
+    browser fill '.compose-form__poll .poll__option:nth-child(2) input' 'Coffee' >/dev/null
+    assert_js poll-compose-ready '/* rustodon-smoke: poll-compose-ready */
+(() => {
+  const duration = document.querySelector(".compose-form__poll__select__value");
+  const submit = document.querySelector(".compose-form__submit button[type=submit]");
+  return duration?.value === "300" && submit && !submit.disabled;
+})()' api
+    browser click '.compose-form__submit button[type="submit"]' >/dev/null
+    wait_ready poll-created "(() => { const node = [...document.querySelectorAll('article[data-id]')].find(article => article.textContent.includes('Rustodon browser poll lifecycle') && article.querySelector('.poll')); if (!node) return false; sessionStorage.setItem('rustodon-smoke-poll-status', node.dataset.id); return /^[0-9]+$/.test(node.dataset.id); })()"
+    poll_status_id=$(browser eval "sessionStorage.getItem('rustodon-smoke-poll-status')")
+    case "$poll_status_id" in
+        ''|*[!0-9]*) fail 'poll composer did not expose a generated status id' ;;
+    esac
+    if [ -n "$poll_status_file" ]; then
+        (umask 077; printf '%s\n' "$poll_status_id" > "$poll_status_file") ||
+            fail 'poll status ID could not be written for fixture cleanup'
+    fi
+    assert_js poll-created '/* rustodon-smoke: poll-created */ (() => { const id = sessionStorage.getItem("rustodon-smoke-poll-status"); return /^[0-9]+$/.test(id || "") && Boolean(document.querySelector(`article[data-id="${id}"] .poll`)); })()' api
+    audit_api
+
     printf '%s\n' 'browser auth: checking profile settings' >&2
     browser open "$base_url/settings/profile" >/dev/null
     wait_ready profile-form "Boolean(document.querySelector('form[action=\"/settings/profile\"] #display_name') && document.querySelector('form[action=\"/settings/profile\"] button[type=\"submit\"]'))"
@@ -842,8 +880,111 @@ if [ "$auth" = true ]; then
         */auth/sign_in*) ;;
         *) fail "server-side logout probe did not redirect to sign-in: $logout_probe_redirect" ;;
     esac
-    printf '%s\n' 'browser auth: clearing browser session' >&2
+    printf '%s\n' 'browser poll: signing in second account' >&2
+    browser cookies clear >/dev/null
+    bootstrap_csrf '/auth/sign_in' '' 'browser voter sign-in'
+    voter_login_result=$(fixture_curl --silent --show-error --max-time 30 \
+        --resolve "$base_host:$base_port:127.0.0.1" \
+        --header "Host: $host" \
+        --header 'X-Forwarded-Proto: https' \
+        --header 'Content-Type: application/x-www-form-urlencoded' \
+        --cookie "__Host-csrf_token=$csrf_cookie" \
+        --cookie-jar "$cookie_jar" \
+        --data-urlencode "csrf_token=$csrf_token" \
+        --data-urlencode "user[email]=$browser_voter_email" \
+        --data-urlencode "user[password]=$browser_voter_password" \
+        --data-urlencode "user[otp_attempt]=$browser_voter_otp" \
+        --dump-header "$header_file" \
+        --write-out '%{http_code}|%{redirect_url}' \
+        --output /dev/null \
+        "$base_url/auth/sign_in")
+    voter_login_status=${voter_login_result%%|*}
+    case "$voter_login_status" in
+        3??) ;;
+        *) fail "browser voter sign-in returned HTTP $voter_login_status" ;;
+    esac
+    voter_session=$(awk 'tolower($0) ~ /^[^:]+:[[:space:]]*_mastodon_session=/ { line = $0; sub(/^[^:]+:[[:space:]]*_mastodon_session=/, "", line); sub(/;.*/, "", line); print line; exit }' "$header_file")
+    [ -n "$voter_session" ] || fail 'browser voter sign-in did not return a session cookie'
+    browser cookies set _mastodon_session "$voter_session" --url "$base_url/" --path / >/dev/null
+    browser open "$base_url/@alice/$poll_status_id" >/dev/null
+    poll_status='.detailed-status__wrapper .detailed-status'
+    wait_ready poll-vote "(() => { const status = document.querySelector('$poll_status'); const datetime = status?.querySelector('a.detailed-status__datetime'); const label = status?.querySelector('.poll li:first-child label.poll__option'); const submit = status?.querySelector('.poll .button.button-secondary'); if (!datetime || !label?.getClientRects().length || !submit?.disabled) return false; let url; try { url = new URL(datetime.href, location.href); } catch { return false; } return url.origin === location.origin && url.search === '' && url.hash === '' && url.pathname === '/@alice/$poll_status_id'; })()"
+    poll_probe_ready=$(browser eval "(() => {
+  const expectedStatusId = '$poll_status_id';
+  const state = window.__rustodonPollSmoke = { expectedStatusId, votePath: null, pollPath: null, getBefore: null };
+  const capture = (method, rawUrl, status) => {
+    let url;
+    try { url = new URL(rawUrl, location.href); } catch { return; }
+    const match = url.pathname.match(/^\\/api\\/v1\\/polls\\/([0-9]+)\\/votes\\/?$/);
+    if (method === 'POST' && match && url.origin === location.origin && url.search === '' && status >= 200 && status < 300) {
+      state.votePath = url.pathname;
+      state.pollPath = url.pathname.replace(/\\/votes\\/?$/, '');
+    }
+  };
+  const originalFetch = window.fetch;
+  window.fetch = async function(input, init) {
+    const method = String(init?.method || input?.method || 'GET').toUpperCase();
+    const rawUrl = typeof input === 'string' || input instanceof URL ? input : input.url;
+    const response = await originalFetch.apply(this, arguments);
+    capture(method, rawUrl, response.status);
+    return response;
+  };
+  const originalOpen = XMLHttpRequest.prototype.open;
+  const originalSend = XMLHttpRequest.prototype.send;
+  const requests = new WeakMap();
+  XMLHttpRequest.prototype.open = function(method, url) {
+    requests.set(this, { method: String(method).toUpperCase(), url });
+    return originalOpen.apply(this, arguments);
+  };
+  XMLHttpRequest.prototype.send = function() {
+    this.addEventListener('loadend', () => {
+      const request = requests.get(this);
+      if (request) capture(request.method, request.url, this.status);
+    }, { once: true });
+    return originalSend.apply(this, arguments);
+  };
+  return true;
+})()")
+    [ "$poll_probe_ready" = true ] || fail 'poll vote observation could not be installed'
+    browser click "$poll_status .poll li:first-child label.poll__option" >/dev/null
+    wait_ready poll-vote-enabled "(() => { const status = document.querySelector('$poll_status'); const datetime = status?.querySelector('a.detailed-status__datetime'); const submit = status?.querySelector('.poll .button.button-secondary'); if (!datetime || !submit || submit.disabled) return false; let url; try { url = new URL(datetime.href, location.href); } catch { return false; } return url.origin === location.origin && url.search === '' && url.hash === '' && url.pathname === '/@alice/$poll_status_id'; })()"
+    browser click "$poll_status .poll .button.button-secondary" >/dev/null
+    wait_ready poll-voted "(() => { const status = document.querySelector('$poll_status'); const datetime = status?.querySelector('a.detailed-status__datetime'); if (!datetime || !status.querySelector('.poll .poll__voted') || !status.querySelector('.poll .poll__link')) return false; let url; try { url = new URL(datetime.href, location.href); } catch { return false; } return url.origin === location.origin && url.search === '' && url.hash === '' && url.pathname === '/@alice/$poll_status_id'; })()"
+    assert_js poll-voted '/* rustodon-smoke: poll-voted */ (() => {
+  const state = window.__rustodonPollSmoke;
+  const status = document.querySelector(".detailed-status__wrapper .detailed-status");
+  const datetime = status?.querySelector("a.detailed-status__datetime");
+  let permalink;
+  try { permalink = new URL(datetime?.href || "", location.href); } catch { return false; }
+  if (permalink.origin !== location.origin || permalink.search !== "" || permalink.hash !== "" || permalink.pathname !== `/@alice/${state?.expectedStatusId || ""}`) return false;
+  if (!status?.querySelector(".poll .poll__voted") || !/1 (vote|person)/.test(status.textContent)) return false;
+  if (!state?.votePath || !/^\/api\/v1\/polls\/[0-9]+\/votes\/?$/.test(state.votePath) || !state.pollPath) return false;
+  const exactSuccessfulPollGets = () => performance.getEntriesByType("resource").filter(entry => {
+    const url = new URL(entry.name, location.href);
+    return url.origin === location.origin && url.search === "" && url.pathname === state.pollPath && entry.responseStatus >= 200 && entry.responseStatus < 300;
+  }).length;
+  state.getBefore = exactSuccessfulPollGets();
+  return Number.isInteger(state.getBefore);
+})()' api
+    browser click "$poll_status .poll .poll__link" >/dev/null
+    wait_ready poll-refreshed "(() => { const state = window.__rustodonPollSmoke; const status = document.querySelector('$poll_status'); const datetime = status?.querySelector('a.detailed-status__datetime'); if (!state?.pollPath || !Number.isInteger(state.getBefore) || !datetime) return false; let permalink; try { permalink = new URL(datetime.href, location.href); } catch { return false; } if (permalink.origin !== location.origin || permalink.search !== '' || permalink.hash !== '' || permalink.pathname !== '/@alice/$poll_status_id') return false; const count = performance.getEntriesByType('resource').filter(entry => { const url = new URL(entry.name, location.href); return url.origin === location.origin && url.search === '' && url.pathname === state.pollPath && entry.responseStatus >= 200 && entry.responseStatus < 300; }).length; return Boolean(status.querySelector('.poll .poll__voted')) && count > state.getBefore; })()"
+    assert_js poll-refreshed '/* rustodon-smoke: poll-refreshed */ (() => { const state = window.__rustodonPollSmoke; if (!state?.pollPath || !Number.isInteger(state.getBefore)) return false; const count = performance.getEntriesByType("resource").filter(entry => { const url = new URL(entry.name, location.href); return url.origin === location.origin && url.search === "" && url.pathname === state.pollPath && entry.responseStatus >= 200 && entry.responseStatus < 300; }).length; const status = document.querySelector(".detailed-status__wrapper .detailed-status"); const datetime = status?.querySelector("a.detailed-status__datetime"); let permalink; try { permalink = new URL(datetime?.href || "", location.href); } catch { return false; } return permalink.origin === location.origin && permalink.search === "" && permalink.hash === "" && permalink.pathname === `/@alice/${state.expectedStatusId}` && Boolean(status?.querySelector(".poll .poll__voted")) && count > state.getBefore; })()' api
     audit_api
+
+    cleanup_status=$(fixture_curl --silent --show-error --max-time 30 \
+        --resolve "$base_host:$base_port:127.0.0.1" \
+        --header "Host: $host" \
+        --header 'X-Forwarded-Proto: https' \
+        --header 'Authorization: Bearer fixture-bearer-token-v4-6-5' \
+        --request DELETE \
+        --write-out '%{http_code}' \
+        --output /dev/null \
+        "$base_url/api/v1/statuses/$poll_status_id")
+    [ "$cleanup_status" = 200 ] || fail "browser poll cleanup returned HTTP $cleanup_status"
+    sessionStorage_cleanup=$(browser eval "sessionStorage.removeItem('rustodon-smoke-poll-status'); true")
+    [ "$sessionStorage_cleanup" = true ] || fail 'browser poll session cleanup failed'
+
+    printf '%s\n' 'browser auth: clearing browser session' >&2
     browser cookies clear >/dev/null
     browser open "$base_url/" >/dev/null
     wait_ready post-logout-app "$app_ready_js"
@@ -873,7 +1014,7 @@ if [ "$recording" = true ]; then
 fi
 
 if [ "$auth" = true ]; then
-    printf 'browser web-client smoke passed: mount, server-authenticated shell/settings/logout, frontend debounced PUT/reload, SPA deep link, API responses, and page errors\n'
+    printf 'browser web-client smoke passed: mount, server-authenticated shell/settings/logout, frontend debounced PUT/reload, two-account poll create/vote/refresh, SPA deep link, API responses, and page errors\n'
 else
     printf 'browser web-client smoke passed: mount, app body, SPA deep link, API responses, and page errors\n'
 fi

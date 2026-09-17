@@ -12,6 +12,17 @@ pub mod signatures;
 mod types;
 mod write_repository;
 
+use serde_json::Value;
+
+/// Matches an ActivityStreams/JSON-LD value represented as either a scalar or an array.
+pub(crate) fn equals_or_includes(value: Option<&Value>, expected: &str) -> bool {
+    match value {
+        Some(Value::String(value)) => value == expected,
+        Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some(expected)),
+        _ => false,
+    }
+}
+
 pub use auth::{
     AuthenticationFailure, TwoFactorVerification, random_auth_token, random_backup_code,
     random_totp_secret, valid_totp_secret, verify_password, verify_two_factor,
@@ -48,11 +59,12 @@ pub use write_repository::{
     OAUTH_CONFIGURED_SCOPES, OAuthApplicationRegistration, OAuthApplicationRegistrationResult,
     OAuthAuthorizationCodeError, OAuthAuthorizationCodeToken, OAuthAuthorizationGrant,
     OAuthAuthorizationGrantError, OAuthClientCredentialsError, OAuthClientCredentialsToken,
-    OAuthTokenRevocationError, REPORT_RATE_LIMIT, ReblogWriteOutcome, RemoteFollowOutcome,
-    RemoteFollowWriteOutcome, RemoteInteractionWriteOutcome, RemoteNoteWriteOutcome,
+    OAuthTokenRevocationError, PollCreate, PollVoteWriteOutcome, REPORT_RATE_LIMIT,
+    ReblogWriteOutcome, RemoteFollowOutcome, RemoteFollowWriteOutcome,
+    RemoteInteractionWriteOutcome, RemoteNoteWriteOutcome, RemotePollVoteOutcome,
     RemoteUndoReferenceKind, STATUS_NOTIFICATION_JOB_KIND, StatusMediaAttributeUpdate,
     StatusUpdate, StatusWriteOutcome, VerifiedPassword, WriteError, WriteOptions, WriteOutcome,
-    WriteRepository,
+    WriteRepository, prepare_local_poll,
 };
 
 #[cfg(feature = "test-support")]

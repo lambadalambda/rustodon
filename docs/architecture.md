@@ -95,6 +95,15 @@ Startup rejects configured lanes without registered handlers. Execution is at
 least once: handlers must make externally visible effects idempotent because a
 crash after an effect but before fenced acknowledgement may repeat work.
 
+Poll-expiration readiness establishes the immutable database-clock activation
+marker and executes exactly one bounded Maintenance reconciliation segment. If
+more candidates remain, that segment commits a durable continuation before its
+fenced success watermark and readiness; startup does not synchronously drain an
+unbounded continuation chain. Core executors start only after activation exists,
+and every expiration handler independently classifies generations at or before
+the activation boundary as baseline-only, so a later continuation cannot turn
+historical polls into notification or federation effects.
+
 ### Preflight
 
 `rustodon preflight` is read-only against PostgreSQL, Redis, and media. It
@@ -168,16 +177,20 @@ repair, and no-op edit behavior are covered by isolated fixture tests.
 
 ## Read and preserve without creating
 
-Rustodon preserves historical polls/votes, scheduled-status rows when none are
-pending, lists, pins, featured/followed tags, filters, preview cards, custom
-emoji, announcements, reports, warnings, appeals, severance events, migrations,
-imports, backups, Web Push rows, quotes, collections, and unknown future values.
-Preflight rejects active unsupported workflows instead of transforming them.
+Rustodon preserves scheduled-status rows when none are pending, lists, pins,
+featured/followed tags, filters, preview cards, custom emoji, announcements,
+reports, warnings, appeals, severance events, migrations, imports, backups, Web
+Push rows, quotes, collections, and unknown future values. Polls and votes have
+an implemented REST and ActivityPub lifecycle, including exact-generation expiry
+repair. Final-tree restored-fixture, worker, and browser acceptance for that poll
+lifecycle remains explicitly deferred; executable test source is not a recorded
+pass. Preflight rejects remaining active unsupported workflows instead of
+transforming them.
 
 Object storage, Elasticsearch, open registration, LDAP/PAM/CAS/SAML/OIDC and
-other SSO providers, active polls, scheduled posts, quote creation, relays,
-advanced federation extensions, and the complete administration surface are
-outside the initial boundary.
+other SSO providers, scheduled posts, quote creation, relays, advanced
+federation extensions, and the complete administration surface are outside the
+initial boundary.
 
 ## Support and acceptance status
 

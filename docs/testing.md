@@ -55,6 +55,12 @@ mise run harness-tests
 | Browser | `mise run browser-integration` | Drives the pinned frontend in Chromium within the HTTPS cutover fixture. |
 | Real peer | `mise run peer-public`, `peer-privacy`, `peer-notes`, `peer-profile`, `peer-interactions` | Runs explicit manual scenarios against a disposable pinned Mastodon peer. |
 
+The poll-expiration portion of worker startup proves an immutable activation
+boundary plus one bounded reconciliation segment, not completion of the full
+historical scan. Remaining work must already be represented by a committed
+Maintenance continuation before readiness; independently guarded Core handlers
+baseline historical generations when that continuation is processed later.
+
 The workflow definitions in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
 show how ordinary, source, schema, worker, differential, and extended lanes are
 grouped. Workflow presence is configuration, not proof that a particular commit
@@ -117,6 +123,7 @@ mise run differential -- oauth_bearer_authentication
 mise run differential -- status_authorization_matrix
 mise run differential -- rest_protocol_contracts
 mise run differential -- federation_discovery
+mise run differential -- poll_lifecycle
 mise run differential -- local_web_client_shell
 ```
 
@@ -129,8 +136,11 @@ The browser lane starts the HTTPS cutover fixture and drives the pinned frontend
 through `agent-browser`. It covers anonymous and authenticated shells, React
 mounting, SPA navigation, password/backup-code session setup, settings and
 logout, Home boost/reply controls, leading/trailing web-settings updates,
-persistence after reload, unexpected API failures, and the enclosing rollback
-comparison.
+persistence after reload, a two-account poll composer → vote → refresh lifecycle,
+unexpected API failures, and the enclosing rollback comparison. The poll scenario
+is executable intended acceptance coverage, but its final-tree browser run (and
+the corresponding restored-schema and worker fixtures) is explicitly deferred;
+source presence alone is not acceptance evidence.
 
 Optional evidence paths:
 

@@ -106,11 +106,10 @@ more convenient.
   from configured trusted proxies.
 - Document a snapshot, drain, cutover, smoke-test, and rollback procedure.
 
-Preflight should specifically detect pending scheduled statuses, active local
-polls if voting is not implemented, pending account deletions, enabled WebAuthn-
-only users, non-empty Sidekiq queues, active relays, object storage, and enabled
-SSO providers. The first version may ask the operator to resolve these before
-cutover rather than implement them badly.
+Preflight should specifically detect pending scheduled statuses, pending account
+deletions, enabled WebAuthn-only users, non-empty Sidekiq queues, active relays,
+object storage, and enabled SSO providers. The first version may ask the
+operator to resolve these before cutover rather than implement them badly.
 
 ### 2. Authentication and OAuth
 
@@ -328,8 +327,6 @@ Required semantics:
 Rustodon must tolerate these existing rows and serialize them where they occur,
 but it does not need to expose their mutation workflows:
 
-- Historical polls and votes. Active local polls must be absent at cutover or
-  supported by a later milestone.
 - Existing list memberships, pins, featured tags, and followed tags.
 - Existing custom filters and explicit status filters.
 - Existing scheduled-status records, provided none are pending at cutover.
@@ -369,7 +366,6 @@ feature work remain possible.
 
 ### User Features
 
-- Creating or voting in polls.
 - Scheduled posts.
 - Quote posts and quote authorization.
 - Custom/featured collections.
@@ -387,7 +383,6 @@ feature work remain possible.
 ### Federation Extensions
 
 - Relays and generic shared-inbox forwarding.
-- Poll federation.
 - Quote and featured-collection federation.
 - Follower synchronization.
 - Account `Move` migration.

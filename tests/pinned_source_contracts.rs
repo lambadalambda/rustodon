@@ -70,6 +70,24 @@ const FRONTEND_ROUTES: &[FrontendRouteContract] = &[
         router_handler: "get(announcements)",
     },
     FrontendRouteContract {
+        label: "poll refresh",
+        source: "app/javascript/mastodon/api/polls.ts",
+        evidence: "apiRequestGet<ApiPollJSON>(`v1/polls/${pollId}`)",
+        path: "/api/v1/polls/{id}",
+        method: ApiMethod::Get,
+        support: ApiRouteSupport::Implemented,
+        router_handler: "get(poll_show)",
+    },
+    FrontendRouteContract {
+        label: "poll vote",
+        source: "app/javascript/mastodon/api/polls.ts",
+        evidence: "apiRequestPost<ApiPollJSON>(`v1/polls/${pollId}/votes`",
+        path: "/api/v1/polls/{id}/votes",
+        method: ApiMethod::Post,
+        support: ApiRouteSupport::Implemented,
+        router_handler: "post(poll_vote)",
+    },
+    FrontendRouteContract {
         label: "hashtag column search",
         source: "app/javascript/mastodon/features/hashtag_timeline/containers/column_settings_container.js",
         evidence: "api().get('/api/v2/search', { params: { q: value, type: 'hashtags' } })",
@@ -157,11 +175,111 @@ fn pinned_frontend_routes_are_explicitly_supported_and_routed() {
         );
     }
 
+    let poll_actions = read(&source.join("app/javascript/mastodon/actions/polls.ts"));
+    assert!(poll_actions.contains("apiPollVote(pollId, choices)"));
+    assert!(poll_actions.contains("apiGetPoll(pollId)"));
+    assert_eq!(
+        poll_actions.matches("importFetchedPoll({ poll })").count(),
+        2
+    );
+    let poll_api = read(&source.join("app/javascript/mastodon/api/polls.ts"));
+    assert!(
+        poll_api.contains(
+            "apiRequestPost<ApiPollJSON>(`v1/polls/${pollId}/votes`, {\n    choices,\n  })"
+        )
+    );
+    let compose = read(&source.join("app/javascript/mastodon/actions/compose.js"));
+    assert!(compose.contains("poll: getState().getIn(['compose', 'poll'], null)"));
+
     let hashtag_source = read(&source.join(FRONTEND_ROUTES.last().unwrap().source));
     for shape in ["response.data.hashtags", "tag.name"] {
         assert!(
             hashtag_source.contains(shape),
             "hashtag response shape drifted: {shape}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the read-only pinned Mastodon source checkout"]
+fn pinned_poll_frontend_contract_covers_compose_vote_and_refresh() {
+    let source = mastodon_source();
+    let compose =
+        read(&source.join("app/javascript/mastodon/features/compose/components/poll_form.jsx"));
+    for evidence in [
+        "compose-form__poll",
+        "poll__option editable",
+        "compose-form__poll__select__value",
+        "placeholder={intl.formatMessage(messages.option_placeholder, { number: index + 1 })}",
+        "{ value: 300",
+        "{ value: 604800",
+        "defaultMessage: 'Option {number}'",
+    ] {
+        assert!(
+            compose.contains(evidence),
+            "poll composer drifted: {evidence}"
+        );
+    }
+    let compose_form =
+        read(&source.join("app/javascript/mastodon/features/compose/components/compose_form.jsx"));
+    for evidence in [
+        "<AutosuggestTextarea",
+        "<div className='compose-form__submit'>",
+        "type='submit'",
+    ] {
+        assert!(
+            compose_form.contains(evidence),
+            "poll composer submit selector drifted: {evidence}"
+        );
+    }
+    let button =
+        read(&source.join("app/javascript/mastodon/features/compose/components/poll_button.jsx"));
+    for evidence in [
+        "Add a poll",
+        "Remove poll",
+        "compose-form__poll-button-icon",
+    ] {
+        assert!(button.contains(evidence), "poll button drifted: {evidence}");
+    }
+    let poll = read(&source.join("app/javascript/mastodon/components/poll.tsx"));
+    for evidence in [
+        "name='vote-options'",
+        "data-index={index}",
+        "<label",
+        "className={classNames('poll__option'",
+        "const voteDisabled =",
+        "Object.values(selected).every((item) => !item)",
+        "onChange={handleOptionChange}",
+        "disabled={voteDisabled}",
+        "className='button button-secondary'",
+        "className='poll__link'",
+        "poll__voted",
+        "defaultMessage='Vote'",
+        "defaultMessage='Refresh'",
+    ] {
+        assert!(
+            poll.contains(evidence),
+            "poll interaction drifted: {evidence}"
+        );
+    }
+    let status_page = read(&source.join("app/javascript/mastodon/features/status/index.jsx"));
+    for evidence in ["detailed-status__wrapper", "<DetailedStatus"] {
+        assert!(
+            status_page.contains(evidence),
+            "poll permalink wrapper drifted: {evidence}"
+        );
+    }
+    let detailed_status = read(
+        &source.join("app/javascript/mastodon/features/status/components/detailed_status.tsx"),
+    );
+    for evidence in [
+        "classNames('detailed-status'",
+        "className='detailed-status__datetime'",
+        "href={`/@${status.getIn(['account', 'acct'])}/${status.get('id')}`}",
+    ] {
+        assert!(
+            detailed_status.contains(evidence),
+            "poll permalink identity selector drifted: {evidence}"
         );
     }
 }
@@ -196,6 +314,7 @@ fn pinned_rails_uri_only_create_contract_dereferences_before_materializing_notes
 
 #[test]
 #[ignore = "requires the read-only pinned Mastodon source checkout"]
+#[allow(clippy::too_many_lines)]
 fn pinned_timeline_stream_protocol_covers_every_bundled_channel_and_lifecycle() {
     let source = mastodon_source();
     let frontend = read(&source.join("app/javascript/mastodon/actions/streaming.js"));
@@ -320,4 +439,140 @@ fn pinned_timeline_stream_protocol_covers_every_bundled_channel_and_lifecycle() 
             "pinned server error drifted: {error}"
         );
     }
+}
+
+#[test]
+#[ignore = "requires the read-only pinned Mastodon source checkout"]
+#[allow(clippy::too_many_lines)]
+fn pinned_poll_backend_contract_covers_policy_delivery_refresh_and_expiry() {
+    let source = mastodon_source();
+    let policy = read(&source.join("app/policies/poll_policy.rb"));
+    for evidence in [
+        "StatusPolicy.new(current_account, record.status).show?",
+        "!current_account.blocking?(record.account)",
+        "!record.account.blocking?(current_account)",
+    ] {
+        assert!(policy.contains(evidence), "poll policy drifted: {evidence}");
+    }
+
+    let vote = read(&source.join("app/services/vote_service.rb"));
+    for evidence in [
+        "ApplicationRecord.transaction do",
+        "@choices.each do |choice|",
+        "ActivityPub::DistributePollUpdateWorker.perform_in(3.minutes",
+        "PollExpirationNotifyWorker.perform_at(@poll.expires_at + 5.minutes",
+        "@votes.each do |vote|",
+        "ActivityPub::DeliveryWorker.perform_async(",
+    ] {
+        assert!(
+            vote.contains(evidence),
+            "poll vote service drifted: {evidence}"
+        );
+    }
+
+    let refresh = read(&source.join("app/services/activitypub/fetch_remote_poll_service.rb"));
+    assert!(refresh.contains("return unless supported_context?(json)"));
+    assert!(
+        refresh
+            .contains("ActivityPub::ProcessStatusUpdateService.new.call(poll.status, json, json)")
+    );
+    let status_update =
+        read(&source.join("app/services/activitypub/process_status_update_service.rb"));
+    for evidence in [
+        "return @status if !expected_type? || already_updated_more_recently?",
+        "@status_parser.edited_at > @status.edited_at",
+        "update_poll!",
+        "return unless allow_significant_changes",
+        "previous_poll.destroy!",
+        "@status.poll_id = nil",
+        "return unless poll.present? && poll.expires_at.present? && poll.votes.exists?",
+        "return if @previous_expires_at&.past?",
+        "PollExpirationNotifyWorker.remove_from_scheduled(poll.id) if @previous_expires_at.present? && @previous_expires_at > poll.expires_at",
+        "PollExpirationNotifyWorker.perform_at(poll.expires_at + 5.minutes, poll.id)",
+    ] {
+        assert!(
+            status_update.contains(evidence),
+            "poll-removal update contract drifted: {evidence}"
+        );
+    }
+    let status_update_spec =
+        read(&source.join("spec/services/activitypub/process_status_update_service_spec.rb"));
+    for evidence in [
+        "context 'when originally with a poll'",
+        "it 'removes poll and records media change in edit'",
+        "expect(status.reload.poll).to be_nil",
+        "context 'with an implicit update of a poll that has already expired'",
+        "it 'does not re-trigger notifications'",
+        ".to_not enqueue_sidekiq_job(PollExpirationNotifyWorker)",
+    ] {
+        assert!(
+            status_update_spec.contains(evidence),
+            "poll-removal regression contract drifted: {evidence}"
+        );
+    }
+
+    let local_notification = read(&source.join("app/workers/local_notification_worker.rb"));
+    for evidence in [
+        "if %w(update quoted_update collection_update).include?(type)",
+        "Notification.where(account: receiver, activity: activity, type: type).in_batches.delete_all",
+        "elsif Notification.where(account: receiver, activity: activity, type: type).any?",
+        "NotifyService.new.call(receiver, type || activity_class_name.underscore, activity, **options.symbolize_keys)",
+    ] {
+        assert!(
+            local_notification.contains(evidence),
+            "local notification idempotence/dismissal contract drifted: {evidence}"
+        );
+    }
+
+    let expiry = read(&source.join("app/workers/poll_expiration_notify_worker.rb"));
+    for evidence in [
+        "sidekiq_options lock: :until_executing",
+        "return if missing_expiration?",
+        "requeue! && return if not_due_yet?",
+        "notify_remote_voters_and_owner! if @poll.local?",
+        "notify_local_voters!",
+        "@poll.expires_at + 5.minutes",
+        "ActivityPub::DistributePollUpdateWorker.perform_async(@poll.status.id)",
+        "LocalNotificationWorker.perform_async(@poll.account_id, @poll.id, 'Poll', 'poll')",
+        "@poll.voters.merge(Account.local).select(:id).find_in_batches",
+        "[account.id, @poll.id, 'Poll', 'poll']",
+        "rescue ActiveRecord::RecordNotFound",
+    ] {
+        assert!(
+            expiry.contains(evidence),
+            "poll expiry worker drifted: {evidence}"
+        );
+    }
+
+    let expiry_spec = read(&source.join("spec/workers/poll_expiration_notify_worker_spec.rb"));
+    for evidence in [
+        "expect(ActivityPub::DistributePollUpdateWorker).to have_enqueued_sidekiq_job(poll.status.id)",
+        "expect(LocalNotificationWorker).to have_enqueued_sidekiq_job(poll.account.id, poll.id, 'Poll', 'poll')",
+        "expect(LocalNotificationWorker).to have_enqueued_sidekiq_job(poll_vote.account.id, poll.id, 'Poll', 'poll')",
+        "expect(ActivityPub::DistributePollUpdateWorker).to_not have_enqueued_sidekiq_job(poll.status.id)",
+        "expect(LocalNotificationWorker).to_not have_enqueued_sidekiq_job(poll.account.id, poll.id, 'Poll', 'poll')",
+    ] {
+        assert!(
+            expiry_spec.contains(evidence),
+            "poll expiry local/remote effect contract drifted: {evidence}"
+        );
+    }
+
+    let note = read(&source.join("app/serializers/activitypub/note_serializer.rb"));
+    assert!(
+        note.contains("context_extensions :atom_uri, :conversation, :sensitive, :voters_count")
+    );
+    assert!(note.contains("class CustomEmojiSerializer < ActivityPub::EmojiSerializer; end"));
+    let emoji = read(&source.join("app/serializers/activitypub/emoji_serializer.rb"));
+    assert!(emoji.contains("class ActivityPub::EmojiSerializer < ActivityPub::Serializer"));
+    assert!(emoji.contains("context_extensions :emoji"));
+    let context = read(&source.join("app/helpers/context_helper.rb"));
+    assert!(
+        context.contains(
+            "emoji: { 'toot' => 'http://joinmastodon.org/ns#', 'Emoji' => 'toot:Emoji' }"
+        )
+    );
+    assert!(context.contains(
+        "voters_count: { 'toot' => 'http://joinmastodon.org/ns#', 'votersCount' => 'toot:votersCount' }"
+    ));
 }

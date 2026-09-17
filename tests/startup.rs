@@ -14,6 +14,50 @@ use sqlx::{Connection, PgConnection, postgres::PgPoolOptions};
 
 const WRITER_PRIVILEGE_MUTATIONS: &[(&str, &str)] = &[
     (
+        "REVOKE INSERT ON public.polls FROM rustodon_differential_writer",
+        "GRANT INSERT ON public.polls TO rustodon_differential_writer",
+    ),
+    (
+        "REVOKE UPDATE ON public.polls FROM rustodon_differential_writer",
+        "GRANT UPDATE ON public.polls TO rustodon_differential_writer",
+    ),
+    (
+        "REVOKE DELETE ON public.polls FROM rustodon_differential_writer",
+        "GRANT DELETE ON public.polls TO rustodon_differential_writer",
+    ),
+    (
+        "REVOKE INSERT ON public.poll_votes FROM rustodon_differential_writer",
+        "GRANT INSERT ON public.poll_votes TO rustodon_differential_writer",
+    ),
+    (
+        "REVOKE DELETE ON public.poll_votes FROM rustodon_differential_writer",
+        "GRANT DELETE ON public.poll_votes TO rustodon_differential_writer",
+    ),
+    (
+        "REVOKE USAGE ON SEQUENCE public.polls_id_seq FROM rustodon_differential_writer",
+        "GRANT USAGE ON SEQUENCE public.polls_id_seq TO rustodon_differential_writer",
+    ),
+    (
+        "REVOKE USAGE ON SEQUENCE public.poll_votes_id_seq FROM rustodon_differential_writer",
+        "GRANT USAGE ON SEQUENCE public.poll_votes_id_seq TO rustodon_differential_writer",
+    ),
+    (
+        "GRANT SELECT ON SEQUENCE public.polls_id_seq TO rustodon_differential_writer",
+        "REVOKE SELECT ON SEQUENCE public.polls_id_seq FROM rustodon_differential_writer",
+    ),
+    (
+        "GRANT UPDATE ON SEQUENCE public.polls_id_seq TO rustodon_differential_writer",
+        "REVOKE UPDATE ON SEQUENCE public.polls_id_seq FROM rustodon_differential_writer",
+    ),
+    (
+        "GRANT SELECT ON SEQUENCE public.poll_votes_id_seq TO rustodon_differential_writer",
+        "REVOKE SELECT ON SEQUENCE public.poll_votes_id_seq FROM rustodon_differential_writer",
+    ),
+    (
+        "GRANT UPDATE ON SEQUENCE public.poll_votes_id_seq TO rustodon_differential_writer",
+        "REVOKE UPDATE ON SEQUENCE public.poll_votes_id_seq FROM rustodon_differential_writer",
+    ),
+    (
         "REVOKE SELECT ON public.web_settings FROM rustodon_differential_writer",
         "GRANT SELECT ON public.web_settings TO rustodon_differential_writer",
     ),

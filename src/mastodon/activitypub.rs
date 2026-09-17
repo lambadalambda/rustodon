@@ -316,6 +316,7 @@ fn note_context() -> Value {
             "conversation": "ostatus:conversation",
             "toot": "http://joinmastodon.org/ns#",
             "Hashtag": "as:Hashtag",
+            "Emoji": "toot:Emoji",
             "blurhash": "toot:blurhash",
             "focalPoint": {"@container": "@list", "@id": "toot:focalPoint"},
             "sensitive": "as:sensitive",
@@ -985,6 +986,41 @@ pub fn note(
     value
 }
 
+/// Projects a status Note into Mastodon's `ActivityPub` Question representation.
+#[must_use]
+pub fn question(mut value: Value, poll: &super::Poll, now: NaiveDateTime) -> Value {
+    value["type"] = json!("Question");
+    let show_totals = !poll.hide_totals || poll.expires_at.is_some_and(|expiry| now >= expiry);
+    let options = poll
+        .options
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            json!({
+                "type": "Note",
+                "name": name,
+                "replies": {
+                    "type": "Collection",
+                    "totalItems": show_totals
+                        .then(|| poll.cached_tallies.get(index).copied().unwrap_or(0))
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let key = if poll.multiple { "anyOf" } else { "oneOf" };
+    value[key] = Value::Array(options);
+    if let Some(expires_at) = poll.expires_at {
+        value["endTime"] = json!(timestamp(expires_at));
+        if now >= expires_at {
+            value["closed"] = json!(timestamp(expires_at));
+        }
+    }
+    if let Some(voters_count) = poll.voters_count {
+        value["votersCount"] = json!(voters_count.max(0));
+    }
+    value
+}
+
 #[must_use]
 pub fn create(origin: &Url, account: &Account, status: &Status, object: Value) -> Value {
     let activity_id = object["id"].as_str().map_or_else(
@@ -1024,6 +1060,31 @@ pub fn status_activity(
     } else {
         create(origin, account, status, object)
     }
+}
+
+#[must_use]
+pub fn vote_with_uris(
+    vote_uri: &str,
+    actor_uri: &str,
+    question_uri: &str,
+    poll_actor_uri: &str,
+    option: &str,
+) -> Value {
+    json!({
+        "@context": ACTIVITY_STREAMS_CONTEXT,
+        "id": format!("{vote_uri}/activity"),
+        "type": "Create",
+        "actor": actor_uri,
+        "to": poll_actor_uri,
+        "object": {
+            "id": vote_uri,
+            "type": "Note",
+            "name": option,
+            "attributedTo": actor_uri,
+            "inReplyTo": question_uri,
+            "to": poll_actor_uri
+        }
+    })
 }
 
 #[must_use]
@@ -1070,7 +1131,7 @@ pub fn update_with_uris(
     object: Value,
 ) -> Value {
     json!({
-        "@context": ACTIVITY_STREAMS_CONTEXT,
+        "@context": note_context(),
         "id": activity_uri,
         "type": "Update",
         "actor": actor_uri,
@@ -1597,12 +1658,12 @@ mod tests {
     use super::{
         CustomEmoji, PUBLIC_ADDRESS, accept, actor, actor_url, actor_with_media,
         announce_with_uris, block_with_uris, create, delete_actor_with_uris, delete_with_uris,
-        follow_with_uris, host_meta, like_with_uris, note, quote_authorization,
-        quote_authorization_url, reject_with_uris, status_activity, status_url,
-        undo_announce_with_uris, undo_block_with_uris, undo_follow_with_uris, undo_like_with_uris,
-        update_actor, update_with_uris,
+        follow_with_uris, host_meta, like_with_uris, note, note_context, question,
+        quote_authorization, quote_authorization_url, reject_with_uris, status_activity,
+        status_url, undo_announce_with_uris, undo_block_with_uris, undo_follow_with_uris,
+        undo_like_with_uris, update_actor, update_with_uris, vote_with_uris,
     };
-    use crate::mastodon::records::{Account, MediaAttachment, Mention, Status};
+    use crate::mastodon::records::{Account, MediaAttachment, Mention, Poll, Status};
     use crate::mastodon::types::{AccountIdScheme, RawI32, RawString, StatusVisibility};
 
     #[test]
@@ -2322,6 +2383,55 @@ mod tests {
     }
 
     #[test]
+    fn questions_and_votes_match_mastodon_poll_shapes() {
+        let expires_at = DateTime::<Utc>::UNIX_EPOCH.naive_utc() + chrono::Duration::hours(1);
+        let poll = Poll {
+            id: 9,
+            account_id: 42,
+            status_id: 7,
+            options: vec!["Tea".to_owned(), "Coffee".to_owned()],
+            cached_tallies: vec![2, 1],
+            votes_count: 3,
+            voters_count: Some(3),
+            multiple: false,
+            hide_totals: true,
+            expires_at: Some(expires_at),
+        };
+        let active = question(
+            json!({"id": "https://example.test/users/alice/statuses/7", "type": "Note"}),
+            &poll,
+            DateTime::<Utc>::UNIX_EPOCH.naive_utc(),
+        );
+        assert_eq!(active["type"], "Question");
+        assert!(active.get("anyOf").is_none());
+        assert_eq!(active["oneOf"][0]["name"], "Tea");
+        assert_eq!(active["oneOf"][0]["replies"]["totalItems"], Value::Null);
+        assert!(active.get("closed").is_none());
+        assert_eq!(active["votersCount"], 3);
+        assert_eq!(note_context()[1]["Emoji"], "toot:Emoji");
+        assert_eq!(note_context()[1]["votersCount"], "toot:votersCount");
+
+        let closed = question(active, &poll, expires_at);
+        assert_eq!(closed["closed"], "1970-01-01T01:00:00Z");
+        assert_eq!(closed["oneOf"][0]["replies"]["totalItems"], 2);
+
+        let vote = vote_with_uris(
+            "https://remote.test/users/bob#votes/1",
+            "https://remote.test/users/bob",
+            "https://example.test/users/alice/statuses/7",
+            "https://example.test/users/alice",
+            "Tea",
+        );
+        assert_eq!(vote["type"], "Create");
+        assert_eq!(vote["object"]["type"], "Note");
+        assert_eq!(vote["object"]["name"], "Tea");
+        assert_eq!(
+            vote["object"]["inReplyTo"],
+            "https://example.test/users/alice/statuses/7"
+        );
+    }
+
+    #[test]
     fn status_activity_selects_create_or_announce_from_the_status_shape() {
         let origin = url::Url::parse("https://example.test/").expect("valid origin");
         let account = account(Some(AccountIdScheme::Username));
@@ -2384,6 +2494,12 @@ mod tests {
             "https://example.test/users/alice/statuses/7#updates/42"
         );
         assert_eq!(update["published"], "1970-01-01T00:00:42Z");
+        assert_eq!(update["@context"], note_context());
+        assert_eq!(
+            update["@context"][1]["votersCount"], "toot:votersCount",
+            "poll Updates need Mastodon's full Note/Question extension context",
+        );
+        assert_eq!(update["@context"][1]["Emoji"], "toot:Emoji");
         assert_eq!(update["to"], object["to"]);
         assert_eq!(update["cc"], object["cc"]);
         assert_eq!(update["object"], object);

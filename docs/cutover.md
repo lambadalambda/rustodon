@@ -13,9 +13,9 @@ concurrent Mastodon/Rustodon writers.
 2. Take a PostgreSQL snapshot and a filesystem snapshot or verified copy of the
    complete Paperclip root. Record the snapshot IDs and restore commands.
 3. Resolve unsupported configuration reported by preflight. In particular,
-   scheduled statuses, active local polls, pending account deletions,
-   WebAuthn-only users, active relays, object storage, SSO providers, and
-   non-empty Sidekiq queues must be handled before cutover.
+   scheduled statuses, pending account deletions, WebAuthn-only users, active
+   relays, object storage, SSO providers, and non-empty Sidekiq queues must be
+   handled before cutover.
 4. Stop new writes at the proxy, allow existing requests to finish, and drain
    Sidekiq. Confirm no Mastodon web, streaming, or worker process is still
    writing the database.

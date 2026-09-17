@@ -746,6 +746,7 @@ fn admin_password(password: Option<String>) -> Result<String, &'static str> {
     Ok(password.trim_end_matches(['\r', '\n']).to_owned())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_worker() -> ExitCode {
     let config = match Config::from_process_environment() {
         Ok(config) => config,
@@ -818,6 +819,7 @@ async fn run_worker() -> ExitCode {
         #[cfg(feature = "test-support")]
         remote_fetch_endpoint: None,
     };
+    let poll_expiration_writer = mastodon_writer.clone();
     let handlers = match infrastructure_handlers_with_writer_and_mail_and_federation(
         &queue,
         mastodon_writer,
@@ -836,6 +838,7 @@ async fn run_worker() -> ExitCode {
         handlers,
         config.worker,
         process_id,
+        poll_expiration_writer,
         shutdown_signal(),
     )
     .await

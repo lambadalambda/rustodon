@@ -2,6 +2,25 @@
 
 ## 2026-09-16
 
+- Added the complete bounded poll lifecycle used by the bundled Mastodon client:
+  transactional poll creation and status idempotency, visibility-authorized show and
+  vote routes, exact option/expiry/grapheme validation, serialized duplicate-safe
+  voting, current viewer/tally projections, and signed SSRF-safe refresh of stale
+  remote polls. Poll writes retain deterministic account/status/poll lock ordering,
+  apply symmetric block and parent-status visibility policy to REST and federated
+  votes, and extend least-privilege writer/preflight contracts.
+- Added ActivityPub `Question`, vote, and independently versioned poll-update support,
+  including inbound identity/idempotency checks, delayed visible-tally fan-out,
+  hidden-tally deferral, exact-generation expiration notifications, and bounded
+  startup/periodic repair. An immutable database-clock activation boundary baselines
+  historical expirations without replaying old notifications or federation; missing
+  post-activation work remains repairable across outages. Reconciliation uses fenced
+  singleton leases, terminal-marker filtering, bounded keyset continuations, and a
+  retry-budgeted raw fallback that cannot create zero-progress job chains. Added
+  pinned-source, unit, restored-fixture source, differential, worker, and two-account
+  browser workflow coverage. The restored database/worker, differential, and browser
+  lanes remain deferred to the final combined Podman sweep.
+
 - Added all nine timeline WebSocket subscriptions used by the bundled Mastodon
   frontend, including parameterized hashtag/list envelopes, exact raw hashtag wire
   casing, compatible subscription errors, REST-selector-backed public/tag/list

@@ -39,8 +39,9 @@ use differential::writes::{
     run_admin_create_user_case, run_browser_authentication_case,
     run_browser_two_factor_management_case, run_conversation_writes_case, run_media_writes_case,
     run_notification_writes_case, run_oauth_authorization_code_case, run_password_recovery_case,
-    run_relationship_writes_case, run_report_writes_case, run_status_creation_writes_case,
-    run_status_interaction_writes_case, run_write_transactions_case,
+    run_poll_lifecycle_case, run_relationship_writes_case, run_report_writes_case,
+    run_status_creation_writes_case, run_status_interaction_writes_case,
+    run_write_transactions_case,
 };
 use reqwest::Method;
 use reqwest::header::{
@@ -175,6 +176,48 @@ async fn write_transactions() -> Result<(), Box<dyn std::error::Error>> {
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let config = DifferentialConfig::from_process_environment(&repository_root)?;
     run_write_transactions_case(config).await
+}
+
+#[tokio::test]
+#[ignore = "requires guarded Mastodon/PostgreSQL/media clones from tools/mastodon-fixture"]
+async fn poll_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let config = DifferentialConfig::from_process_environment(&repository_root)?;
+    let writer_url = config
+        .rust_write_database
+        .as_ref()
+        .expect("poll lifecycle requires a Rust writer URL")
+        .url()
+        .to_owned();
+    let repository = Repository::connect(config.rust_database.url()).await?;
+    let writer = rustodon::mastodon::WriteRepository::connect(&writer_url).await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let rust_url = Url::parse(&format!("http://{}", listener.local_addr()?))?;
+    let app = web_router(
+        WebState::new(
+            repository,
+            Url::parse("https://fixture-v4-6-5.rustodon.invalid/")?,
+            "fixture-v4-6-5.rustodon.invalid",
+            "/system",
+            config.rust_media.clone(),
+            fixture_instance_runtime(),
+            Vec::new(),
+            vec!["fixture-v4-6-5.rustodon.invalid".to_owned()],
+        )?
+        .with_write_repository(writer),
+    );
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    let result = run_poll_lifecycle_case(config, &rust_url).await;
+    let _ = shutdown_tx.send(());
+    server.await??;
+    result
 }
 
 #[tokio::test]

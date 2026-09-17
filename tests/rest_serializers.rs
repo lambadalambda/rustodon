@@ -520,6 +520,7 @@ fn quote_targets_follow_source_and_reblog_rules() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn media_paths_proxy_fallbacks_and_poll_votes_match_wire_shapes() {
     let local = MediaAttachmentProjection {
         id: PUBLIC_STATUS + 1_000,
@@ -598,9 +599,44 @@ fn media_paths_proxy_fallbacks_and_poll_votes_match_wire_shapes() {
         own_votes: Some(vec![0]),
     };
     let poll = serde_json::to_value(serializer().poll(&poll)).unwrap();
-    assert_eq!(poll["id"], "8201");
-    assert_eq!(poll["expired"], true);
-    assert_eq!(poll["own_votes"], json!([0]));
+    assert_eq!(
+        poll,
+        json!({
+            "id": "8201",
+            "expires_at": "2024-01-02T12:00:00.000Z",
+            "expired": true,
+            "multiple": false,
+            "votes_count": 1,
+            "voters_count": 1,
+            "options": [
+                {"title": "Tea", "votes_count": 1},
+                {"title": "Coffee", "votes_count": 0}
+            ],
+            "emojis": [],
+            "voted": true,
+            "own_votes": [0]
+        })
+    );
+
+    let anonymous_hidden = PollProjection {
+        id: 8_202,
+        expires_at: Some(timestamp("2027-01-02 12:00:00")),
+        multiple: true,
+        votes_count: 3,
+        voters_count: Some(2),
+        options: vec![PollOptionProjection {
+            title: "Hidden".to_owned(),
+            votes_count: None,
+        }],
+        emojis: Vec::new(),
+        voted: None,
+        own_votes: None,
+    };
+    let anonymous_hidden = serde_json::to_value(serializer().poll(&anonymous_hidden)).unwrap();
+    assert_eq!(anonymous_hidden["expired"], false);
+    assert_eq!(anonymous_hidden["options"][0]["votes_count"], Value::Null);
+    assert!(anonymous_hidden.get("voted").is_none());
+    assert!(anonymous_hidden.get("own_votes").is_none());
 }
 
 #[test]

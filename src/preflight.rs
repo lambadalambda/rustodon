@@ -429,11 +429,15 @@ SELECT
        AND pg_catalog.has_table_privilege(role.oid, 'public.lists', 'SELECT')
        AND pg_catalog.has_table_privilege(role.oid, 'public.lists', 'DELETE')
        AND pg_catalog.has_table_privilege(role.oid, 'public.poll_votes', 'SELECT')
+       AND pg_catalog.has_table_privilege(role.oid, 'public.poll_votes', 'INSERT')
         AND pg_catalog.has_table_privilege(role.oid, 'public.poll_votes', 'DELETE')
         AND pg_catalog.has_table_privilege(role.oid, 'public.polls', 'SELECT')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.polls', 'INSERT')
         AND pg_catalog.has_table_privilege(role.oid, 'public.quotes', 'SELECT')
         AND pg_catalog.has_table_privilege(role.oid, 'public.polls', 'UPDATE')
        AND pg_catalog.has_table_privilege(role.oid, 'public.polls', 'DELETE')
+       AND pg_catalog.has_sequence_privilege(role.oid, 'public.polls_id_seq', 'USAGE')
+       AND pg_catalog.has_sequence_privilege(role.oid, 'public.poll_votes_id_seq', 'USAGE')
        AND pg_catalog.has_table_privilege(role.oid, 'public.report_notes', 'SELECT')
        AND pg_catalog.has_table_privilege(role.oid, 'public.report_notes', 'DELETE')
        AND pg_catalog.has_table_privilege(role.oid, 'public.scheduled_statuses', 'SELECT')
@@ -1145,7 +1149,9 @@ SELECT
                  'session_activations_id_seq', 'status_edits_id_seq', 'status_pins_id_seq',
                  'status_stats_id_seq', 'statuses_id_seq', 'tags_id_seq', 'tombstones_id_seq',
                  'users_id_seq'))
-               OR (namespace.nspname = 'public' AND relation.relname IN ('custom_emojis_id_seq', 'web_settings_id_seq')
+               OR (namespace.nspname = 'public' AND relation.relname IN (
+                    'custom_emojis_id_seq', 'polls_id_seq', 'poll_votes_id_seq',
+                    'web_settings_id_seq')
                    AND acl.privilege_type = 'USAGE')
                OR (namespace.nspname = 'rustodon' AND relation.relname = 'outbox_events_id_seq')
              )
@@ -1202,7 +1208,8 @@ SELECT
                 'media_attachments', 'mentions', 'mutes', 'notification_permissions',
                 'notification_policies', 'notification_requests', 'notifications',
                 'oauth_access_grants', 'oauth_access_tokens', 'oauth_applications',
-                'reports', 'relationship_severance_events', 'severed_relationships',
+                'poll_votes', 'polls', 'reports', 'relationship_severance_events',
+                'severed_relationships',
                 'session_activations', 'status_edits', 'status_pins', 'status_stats',
                 'statuses', 'statuses_tags', 'tags', 'tombstones'))
              OR (namespace.nspname = 'rustodon' AND relation.relname IN (
@@ -1341,11 +1348,6 @@ WHERE role.rolname = current_user
 const ACTIVE_CONDITIONS_QUERY: &str = r"
 SELECT
   (SELECT count(*) FROM scheduled_statuses) AS scheduled_statuses,
-  (SELECT count(*)
-     FROM polls poll
-     JOIN statuses status ON status.id = poll.status_id AND status.deleted_at IS NULL
-     JOIN accounts account ON account.id = status.account_id AND account.domain IS NULL
-    WHERE poll.expires_at IS NULL OR poll.expires_at >= CURRENT_TIMESTAMP) AS active_local_polls,
   (SELECT count(*) FROM account_deletion_requests) AS account_deletions,
   (SELECT CASE WHEN count(*) = 1 THEN 0::bigint ELSE 1::bigint END
      FROM user_roles WHERE id = -99) AS invalid_everyone_role,
@@ -3207,13 +3209,6 @@ async fn fetch_active_condition_diagnostics(
             "PF_DB_SCHEDULED_STATUSES_PENDING",
             "scheduled statuses are pending",
             "publish or cancel every scheduled status before cutover",
-        ),
-        (
-            row.try_get::<i64, _>("active_local_polls")
-                .map_err(|_| ())?,
-            "PF_DB_LOCAL_POLLS_ACTIVE",
-            "local polls are still active",
-            "wait for local polls to close before cutover",
         ),
         (
             row.try_get::<i64, _>("account_deletions").map_err(|_| ())?,

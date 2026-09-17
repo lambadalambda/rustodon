@@ -874,7 +874,7 @@ impl RestProjectionLoader {
                             }) {
                             None
                         } else {
-                            poll.cached_tallies.get(index).copied()
+                            Some(poll.cached_tallies.get(index).copied().unwrap_or(0))
                         },
                     })
                     .collect();
@@ -1082,6 +1082,21 @@ impl RestProjectionLoader {
     /// Returns a database error when authorization or projection loading fails.
     pub async fn authorized_status(&self, id: i64) -> sqlx::Result<Option<StatusProjection>> {
         Ok(self.authorized_statuses(&[id]).await?.into_iter().next())
+    }
+
+    /// Resolves a poll through its parent status so status visibility remains the authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when the poll or its authorized parent cannot be loaded.
+    pub async fn authorized_poll(&self, id: i64) -> sqlx::Result<Option<PollProjection>> {
+        let Some(poll) = self.repository.poll(id).await? else {
+            return Ok(None);
+        };
+        Ok(self
+            .authorized_status(poll.status_id)
+            .await?
+            .and_then(|status| status.poll))
     }
 
     /// Loads one status without applying presentation policy after a write has

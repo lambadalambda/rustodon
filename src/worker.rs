@@ -29,9 +29,13 @@ use crate::jobs::{
     ACTIVITYPUB_PROFILE_MEDIA_FETCH_JOB_KIND, ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
     ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND, ClaimedJob, JobError, JobSpec,
     LOCAL_MEDIA_CLEANUP_JOB_KIND, Lane, MASTODON_ACCOUNT_PURGE_JOB_KIND,
-    MASTODON_DOMAIN_BLOCK_JOB_KIND, MASTODON_DOMAIN_PURGE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND,
-    NOTIFICATION_CREATE_JOB_KIND, NOTIFICATION_UNFILTER_JOB_KIND, Queue, WorkerHeartbeat,
-    flush_stream_events_in, record_outbox_once_in, record_stream_event_in,
+    MASTODON_DOMAIN_BLOCK_JOB_KIND, MASTODON_DOMAIN_PURGE_JOB_KIND,
+    MASTODON_POLL_EXPIRATION_EFFECT_KIND, MASTODON_POLL_EXPIRATION_JOB_KIND,
+    MASTODON_POLL_EXPIRATION_RECONCILE_JOB_KIND, NOTIFICATION_CLEANUP_JOB_KIND,
+    NOTIFICATION_CREATE_JOB_KIND, NOTIFICATION_UNFILTER_JOB_KIND, PollExpirationStartupClaim,
+    Queue, WorkerHeartbeat, flush_stream_events_in, poll_expiration_effect_key,
+    poll_expiration_generation, record_outbox_once_in, record_stream_event_in,
+    validate_dispatched_poll_expiration_effect,
 };
 use crate::mail::MailRuntime;
 use crate::mastodon::activitypub_inbox::{
@@ -39,8 +43,9 @@ use crate::mastodon::activitypub_inbox::{
 };
 use crate::mastodon::{
     Account, AccountPurgeOutcome, HttpSignatureSigner, NotificationActivity, NotificationCreate,
-    RemoteFollowOutcome, RemoteUndoReferenceKind, Repository, STATUS_NOTIFICATION_JOB_KIND,
-    StatusVisibility, WriteError, WriteRepository, activitypub,
+    RemoteFollowOutcome, RemotePollVoteOutcome, RemoteUndoReferenceKind, Repository,
+    STATUS_NOTIFICATION_JOB_KIND, StatusVisibility, WriteError, WriteRepository, activitypub,
+    equals_or_includes,
 };
 use crate::paperclip::{
     PaperclipAttachment, PaperclipMetadata, PaperclipRoot, parse_paperclip_path,
@@ -352,6 +357,7 @@ pub enum WorkerError {
     InvalidConfiguration(&'static str),
     RegistryUnavailable,
     SemaphoreClosed,
+    StartupReconciliationFailed,
     TaskFailed,
     ShutdownTimedOut,
 }
@@ -365,6 +371,9 @@ impl fmt::Display for WorkerError {
                 formatter.write_str("worker handler registry is unavailable")
             }
             Self::SemaphoreClosed => formatter.write_str("worker resource limiter is closed"),
+            Self::StartupReconciliationFailed => {
+                formatter.write_str("startup poll expiration reconciliation failed")
+            }
             Self::TaskFailed => formatter.write_str("a worker task stopped unexpectedly"),
             Self::ShutdownTimedOut => {
                 formatter.write_str("worker shutdown exceeded its configured deadline")
@@ -380,6 +389,7 @@ impl std::error::Error for WorkerError {
             Self::InvalidConfiguration(_)
             | Self::RegistryUnavailable
             | Self::SemaphoreClosed
+            | Self::StartupReconciliationFailed
             | Self::TaskFailed
             | Self::ShutdownTimedOut => None,
         }
@@ -398,6 +408,25 @@ pub struct WorkerExecutor {
     handlers: HandlerRegistry,
     remote_http: Arc<Semaphore>,
     media: Arc<Semaphore>,
+}
+
+async fn transition_handler_failure(
+    queue: &Queue,
+    job: &ClaimedJob,
+    failure: &HandlerFailure,
+) -> Result<(), JobError> {
+    if failure.disposition == FailureDisposition::Permanent {
+        queue.dead_letter(job, &failure.message).await?;
+    } else {
+        queue
+            .retry(
+                job,
+                Utc::now() + retry_delay(job.id, job.attempt),
+                &failure.message,
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 impl WorkerExecutor {
@@ -484,22 +513,20 @@ impl WorkerExecutor {
             None => {}
             Some(Ok(())) => {
                 // External acceptance precedes this fence; acknowledgement failure must leave the
-                // durable job reclaimable.
-                self.queue
-                    .complete(job.id, &job.lease_owner, job.generation)
-                    .await?;
-            }
-            Some(Err(failure)) if failure.disposition == FailureDisposition::Permanent => {
-                self.queue.dead_letter(&job, &failure.message).await?;
+                // durable job reclaimable. Reconciliation publishes its exact success watermark
+                // in the same fenced transaction that removes the claimed job.
+                if job.kind == MASTODON_POLL_EXPIRATION_RECONCILE_JOB_KIND {
+                    self.queue
+                        .complete_poll_expiration_reconciliation_success(&job)
+                        .await?;
+                } else {
+                    self.queue
+                        .complete(job.id, &job.lease_owner, job.generation)
+                        .await?;
+                }
             }
             Some(Err(failure)) => {
-                self.queue
-                    .retry(
-                        &job,
-                        Utc::now() + retry_delay(job.id, job.attempt),
-                        &failure.message,
-                    )
-                    .await?;
+                transition_handler_failure(&self.queue, &job, &failure).await?;
             }
         }
         Ok(true)
@@ -525,13 +552,183 @@ impl WorkerExecutor {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusUpdateKind {
+    Status,
+    Poll,
+    StatusRepair,
+    PollRepair,
+}
+
+impl StatusUpdateKind {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "status" => Some(Self::Status),
+            "poll" => Some(Self::Poll),
+            "status_repair" => Some(Self::StatusRepair),
+            "poll_repair" => Some(Self::PollRepair),
+            _ => None,
+        }
+    }
+
+    const fn is_repair(self) -> bool {
+        matches!(self, Self::StatusRepair | Self::PollRepair)
+    }
+
+    const fn has_poll_reach(self) -> bool {
+        matches!(self, Self::Poll | Self::PollRepair)
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Poll => "poll",
+            Self::StatusRepair => "status_repair",
+            Self::PollRepair => "poll_repair",
+        }
+    }
+}
+
+fn status_snapshot_repair_activity_id(
+    object_uri: &str,
+    edited_at: NaiveDateTime,
+    poll_updated_at: Option<NaiveDateTime>,
+) -> String {
+    let edited_at_micros = edited_at.and_utc().timestamp_micros();
+    let poll_version = poll_updated_at.map_or_else(
+        || "none".to_owned(),
+        |value| value.and_utc().timestamp_micros().to_string(),
+    );
+    format!("{object_uri}#updates/repair/{edited_at_micros}/{poll_version}")
+}
+
+fn status_update_versions(
+    current_edited_at: NaiveDateTime,
+    current_poll_updated_at: Option<NaiveDateTime>,
+    requested_edited_at: Option<NaiveDateTime>,
+    requested_poll_updated_at: Option<NaiveDateTime>,
+    update_kind: StatusUpdateKind,
+    strict_snapshot: bool,
+) -> Option<(NaiveDateTime, Option<NaiveDateTime>, NaiveDateTime)> {
+    if update_kind == StatusUpdateKind::StatusRepair && current_poll_updated_at.is_some() {
+        return None;
+    }
+    let edited_at = match requested_edited_at {
+        Some(requested) if requested == current_edited_at => requested,
+        Some(_) => return None,
+        None if strict_snapshot => return None,
+        None => current_edited_at,
+    };
+    let poll_updated_at = match (requested_poll_updated_at, current_poll_updated_at) {
+        (Some(requested), Some(current)) if requested == current => Some(requested),
+        (Some(_), Some(current)) if update_kind == StatusUpdateKind::Poll => Some(current),
+        (None, Some(_)) if strict_snapshot => return None,
+        (None, Some(current)) => Some(current),
+        (None, None) => None,
+        _ => return None,
+    };
+    let update_version = match update_kind {
+        StatusUpdateKind::Status | StatusUpdateKind::StatusRepair => edited_at,
+        StatusUpdateKind::Poll => poll_updated_at?,
+        StatusUpdateKind::PollRepair => edited_at.max(poll_updated_at?),
+    };
+    Some((edited_at, poll_updated_at, update_version))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusUpdateVersionDecision {
+    Deliver(NaiveDateTime, Option<NaiveDateTime>, NaiveDateTime),
+    Repair,
+    Stale,
+}
+
+fn status_update_version_decision(
+    current_edited_at: NaiveDateTime,
+    current_poll_updated_at: Option<NaiveDateTime>,
+    requested_edited_at: Option<NaiveDateTime>,
+    requested_poll_updated_at: Option<NaiveDateTime>,
+    update_kind: StatusUpdateKind,
+    strict_snapshot: bool,
+) -> StatusUpdateVersionDecision {
+    if strict_snapshot
+        && update_kind.is_repair()
+        && (requested_edited_at != Some(current_edited_at)
+            || requested_poll_updated_at != current_poll_updated_at)
+    {
+        return StatusUpdateVersionDecision::Repair;
+    }
+    match status_update_versions(
+        current_edited_at,
+        current_poll_updated_at,
+        requested_edited_at,
+        requested_poll_updated_at,
+        update_kind,
+        strict_snapshot,
+    ) {
+        Some((edited_at, poll_updated_at, update_version)) => {
+            StatusUpdateVersionDecision::Deliver(edited_at, poll_updated_at, update_version)
+        }
+        None if strict_snapshot => StatusUpdateVersionDecision::Repair,
+        None => StatusUpdateVersionDecision::Stale,
+    }
+}
+
+async fn queue_status_snapshot_repair(
+    pool: &PgPool,
+    status_id: i64,
+    poll_id: Option<i64>,
+    edited_at: NaiveDateTime,
+    poll_updated_at: Option<NaiveDateTime>,
+) -> Result<(), HandlerFailure> {
+    let edited_at_micros = edited_at.and_utc().timestamp_micros();
+    let (update_kind, update_version, poll_updated_at_micros) = match poll_updated_at {
+        Some(poll_updated_at) => (
+            StatusUpdateKind::PollRepair,
+            edited_at.max(poll_updated_at),
+            Some(poll_updated_at.and_utc().timestamp_micros()),
+        ),
+        None => (StatusUpdateKind::StatusRepair, edited_at, None),
+    };
+    let update_version_micros = update_version.and_utc().timestamp_micros();
+    let repair = JobSpec::new(
+        Lane::Push,
+        ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
+        json!({
+            "status_id": status_id,
+            "activity_type": "Update",
+            "update_kind": update_kind.as_str(),
+            "update_version_micros": update_version_micros,
+            "edited_at_micros": edited_at_micros,
+            "poll_updated_at_micros": poll_updated_at_micros,
+        }),
+    )
+    .logical_key(format!(
+        "activitypub:status:{status_id}:snapshot-repair:{}:{edited_at_micros}:{poll_updated_at_micros:?}",
+        poll_id.unwrap_or_default()
+    ));
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| HandlerFailure::retry("poll snapshot repair transaction failed"))?;
+    record_outbox_once_in(&mut transaction, &repair)
+        .await
+        .map_err(|_| HandlerFailure::retry("poll snapshot repair outbox write failed"))?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| HandlerFailure::retry("poll snapshot repair commit failed"))
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn distribute_status(
     pool: PgPool,
     config: &ActivityPubDeliveryConfig,
     status_id: i64,
     activity_type: &str,
     edited_at_micros: Option<i64>,
+    poll_updated_at_micros: Option<i64>,
+    update_kind: Option<&str>,
+    update_version_micros: Option<i64>,
     explicit_recipient_ids: &[i64],
 ) -> Result<(), HandlerFailure> {
     let is_delete = match activity_type {
@@ -550,6 +747,35 @@ async fn distribute_status(
                 .ok_or_else(|| HandlerFailure::permanent("status edit timestamp is invalid"))
         })
         .transpose()?;
+    let requested_poll_updated_at = poll_updated_at_micros
+        .map(|value| {
+            DateTime::<Utc>::from_timestamp_micros(value)
+                .map(|timestamp| timestamp.naive_utc())
+                .ok_or_else(|| HandlerFailure::permanent("poll update timestamp is invalid"))
+        })
+        .transpose()?;
+    let explicit_update_kind = update_kind.is_some();
+    let resolved_update_kind = match update_kind {
+        Some(value) => StatusUpdateKind::parse(value).ok_or_else(|| {
+            HandlerFailure::permanent("status distribution update kind is unsupported")
+        })?,
+        None if requested_poll_updated_at.is_some() && requested_edited_at.is_none() => {
+            StatusUpdateKind::Poll
+        }
+        None if requested_poll_updated_at.is_some()
+            && update_version_micros == poll_updated_at_micros =>
+        {
+            StatusUpdateKind::Poll
+        }
+        None if requested_poll_updated_at.is_some()
+            && update_version_micros == edited_at_micros =>
+        {
+            StatusUpdateKind::Status
+        }
+        None if requested_poll_updated_at.is_some() => StatusUpdateKind::PollRepair,
+        None => StatusUpdateKind::Status,
+    };
+    let poll_update = resolved_update_kind.has_poll_reach();
     let repository = Repository::from_pool(pool.clone());
     let status_result = if is_delete {
         repository.status_including_deleted(status_id).await
@@ -567,21 +793,70 @@ async fn distribute_status(
     if status.reblog_of_id.is_some() && activity_type == "Update" {
         return Ok(());
     }
-    if activity_type == "Update" {
-        // A newer transactional Update job owns the current payload; avoid serializing an older
-        // edit with newer status content when workers fall behind rapid edits.
-        let current_edited_at = status.edited_at.unwrap_or(status.updated_at);
-        if requested_edited_at.is_some_and(|requested| requested != current_edited_at) {
-            return Ok(());
+    let current_edited_at = status.edited_at.unwrap_or(status.updated_at);
+    let (requested_edited_at, requested_poll_updated_at, selected_update_version) = if activity_type
+        == "Update"
+    {
+        let current_poll_updated_at = if let Some(poll_id) = status.poll_id {
+            sqlx::query_scalar::<_, NaiveDateTime>("SELECT updated_at FROM polls WHERE id = $1")
+                .bind(poll_id)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|_| HandlerFailure::retry("poll update fence lookup failed"))?
+        } else {
+            None
+        };
+        match status_update_version_decision(
+            current_edited_at,
+            current_poll_updated_at,
+            requested_edited_at,
+            requested_poll_updated_at,
+            resolved_update_kind,
+            explicit_update_kind || resolved_update_kind.is_repair(),
+        ) {
+            StatusUpdateVersionDecision::Deliver(edited_at, poll_updated_at, update_version) => {
+                (Some(edited_at), poll_updated_at, Some(update_version))
+            }
+            StatusUpdateVersionDecision::Repair if resolved_update_kind.is_repair() => {
+                let Some((edited_at, poll_updated_at, update_version)) = status_update_versions(
+                    current_edited_at,
+                    current_poll_updated_at,
+                    Some(current_edited_at),
+                    current_poll_updated_at,
+                    resolved_update_kind,
+                    true,
+                ) else {
+                    queue_status_snapshot_repair(
+                        &pool,
+                        status_id,
+                        status.poll_id,
+                        current_edited_at,
+                        current_poll_updated_at,
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                (Some(edited_at), poll_updated_at, Some(update_version))
+            }
+            StatusUpdateVersionDecision::Repair => {
+                queue_status_snapshot_repair(
+                    &pool,
+                    status_id,
+                    status.poll_id,
+                    current_edited_at,
+                    current_poll_updated_at,
+                )
+                .await?;
+                return Ok(());
+            }
+            StatusUpdateVersionDecision::Stale => return Ok(()),
         }
-    }
-    let update_version_micros = (activity_type == "Update").then(|| {
-        requested_edited_at
-            .or(status.edited_at)
-            .unwrap_or(status.updated_at)
-            .and_utc()
-            .timestamp_micros()
-    });
+    } else {
+        (requested_edited_at, requested_poll_updated_at, None)
+    };
+    let selected_update_version_micros = selected_update_version
+        .map(|value| value.and_utc().timestamp_micros())
+        .or(update_version_micros);
     let account = repository
         .account(status.account_id)
         .await
@@ -704,7 +979,7 @@ async fn distribute_status(
                     .map_err(|_| HandlerFailure::retry("private boost statistics lookup failed"))?;
                 let (quoted_link, quoted_identifier, quote_authorization) =
                     activitypub_quote_parts(&repository, config, reblog_of_id).await?;
-                activitypub::note(
+                let mut object = activitypub::note(
                     &config.origin,
                     &config.local_domain,
                     &target_status,
@@ -725,7 +1000,18 @@ async fn distribute_status(
                         .as_ref()
                         .map_or(0, |stats| stats.favourites_count),
                     target_stat.as_ref().map_or(0, |stats| stats.reblogs_count),
-                )
+                );
+                if let Some(poll_id) = target_status.poll_id {
+                    let loaded_poll = repository
+                        .poll(poll_id)
+                        .await
+                        .map_err(|_| HandlerFailure::retry("private boost poll lookup failed"))?
+                        .ok_or_else(|| {
+                            HandlerFailure::permanent("private boost poll is missing")
+                        })?;
+                    object = activitypub::question(object, &loaded_poll, Utc::now().naive_utc());
+                }
+                object
             } else {
                 Value::String(object_uri)
             };
@@ -828,20 +1114,38 @@ async fn distribute_status(
                 .map_or(0, |stats| stats.favourites_count),
             status_stat.as_ref().map_or(0, |stats| stats.reblogs_count),
         );
+        if let Some(poll_id) = status.poll_id {
+            let loaded_poll = repository
+                .poll(poll_id)
+                .await
+                .map_err(|_| HandlerFailure::retry("status poll lookup failed"))?
+                .ok_or_else(|| HandlerFailure::permanent("status poll is missing"))?;
+            object = activitypub::question(object, &loaded_poll, Utc::now().naive_utc());
+        }
         if activity_type == "Update" {
             let object_uri = object["id"]
                 .as_str()
                 .ok_or_else(|| HandlerFailure::permanent("status Note has no ID"))?
                 .to_owned();
-            let edited_at = requested_edited_at
-                .or(status.edited_at)
-                .unwrap_or(status.updated_at);
-            object["updated"] = json!(activitypub::timestamp(edited_at));
-            let update_uri = activitypub::update_activity_id(&object_uri, edited_at);
+            let update_version = selected_update_version
+                .ok_or_else(|| HandlerFailure::permanent("status Update has no version"))?;
+            if !poll_update {
+                object["updated"] = json!(activitypub::timestamp(update_version));
+            }
+            let update_uri = if resolved_update_kind.is_repair() {
+                status_snapshot_repair_activity_id(
+                    &object_uri,
+                    requested_edited_at
+                        .ok_or_else(|| HandlerFailure::permanent("repair has no status version"))?,
+                    requested_poll_updated_at,
+                )
+            } else {
+                activitypub::update_activity_id(&object_uri, update_version)
+            };
             activitypub::update_with_uris(
                 &update_uri,
                 &activitypub::actor_url(&config.origin, &account),
-                edited_at,
+                update_version,
                 object,
             )
         } else {
@@ -874,6 +1178,14 @@ async fn distribute_status(
             .map_err(|_| HandlerFailure::retry("status reach lookup failed"))?
     };
     recipient_ids.extend(reached_account_ids);
+    if poll_update {
+        recipient_ids.extend(
+            repository
+                .activitypub_poll_voter_account_ids(status_id)
+                .await
+                .map_err(|_| HandlerFailure::retry("poll voter reach lookup failed"))?,
+        );
+    }
     recipient_ids.extend(mentioned_recipient_ids);
     let mut inboxes = BTreeMap::new();
     for recipient_id in recipient_ids {
@@ -955,7 +1267,7 @@ async fn distribute_status(
             "Update" => update_delivery_logical_key(
                 status_id,
                 activity_id,
-                update_version_micros.expect("Update activity has an edit version"),
+                selected_update_version_micros.expect("Update activity has an edit version"),
                 &inbox_url,
             ),
             "Delete" => delete_delivery_logical_key(status_id, &inbox_url),
@@ -970,7 +1282,10 @@ async fn distribute_status(
                 "inbox_url": inbox_url,
                 "body": activity.clone(),
                 "activity_type": activity_type,
-                "edited_at_micros": update_version_micros,
+                "update_kind": (activity_type == "Update").then_some(resolved_update_kind.as_str()),
+                "update_version_micros": selected_update_version_micros,
+                "edited_at_micros": requested_edited_at.map(|value| value.and_utc().timestamp_micros()),
+                "poll_updated_at_micros": requested_poll_updated_at.map(|value| value.and_utc().timestamp_micros()),
                 "remote_domain": remote_domain
             }),
         )
@@ -1690,6 +2005,7 @@ async fn process_notification_job(pool: PgPool, arguments: &Value) -> Result<(),
         Some("reblog") => NotificationActivity::Reblog { id: activity_id },
         Some("follow") => NotificationActivity::Follow { id: activity_id },
         Some("follow_request") => NotificationActivity::FollowRequest { id: activity_id },
+        Some("poll") => NotificationActivity::Poll { id: activity_id },
         Some("update") => NotificationActivity::Update { id: activity_id },
         Some("quoted_update") => NotificationActivity::QuotedUpdate { id: activity_id },
         Some("admin.report") => NotificationActivity::AdminReport { id: activity_id },
@@ -1922,6 +2238,113 @@ fn update_delivery_is_current(
         || activity_id == Some(legacy_activity_id.as_str())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn status_update_delivery_is_current(
+    update_kind: StatusUpdateKind,
+    activity_id: Option<&str>,
+    object_uri: &str,
+    current_edited_at: NaiveDateTime,
+    current_poll_updated_at: Option<NaiveDateTime>,
+    requested_edited_at_micros: Option<i64>,
+    requested_poll_updated_at_micros: Option<i64>,
+    requested_update_version_micros: Option<i64>,
+) -> bool {
+    if requested_edited_at_micros != Some(current_edited_at.and_utc().timestamp_micros())
+        || requested_poll_updated_at_micros
+            != current_poll_updated_at.map(|value| value.and_utc().timestamp_micros())
+    {
+        return false;
+    }
+    let expected_update_version = match update_kind {
+        StatusUpdateKind::Status | StatusUpdateKind::StatusRepair => current_edited_at,
+        StatusUpdateKind::Poll => {
+            let Some(poll_updated_at) = current_poll_updated_at else {
+                return false;
+            };
+            poll_updated_at
+        }
+        StatusUpdateKind::PollRepair => {
+            let Some(poll_updated_at) = current_poll_updated_at else {
+                return false;
+            };
+            current_edited_at.max(poll_updated_at)
+        }
+    };
+    if requested_update_version_micros != Some(expected_update_version.and_utc().timestamp_micros())
+    {
+        return false;
+    }
+    if update_kind.is_repair() {
+        return activity_id
+            == Some(
+                status_snapshot_repair_activity_id(
+                    object_uri,
+                    current_edited_at,
+                    current_poll_updated_at,
+                )
+                .as_str(),
+            );
+    }
+    update_delivery_is_current(
+        activity_id,
+        object_uri,
+        expected_update_version,
+        requested_update_version_micros,
+    )
+}
+
+fn complete_status_update_delivery_kind(
+    update_kind: Option<&str>,
+    has_current_poll: bool,
+    requested_edited_at_micros: Option<i64>,
+    requested_poll_updated_at_micros: Option<i64>,
+    requested_update_version_micros: Option<i64>,
+    published_version_micros: Option<i64>,
+) -> Option<StatusUpdateKind> {
+    let update_kind = StatusUpdateKind::parse(update_kind?)?;
+    let edited_at_micros = requested_edited_at_micros?;
+    if requested_poll_updated_at_micros.is_some() != has_current_poll
+        || (update_kind.has_poll_reach() && !has_current_poll)
+        || (update_kind == StatusUpdateKind::StatusRepair && has_current_poll)
+    {
+        return None;
+    }
+    let expected_update_version_micros = match update_kind {
+        StatusUpdateKind::Status | StatusUpdateKind::StatusRepair => edited_at_micros,
+        StatusUpdateKind::Poll => requested_poll_updated_at_micros?,
+        StatusUpdateKind::PollRepair => edited_at_micros.max(requested_poll_updated_at_micros?),
+    };
+    if requested_update_version_micros != Some(expected_update_version_micros)
+        || published_version_micros != Some(expected_update_version_micros)
+    {
+        return None;
+    }
+    Some(update_kind)
+}
+
+fn inferred_current_repair_delivery_kind(
+    activity_id: Option<&str>,
+    object_uri: &str,
+    current_edited_at: NaiveDateTime,
+    current_poll_updated_at: Option<NaiveDateTime>,
+    published_version_micros: Option<i64>,
+) -> Option<StatusUpdateKind> {
+    let update_kind = if current_poll_updated_at.is_some() {
+        StatusUpdateKind::PollRepair
+    } else {
+        StatusUpdateKind::StatusRepair
+    };
+    let expected_update_version = current_poll_updated_at
+        .map_or(current_edited_at, |poll_updated_at| {
+            current_edited_at.max(poll_updated_at)
+        });
+    let expected_activity_id =
+        status_snapshot_repair_activity_id(object_uri, current_edited_at, current_poll_updated_at);
+    (activity_id == Some(expected_activity_id.as_str())
+        && published_version_micros == Some(expected_update_version.and_utc().timestamp_micros()))
+    .then_some(update_kind)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn deliver_activity(
     pool: PgPool,
@@ -1951,6 +2374,18 @@ async fn deliver_activity(
         .map_err(|_| HandlerFailure::permanent("delivery activity could not be serialized"))?;
     let repository = Repository::from_pool(pool.clone());
     let delivery_edited_at_micros = arguments.get("edited_at_micros").and_then(Value::as_i64);
+    let delivery_poll_updated_at_micros = arguments
+        .get("poll_updated_at_micros")
+        .and_then(Value::as_i64);
+    let delivery_update_version_micros = arguments
+        .get("update_version_micros")
+        .and_then(Value::as_i64);
+    let delivery_update_kind = arguments.get("update_kind").and_then(Value::as_str);
+    let delivery_published_version_micros = body_value
+        .get("published")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp_micros());
     let delivery_updated_at_micros = arguments.get("updated_at_micros").and_then(Value::as_i64);
     let configured_remote_domain = arguments
         .get("remote_domain")
@@ -2012,13 +2447,69 @@ async fn deliver_activity(
         && let Some(status) = current_status.as_ref()
     {
         let object_uri = activitypub::status_uri(&config.origin, &source_account, status);
-        let edited_at = status.edited_at.unwrap_or(status.updated_at);
-        if !update_delivery_is_current(
-            body_value["id"].as_str(),
-            &object_uri,
-            edited_at,
+        if body_value
+            .get("object")
+            .and_then(|object| object.get("id"))
+            .and_then(Value::as_str)
+            != Some(object_uri.as_str())
+        {
+            return Ok(());
+        }
+        let current_poll = if let Some(poll_id) = status.poll_id {
+            let Some(current) = sqlx::query_scalar::<_, NaiveDateTime>(
+                "SELECT updated_at FROM polls WHERE id = $1",
+            )
+            .bind(poll_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|_| HandlerFailure::retry("poll delivery fence lookup failed"))?
+            else {
+                return Ok(());
+            };
+            Some((poll_id, current))
+        } else {
+            None
+        };
+        let current_edited_at = status.edited_at.unwrap_or(status.updated_at);
+        let current_poll_updated_at = current_poll.map(|(_, updated_at)| updated_at);
+        let complete_delivery_kind = complete_status_update_delivery_kind(
+            delivery_update_kind,
+            current_poll.is_some(),
             delivery_edited_at_micros,
-        ) {
+            delivery_poll_updated_at_micros,
+            delivery_update_version_micros,
+            delivery_published_version_micros,
+        );
+        let inferred_repair_kind = complete_delivery_kind.is_none().then(|| {
+            inferred_current_repair_delivery_kind(
+                body_value["id"].as_str(),
+                &object_uri,
+                current_edited_at,
+                current_poll_updated_at,
+                delivery_published_version_micros,
+            )
+        });
+        let delivery_is_current = complete_delivery_kind.is_some_and(|delivery_kind| {
+            status_update_delivery_is_current(
+                delivery_kind,
+                body_value["id"].as_str(),
+                &object_uri,
+                current_edited_at,
+                current_poll_updated_at,
+                delivery_edited_at_micros,
+                delivery_poll_updated_at_micros,
+                delivery_update_version_micros,
+            )
+        }) || inferred_repair_kind.flatten().is_some();
+        if !delivery_is_current {
+            queue_status_snapshot_repair(
+                &pool,
+                status.id,
+                current_poll.map(|(poll_id, _)| poll_id),
+                current_edited_at,
+                current_poll_updated_at,
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -2378,6 +2869,7 @@ fn remote_thread_write_failure(error: &WriteError) -> HandlerFailure {
         WriteError::Conflict
         | WriteError::InvalidInput(_)
         | WriteError::Unauthorized
+        | WriteError::Forbidden
         | WriteError::RateLimited
         | WriteError::Validation(_) => {
             HandlerFailure::permanent("remote reply thread payload is invalid")
@@ -2455,9 +2947,12 @@ fn resolved_create_note(
     object_uri: &str,
 ) -> Result<Value, HandlerFailure> {
     validate_create_binding(activity_uri, actor_uri, object_uri)?;
-    if document.get("type").and_then(Value::as_str) != Some("Note") {
+    if !["Note", "Question"]
+        .into_iter()
+        .any(|kind| equals_or_includes(document.get("type"), kind))
+    {
         return Err(HandlerFailure::permanent(
-            "remote Create object is not a Note",
+            "remote Create object is not a Note or Question",
         ));
     }
     if remote_uri_value(document.get("id")) != Some(object_uri) {
@@ -2864,51 +3359,52 @@ fn remote_note_document(
     document: &Value,
     object_uri: &str,
 ) -> Result<(Value, String, String), HandlerFailure> {
-    let (object, actor_uri, target_uri) = match document.get("type").and_then(Value::as_str) {
-        Some("Note") => {
-            let actor_uri = remote_uri_value(document.get("attributedTo")).ok_or_else(|| {
-                HandlerFailure::permanent("remote Announce target Note has no author")
-            })?;
-            if remote_uri_value(document.get("id")) != Some(object_uri) {
-                return Err(HandlerFailure::permanent(
-                    "remote Announce target ID does not match the requested URI",
-                ));
-            }
-            (document, actor_uri, object_uri)
-        }
-        Some("Create") => {
-            if remote_uri_value(document.get("id")) != Some(object_uri) {
-                return Err(HandlerFailure::permanent(
-                    "remote Announce target Create ID does not match the requested URI",
-                ));
-            }
-            let object = document.get("object").ok_or_else(|| {
-                HandlerFailure::permanent("remote Announce target Create has no object")
-            })?;
-            if object.get("type").and_then(Value::as_str) != Some("Note") {
-                return Err(HandlerFailure::permanent(
-                    "remote Announce target Create object is not a Note",
-                ));
-            }
-            let actor_uri = remote_uri_value(document.get("actor")).ok_or_else(|| {
-                HandlerFailure::permanent("remote Announce target Create has no actor")
-            })?;
-            validate_fetched_activity_actor(object_uri, actor_uri)?;
-            if remote_uri_value(object.get("attributedTo")) != Some(actor_uri) {
-                return Err(HandlerFailure::permanent(
-                    "remote Announce target Note author does not match Create actor",
-                ));
-            }
-            let target_uri = remote_uri_value(object.get("id")).ok_or_else(|| {
-                HandlerFailure::permanent("remote Announce target Note has no ID")
-            })?;
-            (object, actor_uri, target_uri)
-        }
-        _ => {
+    let (object, actor_uri, target_uri) = if ["Note", "Question"]
+        .into_iter()
+        .any(|kind| equals_or_includes(document.get("type"), kind))
+    {
+        let actor_uri = remote_uri_value(document.get("attributedTo")).ok_or_else(|| {
+            HandlerFailure::permanent("remote Announce target Note has no author")
+        })?;
+        if remote_uri_value(document.get("id")) != Some(object_uri) {
             return Err(HandlerFailure::permanent(
-                "remote Announce target is not a Note or Create",
+                "remote Announce target ID does not match the requested URI",
             ));
         }
+        (document, actor_uri, object_uri)
+    } else if equals_or_includes(document.get("type"), "Create") {
+        if remote_uri_value(document.get("id")) != Some(object_uri) {
+            return Err(HandlerFailure::permanent(
+                "remote Announce target Create ID does not match the requested URI",
+            ));
+        }
+        let object = document.get("object").ok_or_else(|| {
+            HandlerFailure::permanent("remote Announce target Create has no object")
+        })?;
+        if !["Note", "Question"]
+            .into_iter()
+            .any(|kind| equals_or_includes(object.get("type"), kind))
+        {
+            return Err(HandlerFailure::permanent(
+                "remote Announce target Create object is not a Note or Question",
+            ));
+        }
+        let actor_uri = remote_uri_value(document.get("actor")).ok_or_else(|| {
+            HandlerFailure::permanent("remote Announce target Create has no actor")
+        })?;
+        validate_fetched_activity_actor(object_uri, actor_uri)?;
+        if remote_uri_value(object.get("attributedTo")) != Some(actor_uri) {
+            return Err(HandlerFailure::permanent(
+                "remote Announce target Note author does not match Create actor",
+            ));
+        }
+        let target_uri = remote_uri_value(object.get("id"))
+            .ok_or_else(|| HandlerFailure::permanent("remote Announce target Note has no ID"))?;
+        (object, actor_uri, target_uri)
+    } else {
+        return Err(HandlerFailure::permanent(
+            "remote Announce target is not a Note, Question, or Create",
+        ));
     };
     let object_map = object
         .as_object()
@@ -2940,7 +3436,7 @@ fn remote_announce_document(
     document: &Value,
     object_uri: &str,
 ) -> Result<RemoteAnnounceTarget, HandlerFailure> {
-    if document.get("type").and_then(Value::as_str) != Some("Announce") {
+    if !equals_or_includes(document.get("type"), "Announce") {
         let (object, actor_uri, status_uri) = remote_note_document(document, object_uri)?;
         return Ok(RemoteAnnounceTarget::Note {
             object,
@@ -2964,15 +3460,18 @@ fn remote_announce_document(
     let nested_object_uri = remote_uri_value(Some(nested_object))
         .ok_or_else(|| HandlerFailure::permanent("remote nested Announce object has no URI"))?;
     let embedded_note = nested_object.as_object().and_then(|object| {
-        (object.get("type").and_then(Value::as_str) == Some("Note")).then(|| {
-            let note_actor_uri = remote_uri_value(object.get("attributedTo"))?;
-            // Only self-boosts inherit the wrapper's authority. Foreign authors must
-            // be resolved through their canonical object URI, even on the same server.
-            (note_actor_uri == actor_uri
-                && remote_uri_value(object.get("id")) == Some(nested_object_uri)
-                && validate_note_object(note_actor_uri, object).is_ok())
-            .then(|| nested_object.clone())
-        })?
+        ["Note", "Question"]
+            .into_iter()
+            .any(|kind| equals_or_includes(object.get("type"), kind))
+            .then(|| {
+                let note_actor_uri = remote_uri_value(object.get("attributedTo"))?;
+                // Only self-boosts inherit the wrapper's authority. Foreign authors must
+                // be resolved through their canonical object URI, even on the same server.
+                (note_actor_uri == actor_uri
+                    && remote_uri_value(object.get("id")) == Some(nested_object_uri)
+                    && validate_note_object(note_actor_uri, object).is_ok())
+                .then(|| nested_object.clone())
+            })?
     });
     Ok(RemoteAnnounceTarget::Announce {
         activity_uri: activity_uri.to_owned(),
@@ -3610,36 +4109,37 @@ async fn process_activitypub_thread_resolution(
     }
     let document = serde_json::from_slice::<Value>(&response.body)
         .map_err(|_| HandlerFailure::permanent("thread resolution parent JSON is invalid"))?;
-    let (object, actor_uri) = match document.get("type").and_then(Value::as_str) {
-        Some("Note") => {
-            let actor_uri = remote_uri_value(document.get("attributedTo"))
-                .ok_or_else(|| HandlerFailure::permanent("thread resolution Note has no author"))?;
-            (&document, actor_uri)
-        }
-        Some("Create") => {
-            let object = document.get("object").ok_or_else(|| {
-                HandlerFailure::permanent("thread resolution Create has no object")
-            })?;
-            if object.get("type").and_then(Value::as_str) != Some("Note") {
-                return Err(HandlerFailure::permanent(
-                    "thread resolution Create object is not a Note",
-                ));
-            }
-            let actor_uri = remote_uri_value(document.get("actor")).ok_or_else(|| {
-                HandlerFailure::permanent("thread resolution Create has no actor")
-            })?;
-            if remote_uri_value(object.get("attributedTo")) != Some(actor_uri) {
-                return Err(HandlerFailure::permanent(
-                    "thread resolution Note author does not match Create actor",
-                ));
-            }
-            (object, actor_uri)
-        }
-        _ => {
+    let (object, actor_uri) = if ["Note", "Question"]
+        .into_iter()
+        .any(|kind| equals_or_includes(document.get("type"), kind))
+    {
+        let actor_uri = remote_uri_value(document.get("attributedTo"))
+            .ok_or_else(|| HandlerFailure::permanent("thread resolution Note has no author"))?;
+        (&document, actor_uri)
+    } else if equals_or_includes(document.get("type"), "Create") {
+        let object = document
+            .get("object")
+            .ok_or_else(|| HandlerFailure::permanent("thread resolution Create has no object"))?;
+        if !["Note", "Question"]
+            .into_iter()
+            .any(|kind| equals_or_includes(object.get("type"), kind))
+        {
             return Err(HandlerFailure::permanent(
-                "thread resolution parent is not a Note or Create",
+                "thread resolution Create object is not a Note or Question",
             ));
         }
+        let actor_uri = remote_uri_value(document.get("actor"))
+            .ok_or_else(|| HandlerFailure::permanent("thread resolution Create has no actor"))?;
+        if remote_uri_value(object.get("attributedTo")) != Some(actor_uri) {
+            return Err(HandlerFailure::permanent(
+                "thread resolution Note author does not match Create actor",
+            ));
+        }
+        (object, actor_uri)
+    } else {
+        return Err(HandlerFailure::permanent(
+            "thread resolution parent is not a Note, Question, or Create",
+        ));
     };
     if remote_uri_value(object.get("id")) != Some(parent_uri) {
         return Err(HandlerFailure::permanent(
@@ -4737,6 +5237,10 @@ async fn resolve_inbox_actor(
         .map_err(|_| HandlerFailure::retry("remote inbox actor persistence failed"))
 }
 
+fn remote_poll_vote_allows_note_fallback(outcome: RemotePollVoteOutcome) -> bool {
+    outcome == RemotePollVoteOutcome::NotPollVote
+}
+
 #[allow(clippy::too_many_lines)]
 async fn process_activitypub_inbox(
     pool: PgPool,
@@ -4753,7 +5257,8 @@ async fn process_activitypub_inbox(
         return Ok(());
     }
     let (actor_uri, nested_actor_uri) = match &activity {
-        InboxActivity::CreateNote { actor_uri, .. }
+        InboxActivity::CreateVote { actor_uri, .. }
+        | InboxActivity::CreateNote { actor_uri, .. }
         | InboxActivity::CreateNoteReference { actor_uri, .. }
         | InboxActivity::UpdateNote { actor_uri, .. }
         | InboxActivity::DeleteNote { actor_uri, .. }
@@ -4803,6 +5308,79 @@ async fn process_activitypub_inbox(
         resolve_inbox_actor(&repository, &pool, config, fetcher, &job, actor_uri).await?;
     let writer = WriteRepository::from_pool(pool.clone());
     match activity {
+        InboxActivity::CreateVote {
+            actor_uri,
+            vote_uri,
+            question_uri,
+            option,
+            object,
+            activity,
+            ..
+        } => {
+            let outcome = writer
+                .apply_remote_poll_vote(
+                    source_account_id,
+                    &actor_uri,
+                    &vote_uri,
+                    &question_uri,
+                    &option,
+                    config.origin.as_str(),
+                )
+                .await
+                .map_err(|error| {
+                    remote_note_write_failure(&error, "remote poll vote write failed")
+                })?;
+            if remote_poll_vote_allows_note_fallback(outcome) {
+                let Value::Object(note_object) = &object else {
+                    return Err(HandlerFailure::permanent(
+                        "remote vote candidate object is not a Note object",
+                    ));
+                };
+                validate_note_object(&actor_uri, note_object)
+                    .map_err(|error| HandlerFailure::permanent(error.to_string()))?;
+                if !writer
+                    .remote_note_is_relevant(
+                        source_account_id,
+                        &actor_uri,
+                        &object,
+                        job.delivery_target_account_id,
+                        config.origin.as_str(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        remote_note_write_failure(&error, "remote Note relevance check failed")
+                    })?
+                {
+                    return Ok(());
+                }
+                writer
+                    .apply_remote_note_create(
+                        source_account_id,
+                        &actor_uri,
+                        &object,
+                        job.delivery_target_account_id,
+                        config.origin.as_str(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        remote_note_write_failure(&error, "remote Note Create write failed")
+                    })?;
+                if activity
+                    .get("signature")
+                    .is_some_and(|signature| !signature.is_null())
+                {
+                    writer
+                        .record_remote_note_forwarding(&actor_uri, &object, &activity)
+                        .await
+                        .map_err(|error| {
+                            remote_note_write_failure(
+                                &error,
+                                "remote Note forwarding outbox write failed",
+                            )
+                        })?;
+                }
+            }
+        }
         InboxActivity::Like {
             activity_uri,
             actor_uri,
@@ -5303,6 +5881,7 @@ fn remote_note_write_failure(error: &WriteError, message: &str) -> HandlerFailur
         | &WriteError::InvalidInput(_)
         | &WriteError::NotFound
         | &WriteError::Unauthorized
+        | &WriteError::Forbidden
         | &WriteError::RateLimited
         | &WriteError::Validation(_) => HandlerFailure::permanent(message),
         &WriteError::Sqlx(_) | &WriteError::Job(_) | &WriteError::Filesystem(_) => {
@@ -5347,6 +5926,1042 @@ fn account_update_delivery_logical_key(
 
 fn delete_delivery_logical_key(status_id: i64, inbox_url: &str) -> String {
     activitypub::status_delete_delivery_logical_key(status_id, inbox_url)
+}
+
+const POLL_EXPIRATION_REPAIR_PAGE_SIZE: i64 = 256;
+const POLL_EXPIRATION_REPAIR_MAX_PAGES: usize = 4;
+const POLL_EXPIRATION_REPAIR_MAX_CANDIDATES: usize = 25;
+const POLL_EXPIRATION_REPAIR_WALL_TIME: StdDuration = StdDuration::from_secs(2);
+const POLL_EXPIRATION_REPAIR_WORK_TIME: StdDuration = StdDuration::from_millis(1_500);
+const POLL_EXPIRATION_REPAIR_CONTINUATION_RESERVE: StdDuration = StdDuration::from_millis(500);
+const POLL_EXPIRATION_REPAIR_OPERATION_TIMEOUT: StdDuration = StdDuration::from_secs(1);
+const POLL_EXPIRATION_STARTUP_LEASE_DURATION: Duration = Duration::seconds(3);
+const POLL_EXPIRATION_STARTUP_SUCCESS_POLL_INTERVAL: StdDuration = StdDuration::from_millis(25);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PollExpirationScanMode {
+    Optimized,
+    Raw,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PollExpirationScanStep {
+    AdvanceTerminal,
+    Reconcile,
+    Stop,
+}
+
+fn poll_expiration_scan_step(
+    terminal: bool,
+    candidates_reconciled: usize,
+) -> PollExpirationScanStep {
+    if terminal {
+        PollExpirationScanStep::AdvanceTerminal
+    } else if candidates_reconciled >= POLL_EXPIRATION_REPAIR_MAX_CANDIDATES {
+        PollExpirationScanStep::Stop
+    } else {
+        PollExpirationScanStep::Reconcile
+    }
+}
+
+async fn within_poll_expiration_reconciliation_wall_time<F>(
+    limit: StdDuration,
+    future: F,
+) -> Result<(), HandlerFailure>
+where
+    F: Future<Output = Result<(), HandlerFailure>>,
+{
+    tokio::time::timeout(limit, future)
+        .await
+        .unwrap_or_else(|_| {
+            Err(HandlerFailure::retry(
+                "poll expiration reconciliation wall time exceeded",
+            ))
+        })
+}
+
+fn poll_expiration_reconciliation_job(
+    scan_started_at: DateTime<Utc>,
+    through_poll_id: Option<i64>,
+    after_poll_id: i64,
+    segment: i64,
+) -> JobSpec {
+    poll_expiration_reconciliation_job_with_mode(
+        scan_started_at,
+        through_poll_id,
+        after_poll_id,
+        segment,
+        PollExpirationScanMode::Optimized,
+    )
+}
+
+fn poll_expiration_raw_reconciliation_job(
+    scan_started_at: DateTime<Utc>,
+    through_poll_id: i64,
+    after_poll_id: i64,
+    segment: i64,
+) -> JobSpec {
+    poll_expiration_reconciliation_job_with_mode(
+        scan_started_at,
+        Some(through_poll_id),
+        after_poll_id,
+        segment,
+        PollExpirationScanMode::Raw,
+    )
+}
+
+fn poll_expiration_reconciliation_continuation(
+    scan_started_at: DateTime<Utc>,
+    through_poll_id: Option<i64>,
+    after_poll_id: i64,
+    segment: i64,
+    mode: PollExpirationScanMode,
+) -> Result<JobSpec, HandlerFailure> {
+    let next_segment = segment
+        .checked_add(1)
+        .ok_or_else(|| HandlerFailure::permanent("poll expiration repair segment overflowed"))?;
+    match mode {
+        PollExpirationScanMode::Optimized => Ok(poll_expiration_reconciliation_job(
+            scan_started_at,
+            through_poll_id,
+            after_poll_id,
+            next_segment,
+        )),
+        PollExpirationScanMode::Raw => Ok(poll_expiration_raw_reconciliation_job(
+            scan_started_at,
+            through_poll_id.ok_or_else(|| {
+                HandlerFailure::permanent("raw poll expiration repair high-water mark is missing")
+            })?,
+            after_poll_id,
+            next_segment,
+        )),
+    }
+}
+
+async fn enqueue_poll_expiration_reconciliation_continuation(
+    queue: &Queue,
+    scan_started_at: DateTime<Utc>,
+    through_poll_id: Option<i64>,
+    after_poll_id: i64,
+    segment: i64,
+    mode: PollExpirationScanMode,
+) -> Result<(), HandlerFailure> {
+    let continuation = poll_expiration_reconciliation_continuation(
+        scan_started_at,
+        through_poll_id,
+        after_poll_id,
+        segment,
+        mode,
+    )?;
+    queue
+        .enqueue_exact(&continuation)
+        .await
+        .map_err(|_| HandlerFailure::retry("poll expiration repair continuation failed"))?;
+    Ok(())
+}
+
+fn poll_expiration_reconciliation_job_with_mode(
+    scan_started_at: DateTime<Utc>,
+    through_poll_id: Option<i64>,
+    after_poll_id: i64,
+    segment: i64,
+    mode: PollExpirationScanMode,
+) -> JobSpec {
+    let mut arguments = json!({
+        "scan_started_at": scan_started_at.to_rfc3339(),
+        "through_poll_id": through_poll_id,
+        "after_poll_id": after_poll_id,
+        "segment": segment,
+    });
+    if mode == PollExpirationScanMode::Raw {
+        arguments["scan_mode"] = Value::String("raw".to_owned());
+    }
+    let logical_key =
+        poll_expiration_reconciliation_logical_key(scan_started_at, after_poll_id, segment, mode);
+    JobSpec::new(
+        Lane::Maintenance,
+        MASTODON_POLL_EXPIRATION_RECONCILE_JOB_KIND,
+        arguments,
+    )
+    .logical_key(logical_key)
+}
+
+fn poll_expiration_reconciliation_logical_key(
+    scan_started_at: DateTime<Utc>,
+    after_poll_id: i64,
+    segment: i64,
+    mode: PollExpirationScanMode,
+) -> String {
+    match mode {
+        PollExpirationScanMode::Optimized => format!(
+            "poll-expiration-reconcile:{}:{segment}:{after_poll_id}",
+            scan_started_at.timestamp_micros()
+        ),
+        PollExpirationScanMode::Raw => format!(
+            "poll-expiration-reconcile:{}:raw:{segment}:{after_poll_id}",
+            scan_started_at.timestamp_micros()
+        ),
+    }
+}
+
+fn parse_poll_expiration_scan_mode(
+    arguments: &Value,
+    segment: i64,
+) -> Result<PollExpirationScanMode, HandlerFailure> {
+    match arguments.get("scan_mode") {
+        None => Ok(PollExpirationScanMode::Optimized),
+        Some(Value::String(mode)) if mode == "raw" => {
+            if segment == 0
+                || arguments
+                    .get("through_poll_id")
+                    .and_then(Value::as_i64)
+                    .is_none()
+                || arguments
+                    .get("after_poll_id")
+                    .and_then(Value::as_i64)
+                    .is_none()
+            {
+                return Err(HandlerFailure::permanent(
+                    "raw poll expiration repair continuation is invalid",
+                ));
+            }
+            Ok(PollExpirationScanMode::Raw)
+        }
+        Some(_) => Err(HandlerFailure::permanent(
+            "poll expiration repair scan mode is invalid",
+        )),
+    }
+}
+
+fn poll_expiration_no_progress() -> HandlerFailure {
+    HandlerFailure::retry("poll expiration reconciliation made no cursor progress")
+}
+
+fn poll_expiration_execution_mode(
+    configured_mode: PollExpirationScanMode,
+    attempt: i32,
+) -> PollExpirationScanMode {
+    if configured_mode == PollExpirationScanMode::Raw || attempt > 1 {
+        PollExpirationScanMode::Raw
+    } else {
+        PollExpirationScanMode::Optimized
+    }
+}
+
+fn poll_expiration_reconciliation_key_from_arguments(
+    arguments: &Value,
+) -> Result<String, HandlerFailure> {
+    let scan_started_at = arguments
+        .get("scan_started_at")
+        .or_else(|| arguments.get("cutoff"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| HandlerFailure::permanent("poll expiration repair start is missing"))?
+        .parse::<DateTime<Utc>>()
+        .map_err(|_| HandlerFailure::permanent("poll expiration repair start is invalid"))?;
+    let after_poll_id = match arguments.get("after_poll_id") {
+        None => 0,
+        Some(value) => value
+            .as_i64()
+            .ok_or_else(|| HandlerFailure::permanent("poll expiration repair cursor is invalid"))?,
+    };
+    let segment = match arguments.get("segment") {
+        None => 0,
+        Some(value) => value.as_i64().ok_or_else(|| {
+            HandlerFailure::permanent("poll expiration repair segment is invalid")
+        })?,
+    };
+    let mode = parse_poll_expiration_scan_mode(arguments, segment)?;
+    Ok(poll_expiration_reconciliation_logical_key(
+        scan_started_at,
+        after_poll_id,
+        segment,
+        mode,
+    ))
+}
+
+fn poll_expiration_scan_timed_out(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(database) if database.code().as_deref() == Some("57014")
+    )
+}
+
+type PollExpirationScanRow = (
+    i64,
+    NaiveDateTime,
+    bool,
+    Option<(Value, Option<DateTime<Utc>>)>,
+);
+
+#[derive(Debug)]
+enum PollExpirationHighWater {
+    Value(i64),
+    TimedOut,
+}
+
+async fn poll_expiration_high_water(
+    writer_pool: &PgPool,
+    work_deadline: tokio::time::Instant,
+) -> Result<PollExpirationHighWater, HandlerFailure> {
+    let mut transaction = writer_pool
+        .begin()
+        .await
+        .map_err(|_| HandlerFailure::retry("poll expiration repair transaction failed"))?;
+    let statement_timeout = work_deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .min(POLL_EXPIRATION_REPAIR_OPERATION_TIMEOUT);
+    if statement_timeout.is_zero() {
+        transaction
+            .rollback()
+            .await
+            .map_err(|_| HandlerFailure::retry("poll expiration high-water rollback failed"))?;
+        return Ok(PollExpirationHighWater::TimedOut);
+    }
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(poll_expiration_statement_timeout_value(statement_timeout))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| {
+            HandlerFailure::retry("poll expiration repair statement timeout setup failed")
+        })?;
+    let result = sqlx::query_scalar::<_, Option<i64>>("SELECT max(id) FROM polls")
+        .fetch_one(&mut *transaction)
+        .await;
+    match result {
+        Ok(through) => {
+            transaction
+                .commit()
+                .await
+                .map_err(|_| HandlerFailure::retry("poll expiration repair scan commit failed"))?;
+            Ok(PollExpirationHighWater::Value(through.unwrap_or(0)))
+        }
+        Err(error) if poll_expiration_scan_timed_out(&error) => {
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| HandlerFailure::retry("poll expiration high-water rollback failed"))?;
+            Ok(PollExpirationHighWater::TimedOut)
+        }
+        Err(_) => {
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| HandlerFailure::retry("poll expiration high-water rollback failed"))?;
+            Err(HandlerFailure::retry(
+                "poll expiration repair high-water scan failed",
+            ))
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PollExpirationOptimizedPage {
+    Rows(Vec<PollExpirationScanRow>),
+    TimedOut,
+}
+
+fn poll_expiration_statement_timeout_value(limit: StdDuration) -> String {
+    format!("{}ms", limit.as_millis().max(1))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn poll_expiration_optimized_page(
+    writer_pool: &PgPool,
+    cursor: i64,
+    through_poll_id: i64,
+    work_deadline: tokio::time::Instant,
+    force_timeout: bool,
+) -> Result<PollExpirationOptimizedPage, HandlerFailure> {
+    let mut transaction = writer_pool
+        .begin()
+        .await
+        .map_err(|_| HandlerFailure::retry("poll expiration repair transaction failed"))?;
+    sqlx::query("SET LOCAL lock_timeout = '1s'")
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| HandlerFailure::retry("poll expiration repair lock timeout setup failed"))?;
+    let statement_timeout = work_deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .min(POLL_EXPIRATION_REPAIR_OPERATION_TIMEOUT);
+    if statement_timeout.is_zero() {
+        transaction
+            .rollback()
+            .await
+            .map_err(|_| HandlerFailure::retry("poll expiration timed-out scan rollback failed"))?;
+        return Ok(PollExpirationOptimizedPage::TimedOut);
+    }
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(poll_expiration_statement_timeout_value(statement_timeout))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| {
+            HandlerFailure::retry("poll expiration repair statement timeout setup failed")
+        })?;
+    let candidate_query = sqlx::query_as::<_, (i64, NaiveDateTime, bool)>(
+        "SELECT poll.id, poll.expires_at, author.domain IS NULL \
+           FROM polls poll \
+           JOIN statuses status ON status.id = poll.status_id \
+           JOIN accounts author ON author.id = poll.account_id \
+          WHERE poll.id > $1 AND poll.id <= $2 \
+            AND status.deleted_at IS NULL AND poll.expires_at IS NOT NULL \
+            AND (author.domain IS NULL OR EXISTS ( \
+                SELECT 1 FROM poll_votes vote \
+                JOIN accounts voter ON voter.id = vote.account_id \
+                WHERE vote.poll_id = poll.id AND voter.domain IS NULL)) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM rustodon.outbox_events terminal \
+                WHERE terminal.kind = $4 \
+                  AND terminal.logical_key = format( \
+                    'poll-expiration-effect:%s:generation:%s', poll.id, \
+                    (extract(epoch FROM poll.expires_at) * 1000000)::bigint) \
+                  AND terminal.dispatched_at IS NOT NULL \
+                  AND terminal.payload IN ( \
+                    jsonb_build_object( \
+                      'version', 1, 'poll_id', poll.id, \
+                      'expires_at_micros', \
+                        (extract(epoch FROM poll.expires_at) * 1000000)::bigint, \
+                      'outcome', 'historical_baseline'), \
+                    jsonb_build_object( \
+                      'version', 1, 'poll_id', poll.id, \
+                      'expires_at_micros', \
+                        (extract(epoch FROM poll.expires_at) * 1000000)::bigint, \
+                      'outcome', 'effects_enqueued'), \
+                    jsonb_build_object( \
+                      'version', 1, 'poll_id', poll.id, \
+                      'expires_at_micros', \
+                        (extract(epoch FROM poll.expires_at) * 1000000)::bigint, \
+                      'outcome', 'remote_past_expiry_suppressed'))) \
+          ORDER BY poll.id LIMIT $3",
+    )
+    .bind(cursor)
+    .bind(through_poll_id)
+    .bind(POLL_EXPIRATION_REPAIR_PAGE_SIZE)
+    .bind(MASTODON_POLL_EXPIRATION_EFFECT_KIND);
+    #[cfg(feature = "test-support")]
+    let forced_error = if force_timeout {
+        sqlx::query(
+            "DO $$ BEGIN \
+               RAISE EXCEPTION USING ERRCODE = '57014', \
+                 MESSAGE = 'forced poll expiration scan timeout'; \
+             END $$",
+        )
+        .execute(&mut *transaction)
+        .await
+        .err()
+    } else {
+        None
+    };
+    #[cfg(not(feature = "test-support"))]
+    let forced_error = {
+        let _ = force_timeout;
+        None
+    };
+    let rows_result = if let Some(error) = forced_error {
+        Err(error)
+    } else {
+        candidate_query.fetch_all(&mut *transaction).await
+    };
+    match rows_result {
+        Ok(rows) => {
+            transaction
+                .commit()
+                .await
+                .map_err(|_| HandlerFailure::retry("poll expiration repair scan commit failed"))?;
+            Ok(PollExpirationOptimizedPage::Rows(
+                rows.into_iter()
+                    .map(|(poll_id, expires_at, local_author)| {
+                        (poll_id, expires_at, local_author, None)
+                    })
+                    .collect(),
+            ))
+        }
+        Err(error) if poll_expiration_scan_timed_out(&error) => {
+            transaction.rollback().await.map_err(|_| {
+                HandlerFailure::retry("poll expiration timed-out scan rollback failed")
+            })?;
+            Ok(PollExpirationOptimizedPage::TimedOut)
+        }
+        Err(_) => {
+            transaction.rollback().await.map_err(|_| {
+                HandlerFailure::retry("poll expiration failed scan rollback failed")
+            })?;
+            Err(HandlerFailure::retry("poll expiration repair scan failed"))
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PollExpirationFallbackPageError {
+    TimedOut,
+    Failure(HandlerFailure),
+}
+
+#[allow(clippy::too_many_lines)]
+async fn poll_expiration_fallback_page(
+    writer_pool: &PgPool,
+    cursor: i64,
+    through_poll_id: i64,
+    work_deadline: tokio::time::Instant,
+) -> Result<Vec<PollExpirationScanRow>, PollExpirationFallbackPageError> {
+    let mut transaction = writer_pool.begin().await.map_err(|_| {
+        PollExpirationFallbackPageError::Failure(HandlerFailure::retry(
+            "poll expiration fallback transaction failed",
+        ))
+    })?;
+    sqlx::query("SET LOCAL lock_timeout = '1s'")
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| {
+            PollExpirationFallbackPageError::Failure(HandlerFailure::retry(
+                "poll expiration fallback lock timeout setup failed",
+            ))
+        })?;
+    let statement_timeout = work_deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .min(POLL_EXPIRATION_REPAIR_OPERATION_TIMEOUT);
+    if statement_timeout.is_zero() {
+        transaction.rollback().await.map_err(|_| {
+            PollExpirationFallbackPageError::Failure(HandlerFailure::retry(
+                "poll expiration fallback scan rollback failed",
+            ))
+        })?;
+        return Err(PollExpirationFallbackPageError::TimedOut);
+    }
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(poll_expiration_statement_timeout_value(statement_timeout))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| {
+            PollExpirationFallbackPageError::Failure(HandlerFailure::retry(
+                "poll expiration fallback statement timeout setup failed",
+            ))
+        })?;
+    let rows_result = sqlx::query_as::<_, (i64, NaiveDateTime, bool)>(
+        "SELECT poll.id, poll.expires_at, author.domain IS NULL \
+           FROM polls poll \
+           JOIN statuses status ON status.id = poll.status_id \
+           JOIN accounts author ON author.id = poll.account_id \
+          WHERE poll.id > $1 AND poll.id <= $2 \
+            AND status.deleted_at IS NULL AND poll.expires_at IS NOT NULL \
+            AND (author.domain IS NULL OR EXISTS ( \
+                SELECT 1 FROM poll_votes vote \
+                JOIN accounts voter ON voter.id = vote.account_id \
+                WHERE vote.poll_id = poll.id AND voter.domain IS NULL)) \
+          ORDER BY poll.id LIMIT $3",
+    )
+    .bind(cursor)
+    .bind(through_poll_id)
+    .bind(POLL_EXPIRATION_REPAIR_PAGE_SIZE)
+    .fetch_all(&mut *transaction)
+    .await;
+    let rows = match rows_result {
+        Ok(rows) => rows,
+        Err(error) => {
+            transaction.rollback().await.map_err(|_| {
+                PollExpirationFallbackPageError::Failure(HandlerFailure::retry(
+                    "poll expiration fallback scan rollback failed",
+                ))
+            })?;
+            if poll_expiration_scan_timed_out(&error) {
+                return Err(PollExpirationFallbackPageError::TimedOut);
+            }
+            return Err(PollExpirationFallbackPageError::Failure(
+                HandlerFailure::retry("poll expiration fallback scan failed"),
+            ));
+        }
+    };
+    let keys = rows
+        .iter()
+        .map(|(poll_id, expires_at, _)| {
+            poll_expiration_effect_key(*poll_id, poll_expiration_generation(expires_at.and_utc()))
+        })
+        .collect::<Vec<_>>();
+    let markers_result = if keys.is_empty() {
+        Ok(Vec::new())
+    } else {
+        let statement_timeout = work_deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(POLL_EXPIRATION_REPAIR_OPERATION_TIMEOUT);
+        if statement_timeout.is_zero() {
+            transaction.rollback().await.map_err(|_| {
+                PollExpirationFallbackPageError::Failure(HandlerFailure::retry(
+                    "poll expiration fallback marker rollback failed",
+                ))
+            })?;
+            return Err(PollExpirationFallbackPageError::TimedOut);
+        }
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(poll_expiration_statement_timeout_value(statement_timeout))
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| {
+                PollExpirationFallbackPageError::Failure(HandlerFailure::retry(
+                    "poll expiration fallback marker timeout setup failed",
+                ))
+            })?;
+        sqlx::query_as::<_, (String, Value, Option<DateTime<Utc>>)>(
+            "SELECT logical_key, payload, dispatched_at \
+               FROM rustodon.outbox_events \
+              WHERE kind = $1 AND logical_key = ANY($2)",
+        )
+        .bind(MASTODON_POLL_EXPIRATION_EFFECT_KIND)
+        .bind(&keys)
+        .fetch_all(&mut *transaction)
+        .await
+    };
+    let markers = match markers_result {
+        Ok(markers) => markers,
+        Err(error) => {
+            transaction.rollback().await.map_err(|_| {
+                PollExpirationFallbackPageError::Failure(HandlerFailure::retry(
+                    "poll expiration fallback marker rollback failed",
+                ))
+            })?;
+            if poll_expiration_scan_timed_out(&error) {
+                return Err(PollExpirationFallbackPageError::TimedOut);
+            }
+            return Err(PollExpirationFallbackPageError::Failure(
+                HandlerFailure::retry("poll expiration fallback marker scan failed"),
+            ));
+        }
+    };
+    let mut markers = markers
+        .into_iter()
+        .map(|(key, payload, dispatched_at)| (key, (payload, dispatched_at)))
+        .collect::<BTreeMap<_, _>>();
+    let classified = rows
+        .into_iter()
+        .zip(keys)
+        .map(|((poll_id, expires_at, local_author), key)| {
+            (poll_id, expires_at, local_author, markers.remove(&key))
+        })
+        .collect();
+    transaction.commit().await.map_err(|_| {
+        PollExpirationFallbackPageError::Failure(HandlerFailure::retry(
+            "poll expiration fallback scan commit failed",
+        ))
+    })?;
+    Ok(classified)
+}
+
+async fn poll_expiration_fallback_page_within_work_time(
+    writer_pool: &PgPool,
+    cursor: i64,
+    through_poll_id: i64,
+    started: tokio::time::Instant,
+) -> Result<Option<Vec<PollExpirationScanRow>>, HandlerFailure> {
+    let remaining = POLL_EXPIRATION_REPAIR_WORK_TIME.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Ok(None);
+    }
+    let work_deadline = started + POLL_EXPIRATION_REPAIR_WORK_TIME;
+    match tokio::time::timeout(
+        remaining,
+        poll_expiration_fallback_page(writer_pool, cursor, through_poll_id, work_deadline),
+    )
+    .await
+    {
+        Ok(Ok(rows)) => Ok(Some(rows)),
+        Ok(Err(PollExpirationFallbackPageError::TimedOut)) | Err(_) => Ok(None),
+        Ok(Err(PollExpirationFallbackPageError::Failure(error))) => Err(error),
+    }
+}
+
+async fn reconcile_poll_expirations(
+    queue: Queue,
+    writer_pool: PgPool,
+    arguments: Value,
+    logical_key: String,
+    attempt: i32,
+    wall_deadline: tokio::time::Instant,
+) -> Result<(), HandlerFailure> {
+    let expected_key = poll_expiration_reconciliation_key_from_arguments(&arguments)?;
+    if logical_key != expected_key {
+        return Err(HandlerFailure::permanent(
+            "poll expiration reconciliation logical key is invalid",
+        ));
+    }
+    let now = tokio::time::Instant::now();
+    let remaining_wall = wall_deadline.saturating_duration_since(now);
+    let work_allowance = remaining_wall
+        .saturating_sub(POLL_EXPIRATION_REPAIR_CONTINUATION_RESERVE)
+        .min(POLL_EXPIRATION_REPAIR_WORK_TIME);
+    let elapsed_work = POLL_EXPIRATION_REPAIR_WORK_TIME.saturating_sub(work_allowance);
+    let started = now.checked_sub(elapsed_work).unwrap_or(now);
+    within_poll_expiration_reconciliation_wall_time(remaining_wall, async move {
+        reconcile_poll_expirations_inner(
+            queue,
+            writer_pool,
+            arguments,
+            attempt,
+            started,
+            false,
+            false,
+        )
+        .await
+    })
+    .await
+}
+
+#[cfg(feature = "test-support")]
+/// Runs one reconciliation segment while forcing the optimized scan to return `PostgreSQL`
+/// SQLSTATE 57014, the statement-timeout/query-cancellation code. This is only exposed to
+/// disposable worker fixtures.
+///
+/// # Errors
+///
+/// Returns an error when bounded fallback or continuation persistence fails.
+pub async fn reconcile_poll_expirations_with_primary_timeout_for_test(
+    queue: Queue,
+    writer_pool: PgPool,
+    arguments: Value,
+    attempt: i32,
+) -> Result<(), HandlerFailure> {
+    let started = tokio::time::Instant::now();
+    within_poll_expiration_reconciliation_wall_time(POLL_EXPIRATION_REPAIR_WALL_TIME, async move {
+        reconcile_poll_expirations_inner(
+            queue,
+            writer_pool,
+            arguments,
+            attempt,
+            started,
+            true,
+            false,
+        )
+        .await
+    })
+    .await
+}
+
+#[cfg(feature = "test-support")]
+/// Forces SQLSTATE 57014 and then simulates a fallback timeout without cursor progress.
+///
+/// # Errors
+///
+/// Returns a retryable error when neither scan strategy advances the cursor.
+pub async fn reconcile_poll_expirations_with_exhausted_primary_timeout_for_test(
+    queue: Queue,
+    writer_pool: PgPool,
+    arguments: Value,
+    attempt: i32,
+) -> Result<(), HandlerFailure> {
+    let started = tokio::time::Instant::now();
+    within_poll_expiration_reconciliation_wall_time(POLL_EXPIRATION_REPAIR_WALL_TIME, async move {
+        reconcile_poll_expirations_inner(
+            queue,
+            writer_pool,
+            arguments,
+            attempt,
+            started,
+            true,
+            true,
+        )
+        .await
+    })
+    .await
+}
+
+#[cfg(feature = "test-support")]
+/// Simulates a raw scan timeout without cursor progress.
+///
+/// # Errors
+///
+/// Returns an error for non-raw arguments or a simulated raw timeout.
+pub async fn reconcile_poll_expirations_with_exhausted_raw_budget_for_test(
+    queue: Queue,
+    writer_pool: PgPool,
+    arguments: Value,
+    attempt: i32,
+) -> Result<(), HandlerFailure> {
+    let segment = arguments
+        .get("segment")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| HandlerFailure::permanent("poll expiration repair segment is invalid"))?;
+    if parse_poll_expiration_scan_mode(&arguments, segment)? != PollExpirationScanMode::Raw {
+        return Err(HandlerFailure::permanent(
+            "poll expiration repair test continuation is not raw",
+        ));
+    }
+    let started = tokio::time::Instant::now();
+    within_poll_expiration_reconciliation_wall_time(POLL_EXPIRATION_REPAIR_WALL_TIME, async move {
+        reconcile_poll_expirations_inner(
+            queue,
+            writer_pool,
+            arguments,
+            attempt,
+            started,
+            false,
+            true,
+        )
+        .await
+    })
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn reconcile_poll_expirations_inner(
+    queue: Queue,
+    writer_pool: PgPool,
+    arguments: Value,
+    attempt: i32,
+    started: tokio::time::Instant,
+    force_primary_timeout: bool,
+    force_fallback_timeout: bool,
+) -> Result<(), HandlerFailure> {
+    let scan_started_at = arguments
+        .get("scan_started_at")
+        .or_else(|| arguments.get("cutoff"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| HandlerFailure::permanent("poll expiration repair start is missing"))?
+        .parse::<DateTime<Utc>>()
+        .map_err(|_| HandlerFailure::permanent("poll expiration repair start is invalid"))?;
+    let after_poll_id = match arguments.get("after_poll_id") {
+        None => 0,
+        Some(value) => value
+            .as_i64()
+            .ok_or_else(|| HandlerFailure::permanent("poll expiration repair cursor is invalid"))?,
+    };
+    if after_poll_id < 0 {
+        return Err(HandlerFailure::permanent(
+            "poll expiration repair cursor is invalid",
+        ));
+    }
+    let segment = match arguments.get("segment") {
+        None => 0,
+        Some(value) => value.as_i64().ok_or_else(|| {
+            HandlerFailure::permanent("poll expiration repair segment is invalid")
+        })?,
+    };
+    if segment < 0 {
+        return Err(HandlerFailure::permanent(
+            "poll expiration repair segment is invalid",
+        ));
+    }
+    let scan_mode = poll_expiration_execution_mode(
+        parse_poll_expiration_scan_mode(&arguments, segment)?,
+        attempt,
+    );
+    let initial_cursor = after_poll_id;
+    let through_poll_id = match arguments.get("through_poll_id") {
+        Some(Value::Null) | None => {
+            let remaining = POLL_EXPIRATION_REPAIR_WORK_TIME.saturating_sub(started.elapsed());
+            let high_water = if remaining.is_zero() {
+                PollExpirationHighWater::TimedOut
+            } else {
+                match tokio::time::timeout(
+                    remaining.min(POLL_EXPIRATION_REPAIR_OPERATION_TIMEOUT),
+                    poll_expiration_high_water(
+                        &writer_pool,
+                        started + POLL_EXPIRATION_REPAIR_WORK_TIME,
+                    ),
+                )
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => PollExpirationHighWater::TimedOut,
+                }
+            };
+            match high_water {
+                PollExpirationHighWater::Value(through) => through,
+                PollExpirationHighWater::TimedOut => {
+                    return Err(poll_expiration_no_progress());
+                }
+            }
+        }
+        Some(value) => value.as_i64().ok_or_else(|| {
+            HandlerFailure::permanent("poll expiration repair high-water mark is invalid")
+        })?,
+    };
+    if through_poll_id < after_poll_id || through_poll_id < 0 {
+        return Err(HandlerFailure::permanent(
+            "poll expiration repair high-water mark is invalid",
+        ));
+    }
+    if through_poll_id == after_poll_id {
+        return Ok(());
+    }
+    if started.elapsed() >= POLL_EXPIRATION_REPAIR_WORK_TIME {
+        return Err(poll_expiration_no_progress());
+    }
+    let remaining = POLL_EXPIRATION_REPAIR_WORK_TIME.saturating_sub(started.elapsed());
+    let activation = if let Ok(result) =
+        tokio::time::timeout(remaining, queue.poll_expiration_activation()).await
+    {
+        result.map_err(|_| {
+            HandlerFailure::permanent("poll expiration activation marker is invalid")
+        })?
+    } else {
+        return Err(poll_expiration_no_progress());
+    };
+
+    let mut cursor = after_poll_id;
+    let mut candidates_reconciled = 0_usize;
+    let mut pages_scanned = 0_usize;
+    let mut bounded = false;
+    let mut exhausted = false;
+    let mut force_primary_timeout = force_primary_timeout;
+
+    'pages: while pages_scanned < POLL_EXPIRATION_REPAIR_MAX_PAGES && cursor < through_poll_id {
+        if started.elapsed() >= POLL_EXPIRATION_REPAIR_WORK_TIME {
+            bounded = true;
+            break;
+        }
+        let (rows, fallback_page) = if scan_mode == PollExpirationScanMode::Raw {
+            let fallback_rows = if force_fallback_timeout {
+                None
+            } else {
+                poll_expiration_fallback_page_within_work_time(
+                    &writer_pool,
+                    cursor,
+                    through_poll_id,
+                    started,
+                )
+                .await?
+            };
+            let Some(rows) = fallback_rows else {
+                bounded = true;
+                break;
+            };
+            (rows, true)
+        } else {
+            let remaining = POLL_EXPIRATION_REPAIR_WORK_TIME.saturating_sub(started.elapsed());
+            let force_timeout = force_primary_timeout;
+            force_primary_timeout = false;
+            let optimized_page = if let Ok(result) = tokio::time::timeout(
+                remaining,
+                poll_expiration_optimized_page(
+                    &writer_pool,
+                    cursor,
+                    through_poll_id,
+                    started + POLL_EXPIRATION_REPAIR_WORK_TIME,
+                    force_timeout,
+                ),
+            )
+            .await
+            {
+                result?
+            } else {
+                bounded = true;
+                break;
+            };
+            match optimized_page {
+                PollExpirationOptimizedPage::Rows(rows) => (rows, false),
+                PollExpirationOptimizedPage::TimedOut => {
+                    let fallback_rows = if force_fallback_timeout {
+                        None
+                    } else {
+                        poll_expiration_fallback_page_within_work_time(
+                            &writer_pool,
+                            cursor,
+                            through_poll_id,
+                            started,
+                        )
+                        .await?
+                    };
+                    let Some(rows) = fallback_rows else {
+                        bounded = true;
+                        break;
+                    };
+                    (rows, true)
+                }
+            }
+        };
+        pages_scanned += 1;
+        if rows.is_empty() {
+            exhausted = true;
+            break;
+        }
+        let short_page =
+            rows.len() < usize::try_from(POLL_EXPIRATION_REPAIR_PAGE_SIZE).unwrap_or(usize::MAX);
+        for (poll_id, expires_at, local_author, marker) in rows {
+            if started.elapsed() >= POLL_EXPIRATION_REPAIR_WORK_TIME {
+                bounded = true;
+                break 'pages;
+            }
+            let terminal = if let Some((payload, dispatched_at)) = marker {
+                validate_dispatched_poll_expiration_effect(
+                    &payload,
+                    dispatched_at,
+                    poll_id,
+                    poll_expiration_generation(expires_at.and_utc()),
+                )
+                .map_err(|_| HandlerFailure::retry("poll expiration fallback marker is invalid"))?;
+                true
+            } else {
+                false
+            };
+            match poll_expiration_scan_step(terminal, candidates_reconciled) {
+                PollExpirationScanStep::AdvanceTerminal => {
+                    cursor = poll_id;
+                    continue;
+                }
+                PollExpirationScanStep::Stop => {
+                    bounded = true;
+                    break 'pages;
+                }
+                PollExpirationScanStep::Reconcile => {}
+            }
+            let expires_at = expires_at.and_utc();
+            let run_at = expires_at
+                + if local_author {
+                    Duration::zero()
+                } else {
+                    Duration::minutes(5)
+                };
+            let remaining = POLL_EXPIRATION_REPAIR_WORK_TIME.saturating_sub(started.elapsed());
+            let operation_timeout = remaining.min(POLL_EXPIRATION_REPAIR_OPERATION_TIMEOUT);
+            match tokio::time::timeout(
+                operation_timeout,
+                queue.reconcile_poll_expiration(poll_id, expires_at, run_at, activation),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    candidates_reconciled += 1;
+                    cursor = poll_id;
+                }
+                Ok(Err(_)) => {
+                    return Err(HandlerFailure::retry(
+                        "poll expiration durable repair failed",
+                    ));
+                }
+                Err(_) => {
+                    bounded = true;
+                    break 'pages;
+                }
+            }
+        }
+        if fallback_page {
+            if short_page {
+                exhausted = true;
+            } else {
+                bounded = true;
+            }
+            break;
+        }
+        if short_page {
+            exhausted = true;
+            break;
+        }
+    }
+    if !exhausted && cursor < through_poll_id {
+        bounded = true;
+    }
+    if bounded && cursor < through_poll_id {
+        if cursor == initial_cursor {
+            return Err(poll_expiration_no_progress());
+        }
+        enqueue_poll_expiration_reconciliation_continuation(
+            &queue,
+            scan_started_at,
+            Some(through_poll_id),
+            cursor,
+            segment,
+            scan_mode,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Builds the infrastructure handlers available before feature-specific handlers are registered.
@@ -5454,6 +7069,77 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
             move |job| {
                 let pool = notification_pool.clone();
                 async move { process_notification_job(pool, &job.arguments).await }
+            },
+        )?;
+        let poll_expiration_pool = mastodon_writer.clone();
+        handlers.register(
+            MASTODON_POLL_EXPIRATION_JOB_KIND,
+            Lane::Core,
+            ResourceClass::None,
+            move |job| {
+                let pool = poll_expiration_pool.clone();
+                async move {
+                    let Some(poll_id) = job.arguments.get("poll_id").and_then(Value::as_i64) else {
+                        return Err(HandlerFailure::permanent(
+                            "poll expiration job is missing its poll ID",
+                        ));
+                    };
+                    if poll_id <= 0 {
+                        return Err(HandlerFailure::permanent(
+                            "poll expiration job poll ID is invalid",
+                        ));
+                    }
+                    let expires_at_micros = job
+                        .arguments
+                        .get("expires_at_micros")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| {
+                            HandlerFailure::permanent(
+                                "poll expiration job generation is missing or invalid",
+                            )
+                        })?;
+                    WriteRepository::from_pool(pool)
+                        .expire_poll_generation(poll_id, Some(expires_at_micros))
+                        .await
+                        .map_err(|error| match error {
+                            WriteError::InvalidInput(_)
+                            | WriteError::Job(JobError::InvalidData(_)) => {
+                                HandlerFailure::permanent(
+                                    "poll expiration safety marker is invalid",
+                                )
+                            }
+                            _ => HandlerFailure::retry("poll expiration processing failed"),
+                        })
+                }
+            },
+        )?;
+        let poll_expiration_repair_pool = mastodon_writer.clone();
+        let poll_expiration_repair_queue = queue.clone();
+        handlers.register(
+            MASTODON_POLL_EXPIRATION_RECONCILE_JOB_KIND,
+            Lane::Maintenance,
+            ResourceClass::None,
+            move |job| {
+                let pool = poll_expiration_repair_pool.clone();
+                let queue = poll_expiration_repair_queue.clone();
+                Box::pin(async move {
+                    let Some(logical_key) = job.logical_key.clone() else {
+                        return Err(HandlerFailure::permanent(
+                            "poll expiration reconciliation logical key is missing",
+                        ));
+                    };
+                    let arguments = job.arguments.clone();
+                    let attempt = job.attempt;
+                    reconcile_poll_expirations(
+                        queue,
+                        pool,
+                        arguments,
+                        logical_key,
+                        attempt,
+                        tokio::time::Instant::now() + POLL_EXPIRATION_REPAIR_WALL_TIME,
+                    )
+                    .await
+                }) as HandlerFuture
             },
         )?;
         let unfilter_pool = mastodon_writer.clone();
@@ -5833,6 +7519,15 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
                             .arguments
                             .get("edited_at_micros")
                             .and_then(Value::as_i64);
+                        let poll_updated_at_micros = job
+                            .arguments
+                            .get("poll_updated_at_micros")
+                            .and_then(Value::as_i64);
+                        let update_kind = job.arguments.get("update_kind").and_then(Value::as_str);
+                        let update_version_micros = job
+                            .arguments
+                            .get("update_version_micros")
+                            .and_then(Value::as_i64);
                         let explicit_recipient_ids =
                             match job.arguments.get("recipient_account_ids") {
                                 None => Vec::new(),
@@ -5858,6 +7553,9 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
                             status_id,
                             activity_type,
                             edited_at_micros,
+                            poll_updated_at_micros,
+                            update_kind,
+                            update_version_micros,
                             &explicit_recipient_ids,
                         )
                         .await
@@ -5957,6 +7655,121 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
     Ok(handlers)
 }
 
+fn poll_expiration_startup_lease_owner(process_id: &str) -> String {
+    let digest = Sha256::digest(process_id.as_bytes());
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    format!("poll-expiration-startup:{encoded}")
+}
+
+async fn reconcile_poll_expirations_at_startup(
+    queue: Queue,
+    writer_pool: PgPool,
+    process_id: &str,
+) -> Result<(), WorkerError> {
+    let startup_deadline = tokio::time::Instant::now() + POLL_EXPIRATION_REPAIR_WALL_TIME;
+    let lease_owner = poll_expiration_startup_lease_owner(process_id);
+    let startup = async {
+        queue.ensure_poll_expiration_activation().await?;
+        let scan_started_at = Utc::now();
+        let reservation = poll_expiration_reconciliation_job(scan_started_at, None, 0, 0)
+            .run_at(scan_started_at + POLL_EXPIRATION_STARTUP_LEASE_DURATION);
+        let reservation_key = reservation
+            .logical_key_value()
+            .expect("poll expiration reconciliation reservations have a logical key")
+            .to_owned();
+        let ownership = queue
+            .enqueue_if_kind_idle(MASTODON_POLL_EXPIRATION_RECONCILE_JOB_KIND, &reservation)
+            .await?;
+        let job_id = ownership.job_id();
+        let expected_arguments = ownership.arguments().clone();
+        let logical_key = ownership
+            .existing_logical_key()
+            .unwrap_or(&reservation_key)
+            .to_owned();
+        loop {
+            if queue
+                .poll_expiration_reconciliation_succeeded(job_id, &logical_key, &expected_arguments)
+                .await?
+            {
+                return Ok(());
+            }
+            match queue
+                .claim_poll_expiration_reconciliation_for_startup(
+                    job_id,
+                    &logical_key,
+                    &expected_arguments,
+                    &lease_owner,
+                    POLL_EXPIRATION_STARTUP_LEASE_DURATION,
+                )
+                .await?
+            {
+                PollExpirationStartupClaim::Claimed(job) => {
+                    let job_logical_key = job
+                        .logical_key
+                        .clone()
+                        .ok_or(WorkerError::StartupReconciliationFailed)?;
+                    let result = reconcile_poll_expirations(
+                        queue.clone(),
+                        writer_pool.clone(),
+                        job.arguments.clone(),
+                        job_logical_key,
+                        job.attempt,
+                        startup_deadline,
+                    )
+                    .await;
+                    if let Err(failure) = result {
+                        transition_handler_failure(&queue, &job, &failure).await?;
+                        return Err(WorkerError::StartupReconciliationFailed);
+                    }
+                    if queue
+                        .complete_poll_expiration_reconciliation_success(&job)
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                    return Err(WorkerError::StartupReconciliationFailed);
+                }
+                PollExpirationStartupClaim::ActiveLease => {
+                    tokio::time::sleep(POLL_EXPIRATION_STARTUP_SUCCESS_POLL_INTERVAL).await;
+                }
+                PollExpirationStartupClaim::Missing => {
+                    if queue
+                        .poll_expiration_reconciliation_succeeded(
+                            job_id,
+                            &logical_key,
+                            &expected_arguments,
+                        )
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                    return Err(WorkerError::StartupReconciliationFailed);
+                }
+            }
+        }
+    };
+    tokio::time::timeout_at(startup_deadline, startup)
+        .await
+        .unwrap_or(Err(WorkerError::StartupReconciliationFailed))
+}
+
+/// Runs the bounded startup poll-expiration segment in disposable fixtures.
+///
+/// # Errors
+///
+/// Returns an error when activation or the bounded reconciliation segment cannot complete.
+#[cfg(feature = "test-support")]
+pub async fn reconcile_poll_expirations_at_startup_for_test(
+    queue: Queue,
+    writer_pool: PgPool,
+    process_id: &str,
+) -> Result<(), WorkerError> {
+    reconcile_poll_expirations_at_startup(queue, writer_pool, process_id).await
+}
+
 /// Runs worker and scheduler loops until shutdown, then stops claiming and drains in-flight jobs.
 ///
 /// # Errors
@@ -5969,6 +7782,7 @@ pub async fn run_until_shutdown<F>(
     handlers: HandlerRegistry,
     config: WorkerConfig,
     process_id: String,
+    poll_expiration_writer: Option<PgPool>,
     shutdown: F,
 ) -> Result<(), WorkerError>
 where
@@ -5986,6 +7800,26 @@ where
     }
     let lanes = config.lanes.iter().copied().collect::<Vec<_>>();
     let schedules_maintenance = lanes.contains(&Lane::Maintenance);
+    let schedules_poll_expiration_repair = schedules_maintenance
+        && handlers
+            .get(MASTODON_POLL_EXPIRATION_RECONCILE_JOB_KIND)?
+            .is_some();
+    let executes_poll_expirations =
+        lanes.contains(&Lane::Core) && handlers.get(MASTODON_POLL_EXPIRATION_JOB_KIND)?.is_some();
+    if schedules_poll_expiration_repair {
+        let writer_pool = poll_expiration_writer.ok_or(WorkerError::InvalidConfiguration(
+            "poll expiration maintenance requires a writer pool",
+        ))?;
+        reconcile_poll_expirations_at_startup(queue.clone(), writer_pool, &process_id).await?;
+    } else if executes_poll_expirations {
+        // Core handlers establish the immutable boundary before executors or readiness heartbeats.
+        tokio::time::timeout(
+            POLL_EXPIRATION_REPAIR_WALL_TIME,
+            queue.ensure_poll_expiration_activation(),
+        )
+        .await
+        .map_err(|_| WorkerError::StartupReconciliationFailed)??;
+    }
     let executor = WorkerExecutor::new(queue.clone(), handlers, remote_http, media)?;
     let lease = Duration::seconds(i64::from(config.lease_seconds));
     let poll = StdDuration::from_millis(u64::from(config.poll_milliseconds));
@@ -6043,7 +7877,10 @@ where
     let mut scheduler = tokio::spawn(async move {
         let mut heartbeat_tick = tokio::time::interval(heartbeat);
         let mut outbox_tick = tokio::time::interval(poll);
-        let mut maintenance_tick = tokio::time::interval(StdDuration::from_mins(1));
+        let mut maintenance_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + StdDuration::from_mins(1),
+            StdDuration::from_mins(1),
+        );
         loop {
             tokio::select! {
                 result = scheduler_stop.changed() => {
@@ -6066,7 +7903,8 @@ where
                     scheduler_queue.dispatch_outbox(100).await?;
                 }
                 _ = maintenance_tick.tick(), if schedules_maintenance => {
-                    let minute = Utc::now().timestamp() / 60;
+                    let now = Utc::now();
+                    let minute = now.timestamp() / 60;
                     scheduler_queue.enqueue(
                         &JobSpec::new(
                             Lane::Maintenance,
@@ -6074,6 +7912,14 @@ where
                             json!({"minute": minute}),
                         ).logical_key(format!("maintenance:{minute}")),
                     ).await?;
+                    if schedules_poll_expiration_repair {
+                        scheduler_queue
+                            .enqueue_if_kind_idle(
+                                MASTODON_POLL_EXPIRATION_RECONCILE_JOB_KIND,
+                                &poll_expiration_reconciliation_job(now, None, 0, 0),
+                            )
+                            .await?;
+                    }
                 }
             }
         }
@@ -6180,17 +8026,199 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        FailureDisposition, HandlerRegistry, RemoteAnnounceTarget, ResourceClass,
-        account_purge_cleanup_paths, account_update_delivery_logical_key, delivery_failure,
-        delivery_logical_key, inbox_actor_domain, note_fetch_audience, note_resolution_logical_key,
+        FailureDisposition, HandlerRegistry, PollExpirationScanMode, PollExpirationScanStep,
+        RemoteAnnounceTarget, ResourceClass, StatusUpdateKind, StatusUpdateVersionDecision,
+        account_purge_cleanup_paths, account_update_delivery_logical_key,
+        complete_status_update_delivery_kind, delivery_failure, delivery_logical_key,
+        inbox_actor_domain, inferred_current_repair_delivery_kind, note_fetch_audience,
+        note_resolution_logical_key, parse_poll_expiration_scan_mode,
+        poll_expiration_execution_mode, poll_expiration_raw_reconciliation_job,
+        poll_expiration_reconciliation_continuation, poll_expiration_reconciliation_job,
+        poll_expiration_reconciliation_key_from_arguments, poll_expiration_scan_step,
         preferred_note_fetch_signer_id, remote_announce_document, remote_media_fetch_failure,
-        remote_note_document, remote_note_fetch_failure, resolved_create_note, retry_delay,
-        safe_cleanup_path, update_delivery_is_current, update_delivery_logical_key,
-        validate_create_binding,
+        remote_note_document, remote_note_fetch_failure, remote_poll_vote_allows_note_fallback,
+        resolved_create_note, retry_delay, safe_cleanup_path, status_snapshot_repair_activity_id,
+        status_update_delivery_is_current, status_update_version_decision, status_update_versions,
+        update_delivery_is_current, update_delivery_logical_key, validate_create_binding,
+        within_poll_expiration_reconciliation_wall_time,
     };
     use crate::jobs::Lane;
-    use crate::mastodon::activitypub;
+    use crate::mastodon::{RemotePollVoteOutcome, activitypub};
     use crate::remote::RemoteFetchError;
+
+    #[tokio::test]
+    async fn poll_reconciliation_wall_time_cancels_the_whole_operation() {
+        struct CancellationGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for CancellationGuard {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard_flag = cancelled.clone();
+        let started = tokio::time::Instant::now();
+        let result = within_poll_expiration_reconciliation_wall_time(
+            std::time::Duration::from_millis(10),
+            async move {
+                let _guard = CancellationGuard(guard_flag);
+                std::future::pending::<Result<(), super::HandlerFailure>>().await
+            },
+        )
+        .await;
+        let failure = result.expect_err("the wall-time bound must cancel pending work");
+        assert_eq!(failure.disposition, FailureDisposition::Retry);
+        assert_eq!(
+            failure.message,
+            "poll expiration reconciliation wall time exceeded"
+        );
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn fallback_terminal_prefix_advances_without_spending_candidate_budget() {
+        let mut cursor = 0_i64;
+        let mut candidates = 0_usize;
+        for poll_id in 1_i64..=33 {
+            assert_eq!(
+                poll_expiration_scan_step(true, candidates),
+                PollExpirationScanStep::AdvanceTerminal
+            );
+            cursor = poll_id;
+        }
+        assert_eq!(cursor, 33);
+        assert_eq!(candidates, 0);
+
+        for poll_id in 34_i64..=58 {
+            assert_eq!(
+                poll_expiration_scan_step(false, candidates),
+                PollExpirationScanStep::Reconcile
+            );
+            candidates += 1;
+            cursor = poll_id;
+        }
+        assert_eq!(cursor, 58);
+        assert_eq!(candidates, 25);
+        assert_eq!(
+            poll_expiration_scan_step(false, candidates),
+            PollExpirationScanStep::Stop
+        );
+        assert_eq!(
+            cursor, 58,
+            "the unprocessed 26th actionable row remains behind the continuation cursor"
+        );
+    }
+
+    #[test]
+    fn reconciliation_segments_have_distinct_mode_bound_singleton_keys() {
+        let started = Utc::now();
+        let first = poll_expiration_reconciliation_job(started, Some(42), 7, 0);
+        let continuation = poll_expiration_reconciliation_job(started, Some(42), 7, 1);
+        let raw = poll_expiration_raw_reconciliation_job(started, 42, 7, 1);
+        assert_ne!(first.logical_key_value(), continuation.logical_key_value());
+        assert_ne!(continuation.logical_key_value(), raw.logical_key_value());
+        assert_eq!(first.arguments()["segment"], 0);
+        assert_eq!(continuation.arguments()["segment"], 1);
+        assert_eq!(raw.arguments()["segment"], 1);
+        assert_eq!(raw.arguments()["scan_mode"], "raw");
+        assert_eq!(
+            raw.logical_key_value(),
+            Some(
+                format!(
+                    "poll-expiration-reconcile:{}:raw:1:7",
+                    started.timestamp_micros()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            poll_expiration_reconciliation_key_from_arguments(raw.arguments())
+                .expect("raw arguments determine their exact singleton key"),
+            raw.logical_key_value().expect("raw job has a key")
+        );
+        assert_eq!(
+            parse_poll_expiration_scan_mode(raw.arguments(), 1)
+                .expect("raw continuation shape is valid"),
+            PollExpirationScanMode::Raw
+        );
+        assert!(
+            parse_poll_expiration_scan_mode(&json!({"scan_mode": "raw"}), 0).is_err(),
+            "raw mode is continuation-only"
+        );
+        assert!(parse_poll_expiration_scan_mode(&json!({"scan_mode": "unknown"}), 1).is_err());
+        assert!(parse_poll_expiration_scan_mode(&json!({"scan_mode": 1}), 1).is_err());
+    }
+
+    #[test]
+    fn reconciliation_retries_switch_optimized_jobs_to_raw_without_mutating_explicit_mode() {
+        assert_eq!(
+            poll_expiration_execution_mode(PollExpirationScanMode::Optimized, 1),
+            PollExpirationScanMode::Optimized
+        );
+        assert_eq!(
+            poll_expiration_execution_mode(PollExpirationScanMode::Optimized, 2),
+            PollExpirationScanMode::Raw
+        );
+        assert_eq!(
+            poll_expiration_execution_mode(PollExpirationScanMode::Raw, 1),
+            PollExpirationScanMode::Raw
+        );
+        assert_eq!(
+            poll_expiration_execution_mode(PollExpirationScanMode::Raw, 7),
+            PollExpirationScanMode::Raw
+        );
+    }
+
+    #[test]
+    fn progress_after_retry_fallback_keeps_successors_raw() {
+        let started = Utc::now();
+        let initial = poll_expiration_reconciliation_job(started, Some(100), 0, 0);
+        let first_execution = poll_expiration_execution_mode(
+            parse_poll_expiration_scan_mode(initial.arguments(), 0)
+                .expect("the initial optimized job has valid arguments"),
+            2,
+        );
+        let first_successor =
+            poll_expiration_reconciliation_continuation(started, Some(100), 25, 0, first_execution)
+                .expect("the first progress-making successor is valid");
+        assert_eq!(first_successor.arguments()["scan_mode"], "raw");
+        assert!(
+            first_successor
+                .logical_key_value()
+                .is_some_and(|key| key.contains(":raw:1:25"))
+        );
+
+        let configured_second = parse_poll_expiration_scan_mode(first_successor.arguments(), 1)
+            .expect("the first progress-making successor has valid raw arguments");
+        let second_execution = poll_expiration_execution_mode(configured_second, 1);
+        let second_successor = poll_expiration_reconciliation_continuation(
+            started,
+            Some(100),
+            50,
+            1,
+            second_execution,
+        )
+        .expect("the second progress-making successor is valid");
+        assert_eq!(configured_second, PollExpirationScanMode::Raw);
+        assert_eq!(second_successor.arguments()["scan_mode"], "raw");
+        assert!(
+            second_successor
+                .logical_key_value()
+                .is_some_and(|key| key.contains(":raw:2:50"))
+        );
+    }
+
+    #[test]
+    fn rejected_poll_votes_never_fall_back_to_ordinary_notes() {
+        assert!(!remote_poll_vote_allows_note_fallback(
+            RemotePollVoteOutcome::Consumed
+        ));
+        assert!(remote_poll_vote_allows_note_fallback(
+            RemotePollVoteOutcome::NotPollVote
+        ));
+    }
 
     #[test]
     fn retry_backoff_is_deterministic_jittered_and_bounded() {
@@ -6398,18 +8426,269 @@ mod tests {
     }
 
     #[test]
+    fn status_update_distribution_fences_both_versions_and_only_coalesces_poll_jobs() {
+        let status_version = DateTime::<Utc>::from_timestamp(1_700_000_000, 0)
+            .expect("valid timestamp")
+            .naive_utc();
+        let old_poll = status_version + Duration::microseconds(1);
+        let current_poll = old_poll + Duration::microseconds(1);
+
+        assert_eq!(
+            status_update_versions(
+                status_version,
+                Some(current_poll),
+                Some(status_version),
+                Some(old_poll),
+                StatusUpdateKind::Status,
+                true,
+            ),
+            None,
+            "a delayed status edit must not serialize a newer poll"
+        );
+        assert_eq!(
+            status_update_versions(
+                status_version,
+                Some(current_poll),
+                Some(status_version),
+                Some(old_poll),
+                StatusUpdateKind::Poll,
+                true,
+            ),
+            Some((status_version, Some(current_poll), current_poll)),
+            "a poll job may coalesce only while its status snapshot remains current"
+        );
+        assert_eq!(
+            status_update_versions(
+                status_version + Duration::microseconds(1),
+                Some(current_poll),
+                Some(status_version),
+                Some(old_poll),
+                StatusUpdateKind::Poll,
+                true,
+            ),
+            None,
+            "a poll job must repair rather than coalesce across status edits"
+        );
+        assert_eq!(
+            status_update_version_decision(
+                status_version + Duration::microseconds(2),
+                Some(current_poll),
+                Some(status_version),
+                Some(current_poll),
+                StatusUpdateKind::Poll,
+                true,
+            ),
+            StatusUpdateVersionDecision::Repair,
+            "a poll update stale only by a status edit must schedule combined repair"
+        );
+        let repaired_status = status_version + Duration::microseconds(3);
+        assert_eq!(
+            status_update_version_decision(
+                repaired_status,
+                Some(current_poll),
+                Some(repaired_status),
+                Some(current_poll),
+                StatusUpdateKind::PollRepair,
+                true,
+            ),
+            StatusUpdateVersionDecision::Deliver(
+                repaired_status,
+                Some(current_poll),
+                repaired_status,
+            ),
+            "an exact combined repair uses the newest component and does not loop"
+        );
+        assert_eq!(
+            status_update_version_decision(
+                repaired_status,
+                Some(current_poll + Duration::microseconds(1)),
+                Some(repaired_status),
+                Some(current_poll),
+                StatusUpdateKind::PollRepair,
+                true,
+            ),
+            StatusUpdateVersionDecision::Repair,
+            "a superseded repair schedules one repair for the new pair"
+        );
+        assert!(StatusUpdateKind::PollRepair.has_poll_reach());
+    }
+
+    #[test]
+    fn status_update_delivery_fences_status_and_poll_versions_independently() {
+        let status_version = DateTime::<Utc>::from_timestamp(1_700_000_000, 123_000_000)
+            .expect("valid timestamp")
+            .naive_utc();
+        let poll_version = status_version + Duration::microseconds(10);
+        let next_poll_version = poll_version + Duration::microseconds(1);
+        let object_uri = "https://local.example/users/alice/statuses/7";
+        let activity_id = activitypub::update_activity_id(object_uri, status_version);
+        let status_micros = status_version.and_utc().timestamp_micros();
+        let poll_micros = poll_version.and_utc().timestamp_micros();
+
+        assert!(status_update_delivery_is_current(
+            StatusUpdateKind::Status,
+            Some(&activity_id),
+            object_uri,
+            status_version,
+            Some(poll_version),
+            Some(status_micros),
+            Some(poll_micros),
+            Some(status_micros),
+        ));
+        let status_repair_activity_id =
+            status_snapshot_repair_activity_id(object_uri, status_version, None);
+        assert_ne!(status_repair_activity_id, activity_id);
+        assert!(status_update_delivery_is_current(
+            StatusUpdateKind::StatusRepair,
+            Some(&status_repair_activity_id),
+            object_uri,
+            status_version,
+            None,
+            Some(status_micros),
+            None,
+            Some(status_micros),
+        ));
+        let poll_activity_id = activitypub::update_activity_id(object_uri, poll_version);
+        assert!(status_update_delivery_is_current(
+            StatusUpdateKind::Poll,
+            Some(&poll_activity_id),
+            object_uri,
+            status_version,
+            Some(poll_version),
+            Some(status_micros),
+            Some(poll_micros),
+            Some(poll_micros),
+        ));
+        let repair_status_version = poll_version + Duration::microseconds(10);
+        let repair_status_micros = repair_status_version.and_utc().timestamp_micros();
+        let repair_activity_id = status_snapshot_repair_activity_id(
+            object_uri,
+            repair_status_version,
+            Some(poll_version),
+        );
+        assert_ne!(
+            repair_activity_id,
+            status_snapshot_repair_activity_id(
+                object_uri,
+                repair_status_version,
+                Some(next_poll_version),
+            ),
+            "repair identity must bind both snapshots even when their maximum is unchanged"
+        );
+        assert!(status_update_delivery_is_current(
+            StatusUpdateKind::PollRepair,
+            Some(&repair_activity_id),
+            object_uri,
+            repair_status_version,
+            Some(poll_version),
+            Some(repair_status_micros),
+            Some(poll_micros),
+            Some(repair_status_micros),
+        ));
+        assert_eq!(
+            inferred_current_repair_delivery_kind(
+                Some(&repair_activity_id),
+                object_uri,
+                repair_status_version,
+                Some(poll_version),
+                Some(repair_status_micros),
+            ),
+            Some(StatusUpdateKind::PollRepair),
+            "an exact pair-bound repair remains deliverable if its metadata is stripped"
+        );
+        assert!(!status_update_delivery_is_current(
+            StatusUpdateKind::Status,
+            Some(&activity_id),
+            object_uri,
+            status_version,
+            Some(next_poll_version),
+            Some(status_micros),
+            Some(poll_micros),
+            Some(status_micros),
+        ));
+        assert!(!status_update_delivery_is_current(
+            StatusUpdateKind::Status,
+            Some(&activity_id),
+            object_uri,
+            status_version + Duration::microseconds(1),
+            Some(poll_version),
+            Some(status_micros),
+            Some(poll_micros),
+            Some(status_micros),
+        ));
+    }
+
+    #[test]
+    fn legacy_or_partial_status_update_delivery_metadata_requires_current_repair() {
+        let micros = Some(1_700_000_000_000_000);
+        assert_eq!(
+            complete_status_update_delivery_kind(
+                Some("poll_repair"),
+                true,
+                micros,
+                micros,
+                micros,
+                micros,
+            ),
+            Some(StatusUpdateKind::PollRepair)
+        );
+        for (kind, edited, poll, version) in [
+            (None, micros, micros, micros),
+            (Some("poll"), None, micros, micros),
+            (Some("poll"), micros, None, micros),
+            (Some("poll"), micros, micros, None),
+        ] {
+            assert_eq!(
+                complete_status_update_delivery_kind(kind, true, edited, poll, version, micros),
+                None,
+                "incomplete legacy metadata must schedule a current combined repair"
+            );
+        }
+        assert_eq!(
+            complete_status_update_delivery_kind(
+                Some("status"),
+                false,
+                micros,
+                None,
+                micros,
+                micros,
+            ),
+            Some(StatusUpdateKind::Status)
+        );
+        assert_eq!(
+            complete_status_update_delivery_kind(
+                Some("status"),
+                false,
+                micros,
+                micros,
+                micros,
+                micros,
+            ),
+            None,
+            "a contradictory poll snapshot must not make a legacy body current"
+        );
+        let later = micros.map(|value| value + 1);
+        assert_eq!(
+            complete_status_update_delivery_kind(Some("status"), true, micros, later, later, later,),
+            None,
+            "kind, published time, and selected version must agree"
+        );
+    }
+
+    #[test]
     fn remote_create_wrapper_keeps_activity_and_note_uris_distinct() {
         let note_uri = "https://remote.example/users/alice/statuses/1";
         let create_uri = "https://remote.example/activities/1";
         let document = json!({
             "id": create_uri,
-            "type": "Create",
+            "type": ["Create"],
             "actor": "https://remote.example/users/alice",
             "object": {
                 "id": note_uri,
-                "type": "Note",
+                "type": ["Question"],
                 "attributedTo": "https://remote.example/users/alice",
-                "content": "hello"
+                "content": "hello",
+                "oneOf": [{"type": "Note", "name": "Tea"}]
             }
         });
         let (object, actor_uri, target_uri) =
@@ -6515,9 +8794,10 @@ mod tests {
         let object_uri = "https://remote.example/statuses/1";
         let valid = json!({
             "id": object_uri,
-            "type": "Note",
+            "type": ["Question"],
             "attributedTo": actor_uri,
-            "content": "hello"
+            "content": "hello",
+            "oneOf": [{"type": "Note", "name": "Tea"}]
         });
         assert!(resolved_create_note(&valid, activity_uri, actor_uri, object_uri).is_ok());
     }

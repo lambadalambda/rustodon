@@ -488,6 +488,7 @@ async fn stream_history_is_durable_and_bounded_without_pruning_other_outbox_kind
 
 #[tokio::test]
 #[ignore = "starts a disposable restored Mastodon PostgreSQL fixture through Mise"]
+#[allow(clippy::too_many_lines)]
 async fn timeline_replay_is_bounded_by_event_class_and_commit_cursor()
 -> Result<(), Box<dyn std::error::Error>> {
     let url = std::env::var("RUSTODON_OPERATIONAL_ADMIN_DATABASE_URL")?;
@@ -912,7 +913,10 @@ async fn staged_stream_flush_is_bounded_ordered_and_does_not_lock_early()
                 || (FIRST_OBJECT..FIRST_OBJECT + EVENT_COUNT).contains(&event.object_id)
         })
         .collect::<Vec<_>>();
-    assert_eq!(relevant.len(), EVENT_COUNT as usize + 1);
+    assert_eq!(
+        relevant.len(),
+        usize::try_from(EVENT_COUNT).expect("event count fits usize") + 1
+    );
     assert_eq!(relevant[0].id, unrelated_id);
     assert_eq!(relevant[0].object_id, UNRELATED_OBJECT);
     assert_eq!(

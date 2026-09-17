@@ -328,6 +328,7 @@ pub struct TimelineListRoute {
     pub list_id: i64,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TimelineRouteSnapshot {
     #[serde(default)]

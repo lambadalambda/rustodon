@@ -29,6 +29,15 @@ pub const ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND: &str = "rustodon.activitypub
 pub const ACTIVITYPUB_ACCOUNT_UPDATE_JOB_KIND: &str = "rustodon.activitypub.update_account";
 pub const ACTIVITYPUB_ACCOUNT_DELETE_JOB_KIND: &str = "rustodon.activitypub.delete_account";
 pub const MASTODON_ACCOUNT_PURGE_JOB_KIND: &str = "rustodon.mastodon.purge_account";
+pub const MASTODON_POLL_EXPIRATION_JOB_KIND: &str = "rustodon.mastodon.expire_poll";
+pub const MASTODON_POLL_EXPIRATION_EFFECT_KIND: &str = "rustodon.mastodon.poll_expiration_effect";
+pub const MASTODON_POLL_EXPIRATION_ACTIVATION_KIND: &str =
+    "rustodon.mastodon.poll_expiration_activation";
+const MASTODON_POLL_EXPIRATION_ACTIVATION_KEY: &str = "v1";
+pub const MASTODON_POLL_EXPIRATION_RECONCILE_JOB_KIND: &str =
+    "rustodon.mastodon.reconcile_poll_expirations";
+const MASTODON_POLL_EXPIRATION_RECONCILE_SUCCESS_SCOPE: &str =
+    "rustodon.mastodon.poll_expiration_reconcile_success";
 pub const MASTODON_DOMAIN_BLOCK_JOB_KIND: &str = "rustodon.mastodon.domain_block";
 pub const ACTIVITYPUB_DELIVERY_JOB_KIND: &str = "rustodon.activitypub.deliver";
 pub const ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND: &str = "rustodon.activitypub.resolve_thread";
@@ -102,6 +111,328 @@ impl FromStr for Lane {
             "maintenance" => Ok(Self::Maintenance),
             _ => Err(JobError::InvalidData("unknown durable-job lane")),
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum KindScheduleOwnership {
+    Acquired {
+        job_id: i64,
+        arguments: Value,
+    },
+    Existing {
+        job_id: i64,
+        logical_key: String,
+        arguments: Value,
+    },
+}
+
+impl KindScheduleOwnership {
+    pub(crate) const fn job_id(&self) -> i64 {
+        match self {
+            Self::Acquired { job_id, .. } | Self::Existing { job_id, .. } => *job_id,
+        }
+    }
+
+    pub(crate) const fn arguments(&self) -> &Value {
+        match self {
+            Self::Acquired { arguments, .. } | Self::Existing { arguments, .. } => arguments,
+        }
+    }
+
+    pub(crate) fn existing_logical_key(&self) -> Option<&str> {
+        match self {
+            Self::Acquired { .. } => None,
+            Self::Existing { logical_key, .. } => Some(logical_key),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PollExpirationStartupClaim {
+    Claimed(ClaimedJob),
+    ActiveLease,
+    Missing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PollExpirationEffectOutcome {
+    HistoricalBaseline,
+    EffectsEnqueued,
+    RemotePastExpirySuppressed,
+}
+
+impl PollExpirationEffectOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::HistoricalBaseline => "historical_baseline",
+            Self::EffectsEnqueued => "effects_enqueued",
+            Self::RemotePastExpirySuppressed => "remote_past_expiry_suppressed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PollExpirationRepairAction {
+    Healthy,
+    MoveEarlier,
+    MovePendingEarlier,
+    Completed,
+    Create,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PollExpirationRepairState {
+    pub effect_recorded: bool,
+    pub live_run_at: Option<DateTime<Utc>>,
+    pub live_expected_run_at: Option<DateTime<Utc>>,
+    pub live_leased: bool,
+    pub live_attempted: bool,
+    pub pending_run_at: Option<DateTime<Utc>>,
+    pub pending_expected_run_at: Option<DateTime<Utc>>,
+}
+
+fn poll_expiration_repair_action(state: PollExpirationRepairState) -> PollExpirationRepairAction {
+    if state.effect_recorded {
+        return PollExpirationRepairAction::Completed;
+    }
+    if let Some(run_at) = state.live_run_at {
+        return if !state.live_leased
+            && !state.live_attempted
+            && state
+                .live_expected_run_at
+                .is_some_and(|expected| run_at > expected)
+        {
+            PollExpirationRepairAction::MoveEarlier
+        } else {
+            PollExpirationRepairAction::Healthy
+        };
+    }
+    if let Some(run_at) = state.pending_run_at {
+        return if state
+            .pending_expected_run_at
+            .is_some_and(|expected| run_at > expected)
+        {
+            PollExpirationRepairAction::MovePendingEarlier
+        } else {
+            PollExpirationRepairAction::Healthy
+        };
+    }
+    PollExpirationRepairAction::Create
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PollExpirationIntentKind {
+    Initial,
+    Reschedule,
+    Repair,
+}
+
+#[must_use]
+pub(crate) fn poll_expiration_generation(expires_at: DateTime<Utc>) -> i64 {
+    expires_at.timestamp_micros()
+}
+
+#[must_use]
+pub(crate) fn poll_expiration_effect_key(poll_id: i64, generation: i64) -> String {
+    format!("poll-expiration-effect:{poll_id}:generation:{generation}")
+}
+
+#[must_use]
+pub(crate) fn poll_expiration_is_historical(
+    expires_at: DateTime<Utc>,
+    activation: DateTime<Utc>,
+) -> bool {
+    expires_at <= activation
+}
+
+pub(crate) fn poll_expiration_activation_payload(activation: DateTime<Utc>) -> Value {
+    json!({
+        "version": 1,
+        "activated_at_micros": activation.timestamp_micros(),
+    })
+}
+
+pub(crate) fn validate_poll_expiration_activation(
+    created_at: DateTime<Utc>,
+    dispatched_at: Option<DateTime<Utc>>,
+    payload: &Value,
+) -> Result<DateTime<Utc>, JobError> {
+    if dispatched_at != Some(created_at)
+        || *payload != poll_expiration_activation_payload(created_at)
+    {
+        return Err(JobError::InvalidData(
+            "poll expiration activation marker is malformed",
+        ));
+    }
+    Ok(created_at)
+}
+
+pub(crate) fn poll_expiration_effect_payload(
+    poll_id: i64,
+    generation: i64,
+    outcome: PollExpirationEffectOutcome,
+) -> Value {
+    json!({
+        "version": 1,
+        "poll_id": poll_id,
+        "expires_at_micros": generation,
+        "outcome": outcome.as_str(),
+    })
+}
+
+pub(crate) fn validate_poll_expiration_effect(
+    payload: &Value,
+    poll_id: i64,
+    generation: i64,
+) -> Result<PollExpirationEffectOutcome, JobError> {
+    for outcome in [
+        PollExpirationEffectOutcome::HistoricalBaseline,
+        PollExpirationEffectOutcome::EffectsEnqueued,
+        PollExpirationEffectOutcome::RemotePastExpirySuppressed,
+    ] {
+        if *payload == poll_expiration_effect_payload(poll_id, generation, outcome) {
+            return Ok(outcome);
+        }
+    }
+    Err(JobError::InvalidData(
+        "poll expiration effect marker is malformed",
+    ))
+}
+
+pub(crate) fn validate_dispatched_poll_expiration_effect(
+    payload: &Value,
+    dispatched_at: Option<DateTime<Utc>>,
+    poll_id: i64,
+    generation: i64,
+) -> Result<PollExpirationEffectOutcome, JobError> {
+    if dispatched_at.is_none() {
+        return Err(JobError::InvalidData(
+            "poll expiration effect marker is not dispatched",
+        ));
+    }
+    validate_poll_expiration_effect(payload, poll_id, generation)
+}
+
+pub(crate) async fn poll_expiration_activation_in(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<DateTime<Utc>, JobError> {
+    let row = sqlx::query_as::<_, (DateTime<Utc>, Option<DateTime<Utc>>, Value)>(
+        "SELECT created_at, dispatched_at, payload FROM rustodon.outbox_events \
+         WHERE kind = $1 AND logical_key = $2",
+    )
+    .bind(MASTODON_POLL_EXPIRATION_ACTIVATION_KIND)
+    .bind(MASTODON_POLL_EXPIRATION_ACTIVATION_KEY)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(JobError::InvalidData(
+        "poll expiration activation marker is missing",
+    ))?;
+    validate_poll_expiration_activation(row.0, row.1, &row.2)
+}
+
+pub(crate) async fn poll_expiration_effect_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    poll_id: i64,
+    generation: i64,
+) -> Result<Option<PollExpirationEffectOutcome>, JobError> {
+    let row = sqlx::query_as::<_, (Value, Option<DateTime<Utc>>)>(
+        "SELECT payload, dispatched_at FROM rustodon.outbox_events \
+         WHERE kind = $1 AND logical_key = $2",
+    )
+    .bind(MASTODON_POLL_EXPIRATION_EFFECT_KIND)
+    .bind(poll_expiration_effect_key(poll_id, generation))
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some((payload, dispatched_at)) = row else {
+        return Ok(None);
+    };
+    validate_dispatched_poll_expiration_effect(&payload, dispatched_at, poll_id, generation)
+        .map(Some)
+}
+
+pub(crate) async fn record_poll_expiration_effect_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    poll_id: i64,
+    generation: i64,
+    outcome: PollExpirationEffectOutcome,
+) -> Result<(), JobError> {
+    sqlx::query(
+        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload, dispatched_at) \
+         VALUES ($1, $2, $3, clock_timestamp()) \
+         ON CONFLICT (kind, logical_key) WHERE logical_key IS NOT NULL DO NOTHING",
+    )
+    .bind(MASTODON_POLL_EXPIRATION_EFFECT_KIND)
+    .bind(poll_expiration_effect_key(poll_id, generation))
+    .bind(poll_expiration_effect_payload(poll_id, generation, outcome))
+    .execute(&mut **transaction)
+    .await?;
+    let recorded = poll_expiration_effect_in(transaction, poll_id, generation).await?;
+    if recorded != Some(outcome) {
+        return Err(JobError::InvalidData(
+            "poll expiration effect marker conflicts with its generation",
+        ));
+    }
+    Ok(())
+}
+
+#[must_use]
+pub(crate) fn poll_expiration_job(
+    poll_id: i64,
+    expires_at: DateTime<Utc>,
+    kind: PollExpirationIntentKind,
+    run_at: DateTime<Utc>,
+) -> JobSpec {
+    let generation = poll_expiration_generation(expires_at);
+    let suffix = match kind {
+        PollExpirationIntentKind::Initial => "initial",
+        PollExpirationIntentKind::Reschedule => "reschedule",
+        PollExpirationIntentKind::Repair => "repair",
+    };
+    JobSpec::new(
+        Lane::Core,
+        MASTODON_POLL_EXPIRATION_JOB_KIND,
+        json!({"poll_id": poll_id, "expires_at_micros": generation}),
+    )
+    .logical_key(format!(
+        "poll-expiration:{poll_id}:generation:{generation}:{suffix}"
+    ))
+    .run_at(run_at)
+}
+
+fn poll_expiration_reconciliation_keys(
+    poll_id: i64,
+    expires_at: DateTime<Utc>,
+    target_run_at: DateTime<Utc>,
+) -> Vec<String> {
+    let generation = poll_expiration_generation(expires_at);
+    vec![
+        format!("poll-expiration:{poll_id}:generation:{generation}:reschedule"),
+        format!("poll-expiration:{poll_id}:generation:{generation}:initial"),
+        format!("poll-expiration:{poll_id}:generation:{generation}:repair"),
+        format!("poll-expiration:{poll_id}:reschedule:{generation}"),
+        format!(
+            "poll-expiration:{poll_id}:{}",
+            target_run_at.timestamp_micros()
+        ),
+        format!("poll-expiration:{poll_id}"),
+    ]
+}
+
+fn poll_expiration_expected_run_at(
+    key: Option<&str>,
+    poll_id: i64,
+    expires_at: DateTime<Utc>,
+    target_run_at: DateTime<Utc>,
+) -> DateTime<Utc> {
+    let generation = poll_expiration_generation(expires_at);
+    let current_reschedule =
+        format!("poll-expiration:{poll_id}:generation:{generation}:reschedule");
+    let legacy_reschedule = format!("poll-expiration:{poll_id}:reschedule:{generation}");
+    if key.is_some_and(|key| key == current_reschedule || key == legacy_reschedule) {
+        expires_at + chrono::Duration::minutes(5)
+    } else {
+        target_run_at
     }
 }
 
@@ -366,6 +697,506 @@ impl Queue {
         let id = enqueue_in(&mut transaction, spec).await?;
         transaction.commit().await?;
         Ok(id)
+    }
+
+    /// Creates or reads the immutable database-clock poll-expiration activation boundary.
+    pub(crate) async fn ensure_poll_expiration_activation(
+        &self,
+    ) -> Result<DateTime<Utc>, JobError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "WITH stamp AS (SELECT clock_timestamp() AS activated_at) \
+             INSERT INTO rustodon.outbox_events \
+                 (kind, logical_key, payload, created_at, dispatched_at) \
+             SELECT $1, $2, jsonb_build_object( \
+                        'version', 1, \
+                        'activated_at_micros', \
+                        (extract(epoch FROM activated_at) * 1000000)::bigint), \
+                    activated_at, activated_at \
+               FROM stamp \
+             ON CONFLICT (kind, logical_key) WHERE logical_key IS NOT NULL DO NOTHING",
+        )
+        .bind(MASTODON_POLL_EXPIRATION_ACTIVATION_KIND)
+        .bind(MASTODON_POLL_EXPIRATION_ACTIVATION_KEY)
+        .execute(&mut *transaction)
+        .await?;
+        let activation = poll_expiration_activation_in(&mut transaction).await?;
+        transaction.commit().await?;
+        Ok(activation)
+    }
+
+    /// Creates the poll-expiration activation marker in disposable fixtures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the marker is malformed or the database operation fails.
+    #[cfg(feature = "test-support")]
+    pub async fn ensure_poll_expiration_activation_for_test(
+        &self,
+    ) -> Result<DateTime<Utc>, JobError> {
+        self.ensure_poll_expiration_activation().await
+    }
+
+    /// Reads the immutable poll-expiration activation boundary, failing closed if absent or bad.
+    pub(crate) async fn poll_expiration_activation(&self) -> Result<DateTime<Utc>, JobError> {
+        let mut transaction = self.pool.begin().await?;
+        let activation = poll_expiration_activation_in(&mut transaction).await?;
+        transaction.commit().await?;
+        Ok(activation)
+    }
+
+    /// Enqueues a scheduled job only when no live job of that kind exists.
+    ///
+    /// A transaction-scoped advisory lock makes the idle check and enqueue atomic across
+    /// independent schedulers.
+    pub(crate) async fn enqueue_if_kind_idle(
+        &self,
+        kind: &str,
+        spec: &JobSpec,
+    ) -> Result<KindScheduleOwnership, JobError> {
+        if spec.kind() != kind {
+            return Err(JobError::InvalidInput(
+                "scheduled job kind must match its singleton kind",
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock( \
+                pg_catalog.hashtextextended($1, 0))",
+        )
+        .bind(format!("rustodon:schedule-kind:{kind}"))
+        .execute(&mut *transaction)
+        .await?;
+        let existing = sqlx::query_as::<_, (i64, String, Option<String>, Value)>(
+            "SELECT id, lane, logical_key, arguments FROM rustodon.durable_jobs \
+             WHERE kind = $1 AND dead_at IS NULL ORDER BY id LIMIT 1",
+        )
+        .bind(kind)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let ownership = if let Some((job_id, lane, logical_key, arguments)) = existing {
+            if lane != spec.lane.as_str() {
+                transaction.rollback().await?;
+                return Err(JobError::InvalidData(
+                    "singleton job exists in an unexpected lane",
+                ));
+            }
+            KindScheduleOwnership::Existing {
+                job_id,
+                logical_key: logical_key.ok_or(JobError::InvalidData(
+                    "singleton jobs require a logical key",
+                ))?,
+                arguments,
+            }
+        } else {
+            let job_id = enqueue_in(&mut transaction, spec).await?;
+            let arguments = sqlx::query_scalar::<_, Value>(
+                "SELECT arguments FROM rustodon.durable_jobs WHERE id = $1 AND kind = $2",
+            )
+            .bind(job_id)
+            .bind(kind)
+            .fetch_one(&mut *transaction)
+            .await?;
+            KindScheduleOwnership::Acquired { job_id, arguments }
+        };
+        transaction.commit().await?;
+        Ok(ownership)
+    }
+
+    /// Enqueues a job and verifies that any conflict resolved to the exact requested row.
+    pub(crate) async fn enqueue_exact(&self, spec: &JobSpec) -> Result<i64, JobError> {
+        let mut transaction = self.pool.begin().await?;
+        let id = enqueue_in(&mut transaction, spec).await?;
+        let persisted = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                Value,
+                Option<String>,
+                DateTime<Utc>,
+                i32,
+                i32,
+            ),
+        >(
+            "SELECT lane, kind, arguments, logical_key, run_at, attempts, max_attempts \
+             FROM rustodon.durable_jobs WHERE id = $1 AND dead_at IS NULL FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(JobError::InvalidData("exact durable job is missing"))?;
+        if persisted.0 != spec.lane.as_str()
+            || persisted.1 != spec.kind
+            || persisted.2 != spec.arguments
+            || persisted.3 != spec.logical_key
+            || persisted.4 > spec.run_at
+            || persisted.5 >= persisted.6
+            || persisted.6 != spec.max_attempts
+        {
+            transaction.rollback().await?;
+            return Err(JobError::InvalidData(
+                "exact durable job conflicts with existing work",
+            ));
+        }
+        transaction.commit().await?;
+        Ok(id)
+    }
+
+    /// Exercises exact continuation persistence in disposable fixtures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when existing live work does not exactly match the requested job.
+    #[cfg(feature = "test-support")]
+    pub async fn enqueue_exact_for_test(&self, spec: &JobSpec) -> Result<i64, JobError> {
+        self.enqueue_exact(spec).await
+    }
+
+    /// Claims one exact existing reconciliation for bounded startup execution.
+    ///
+    /// Unlike ordinary claims this deliberately ignores `run_at`, but only for the exact
+    /// reconciliation kind and logical key. A live external lease is never stolen.
+    pub(crate) async fn claim_poll_expiration_reconciliation_for_startup(
+        &self,
+        job_id: i64,
+        logical_key: &str,
+        arguments: &Value,
+        lease_owner: &str,
+        lease_duration: Duration,
+    ) -> Result<PollExpirationStartupClaim, JobError> {
+        validate_lease(lease_owner, lease_duration)?;
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT lease_expires_at FROM rustodon.durable_jobs \
+             WHERE id = $1 AND kind = $2 AND lane = 'maintenance' \
+               AND logical_key = $3 AND arguments = $4 AND dead_at IS NULL FOR UPDATE",
+        )
+        .bind(job_id)
+        .bind(MASTODON_POLL_EXPIRATION_RECONCILE_JOB_KIND)
+        .bind(logical_key)
+        .bind(arguments)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(lease_expires_at) = row else {
+            transaction.commit().await?;
+            return Ok(PollExpirationStartupClaim::Missing);
+        };
+        let now = sqlx::query_scalar::<_, DateTime<Utc>>("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await?;
+        if lease_expires_at.is_some_and(|expires_at| expires_at > now) {
+            transaction.commit().await?;
+            return Ok(PollExpirationStartupClaim::ActiveLease);
+        }
+        let row = sqlx::query(
+            "UPDATE rustodon.durable_jobs \
+                SET attempts = CASE WHEN attempts < max_attempts THEN attempts + 1 ELSE attempts END, \
+                    lease_generation = lease_generation + 1, lease_owner = $2, \
+                    lease_expires_at = clock_timestamp() \
+                      + make_interval(secs => $3::double precision / 1000), \
+                    updated_at = clock_timestamp() \
+              WHERE id = $1 AND dead_at IS NULL \
+              RETURNING id, lane, kind, arguments, logical_key, run_at, attempts, max_attempts, \
+                        lease_generation, lease_owner, lease_expires_at",
+        )
+        .bind(job_id)
+        .bind(lease_owner)
+        .bind(lease_duration.num_milliseconds())
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(PollExpirationStartupClaim::Claimed(claimed_job(&row)?))
+    }
+
+    /// Atomically acknowledges a leased reconciliation and records its successful pass.
+    pub(crate) async fn complete_poll_expiration_reconciliation_success(
+        &self,
+        job: &ClaimedJob,
+    ) -> Result<bool, JobError> {
+        if job.kind != MASTODON_POLL_EXPIRATION_RECONCILE_JOB_KIND || job.lane != Lane::Maintenance
+        {
+            return Err(JobError::InvalidInput(
+                "reconciliation completion requires a maintenance reconciliation job",
+            ));
+        }
+        let logical_key = job.logical_key.as_deref().ok_or(JobError::InvalidData(
+            "poll expiration reconciliation logical key is missing",
+        ))?;
+        #[cfg(feature = "test-support")]
+        if self.fail_complete_once.swap(false, Ordering::SeqCst) {
+            return Err(JobError::InvalidData(
+                "injected durable-job completion failure",
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        let deleted = sqlx::query(
+            "DELETE FROM rustodon.durable_jobs \
+             WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3 \
+               AND kind = $4 AND lane = 'maintenance' AND logical_key = $5 AND arguments = $6 \
+               AND dead_at IS NULL AND lease_expires_at > clock_timestamp()",
+        )
+        .bind(job.id)
+        .bind(&job.lease_owner)
+        .bind(job.generation)
+        .bind(MASTODON_POLL_EXPIRATION_RECONCILE_JOB_KIND)
+        .bind(logical_key)
+        .bind(&job.arguments)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if deleted != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        record_poll_expiration_reconciliation_success_in(
+            &mut transaction,
+            job.id,
+            logical_key,
+            &job.arguments,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    /// Exercises lease-fenced poll reconciliation completion in disposable fixtures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the claimed job is invalid or `PostgreSQL` rejects completion.
+    #[cfg(feature = "test-support")]
+    pub async fn complete_poll_expiration_reconciliation_success_for_test(
+        &self,
+        job: &ClaimedJob,
+    ) -> Result<bool, JobError> {
+        self.complete_poll_expiration_reconciliation_success(job)
+            .await
+    }
+
+    /// Reports whether one exact poll-expiration reconciliation pass completed successfully.
+    pub(crate) async fn poll_expiration_reconciliation_succeeded(
+        &self,
+        job_id: i64,
+        logical_key: &str,
+        arguments: &Value,
+    ) -> Result<bool, JobError> {
+        let fingerprint = poll_expiration_reconciliation_success_fingerprint(job_id, logical_key);
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM rustodon.idempotency_keys \
+             WHERE scope = $1 AND key = $2 AND expires_at > clock_timestamp() \
+               AND fingerprint = $3 AND result = $4)",
+        )
+        .bind(MASTODON_POLL_EXPIRATION_RECONCILE_SUCCESS_SCOPE)
+        .bind(poll_expiration_reconciliation_success_key(
+            job_id,
+            logical_key,
+        ))
+        .bind(fingerprint.as_slice())
+        .bind(poll_expiration_reconciliation_success_result(
+            job_id,
+            logical_key,
+            arguments,
+        ))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(JobError::from)
+    }
+
+    /// Repairs one exact poll-expiration generation without deleting audit or dead-letter rows.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn reconcile_poll_expiration(
+        &self,
+        poll_id: i64,
+        expires_at: DateTime<Utc>,
+        target_run_at: DateTime<Utc>,
+        activation: DateTime<Utc>,
+    ) -> Result<PollExpirationRepairAction, JobError> {
+        if poll_id <= 0 {
+            return Err(JobError::InvalidInput("poll ID must be positive"));
+        }
+        let generation = poll_expiration_generation(expires_at);
+        let mut keys = poll_expiration_reconciliation_keys(poll_id, expires_at, target_run_at);
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SET LOCAL lock_timeout = '1s'")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("SET LOCAL statement_timeout = '1s'")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock( \
+                pg_catalog.hashtextextended($1, 0))",
+        )
+        .bind(format!(
+            "rustodon:poll_expiration_repair:{poll_id}:{generation}"
+        ))
+        .execute(&mut *transaction)
+        .await?;
+
+        let primary_repair_key =
+            format!("poll-expiration:{poll_id}:generation:{generation}:repair");
+        let malformed_repair_id = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM rustodon.durable_jobs \
+             WHERE kind = $1 AND logical_key = $2 AND dead_at IS NULL \
+               AND (jsonb_typeof(arguments -> 'poll_id') IS DISTINCT FROM 'number' \
+                 OR arguments ->> 'poll_id' IS DISTINCT FROM $3::bigint::text \
+                 OR jsonb_typeof(arguments -> 'expires_at_micros') IS DISTINCT FROM 'number' \
+                 OR arguments ->> 'expires_at_micros' IS DISTINCT FROM $4::bigint::text) \
+             ORDER BY id DESC LIMIT 1 FOR UPDATE",
+        )
+        .bind(MASTODON_POLL_EXPIRATION_JOB_KIND)
+        .bind(&primary_repair_key)
+        .bind(poll_id)
+        .bind(generation)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(blocking_id) = malformed_repair_id {
+            keys.insert(0, format!("{primary_repair_key}:recovery:{blocking_id}"));
+        }
+
+        let effect_recorded = poll_expiration_effect_in(&mut transaction, poll_id, generation)
+            .await?
+            .is_some();
+        if poll_expiration_is_historical(expires_at, activation) {
+            if !effect_recorded {
+                record_poll_expiration_effect_in(
+                    &mut transaction,
+                    poll_id,
+                    generation,
+                    PollExpirationEffectOutcome::HistoricalBaseline,
+                )
+                .await?;
+            }
+            transaction.commit().await?;
+            return Ok(PollExpirationRepairAction::Completed);
+        }
+        let pending = sqlx::query_as::<_, (i64, Option<String>, DateTime<Utc>)>(
+            "SELECT id, logical_key, (payload ->> 'run_at')::timestamptz \
+               FROM rustodon.outbox_events \
+              WHERE kind = $1 AND dispatched_at IS NULL AND logical_key = ANY($2) \
+                AND jsonb_typeof(payload -> 'arguments' -> 'poll_id') = 'number' \
+                AND payload -> 'arguments' ->> 'poll_id' = $3::bigint::text \
+                AND jsonb_typeof(payload -> 'arguments' -> 'expires_at_micros') = 'number' \
+                AND payload -> 'arguments' ->> 'expires_at_micros' = $4::bigint::text \
+              ORDER BY array_position($2::text[], logical_key), id DESC LIMIT 1 FOR UPDATE",
+        )
+        .bind(MASTODON_POLL_EXPIRATION_JOB_KIND)
+        .bind(&keys)
+        .bind(poll_id)
+        .bind(generation)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let live = sqlx::query_as::<_, (i64, Option<String>, DateTime<Utc>, bool, i32)>(
+            "SELECT id, logical_key, run_at, \
+                    lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp(), \
+                    attempts \
+               FROM rustodon.durable_jobs \
+              WHERE kind = $1 AND dead_at IS NULL AND logical_key = ANY($2) \
+                AND jsonb_typeof(arguments -> 'poll_id') = 'number' \
+                AND arguments ->> 'poll_id' = $3::bigint::text \
+                AND jsonb_typeof(arguments -> 'expires_at_micros') = 'number' \
+                AND arguments ->> 'expires_at_micros' = $4::bigint::text \
+              ORDER BY array_position($2::text[], logical_key), id DESC LIMIT 1 FOR UPDATE",
+        )
+        .bind(MASTODON_POLL_EXPIRATION_JOB_KIND)
+        .bind(&keys)
+        .bind(poll_id)
+        .bind(generation)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let state = PollExpirationRepairState {
+            effect_recorded,
+            live_run_at: live.as_ref().map(|row| row.2),
+            live_expected_run_at: live.as_ref().map(|row| {
+                poll_expiration_expected_run_at(
+                    row.1.as_deref(),
+                    poll_id,
+                    expires_at,
+                    target_run_at,
+                )
+            }),
+            live_leased: live.as_ref().is_some_and(|row| row.3),
+            live_attempted: live.as_ref().is_some_and(|row| row.4 > 0),
+            pending_run_at: pending.as_ref().map(|row| row.2),
+            pending_expected_run_at: pending.as_ref().map(|row| {
+                poll_expiration_expected_run_at(
+                    row.1.as_deref(),
+                    poll_id,
+                    expires_at,
+                    target_run_at,
+                )
+            }),
+        };
+        let action = poll_expiration_repair_action(state);
+        match action {
+            PollExpirationRepairAction::MoveEarlier => {
+                let live_id = live.as_ref().map(|row| row.0).ok_or(JobError::InvalidData(
+                    "poll expiration repair lost its live job",
+                ))?;
+                let expected = state.live_expected_run_at.unwrap_or(target_run_at);
+                sqlx::query(
+                    "UPDATE rustodon.durable_jobs SET run_at = $2, updated_at = clock_timestamp() \
+                      WHERE id = $1 AND dead_at IS NULL AND attempts = 0 \
+                        AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())",
+                )
+                .bind(live_id)
+                .bind(expected)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            PollExpirationRepairAction::MovePendingEarlier => {
+                let pending_id = pending
+                    .as_ref()
+                    .map(|row| row.0)
+                    .ok_or(JobError::InvalidData(
+                        "poll expiration repair lost its pending intent",
+                    ))?;
+                let expected = state.pending_expected_run_at.unwrap_or(target_run_at);
+                sqlx::query(
+                    "UPDATE rustodon.outbox_events \
+                        SET payload = jsonb_set(payload, '{run_at}', to_jsonb($2::text)), \
+                            created_at = clock_timestamp() \
+                      WHERE id = $1 AND dispatched_at IS NULL",
+                )
+                .bind(pending_id)
+                .bind(expected.to_rfc3339())
+                .execute(&mut *transaction)
+                .await?;
+            }
+            PollExpirationRepairAction::Create => {
+                let mut repair = poll_expiration_job(
+                    poll_id,
+                    expires_at,
+                    PollExpirationIntentKind::Repair,
+                    target_run_at,
+                );
+                if let Some(recovery_key) = keys.first().filter(|_| malformed_repair_id.is_some()) {
+                    repair = repair.logical_key(recovery_key);
+                }
+                enqueue_in(&mut transaction, &repair).await?;
+            }
+            PollExpirationRepairAction::Healthy | PollExpirationRepairAction::Completed => {}
+        }
+        transaction.commit().await?;
+        Ok(action)
+    }
+
+    /// Repairs one exact generation in disposable fixtures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed state or a rejected database operation.
+    #[cfg(feature = "test-support")]
+    pub async fn reconcile_poll_expiration_for_test(
+        &self,
+        poll_id: i64,
+        expires_at: DateTime<Utc>,
+        target_run_at: DateTime<Utc>,
+        activation: DateTime<Utc>,
+    ) -> Result<PollExpirationRepairAction, JobError> {
+        self.reconcile_poll_expiration(poll_id, expires_at, target_run_at, activation)
+            .await
     }
 
     /// Enqueues a job while serializing jobs sharing an ordering key.
@@ -869,7 +1700,7 @@ impl Queue {
     ///
     /// # Errors
     ///
-    /// Returns an error when PostgreSQL cannot lock or prune the stream-event table.
+    /// Returns an error when `PostgreSQL` cannot lock or prune the stream-event table.
     pub async fn prune_stream_history(&self) -> Result<i64, JobError> {
         self.prune_stream_history_with_limits(
             Duration::hours(STREAM_HISTORY_MAX_AGE_HOURS),
@@ -883,7 +1714,7 @@ impl Queue {
     ///
     /// # Errors
     ///
-    /// Returns an error for non-positive bounds or when PostgreSQL rejects the prune.
+    /// Returns an error for non-positive bounds or when `PostgreSQL` rejects the prune.
     pub async fn prune_stream_history_with_limits(
         &self,
         max_age: Duration,
@@ -962,7 +1793,7 @@ impl Queue {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid bounds or when PostgreSQL rejects the read.
+    /// Returns an error for invalid bounds or when `PostgreSQL` rejects the read.
     pub async fn stream_replay_events(&self, through: i64) -> Result<Vec<StreamEvent>, JobError> {
         self.stream_replay_events_with_limits(
             through,
@@ -984,7 +1815,7 @@ impl Queue {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid bounds or when PostgreSQL rejects the read.
+    /// Returns an error for invalid bounds or when `PostgreSQL` rejects the read.
     pub async fn stream_replay_events_for_subscription(
         &self,
         through: i64,
@@ -1092,7 +1923,7 @@ impl Queue {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid bounds or when PostgreSQL rejects the read.
+    /// Returns an error for invalid bounds or when `PostgreSQL` rejects the read.
     pub async fn stream_replay_events_with_limits(
         &self,
         through: i64,
@@ -1306,6 +2137,56 @@ pub async fn connect_pool(
         })
         .connect_with(options)
         .await
+}
+
+fn poll_expiration_reconciliation_success_fingerprint(
+    job_id: i64,
+    logical_key: &str,
+) -> sha2::digest::Output<Sha256> {
+    Sha256::digest(format!("{job_id}\0{logical_key}").as_bytes())
+}
+
+fn poll_expiration_reconciliation_success_key(job_id: i64, logical_key: &str) -> String {
+    hex(poll_expiration_reconciliation_success_fingerprint(job_id, logical_key).as_slice())
+}
+
+fn poll_expiration_reconciliation_success_result(
+    job_id: i64,
+    logical_key: &str,
+    arguments: &Value,
+) -> Value {
+    json!({
+        "completed": true,
+        "job_id": job_id,
+        "logical_key": logical_key,
+        "arguments": arguments,
+    })
+}
+
+async fn record_poll_expiration_reconciliation_success_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    job_id: i64,
+    logical_key: &str,
+    arguments: &Value,
+) -> Result<(), JobError> {
+    let fingerprint = poll_expiration_reconciliation_success_fingerprint(job_id, logical_key);
+    let success_key = poll_expiration_reconciliation_success_key(job_id, logical_key);
+    let result = poll_expiration_reconciliation_success_result(job_id, logical_key, arguments);
+    sqlx::query(
+        "INSERT INTO rustodon.idempotency_keys \
+             (scope, key, fingerprint, result, expires_at) \
+         VALUES ($1, $2, $3, $4, clock_timestamp() + interval '30 days') \
+         ON CONFLICT (scope, key) DO UPDATE SET \
+             fingerprint = EXCLUDED.fingerprint, result = EXCLUDED.result, \
+             created_at = clock_timestamp(), expires_at = EXCLUDED.expires_at",
+    )
+    .bind(MASTODON_POLL_EXPIRATION_RECONCILE_SUCCESS_SCOPE)
+    .bind(success_key)
+    .bind(fingerprint.as_slice())
+    .bind(result)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 /// Enqueues a job inside an existing transaction for atomic application writes.
@@ -1714,12 +2595,12 @@ impl StreamEventStagingProbe {
         Ok(())
     }
 
-    /// Moves the current batch to transaction-local PostgreSQL staging without taking the global
+    /// Moves the current batch to transaction-local `PostgreSQL` staging without taking the global
     /// stream writer-order lock.
     ///
     /// # Errors
     ///
-    /// Returns an error when PostgreSQL rejects staging.
+    /// Returns an error when `PostgreSQL` rejects staging.
     pub async fn stage(
         &mut self,
         transaction: &mut Transaction<'_, Postgres>,
@@ -1731,7 +2612,7 @@ impl StreamEventStagingProbe {
     ///
     /// # Errors
     ///
-    /// Returns an error when PostgreSQL rejects the flush.
+    /// Returns an error when `PostgreSQL` rejects the flush.
     pub async fn flush(
         &mut self,
         transaction: &mut Transaction<'_, Postgres>,
@@ -1928,6 +2809,7 @@ async fn record_stream_event_for_audience_in(
         .ok_or(JobError::InvalidData("stream event batch was empty"))
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn stream_event_from_row(row: sqlx::postgres::PgRow) -> Result<StreamEvent, JobError> {
     let decode_snapshot = |column| -> Result<Option<TimelineRouteSnapshot>, JobError> {
         let value = row.try_get::<Option<Value>, _>(column)?;
@@ -2034,4 +2916,252 @@ fn bounded(value: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &value[..end]
+}
+
+#[cfg(test)]
+mod poll_expiration_repair_tests {
+    use chrono::{Duration, Utc};
+
+    use super::{
+        KindScheduleOwnership, PollExpirationEffectOutcome, PollExpirationIntentKind,
+        PollExpirationRepairAction, PollExpirationRepairState, poll_expiration_activation_payload,
+        poll_expiration_effect_key, poll_expiration_effect_payload, poll_expiration_is_historical,
+        poll_expiration_job, poll_expiration_reconciliation_success_key,
+        poll_expiration_repair_action, validate_dispatched_poll_expiration_effect,
+        validate_poll_expiration_activation, validate_poll_expiration_effect,
+    };
+
+    fn state() -> PollExpirationRepairState {
+        PollExpirationRepairState {
+            effect_recorded: false,
+            live_run_at: None,
+            live_expected_run_at: None,
+            live_leased: false,
+            live_attempted: false,
+            pending_run_at: None,
+            pending_expected_run_at: None,
+        }
+    }
+
+    #[test]
+    fn repair_decision_covers_missing_dead_healthy_late_and_completed_work() {
+        let target = Utc::now();
+        assert_eq!(
+            poll_expiration_repair_action(state()),
+            PollExpirationRepairAction::Create
+        );
+        assert_eq!(
+            poll_expiration_repair_action(PollExpirationRepairState {
+                live_run_at: Some(target),
+                live_expected_run_at: Some(target),
+                ..state()
+            }),
+            PollExpirationRepairAction::Healthy
+        );
+        assert_eq!(
+            poll_expiration_repair_action(PollExpirationRepairState {
+                live_run_at: Some(target + Duration::minutes(1)),
+                live_expected_run_at: Some(target),
+                ..state()
+            }),
+            PollExpirationRepairAction::MoveEarlier
+        );
+        assert_eq!(
+            poll_expiration_repair_action(PollExpirationRepairState {
+                live_run_at: Some(target + Duration::minutes(1)),
+                live_expected_run_at: Some(target),
+                live_leased: true,
+                ..state()
+            }),
+            PollExpirationRepairAction::Healthy
+        );
+        assert_eq!(
+            poll_expiration_repair_action(PollExpirationRepairState {
+                live_run_at: Some(target + Duration::minutes(1)),
+                live_expected_run_at: Some(target),
+                live_attempted: true,
+                ..state()
+            }),
+            PollExpirationRepairAction::Healthy
+        );
+        assert_eq!(
+            poll_expiration_repair_action(PollExpirationRepairState {
+                effect_recorded: true,
+                ..state()
+            }),
+            PollExpirationRepairAction::Completed
+        );
+    }
+
+    #[test]
+    fn early_reschedule_generations_are_healthy_at_expiry_plus_five_minutes() {
+        let expires_at = Utc::now();
+        let retry_at = expires_at + Duration::minutes(5);
+        for state in [
+            PollExpirationRepairState {
+                live_run_at: Some(retry_at),
+                live_expected_run_at: Some(retry_at),
+                ..state()
+            },
+            PollExpirationRepairState {
+                pending_run_at: Some(retry_at),
+                pending_expected_run_at: Some(retry_at),
+                ..state()
+            },
+        ] {
+            assert_eq!(
+                poll_expiration_repair_action(state),
+                PollExpirationRepairAction::Healthy
+            );
+        }
+    }
+
+    #[test]
+    fn repair_decision_updates_only_late_pending_intent() {
+        let target = Utc::now();
+        assert_eq!(
+            poll_expiration_repair_action(PollExpirationRepairState {
+                pending_run_at: Some(target + Duration::minutes(1)),
+                pending_expected_run_at: Some(target),
+                ..state()
+            }),
+            PollExpirationRepairAction::MovePendingEarlier
+        );
+        assert_eq!(
+            poll_expiration_repair_action(PollExpirationRepairState {
+                pending_run_at: Some(target),
+                pending_expected_run_at: Some(target),
+                ..state()
+            }),
+            PollExpirationRepairAction::Healthy
+        );
+    }
+
+    #[test]
+    fn kind_scheduler_preserves_the_exact_job_identity() {
+        let acquired = KindScheduleOwnership::Acquired {
+            job_id: 7,
+            arguments: serde_json::json!({"segment": 1}),
+        };
+        let existing = KindScheduleOwnership::Existing {
+            job_id: 11,
+            logical_key: "existing-reconciliation".to_owned(),
+            arguments: serde_json::json!({"segment": 2}),
+        };
+        assert_eq!(acquired.job_id(), 7);
+        assert_eq!(acquired.arguments(), &serde_json::json!({"segment": 1}));
+        assert_eq!(acquired.existing_logical_key(), None);
+        assert_eq!(existing.job_id(), 11);
+        assert_eq!(
+            existing.existing_logical_key(),
+            Some("existing-reconciliation")
+        );
+        assert_ne!(
+            poll_expiration_reconciliation_success_key(7, "same-key"),
+            poll_expiration_reconciliation_success_key(11, "same-key"),
+            "a prior row's success cannot satisfy a replacement row"
+        );
+    }
+
+    #[test]
+    fn activation_boundary_is_immutable_and_inclusive_for_history() {
+        let activation = Utc::now();
+        assert!(poll_expiration_is_historical(activation, activation));
+        assert!(poll_expiration_is_historical(
+            activation - Duration::microseconds(1),
+            activation
+        ));
+        assert!(!poll_expiration_is_historical(
+            activation + Duration::microseconds(1),
+            activation
+        ));
+
+        let payload = poll_expiration_activation_payload(activation);
+        assert_eq!(
+            validate_poll_expiration_activation(activation, Some(activation), &payload)
+                .expect("exact activation payload"),
+            activation
+        );
+        for malformed in [
+            serde_json::json!({}),
+            serde_json::json!({"version": 2, "activated_at_micros": activation.timestamp_micros()}),
+            serde_json::json!({"version": 1, "activated_at_micros": activation.timestamp_micros() + 1}),
+            serde_json::json!({"version": 1, "activated_at_micros": activation.timestamp_micros(), "extra": true}),
+        ] {
+            assert!(
+                validate_poll_expiration_activation(activation, Some(activation), &malformed)
+                    .is_err()
+            );
+        }
+        assert!(validate_poll_expiration_activation(activation, None, &payload).is_err());
+    }
+
+    #[test]
+    fn exact_generation_effect_markers_distinguish_history_from_published_effects() {
+        for outcome in [
+            PollExpirationEffectOutcome::HistoricalBaseline,
+            PollExpirationEffectOutcome::EffectsEnqueued,
+            PollExpirationEffectOutcome::RemotePastExpirySuppressed,
+        ] {
+            let payload = poll_expiration_effect_payload(7, 11, outcome);
+            assert_eq!(
+                validate_poll_expiration_effect(&payload, 7, 11).expect("exact effect payload"),
+                outcome
+            );
+        }
+        for malformed in [
+            serde_json::json!({"poll_id": 7, "expires_at_micros": 11}),
+            serde_json::json!({"version": 1, "poll_id": 8, "expires_at_micros": 11, "outcome": "effects_enqueued"}),
+            serde_json::json!({"version": 1, "poll_id": 7, "expires_at_micros": 12, "outcome": "effects_enqueued"}),
+            serde_json::json!({"version": 1, "poll_id": 7, "expires_at_micros": 11, "outcome": "unknown"}),
+        ] {
+            assert!(validate_poll_expiration_effect(&malformed, 7, 11).is_err());
+        }
+    }
+
+    #[test]
+    fn dispatched_exact_generation_effect_markers_are_the_only_terminal_markers() {
+        let dispatched_at = Utc::now();
+        for outcome in [
+            PollExpirationEffectOutcome::HistoricalBaseline,
+            PollExpirationEffectOutcome::EffectsEnqueued,
+            PollExpirationEffectOutcome::RemotePastExpirySuppressed,
+        ] {
+            let payload = poll_expiration_effect_payload(7, 11, outcome);
+            assert_eq!(
+                validate_dispatched_poll_expiration_effect(&payload, Some(dispatched_at), 7, 11,)
+                    .expect("dispatched exact effect payload"),
+                outcome
+            );
+            assert!(
+                validate_dispatched_poll_expiration_effect(&payload, None, 7, 11).is_err(),
+                "an undispatched exact effect remains actionable"
+            );
+        }
+        assert!(
+            validate_dispatched_poll_expiration_effect(
+                &serde_json::json!({"version": 0}),
+                Some(dispatched_at),
+                7,
+                11,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn expiration_jobs_and_effects_are_bound_to_the_exact_generation() {
+        let expires_at = Utc::now();
+        let generation = expires_at.timestamp_micros();
+        let job = poll_expiration_job(7, expires_at, PollExpirationIntentKind::Repair, expires_at);
+        assert_eq!(
+            job.logical_key_value(),
+            Some(format!("poll-expiration:7:generation:{generation}:repair").as_str())
+        );
+        assert_eq!(job.arguments()["expires_at_micros"], generation);
+        assert_eq!(
+            poll_expiration_effect_key(7, generation),
+            format!("poll-expiration-effect:7:generation:{generation}")
+        );
+    }
 }

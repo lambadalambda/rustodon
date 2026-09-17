@@ -983,7 +983,8 @@ schema_read_rust_test() {
     web_settings) set -- --features test-support --lib web::web_settings_tests ;;
     media_proxy) set -- --features test-support --lib web::cached_media_response_tests::cached_private_media_http_requires_status_access_even_when_files_exist ;;
     account_stats_repair) set -- --features test-support --test account_stats_repair ;;
-    mastodon_schema|saved_status_authorization|qualified_local_mentions|followed_hashtag_streams|public_oauth_revocation|oauth_response_modes|media_state)
+    mastodon_schema) set -- --features test-support --test mastodon_schema ;;
+    saved_status_authorization|qualified_local_mentions|followed_hashtag_streams|public_oauth_revocation|oauth_response_modes|media_state)
       set -- --test "$1" ;;
     *) die "unknown schema-read test: $1" ;;
   esac
@@ -1763,8 +1764,6 @@ EOF
     "UPDATE accounts SET url = 'https://wrong.invalid/@alice' WHERE id = 116844606259201001"
   run_preflight_clone_case scheduled PF_DB_SCHEDULED_STATUSES_PENDING \
     "INSERT INTO scheduled_statuses (id, account_id, params, scheduled_at) VALUES (-1, 116844606259201001, '{}'::jsonb, CURRENT_TIMESTAMP + INTERVAL '1 hour')"
-  run_preflight_clone_case active_poll PF_DB_LOCAL_POLLS_ACTIVE \
-    "UPDATE statuses SET deleted_at = NULL WHERE id = 116846257766400501; UPDATE polls SET expires_at = CURRENT_TIMESTAMP + INTERVAL '1 hour' WHERE id = 8203"
   run_preflight_clone_case account_deletion PF_DB_ACCOUNT_DELETIONS_PENDING \
     "INSERT INTO account_deletion_requests (id, account_id, created_at, updated_at) VALUES (-1, 116844606259201001, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
   run_preflight_clone_case everyone_role PF_DB_EVERYONE_ROLE_INVALID \
@@ -1897,6 +1896,9 @@ cutover_abort() {
   if [ -n "${cutover_browser_user_restore:-}" ]; then
     rm -f "$cutover_browser_user_restore"
   fi
+  if [ -n "${cutover_browser_poll_status_file:-}" ]; then
+    rm -f "$cutover_browser_poll_status_file"
+  fi
   if [ "${CUTOVER_KEEP_ARTIFACTS:-false}" = true ]; then
     printf 'cutover artifacts retained under %s and %s\n' \
       "${cutover_worker_log:-}" "${cutover_web_log:-}" >&2
@@ -2001,6 +2003,8 @@ cutover_test() {
   cutover_browser_login_activity_max=''
   cutover_browser_session_activation_max=''
   cutover_browser_token_max=''
+  cutover_browser_poll_status_file=''
+  cutover_browser_poll_status_id=''
   cutover_media_root="$ROOT/target/cutover-media-$$"
   trap cutover_abort EXIT HUP INT TERM
 
@@ -2112,6 +2116,8 @@ EOF
   case "${RUSTODON_BROWSER_AUTH:-false}" in
     true)
       cutover_browser_user_restore="$ROOT/target/cutover-browser-user-$$.sql"
+      cutover_browser_poll_status_file="$ROOT/target/cutover-browser-poll-status-$$"
+      rm -f "$cutover_browser_poll_status_file"
       cutover_browser_login_activity_max=$(run_podman exec "$PG_CONTAINER" psql \
         --set ON_ERROR_STOP=1 --tuples-only --no-align \
         --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
@@ -2124,7 +2130,19 @@ EOF
         --set ON_ERROR_STOP=1 --tuples-only --no-align \
         --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
         --command 'SELECT COALESCE(max(id), 0) FROM public.oauth_access_tokens WHERE resource_owner_id = 101' | tr -d '[:space:]')
-      case "$cutover_browser_login_activity_max:$cutover_browser_session_activation_max:$cutover_browser_token_max" in
+      cutover_browser_voter_login_activity_max=$(run_podman exec "$PG_CONTAINER" psql \
+        --set ON_ERROR_STOP=1 --tuples-only --no-align \
+        --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+        --command 'SELECT COALESCE(max(id), 0) FROM public.login_activities WHERE user_id = 102' | tr -d '[:space:]')
+      cutover_browser_voter_session_activation_max=$(run_podman exec "$PG_CONTAINER" psql \
+        --set ON_ERROR_STOP=1 --tuples-only --no-align \
+        --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+        --command 'SELECT COALESCE(max(id), 0) FROM public.session_activations WHERE user_id = 102' | tr -d '[:space:]')
+      cutover_browser_voter_token_max=$(run_podman exec "$PG_CONTAINER" psql \
+        --set ON_ERROR_STOP=1 --tuples-only --no-align \
+        --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+        --command 'SELECT COALESCE(max(id), 0) FROM public.oauth_access_tokens WHERE resource_owner_id = 102' | tr -d '[:space:]')
+      case "$cutover_browser_login_activity_max:$cutover_browser_session_activation_max:$cutover_browser_token_max:$cutover_browser_voter_login_activity_max:$cutover_browser_voter_session_activation_max:$cutover_browser_voter_token_max" in
         ''|*[!0-9:]*) die 'invalid browser authentication fixture baselines' ;;
       esac
       run_podman exec "$PG_CONTAINER" psql \
@@ -2132,6 +2150,11 @@ EOF
         --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
         --command "SELECT format('UPDATE public.users SET current_sign_in_at = %L, last_sign_in_at = %L, sign_in_count = %s, consumed_timestep = %L, updated_at = %L, otp_backup_codes = %L WHERE id = 101;', current_sign_in_at, last_sign_in_at, sign_in_count, consumed_timestep, updated_at, otp_backup_codes) FROM public.users WHERE id = 101" \
         > "$cutover_browser_user_restore"
+      run_podman exec "$PG_CONTAINER" psql \
+        --set ON_ERROR_STOP=1 --tuples-only --no-align \
+        --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+        --command "SELECT format('UPDATE public.users SET current_sign_in_at = %L, last_sign_in_at = %L, sign_in_count = %s, consumed_timestep = %L, updated_at = %L, otp_backup_codes = %L WHERE id = 102;', current_sign_in_at, last_sign_in_at, sign_in_count, consumed_timestep, updated_at, otp_backup_codes) FROM public.users WHERE id = 102" \
+        >> "$cutover_browser_user_restore"
       run_podman exec "$PG_CONTAINER" psql \
         --set ON_ERROR_STOP=1 --tuples-only --no-align \
         --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
@@ -2148,6 +2171,18 @@ EOF
   SELECT 1, format('INSERT INTO public.web_settings (id, created_at, data, updated_at, user_id) VALUES (%s, %L, %L, %L, 101);', id, created_at, data, updated_at) FROM public.web_settings WHERE user_id = 101
   UNION ALL
   SELECT 2, format('SELECT setval(''public.web_settings_id_seq'', %s, %L);', last_value, is_called) FROM public.web_settings_id_seq
+  UNION ALL
+  SELECT 3, format('DELETE FROM public.account_stats WHERE account_id = 116844606259201001; INSERT INTO public.account_stats SELECT * FROM jsonb_populate_record(NULL::public.account_stats, %L::jsonb);', to_jsonb(stats)::text) FROM public.account_stats AS stats WHERE account_id = 116844606259201001
+  UNION ALL
+  SELECT 4, format('SELECT setval(''public.statuses_id_seq'', %s, %L);', last_value, is_called) FROM public.statuses_id_seq
+  UNION ALL
+  SELECT 5, format('SELECT setval(''public.status_stats_id_seq'', %s, %L);', last_value, is_called) FROM public.status_stats_id_seq
+  UNION ALL
+  SELECT 6, format('SELECT setval(''public.conversations_id_seq'', %s, %L);', last_value, is_called) FROM public.conversations_id_seq
+  UNION ALL
+  SELECT 7, format('SELECT setval(''public.polls_id_seq'', %s, %L);', last_value, is_called) FROM public.polls_id_seq
+  UNION ALL
+  SELECT 8, format('SELECT setval(''public.poll_votes_id_seq'', %s, %L);', last_value, is_called) FROM public.poll_votes_id_seq
 ) AS restore_statements ORDER BY step;" \
         >> "$cutover_browser_user_restore"
       ;;
@@ -2165,23 +2200,70 @@ EOF
         RUSTODON_BROWSER_EMAIL="${RUSTODON_BROWSER_EMAIL:-}" \
         RUSTODON_BROWSER_PASSWORD="${RUSTODON_BROWSER_PASSWORD:-}" \
         RUSTODON_BROWSER_OTP="${RUSTODON_BROWSER_OTP:-}" \
+        RUSTODON_BROWSER_VOTER_EMAIL="${RUSTODON_BROWSER_VOTER_EMAIL:-}" \
+        RUSTODON_BROWSER_VOTER_PASSWORD="${RUSTODON_BROWSER_VOTER_PASSWORD:-}" \
+        RUSTODON_BROWSER_VOTER_OTP="${RUSTODON_BROWSER_VOTER_OTP:-}" \
+        RUSTODON_BROWSER_POLL_STATUS_FILE="$cutover_browser_poll_status_file" \
         "$ROOT/tools/rustodon-browser-smoke" \
         "https://$LOCAL_DOMAIN:$cutover_tls_port" "$LOCAL_DOMAIN"
       cutover_stop_browser_tls
+      if [ -n "$cutover_browser_poll_status_file" ]; then
+        [ -s "$cutover_browser_poll_status_file" ] ||
+          die 'browser poll smoke did not record its generated status ID'
+        cutover_browser_poll_status_id=$(tr -d '[:space:]' < "$cutover_browser_poll_status_file")
+        case "$cutover_browser_poll_status_id" in
+          ''|*[!0-9]*) die 'browser poll smoke recorded an invalid status ID' ;;
+        esac
+        rm -f "$cutover_browser_poll_status_file"
+        cutover_browser_poll_status_file=''
+      fi
       ;;
     false) ;;
     *) die 'RUSTODON_BROWSER_SMOKE must be true or false' ;;
   esac
   if [ -n "$cutover_browser_user_restore" ]; then
+    if [ -n "$cutover_browser_poll_status_id" ]; then
+      run_podman exec "$PG_CONTAINER" psql \
+      --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+      --command "BEGIN;
+CREATE TEMP TABLE rustodon_browser_poll_statuses ON COMMIT DROP AS
+  SELECT id, poll_id, conversation_id FROM public.statuses
+   WHERE id = $cutover_browser_poll_status_id
+     AND account_id = 116844606259201001 AND poll_id IS NOT NULL;
+DO \$\$ BEGIN
+  IF (SELECT count(*) FROM rustodon_browser_poll_statuses) <> 1 THEN
+    RAISE EXCEPTION 'expected exactly one browser poll status';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM public.polls
+     WHERE id = (SELECT poll_id FROM rustodon_browser_poll_statuses)
+  ) THEN
+    RAISE EXCEPTION 'browser poll is missing before exact fixture cleanup';
+  END IF;
+END \$\$;
+DELETE FROM public.notifications WHERE activity_type = 'Poll'
+  AND activity_id IN (SELECT poll_id FROM rustodon_browser_poll_statuses);
+DELETE FROM public.poll_votes WHERE poll_id IN (SELECT poll_id FROM rustodon_browser_poll_statuses);
+UPDATE public.statuses SET poll_id = NULL, conversation_id = NULL
+ WHERE id IN (SELECT id FROM rustodon_browser_poll_statuses);
+DELETE FROM public.polls WHERE id IN (SELECT poll_id FROM rustodon_browser_poll_statuses);
+DELETE FROM public.status_stats WHERE status_id IN (SELECT id FROM rustodon_browser_poll_statuses);
+DELETE FROM public.statuses WHERE id IN (SELECT id FROM rustodon_browser_poll_statuses);
+DELETE FROM public.conversations WHERE id IN (
+  SELECT conversation_id FROM rustodon_browser_poll_statuses WHERE conversation_id IS NOT NULL
+);
+COMMIT;" >/dev/null
+    fi
     run_podman exec -i "$PG_CONTAINER" psql \
       --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
       < "$cutover_browser_user_restore" >/dev/null
     run_podman exec "$PG_CONTAINER" psql \
       --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
-      --command "DELETE FROM public.session_activations WHERE user_id = 101 AND id > $cutover_browser_session_activation_max; DELETE FROM public.oauth_access_tokens WHERE resource_owner_id = 101 AND id > $cutover_browser_token_max; DELETE FROM public.login_activities WHERE user_id = 101 AND id > $cutover_browser_login_activity_max;" \
+      --command "DELETE FROM public.session_activations WHERE (user_id = 101 AND id > $cutover_browser_session_activation_max) OR (user_id = 102 AND id > $cutover_browser_voter_session_activation_max); DELETE FROM public.oauth_access_tokens WHERE (resource_owner_id = 101 AND id > $cutover_browser_token_max) OR (resource_owner_id = 102 AND id > $cutover_browser_voter_token_max); DELETE FROM public.login_activities WHERE (user_id = 101 AND id > $cutover_browser_login_activity_max) OR (user_id = 102 AND id > $cutover_browser_voter_login_activity_max);" \
       >/dev/null
-    rm -f "$cutover_browser_user_restore"
+    rm -f "$cutover_browser_user_restore" "$cutover_browser_poll_status_file"
     cutover_browser_user_restore=''
+    cutover_browser_poll_status_file=''
   fi
   RUSTODON_SMOKE_DOMAIN="$LOCAL_DOMAIN" \
     RUSTODON_SMOKE_HOST="$LOCAL_DOMAIN" \
@@ -2307,7 +2389,7 @@ validate_differential_case() {
       ;;
   esac
   case "$case_name" in
-    account_settings|actor_media_root_url|admin_create_user|authorized_fetch_read_routes_require_signatures|browser_authentication|browser_recovery_fences|browser_reauthentication_limits|browser_two_factor_management|core_rest_serializers|extended_description|extended_description_limited_mode|federation_discovery|instance_v2|local_paperclip_media|local_paperclip_deleted_media|local_web_client_shell|media_writes|mixed_profile_media|notification_writes|oauth_authorization_code|oauth_bearer_authentication|password_recovery|report_writes|rest_protocol_contracts|status_authorization_matrix|write_transactions) ;;
+    account_settings|actor_media_root_url|admin_create_user|authorized_fetch_read_routes_require_signatures|browser_authentication|browser_recovery_fences|browser_reauthentication_limits|browser_two_factor_management|core_rest_serializers|extended_description|extended_description_limited_mode|federation_discovery|instance_v2|local_paperclip_media|local_paperclip_deleted_media|local_web_client_shell|media_writes|mixed_profile_media|notification_writes|oauth_authorization_code|oauth_bearer_authentication|password_recovery|poll_lifecycle|report_writes|rest_protocol_contracts|status_authorization_matrix|write_transactions) ;;
     *) die "unknown differential case: $case_name" ;;
   esac
 }
@@ -2464,7 +2546,8 @@ GRANT SELECT, INSERT, UPDATE ON TABLE
 GRANT SELECT, INSERT ON TABLE public.severed_relationships TO $DIFFERENTIAL_WRITER;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.notification_policies TO $DIFFERENTIAL_WRITER;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.statuses TO $DIFFERENTIAL_WRITER;
-GRANT SELECT, UPDATE, DELETE ON TABLE public.polls TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.polls TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, DELETE ON TABLE public.poll_votes TO $DIFFERENTIAL_WRITER;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.account_stats TO $DIFFERENTIAL_WRITER;
 GRANT SELECT, DELETE ON TABLE public.generated_annual_reports TO $DIFFERENTIAL_WRITER;
 GRANT SELECT, DELETE ON TABLE public.fasp_follow_recommendations TO $DIFFERENTIAL_WRITER;
@@ -2496,7 +2579,8 @@ GRANT USAGE, SELECT ON SEQUENCE
 GRANT USAGE, SELECT ON SEQUENCE public.reports_id_seq, public.collection_reports_id_seq
    TO $DIFFERENTIAL_WRITER;
 GRANT USAGE, SELECT ON SEQUENCE public.admin_action_logs_id_seq TO $DIFFERENTIAL_WRITER;
-GRANT USAGE ON SEQUENCE public.web_settings_id_seq TO $DIFFERENTIAL_WRITER;
+ GRANT USAGE ON SEQUENCE public.web_settings_id_seq, public.polls_id_seq,
+   public.poll_votes_id_seq TO $DIFFERENTIAL_WRITER;
 GRANT USAGE, SELECT ON SEQUENCE
    public.bookmarks_id_seq, public.favourites_id_seq, public.status_stats_id_seq,
    public.status_pins_id_seq, public.statuses_id_seq, public.conversations_id_seq,

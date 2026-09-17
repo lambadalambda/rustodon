@@ -8,7 +8,8 @@ use rustodon::jobs::{
     ACCOUNT_DELETION_DELAY_DAYS, ACTIVITYPUB_ACCOUNT_DELETE_JOB_KIND,
     ACTIVITYPUB_ACCOUNT_UPDATE_JOB_KIND, ACTIVITYPUB_DELIVERY_JOB_KIND,
     ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND, JobSpec, Lane, MASTODON_ACCOUNT_PURGE_JOB_KIND,
-    MASTODON_DOMAIN_BLOCK_JOB_KIND, NOTIFICATION_CREATE_JOB_KIND, Queue, record_stream_event_in,
+    MASTODON_DOMAIN_BLOCK_JOB_KIND, MASTODON_POLL_EXPIRATION_EFFECT_KIND,
+    MASTODON_POLL_EXPIRATION_JOB_KIND, NOTIFICATION_CREATE_JOB_KIND, Queue, record_stream_event_in,
 };
 use rustodon::mastodon::rest::{
     AccountListKind, AccountListOptions, AccountStatusesOptions, FollowCollectionKind,
@@ -20,10 +21,10 @@ use rustodon::mastodon::{
     AccountProfileValue, AccountSourceUpdate, BearerAuthenticator, IdempotencyKey,
     InvalidTokenReason, MediaAttachmentCreate, MediaAttachmentUpdate, MediaFocus,
     NotificationActivity, NotificationCreate, NotificationCreateOutcome, NotificationType,
-    OAuthAuthenticationError, OAuthError, READ_ACCOUNTS, READ_STATUSES, Repository,
-    StatusMediaAttributeUpdate, StatusUpdate, StatusVisibility, WRITE_ACCOUNTS, WRITE_BOOKMARKS,
-    WRITE_CONVERSATIONS, WRITE_FAVOURITES, WRITE_MEDIA, WRITE_REPORTS, WRITE_STATUSES, WriteError,
-    WriteRepository,
+    OAuthAuthenticationError, OAuthError, PollCreate, READ_ACCOUNTS, READ_STATUSES,
+    RemotePollVoteOutcome, Repository, StatusMediaAttributeUpdate, StatusUpdate, StatusVisibility,
+    WRITE_ACCOUNTS, WRITE_BOOKMARKS, WRITE_CONVERSATIONS, WRITE_FAVOURITES, WRITE_MEDIA,
+    WRITE_REPORTS, WRITE_STATUSES, WriteError, WriteRepository,
 };
 use rustodon::operational_schema::migrate;
 use rustodon::paperclip::PaperclipAttachment;
@@ -7392,6 +7393,870 @@ async fn write_repository_creates_text_statuses_for_all_visibilities() -> Result
 
 #[tokio::test]
 #[ignore = "starts a restored Mastodon PostgreSQL fixture through the Mise task"]
+#[allow(clippy::too_many_lines)]
+async fn write_repository_runs_local_poll_lifecycle_transactionally() -> Result<(), Box<dyn Error>>
+{
+    let database_url = database_url();
+    let owner_url = std::env::var("RUSTODON_MASTODON_OWNER_DATABASE_URL")
+        .expect("the Podman fixture task must provide RUSTODON_MASTODON_OWNER_DATABASE_URL");
+    let writer_url = std::env::var("RUSTODON_MASTODON_WRITER_DATABASE_URL")
+        .expect("the Podman fixture task must provide RUSTODON_MASTODON_WRITER_DATABASE_URL");
+    let pool = sqlx::PgPool::connect(&owner_url).await?;
+    let mut operational_connection = PgConnection::connect(&owner_url).await?;
+    migrate(&mut operational_connection).await?;
+    for statement in [
+        "GRANT USAGE ON SCHEMA rustodon TO rustodon_differential_writer",
+        "GRANT SELECT, DELETE ON TABLE rustodon.durable_jobs TO rustodon_differential_writer",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE rustodon.idempotency_keys, rustodon.outbox_events, rustodon.ordering_markers TO rustodon_differential_writer",
+        "GRANT USAGE, SELECT ON SEQUENCE rustodon.outbox_events_id_seq TO rustodon_differential_writer",
+    ] {
+        sqlx::query(statement).execute(&pool).await?;
+    }
+    let writer = WriteRepository::connect(&writer_url).await?;
+    let before_stats: Value =
+        sqlx::query_scalar("SELECT to_jsonb(stats) FROM account_stats stats WHERE account_id = $1")
+            .bind(ALICE)
+            .fetch_one(&pool)
+            .await?;
+    let voter_scope: String = sqlx::query_scalar(
+        "SELECT scopes FROM oauth_access_tokens
+          WHERE token = 'fixture-bearer-api-moderator-v4-6-5'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    let mut status_id = None;
+    let mut poll_id = None;
+    let result = async {
+        sqlx::query(
+            "UPDATE oauth_access_tokens SET scopes = 'read write'
+              WHERE token = 'fixture-bearer-api-moderator-v4-6-5'",
+        )
+        .execute(&pool)
+        .await?;
+        let authenticator = BearerAuthenticator::new(Repository::connect(&database_url).await?);
+        let mut owner_headers = HeaderMap::new();
+        owner_headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer fixture-bearer-token-v4-6-5"),
+        );
+        let owner = authenticator
+            .authenticate(&owner_headers, WRITE_STATUSES)
+            .await?;
+        let mut voter_headers = HeaderMap::new();
+        voter_headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer fixture-bearer-api-moderator-v4-6-5"),
+        );
+        let voter = authenticator
+            .authenticate(&voter_headers, WRITE_STATUSES)
+            .await?;
+        let status = writer
+            .create_status_with_poll(
+                &owner,
+                "restored schema poll",
+                &[],
+                None,
+                Some(false),
+                Some("public"),
+                Some("en"),
+                None,
+                Some(&PollCreate {
+                    options: vec!["Tea".to_owned(), "Coffee".to_owned()],
+                    expires_in: 300,
+                    multiple: false,
+                    hide_totals: false,
+                }),
+                None,
+            )
+            .await?;
+        status_id = Some(status.status_id);
+        let created_poll_id: i64 = sqlx::query_scalar(
+            "SELECT poll.id FROM polls poll JOIN statuses status
+              ON status.poll_id = poll.id AND poll.status_id = status.id
+             WHERE status.id = $1",
+        )
+        .bind(status.status_id)
+        .fetch_one(&pool)
+        .await?;
+        poll_id = Some(created_poll_id);
+        let multiple_on_single = writer
+            .vote_poll(
+                &voter,
+                created_poll_id,
+                &[0, 1],
+                "https://fixture-v4-6-5.rustodon.invalid/",
+            )
+            .await;
+        if !matches!(multiple_on_single, Err(WriteError::Validation(_))) {
+            return Err(format!(
+                "unexpected multiple-choice ballot result for a single-choice poll: {multiple_on_single:?}"
+            )
+            .into());
+        }
+        let untouched: (Vec<i64>, i64, i64) = sqlx::query_as(
+            "SELECT poll.cached_tallies, poll.votes_count, count(vote.id) \
+               FROM polls poll LEFT JOIN poll_votes vote ON vote.poll_id = poll.id \
+              WHERE poll.id = $1 GROUP BY poll.id",
+        )
+        .bind(created_poll_id)
+        .fetch_one(&pool)
+        .await?;
+        if untouched != (vec![0, 0], 0, 0) {
+            return Err(format!("rejected ballot was not atomic: {untouched:?}").into());
+        }
+        let question_uri = format!(
+            "https://fixture-v4-6-5.rustodon.invalid/users/alice/statuses/{}",
+            status.status_id
+        );
+        if writer
+            .apply_remote_poll_vote(
+                BOB,
+                "https://remote.fixture.invalid/users/not-bob",
+                "https://remote.fixture.invalid/users/not-bob#votes/rejected",
+                &question_uri,
+                "Tea",
+                "https://fixture-v4-6-5.rustodon.invalid/",
+            )
+            .await?
+            != RemotePollVoteOutcome::Consumed
+        {
+            return Err("a signer-mismatched poll vote was not consumed fail-closed".into());
+        }
+        sqlx::query("UPDATE statuses SET visibility = 2 WHERE id = $1")
+            .bind(status.status_id)
+            .execute(&pool)
+            .await?;
+        if writer
+            .apply_remote_poll_vote(
+                CAROL,
+                "https://remote.fixture.invalid/users/carol",
+                "https://remote.fixture.invalid/users/carol#votes/private-hidden",
+                &question_uri,
+                "Tea",
+                "https://fixture-v4-6-5.rustodon.invalid/",
+            )
+            .await?
+            != RemotePollVoteOutcome::Consumed
+        {
+            return Err("a non-follower private-poll vote was not consumed fail-closed".into());
+        }
+        for _ in 0..2 {
+            if writer
+                .apply_remote_poll_vote(
+                    BOB,
+                    "https://remote.fixture.invalid/users/bob",
+                    "https://remote.fixture.invalid/users/bob#votes/restored-poll",
+                    &question_uri,
+                    "Tea",
+                    "https://fixture-v4-6-5.rustodon.invalid/",
+                )
+                .await?
+                != RemotePollVoteOutcome::Consumed
+            {
+                return Err("valid inbound poll vote was not consumed".into());
+            }
+        }
+        sqlx::query("UPDATE statuses SET visibility = 3 WHERE id = $1")
+            .bind(status.status_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO mentions (account_id, status_id, silent, created_at, updated_at) \
+             VALUES ($1, $2, false, clock_timestamp(), clock_timestamp())",
+        )
+        .bind(BOB)
+        .bind(status.status_id)
+        .execute(&pool)
+        .await?;
+        if writer
+            .apply_remote_poll_vote(
+                BOB,
+                "https://remote.fixture.invalid/users/bob",
+                "https://remote.fixture.invalid/users/bob#votes/restored-poll",
+                &question_uri,
+                "Tea",
+                "https://fixture-v4-6-5.rustodon.invalid/",
+            )
+            .await?
+            != RemotePollVoteOutcome::Consumed
+        {
+            return Err("a mentioned recipient could not replay a direct-poll vote".into());
+        }
+        if writer
+            .apply_remote_poll_vote(
+                CAROL,
+                "https://remote.fixture.invalid/users/carol",
+                "https://remote.fixture.invalid/users/carol#votes/direct-hidden",
+                &question_uri,
+                "Tea",
+                "https://fixture-v4-6-5.rustodon.invalid/",
+            )
+            .await?
+            != RemotePollVoteOutcome::Consumed
+        {
+            return Err("a non-recipient direct-poll vote was not consumed fail-closed".into());
+        }
+        for (blocker, blocked, suffix) in [
+            (ALICE, BOB, "author-blocks-voter"),
+            (BOB, ALICE, "voter-blocks-author"),
+        ] {
+            sqlx::query(
+                "INSERT INTO blocks (account_id, target_account_id, uri, created_at, updated_at) \
+                 VALUES ($1, $2, NULL, clock_timestamp(), clock_timestamp())",
+            )
+            .bind(blocker)
+            .bind(blocked)
+            .execute(&pool)
+            .await?;
+            let blocked_vote = writer
+                .apply_remote_poll_vote(
+                    BOB,
+                    "https://remote.fixture.invalid/users/bob",
+                    &format!("https://remote.fixture.invalid/users/bob#votes/{suffix}"),
+                    &question_uri,
+                    "Tea",
+                    "https://fixture-v4-6-5.rustodon.invalid/",
+                )
+                .await?;
+            sqlx::query("DELETE FROM blocks WHERE account_id = $1 AND target_account_id = $2")
+                .bind(blocker)
+                .bind(blocked)
+                .execute(&pool)
+                .await?;
+            if blocked_vote != RemotePollVoteOutcome::Consumed {
+                return Err(format!("blocked inbound vote was not consumed fail-closed: {suffix}").into());
+            }
+        }
+        sqlx::query("UPDATE statuses SET visibility = 0 WHERE id = $1")
+            .bind(status.status_id)
+            .execute(&pool)
+            .await?;
+        let inbound_state: (Vec<i64>, i64, i64) = sqlx::query_as(
+            "SELECT poll.cached_tallies, poll.votes_count, count(vote.id) \
+               FROM polls poll LEFT JOIN poll_votes vote ON vote.poll_id = poll.id \
+              WHERE poll.id = $1 GROUP BY poll.id",
+        )
+        .bind(created_poll_id)
+        .fetch_one(&pool)
+        .await?;
+        if inbound_state != (vec![1, 0], 1, 1) {
+            return Err(format!("inbound vote replay was not idempotent: {inbound_state:?}").into());
+        }
+        let vote_started_at = Utc::now();
+        writer
+            .vote_poll(
+                &voter,
+                created_poll_id,
+                &[0],
+                "https://fixture-v4-6-5.rustodon.invalid/",
+            )
+            .await?;
+        let delayed_update: (i64, DateTime<Utc>) = sqlx::query_as(
+            "SELECT count(*) OVER (), (payload ->> 'run_at')::timestamptz \
+               FROM rustodon.outbox_events WHERE kind = $1 \
+                AND payload -> 'arguments' ->> 'status_id' = $2 \
+                AND payload -> 'arguments' ->> 'update_kind' = 'poll' \
+              ORDER BY id LIMIT 1",
+        )
+        .bind(ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND)
+        .bind(status.status_id.to_string())
+        .fetch_one(&pool)
+        .await?;
+        if delayed_update.0 != 1
+            || delayed_update.1 < vote_started_at + chrono::Duration::minutes(3)
+            || delayed_update.1 > Utc::now() + chrono::Duration::minutes(3) + chrono::Duration::seconds(2)
+        {
+            return Err(format!("unexpected delayed poll update intent: {delayed_update:?}").into());
+        }
+        let state: (Vec<i64>, i64, Option<i64>, i64) = sqlx::query_as(
+            "SELECT poll.cached_tallies, poll.votes_count, poll.voters_count,
+                    count(vote.id)
+               FROM polls poll LEFT JOIN poll_votes vote ON vote.poll_id = poll.id
+              WHERE poll.id = $1 GROUP BY poll.id",
+        )
+        .bind(created_poll_id)
+        .fetch_one(&pool)
+        .await?;
+        if state != (vec![2, 0], 2, Some(2), 2) {
+            return Err(format!("unexpected poll state after vote: {state:?}").into());
+        }
+        let duplicate = writer
+            .vote_poll(
+                &voter,
+                created_poll_id,
+                &[0],
+                "https://fixture-v4-6-5.rustodon.invalid/",
+            )
+            .await;
+        if !matches!(
+            duplicate,
+            Err(WriteError::Validation(
+                "You have already voted on this poll"
+            ))
+        ) {
+            return Err(format!("unexpected duplicate vote result: {duplicate:?}").into());
+        }
+        let owner_vote = writer
+            .vote_poll(
+                &owner,
+                created_poll_id,
+                &[1],
+                "https://fixture-v4-6-5.rustodon.invalid/",
+            )
+            .await;
+        if !matches!(
+            owner_vote,
+            Err(WriteError::Validation("You cannot vote in your own polls"))
+        ) {
+            return Err(format!("unexpected owner vote result: {owner_vote:?}").into());
+        }
+        let invalid_vote = writer
+            .vote_poll(
+                &voter,
+                created_poll_id,
+                &[99],
+                "https://fixture-v4-6-5.rustodon.invalid/",
+            )
+            .await;
+        if !matches!(
+            invalid_vote,
+            Err(WriteError::Validation(
+                "The chosen vote option does not exist"
+            ))
+        ) {
+            return Err(format!("unexpected invalid vote result: {invalid_vote:?}").into());
+        }
+        writer.expire_poll(created_poll_id).await?;
+        let current_expiry: NaiveDateTime =
+            sqlx::query_scalar("SELECT expires_at FROM polls WHERE id = $1")
+                .bind(created_poll_id)
+                .fetch_one(&pool)
+                .await?;
+        let early_reschedule: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT (payload ->> 'run_at')::timestamptz FROM rustodon.outbox_events \
+              WHERE kind = $1 AND payload -> 'arguments' ->> 'poll_id' = $2 \
+                AND logical_key = $3",
+        )
+        .bind(MASTODON_POLL_EXPIRATION_JOB_KIND)
+        .bind(created_poll_id.to_string())
+        .bind(format!(
+            "poll-expiration:{created_poll_id}:generation:{}:reschedule",
+            current_expiry.and_utc().timestamp_micros()
+        ))
+        .fetch_one(&pool)
+        .await?;
+        if early_reschedule != current_expiry.and_utc() + Duration::minutes(5) {
+            return Err(format!("unexpected early expiration reschedule: {early_reschedule}").into());
+        }
+        sqlx::query(
+            "UPDATE polls SET expires_at = clock_timestamp() - interval '1 second'
+              WHERE id = $1",
+        )
+        .bind(created_poll_id)
+        .execute(&pool)
+        .await?;
+        let expired_vote = writer
+            .vote_poll(
+                &voter,
+                created_poll_id,
+                &[1],
+                "https://fixture-v4-6-5.rustodon.invalid/",
+            )
+            .await;
+        if !matches!(
+            expired_vote,
+            Err(WriteError::Validation("The poll has already ended"))
+        ) {
+            return Err(format!("unexpected expired vote result: {expired_vote:?}").into());
+        }
+        writer.expire_poll(created_poll_id).await?;
+        let notification_jobs: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM rustodon.outbox_events
+              WHERE kind = $1 AND payload -> 'arguments' ->> 'activity_type' = 'poll'
+                AND (payload -> 'arguments' ->> 'activity_id')::bigint = $2",
+        )
+        .bind(NOTIFICATION_CREATE_JOB_KIND)
+        .bind(created_poll_id)
+        .fetch_one(&pool)
+        .await?;
+        if notification_jobs != 2 {
+            return Err(format!(
+                "unexpected poll expiration notification job count: {notification_jobs}"
+            )
+            .into());
+        }
+        let final_updates: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM rustodon.outbox_events \
+              WHERE kind = $1 AND logical_key = $2 \
+                AND payload -> 'arguments' ->> 'activity_type' = 'Update' \
+                AND payload -> 'arguments' ->> 'update_kind' = 'poll'",
+        )
+        .bind(ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND)
+        .bind(format!("activitypub:poll:{created_poll_id}:expired"))
+        .fetch_one(&pool)
+        .await?;
+        if final_updates != 1 {
+            return Err(format!("unexpected final poll Update count: {final_updates}").into());
+        }
+        writer.expire_poll(created_poll_id).await?;
+        let repeated_effects: (i64, i64) = sqlx::query_as(
+            "SELECT \
+                count(*) FILTER (WHERE kind = $1 \
+                  AND payload -> 'arguments' ->> 'activity_type' = 'poll' \
+                  AND (payload -> 'arguments' ->> 'activity_id')::bigint = $3), \
+                count(*) FILTER (WHERE kind = $2 AND logical_key = $4) \
+               FROM rustodon.outbox_events",
+        )
+        .bind(NOTIFICATION_CREATE_JOB_KIND)
+        .bind(ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND)
+        .bind(created_poll_id)
+        .bind(format!("activitypub:poll:{created_poll_id}:expired"))
+        .fetch_one(&pool)
+        .await?;
+        if repeated_effects != (2, 1) {
+            return Err(format!("poll expiration was not idempotent: {repeated_effects:?}").into());
+        }
+        let expiration_generation: NaiveDateTime =
+            sqlx::query_scalar("SELECT expires_at FROM polls WHERE id = $1")
+                .bind(created_poll_id)
+                .fetch_one(&pool)
+                .await?;
+        let effect_markers: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM rustodon.outbox_events \
+              WHERE kind = $1 AND logical_key = $2 AND dispatched_at IS NOT NULL",
+        )
+        .bind(MASTODON_POLL_EXPIRATION_EFFECT_KIND)
+        .bind(format!(
+            "poll-expiration-effect:{created_poll_id}:generation:{}",
+            expiration_generation.and_utc().timestamp_micros()
+        ))
+        .fetch_one(&pool)
+        .await?;
+        if effect_markers != 1 {
+            return Err(format!("unexpected poll expiration effect markers: {effect_markers}").into());
+        }
+        Ok::<(), Box<dyn Error>>(())
+    }
+    .await;
+
+    let cleanup_result = async {
+        sqlx::query(
+            "DELETE FROM blocks WHERE (account_id = $1 AND target_account_id = $2) \
+                OR (account_id = $2 AND target_account_id = $1)",
+        )
+        .bind(ALICE)
+        .bind(BOB)
+        .execute(&pool)
+        .await?;
+        if let Some(poll_id) = poll_id {
+            sqlx::query(
+                "DELETE FROM rustodon.outbox_events
+              WHERE payload -> 'arguments' ->> 'poll_id' = $1
+                 OR payload -> 'arguments' ->> 'activity_id' = $1",
+            )
+            .bind(poll_id.to_string())
+            .execute(&pool)
+            .await?;
+            sqlx::query(
+                "DELETE FROM rustodon.durable_jobs
+              WHERE arguments ->> 'poll_id' = $1
+                 OR arguments ->> 'activity_id' = $1",
+            )
+            .bind(poll_id.to_string())
+            .execute(&pool)
+            .await?;
+            sqlx::query(
+                "DELETE FROM notifications WHERE activity_type = 'Poll' AND activity_id = $1",
+            )
+            .bind(poll_id)
+            .execute(&pool)
+            .await?;
+            sqlx::query("DELETE FROM poll_votes WHERE poll_id = $1")
+                .bind(poll_id)
+                .execute(&pool)
+                .await?;
+            if let Some(status_id) = status_id {
+                sqlx::query("UPDATE statuses SET poll_id = NULL WHERE id = $1")
+                    .bind(status_id)
+                    .execute(&pool)
+                    .await?;
+            }
+            sqlx::query("DELETE FROM polls WHERE id = $1")
+                .bind(poll_id)
+                .execute(&pool)
+                .await?;
+        }
+        if let Some(status_id) = status_id {
+            sqlx::query(
+                "DELETE FROM rustodon.outbox_events
+              WHERE payload -> 'arguments' ->> 'status_id' = $1",
+            )
+            .bind(status_id.to_string())
+            .execute(&pool)
+            .await?;
+            sqlx::query(
+                "DELETE FROM rustodon.durable_jobs
+              WHERE arguments ->> 'status_id' = $1",
+            )
+            .bind(status_id.to_string())
+            .execute(&pool)
+            .await?;
+            sqlx::query("DELETE FROM status_stats WHERE status_id = $1")
+                .bind(status_id)
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM statuses WHERE id = $1")
+                .bind(status_id)
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM conversations WHERE parent_status_id = $1")
+                .bind(status_id)
+                .execute(&pool)
+                .await?;
+        }
+        sqlx::query("DELETE FROM account_stats WHERE account_id = $1")
+            .bind(ALICE)
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+        "INSERT INTO account_stats SELECT * FROM jsonb_populate_record(NULL::account_stats, $1)",
+    )
+        .bind(before_stats)
+        .execute(&pool)
+        .await?;
+        Ok::<(), Box<dyn Error>>(())
+    }
+    .await;
+    let scope_restore_result = sqlx::query(
+        "UPDATE oauth_access_tokens SET scopes = $1
+          WHERE token = 'fixture-bearer-api-moderator-v4-6-5'",
+    )
+    .bind(voter_scope)
+    .execute(&pool)
+    .await;
+    cleanup_result?;
+    scope_restore_result?;
+    result
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "starts a restored Mastodon PostgreSQL fixture through the Mise task"]
+#[allow(clippy::too_many_lines)]
+async fn newer_signed_note_refresh_removes_obsolete_remote_poll_state() -> Result<(), Box<dyn Error>>
+{
+    const STATUS_ID: i64 = -98_700;
+    const POLL_ID: i64 = -98_701;
+    const VOTE_ID: i64 = -98_702;
+    const NOTIFICATION_ID: i64 = -98_703;
+    const ORIGIN: &str = "https://fixture-v4-6-5.rustodon.invalid/";
+
+    let owner_url = std::env::var("RUSTODON_MASTODON_OWNER_DATABASE_URL")
+        .expect("the Podman fixture task must provide RUSTODON_MASTODON_OWNER_DATABASE_URL");
+    let writer_url = std::env::var("RUSTODON_MASTODON_WRITER_DATABASE_URL")
+        .expect("the Podman fixture task must provide RUSTODON_MASTODON_WRITER_DATABASE_URL");
+    let pool = sqlx::PgPool::connect(&owner_url).await?;
+    let mut operational_connection = PgConnection::connect(&owner_url).await?;
+    migrate(&mut operational_connection).await?;
+    let writer = WriteRepository::connect(&writer_url).await?;
+    let actor_uri: String = sqlx::query_scalar("SELECT uri FROM accounts WHERE id = $1")
+        .bind(BOB)
+        .fetch_one(&pool)
+        .await?;
+    let status_uri = format!("{actor_uri}/statuses/signed-note-removes-poll");
+
+    sqlx::query("DELETE FROM notifications WHERE id = $1")
+        .bind(NOTIFICATION_ID)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM poll_votes WHERE id = $1 OR poll_id = $2")
+        .bind(VOTE_ID)
+        .bind(POLL_ID)
+        .execute(&pool)
+        .await?;
+    sqlx::query("UPDATE statuses SET poll_id = NULL WHERE id = $1")
+        .bind(STATUS_ID)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM polls WHERE id = $1")
+        .bind(POLL_ID)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM status_stats WHERE status_id = $1")
+        .bind(STATUS_ID)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM statuses WHERE id = $1")
+        .bind(STATUS_ID)
+        .execute(&pool)
+        .await?;
+
+    let current_version: NaiveDateTime = sqlx::query_scalar(
+        "INSERT INTO statuses (id, account_id, text, spoiler_text, visibility, local, uri, url, \
+             language, sensitive, reply, created_at, edited_at, updated_at) \
+         VALUES ($1, $2, 'Question', '', 0, false, $3, $3, 'en', false, false, \
+             clock_timestamp() - interval '1 hour', clock_timestamp(), clock_timestamp()) \
+         RETURNING edited_at",
+    )
+    .bind(STATUS_ID)
+    .bind(BOB)
+    .bind(&status_uri)
+    .fetch_one(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO status_stats (status_id, created_at, updated_at) \
+         VALUES ($1, clock_timestamp(), clock_timestamp())",
+    )
+    .bind(STATUS_ID)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO polls (id, account_id, status_id, options, cached_tallies, votes_count, \
+             voters_count, multiple, hide_totals, expires_at, created_at, updated_at) \
+         VALUES ($1, $2, $3, ARRAY['Tea', 'Coffee'], ARRAY[1, 0]::bigint[], 1, 1, false, \
+             false, clock_timestamp() + interval '1 hour', clock_timestamp(), clock_timestamp())",
+    )
+    .bind(POLL_ID)
+    .bind(BOB)
+    .bind(STATUS_ID)
+    .execute(&pool)
+    .await?;
+    sqlx::query("UPDATE statuses SET poll_id = $1 WHERE id = $2")
+        .bind(POLL_ID)
+        .bind(STATUS_ID)
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO poll_votes (id, account_id, poll_id, choice, uri, created_at, updated_at) \
+         VALUES ($1, $2, $3, 0, NULL, clock_timestamp(), clock_timestamp())",
+    )
+    .bind(VOTE_ID)
+    .bind(ALICE)
+    .bind(POLL_ID)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO notifications (id, account_id, activity_id, activity_type, created_at, \
+             filtered, from_account_id, group_key, type, updated_at) \
+         VALUES ($1, $2, $3, 'Poll', clock_timestamp(), false, $4, NULL, 'poll', clock_timestamp())",
+    )
+    .bind(NOTIFICATION_ID)
+    .bind(ALICE)
+    .bind(POLL_ID)
+    .bind(BOB)
+    .execute(&pool)
+    .await?;
+
+    let note = |updated: Option<NaiveDateTime>| {
+        let mut object = json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "id": status_uri,
+            "type": "Note",
+            "attributedTo": actor_uri,
+            "content": "The poll was removed",
+            "published": (current_version - Duration::hours(1)).and_utc().to_rfc3339(),
+            "to": ["https://www.w3.org/ns/activitystreams#Public"],
+            "cc": []
+        });
+        if let Some(updated) = updated {
+            object["updated"] = json!(updated.and_utc().to_rfc3339());
+        }
+        object
+    };
+    for object in [
+        note(Some(current_version - Duration::seconds(1))),
+        note(Some(current_version)),
+        note(None),
+    ] {
+        writer
+            .apply_signed_remote_poll_refresh_for_test(BOB, &actor_uri, &object, ORIGIN, POLL_ID, 0)
+            .await?;
+        let retained: (Option<i64>, i64, i64, i64) = sqlx::query_as(
+            "SELECT status.poll_id, \
+                (SELECT count(*) FROM polls WHERE id = $2), \
+                (SELECT count(*) FROM poll_votes WHERE poll_id = $2), \
+                (SELECT count(*) FROM notifications WHERE activity_type = 'Poll' AND activity_id = $2) \
+             FROM statuses status WHERE status.id = $1",
+        )
+        .bind(STATUS_ID)
+        .bind(POLL_ID)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            retained,
+            (Some(POLL_ID), 1, 1, 1),
+            "stale/equal/unversioned Notes must preserve complete poll state"
+        );
+    }
+
+    writer
+        .apply_signed_remote_poll_refresh_for_test(
+            BOB,
+            &actor_uri,
+            &note(Some(current_version + Duration::seconds(1))),
+            ORIGIN,
+            POLL_ID,
+            0,
+        )
+        .await?;
+    let removed: (Option<i64>, i64, i64, i64) = sqlx::query_as(
+        "SELECT status.poll_id, \
+            (SELECT count(*) FROM polls WHERE id = $2), \
+            (SELECT count(*) FROM poll_votes WHERE poll_id = $2), \
+            (SELECT count(*) FROM notifications WHERE activity_type = 'Poll' AND activity_id = $2) \
+         FROM statuses status WHERE status.id = $1",
+    )
+    .bind(STATUS_ID)
+    .bind(POLL_ID)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(removed, (None, 0, 0, 0));
+
+    sqlx::query(
+        "DELETE FROM rustodon.outbox_events WHERE payload #>> '{arguments,status_id}' = $1",
+    )
+    .bind(STATUS_ID.to_string())
+    .execute(&pool)
+    .await?;
+    sqlx::query("DELETE FROM status_stats WHERE status_id = $1")
+        .bind(STATUS_ID)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM statuses WHERE id = $1")
+        .bind(STATUS_ID)
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "starts a restored Mastodon PostgreSQL fixture through the Mise task"]
+#[allow(clippy::too_many_lines)]
+async fn write_repository_queues_each_remote_poll_vote_and_final_check()
+-> Result<(), Box<dyn Error>> {
+    let database_url = database_url();
+    let owner_url = std::env::var("RUSTODON_MASTODON_OWNER_DATABASE_URL")
+        .expect("the Podman fixture task must provide RUSTODON_MASTODON_OWNER_DATABASE_URL");
+    let pool = sqlx::PgPool::connect(&owner_url).await?;
+    let mut operational_connection = PgConnection::connect(&owner_url).await?;
+    migrate(&mut operational_connection).await?;
+    let writer = WriteRepository::connect(&owner_url).await?;
+    let authenticator = BearerAuthenticator::new(Repository::connect(&database_url).await?);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_static("Bearer fixture-bearer-token-v4-6-5"),
+    );
+    let voter = authenticator.authenticate(&headers, WRITE_STATUSES).await?;
+    let status_uri = "https://remote.fixture.invalid/users/bob/statuses/outbound-poll-review";
+    let status_id: i64 = sqlx::query_scalar(
+        "INSERT INTO statuses (account_id, text, spoiler_text, visibility, local, uri, url, \
+             language, sensitive, reply, created_at, updated_at) \
+         VALUES ($1, 'remote poll delivery fixture', '', 0, false, $2, $2, 'en', false, false, \
+             clock_timestamp(), clock_timestamp()) RETURNING id",
+    )
+    .bind(BOB)
+    .bind(status_uri)
+    .fetch_one(&pool)
+    .await?;
+    let expires_at = Utc::now().naive_utc() + Duration::minutes(10);
+    let poll_id: i64 = sqlx::query_scalar(
+        "INSERT INTO polls (account_id, status_id, options, cached_tallies, votes_count, \
+             voters_count, multiple, hide_totals, expires_at, created_at, updated_at) \
+         VALUES ($1, $2, ARRAY['Tea', 'Coffee'], ARRAY[0, 0]::bigint[], 0, 0, true, false, $3, \
+             clock_timestamp(), clock_timestamp()) RETURNING id",
+    )
+    .bind(BOB)
+    .bind(status_id)
+    .bind(expires_at)
+    .fetch_one(&pool)
+    .await?;
+    sqlx::query("UPDATE statuses SET poll_id = $2 WHERE id = $1")
+        .bind(status_id)
+        .bind(poll_id)
+        .execute(&pool)
+        .await?;
+
+    let result = async {
+        writer
+            .vote_poll(
+                &voter,
+                poll_id,
+                &[0, 1],
+                "https://fixture-v4-6-5.rustodon.invalid/",
+            )
+            .await?;
+        let deliveries = sqlx::query_as::<_, (i64, String, String, String, String)>(
+            "SELECT (payload -> 'arguments' ->> 'source_account_id')::bigint, \
+                    payload -> 'arguments' ->> 'inbox_url', \
+                    payload -> 'arguments' -> 'body' ->> 'type', \
+                    payload -> 'arguments' -> 'body' -> 'object' ->> 'name', \
+                    payload -> 'arguments' -> 'body' -> 'object' ->> 'inReplyTo' \
+               FROM rustodon.outbox_events WHERE kind = $1 \
+                AND payload -> 'arguments' -> 'body' -> 'object' ->> 'inReplyTo' = $2 \
+              ORDER BY payload -> 'arguments' -> 'body' -> 'object' ->> 'name'",
+        )
+        .bind(ACTIVITYPUB_DELIVERY_JOB_KIND)
+        .bind(status_uri)
+        .fetch_all(&pool)
+        .await?;
+        if deliveries.len() != 2
+            || deliveries
+                .iter()
+                .any(|row| row.0 != ALICE || row.2 != "Create" || row.4 != status_uri)
+            || deliveries
+                .iter()
+                .map(|row| row.3.as_str())
+                .collect::<Vec<_>>()
+                != ["Coffee", "Tea"]
+            || deliveries.iter().any(|row| row.1.is_empty())
+        {
+            return Err(format!("unexpected remote poll vote deliveries: {deliveries:?}").into());
+        }
+        let expiration_at: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT (payload ->> 'run_at')::timestamptz FROM rustodon.outbox_events \
+              WHERE kind = $1 AND payload -> 'arguments' ->> 'poll_id' = $2",
+        )
+        .bind(MASTODON_POLL_EXPIRATION_JOB_KIND)
+        .bind(poll_id.to_string())
+        .fetch_one(&pool)
+        .await?;
+        if expiration_at != expires_at.and_utc() + Duration::minutes(5) {
+            return Err(format!("unexpected remote poll final-check time: {expiration_at}").into());
+        }
+        Ok::<(), Box<dyn Error>>(())
+    }
+    .await;
+
+    sqlx::query(
+        "DELETE FROM rustodon.outbox_events WHERE payload -> 'arguments' ->> 'poll_id' = $1 \
+            OR payload -> 'arguments' -> 'body' -> 'object' ->> 'inReplyTo' = $2",
+    )
+    .bind(poll_id.to_string())
+    .bind(status_uri)
+    .execute(&pool)
+    .await?;
+    sqlx::query("DELETE FROM poll_votes WHERE poll_id = $1")
+        .bind(poll_id)
+        .execute(&pool)
+        .await?;
+    sqlx::query("UPDATE statuses SET poll_id = NULL WHERE id = $1")
+        .bind(status_id)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM polls WHERE id = $1")
+        .bind(poll_id)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM statuses WHERE id = $1")
+        .bind(status_id)
+        .execute(&pool)
+        .await?;
+    result
+}
+
+#[tokio::test]
+#[ignore = "starts a restored Mastodon PostgreSQL fixture through the Mise task"]
 async fn write_repository_unlinks_deleted_direct_statuses_from_conversations()
 -> Result<(), Box<dyn Error>> {
     let database_url = database_url();
@@ -7994,7 +8859,7 @@ async fn high_fanout_status_write_takes_stream_order_lock_only_at_terminal_flush
             .iter()
             .filter(|id| (ACCOUNT_BASE..ACCOUNT_BASE + FANOUT).contains(id))
             .count(),
-        FANOUT as usize
+        usize::try_from(FANOUT).expect("fanout fits usize")
     );
     assert!(recipient_ids.contains(&(ACCOUNT_BASE + FANOUT - 1)));
 

@@ -45,6 +45,8 @@ const BROWSER_MEDIA_USER_ID: i64 = 104;
 const BROWSER_MEDIA_ACCOUNT_ID: i64 = 116_844_606_259_201_004;
 const NOTIFICATION_ACCOUNT_ID: i64 = 116_844_606_259_201_001;
 const INTERACTION_ACCOUNT_ID: i64 = 116_844_606_259_201_001;
+const POLL_VOTER_ACCOUNT_ID: i64 = 116_844_606_259_201_004;
+const POLL_OUTSIDER_TOKEN: &str = "fixture-bearer-matrix-viewer-v4-6-5";
 const RELATIONSHIP_REQUEST_SOURCE_ACCOUNT_ID: i64 = 116_844_606_259_202_002;
 const RELATIONSHIP_FOLLOWER_ACCOUNT_ID: i64 = 116_844_606_259_202_001;
 const RELATIONSHIP_TARGET_ACCOUNT_ID: i64 = -323;
@@ -268,6 +270,20 @@ type DifferentialEditedStatusFields = (
     bool,
     i64,
 );
+
+type DifferentialPollState = (
+    i64,
+    Vec<String>,
+    Vec<i64>,
+    i64,
+    Option<i64>,
+    bool,
+    bool,
+    bool,
+    Vec<(i64, i32, bool)>,
+);
+
+const POLL_VOTER_TOKEN: &str = "fixture-bearer-api-moderator-v4-6-5";
 
 type StableInteractionAccountStat = (Option<i64>, Option<i64>, Option<i64>, Option<i64>);
 
@@ -559,6 +575,557 @@ pub(crate) async fn run_write_transactions_case(
 }
 
 #[allow(clippy::too_many_lines)]
+pub(crate) async fn run_poll_lifecycle_case(
+    config: DifferentialConfig,
+    rust_url: &Url,
+) -> Result<(), Box<dyn Error>> {
+    config.validate_database_comments().await?;
+    let mastodon_owner = config
+        .mastodon_owner_database
+        .as_ref()
+        .expect("poll differential configuration must include a Mastodon owner URL");
+    let rust_writer = config
+        .rust_write_database
+        .as_ref()
+        .expect("poll differential configuration must include a Rust writer URL");
+    let rust_owner = config
+        .rust_owner_database
+        .as_ref()
+        .expect("poll differential configuration must include a Rust owner URL");
+    let targets = HttpTargets::new(config.mastodon_http.as_str(), rust_url.as_str())?;
+    let mastodon_account_stats =
+        interaction_account_stat(mastodon_owner.url(), INTERACTION_ACCOUNT_ID).await?;
+    let rust_account_stats =
+        interaction_account_stat(rust_writer.url(), INTERACTION_ACCOUNT_ID).await?;
+    let mastodon_voter_scope =
+        replace_access_token_scopes(mastodon_owner.url(), POLL_VOTER_TOKEN, "read write").await?;
+    let rust_voter_scope =
+        match replace_access_token_scopes(rust_owner.url(), POLL_VOTER_TOKEN, "read write").await {
+            Ok(scope) => scope,
+            Err(error) => {
+                replace_access_token_scopes(
+                    mastodon_owner.url(),
+                    POLL_VOTER_TOKEN,
+                    &mastodon_voter_scope,
+                )
+                .await?;
+                return Err(error.into());
+            }
+        };
+    let mastodon_outsider_scope =
+        replace_access_token_scopes(mastodon_owner.url(), POLL_OUTSIDER_TOKEN, "read write")
+            .await?;
+    let rust_outsider_scope = match replace_access_token_scopes(
+        rust_owner.url(),
+        POLL_OUTSIDER_TOKEN,
+        "read write",
+    )
+    .await
+    {
+        Ok(scope) => scope,
+        Err(error) => {
+            replace_access_token_scopes(
+                mastodon_owner.url(),
+                POLL_OUTSIDER_TOKEN,
+                &mastodon_outsider_scope,
+            )
+            .await?;
+            replace_access_token_scopes(
+                mastodon_owner.url(),
+                POLL_VOTER_TOKEN,
+                &mastodon_voter_scope,
+            )
+            .await?;
+            replace_access_token_scopes(rust_owner.url(), POLL_VOTER_TOKEN, &rust_voter_scope)
+                .await?;
+            return Err(error.into());
+        }
+    };
+    let mut mastodon_ids = Vec::new();
+    let mut rust_ids = Vec::new();
+    let operation = async {
+        for (label, body) in [
+            ("missing poll before empty choices", ""),
+            (
+                "missing poll before malformed choices",
+                "choices%5B%5D=not-an-integer",
+            ),
+        ] {
+            let request = poll_request(
+                Method::POST,
+                "/api/v1/polls/9223372036854775807/votes",
+                POLL_VOTER_TOKEN,
+                body,
+            )?;
+            let responses = send_identically(&targets, &request).await?;
+            compare_poll_http(&responses.mastodon, &responses.rust, label)?;
+        }
+
+        let poll_create = status_request(
+            Method::POST,
+            "/api/v1/statuses",
+            "status=fixture+poll+write&visibility=public&poll%5Boptions%5D%5B%5D=Tea&poll%5Boptions%5D%5B%5D=Coffee&poll%5Bexpires_in%5D=300&poll%5Bmultiple%5D=false&poll%5Bhide_totals%5D=false",
+        )?;
+        let mut poll_created = send_identically(&targets, &poll_create).await?;
+        let mastodon_poll_id = normalize_poll_response(
+            &mut poll_created.mastodon,
+            "Mastodon poll create",
+            true,
+        )?;
+        let rust_poll_id =
+            normalize_poll_response(&mut poll_created.rust, "Rust poll create", true)?;
+        let mastodon_status_id = normalize_generated_status_response(
+            &mut poll_created.mastodon,
+            "Mastodon poll status",
+        )?;
+        let rust_status_id =
+            normalize_generated_status_response(&mut poll_created.rust, "Rust poll status")?;
+        mastodon_ids.push(mastodon_status_id);
+        rust_ids.push(rust_status_id);
+        compare_responses(
+            &poll_created.mastodon,
+            &poll_created.rust,
+            &[
+                http::header::CONTENT_TYPE,
+                http::header::CACHE_CONTROL,
+                http::header::VARY,
+            ],
+            &[],
+            DEFAULT_MISMATCH_LIMIT,
+        )
+        .map_err(|error| format!("poll status create: {error}"))?;
+
+        let mastodon_multi_single = poll_request(
+            Method::POST,
+            &format!("/api/v1/polls/{mastodon_poll_id}/votes"),
+            POLL_VOTER_TOKEN,
+            "choices%5B%5D=0&choices%5B%5D=1",
+        )?;
+        let rust_multi_single = poll_request(
+            Method::POST,
+            &format!("/api/v1/polls/{rust_poll_id}/votes"),
+            POLL_VOTER_TOKEN,
+            "choices%5B%5D=0&choices%5B%5D=1",
+        )?;
+        let (mastodon_multi_single, rust_multi_single) = tokio::join!(
+            send_single(targets.mastodon(), &mastodon_multi_single, "Mastodon"),
+            send_single(targets.rust(), &rust_multi_single, "Rust")
+        );
+        compare_poll_http(
+            &mastodon_multi_single?,
+            &rust_multi_single?,
+            "multiple-choice ballot on a single-choice poll",
+        )?;
+
+        for (label, blocker, blocked) in [
+            (
+                "poll author blocks voter",
+                INTERACTION_ACCOUNT_ID,
+                POLL_VOTER_ACCOUNT_ID,
+            ),
+            (
+                "poll voter blocks author",
+                POLL_VOTER_ACCOUNT_ID,
+                INTERACTION_ACCOUNT_ID,
+            ),
+        ] {
+            set_poll_block(mastodon_owner.url(), blocker, blocked, true).await?;
+            set_poll_block(rust_writer.url(), blocker, blocked, true).await?;
+            let mastodon_blocked = poll_request(
+                Method::POST,
+                &format!("/api/v1/polls/{mastodon_poll_id}/votes"),
+                POLL_VOTER_TOKEN,
+                "choices%5B%5D=0",
+            )?;
+            let rust_blocked = poll_request(
+                Method::POST,
+                &format!("/api/v1/polls/{rust_poll_id}/votes"),
+                POLL_VOTER_TOKEN,
+                "choices%5B%5D=0",
+            )?;
+            let (mastodon_blocked, rust_blocked) = tokio::join!(
+                send_single(targets.mastodon(), &mastodon_blocked, "Mastodon"),
+                send_single(targets.rust(), &rust_blocked, "Rust")
+            );
+            let comparison = compare_poll_http(&mastodon_blocked?, &rust_blocked?, label);
+            set_poll_block(mastodon_owner.url(), blocker, blocked, false).await?;
+            set_poll_block(rust_writer.url(), blocker, blocked, false).await?;
+            comparison?;
+        }
+
+        let mastodon_vote = poll_request(
+            Method::POST,
+            &format!("/api/v1/polls/{mastodon_poll_id}/votes"),
+            POLL_VOTER_TOKEN,
+            "choices%5B%5D=0",
+        )?;
+        let rust_vote = poll_request(
+            Method::POST,
+            &format!("/api/v1/polls/{rust_poll_id}/votes"),
+            POLL_VOTER_TOKEN,
+            "choices%5B%5D=0",
+        )?;
+        let (mut mastodon_vote, mut rust_vote) = tokio::join!(
+            send_single(targets.mastodon(), &mastodon_vote, "Mastodon"),
+            send_single(targets.rust(), &rust_vote, "Rust")
+        );
+        let mastodon_vote = mastodon_vote.as_mut().map_err(|error| error.to_string())?;
+        let rust_vote = rust_vote.as_mut().map_err(|error| error.to_string())?;
+        normalize_poll_response(mastodon_vote, "Mastodon poll vote", false)?;
+        normalize_poll_response(rust_vote, "Rust poll vote", false)?;
+        compare_poll_http(mastodon_vote, rust_vote, "poll vote")?;
+
+        let mastodon_show = poll_request(
+            Method::GET,
+            &format!("/api/v1/polls/{mastodon_poll_id}"),
+            POLL_VOTER_TOKEN,
+            "",
+        )?;
+        let rust_show = poll_request(
+            Method::GET,
+            &format!("/api/v1/polls/{rust_poll_id}"),
+            POLL_VOTER_TOKEN,
+            "",
+        )?;
+        let (mut mastodon_show, mut rust_show) = tokio::join!(
+            send_single(targets.mastodon(), &mastodon_show, "Mastodon"),
+            send_single(targets.rust(), &rust_show, "Rust")
+        );
+        let mastodon_show = mastodon_show.as_mut().map_err(|error| error.to_string())?;
+        let rust_show = rust_show.as_mut().map_err(|error| error.to_string())?;
+        normalize_poll_response(mastodon_show, "Mastodon poll refresh", false)?;
+        normalize_poll_response(rust_show, "Rust poll refresh", false)?;
+        compare_poll_http(mastodon_show, rust_show, "poll refresh")?;
+
+        for (label, token, body) in [
+            ("duplicate poll vote", POLL_VOTER_TOKEN, "choices%5B%5D=0"),
+            (
+                "owner poll vote",
+                "fixture-bearer-token-v4-6-5",
+                "choices%5B%5D=1",
+            ),
+            ("invalid poll choice", POLL_VOTER_TOKEN, "choices%5B%5D=99"),
+            ("empty poll vote", POLL_VOTER_TOKEN, ""),
+        ] {
+            let mastodon_request = poll_request(
+                Method::POST,
+                &format!("/api/v1/polls/{mastodon_poll_id}/votes"),
+                token,
+                body,
+            )?;
+            let rust_request = poll_request(
+                Method::POST,
+                &format!("/api/v1/polls/{rust_poll_id}/votes"),
+                token,
+                body,
+            )?;
+            let (mastodon, rust) = tokio::join!(
+                send_single(targets.mastodon(), &mastodon_request, "Mastodon"),
+                send_single(targets.rust(), &rust_request, "Rust")
+            );
+            compare_poll_http(&mastodon?, &rust?, label)?;
+        }
+
+        expire_poll_for_differential(mastodon_owner.url(), mastodon_poll_id).await?;
+        expire_poll_for_differential(rust_writer.url(), rust_poll_id).await?;
+        let mastodon_expired = poll_request(
+            Method::POST,
+            &format!("/api/v1/polls/{mastodon_poll_id}/votes"),
+            POLL_VOTER_TOKEN,
+            "choices%5B%5D=1",
+        )?;
+        let rust_expired = poll_request(
+            Method::POST,
+            &format!("/api/v1/polls/{rust_poll_id}/votes"),
+            POLL_VOTER_TOKEN,
+            "choices%5B%5D=1",
+        )?;
+        let (mastodon_expired, rust_expired) = tokio::join!(
+            send_single(targets.mastodon(), &mastodon_expired, "Mastodon"),
+            send_single(targets.rust(), &rust_expired, "Rust")
+        );
+        compare_poll_http(&mastodon_expired?, &rust_expired?, "expired poll vote")?;
+
+        let mastodon_poll_state = poll_write_state(
+            mastodon_owner.url(),
+            mastodon_poll_id,
+            mastodon_status_id,
+        )
+        .await?;
+        let rust_poll_state =
+            poll_write_state(rust_writer.url(), rust_poll_id, rust_status_id).await?;
+        if mastodon_poll_state != rust_poll_state {
+            return Err(format!(
+                "poll database state differs: Mastodon={mastodon_poll_state:?}, Rust={rust_poll_state:?}"
+            )
+            .into());
+        }
+
+        let hidden_multiple_create = status_request(
+            Method::POST,
+            "/api/v1/statuses",
+            "status=fixture+hidden+multiple+poll&visibility=public&poll%5Boptions%5D%5B%5D=Tea&poll%5Boptions%5D%5B%5D=Coffee&poll%5Bexpires_in%5D=300&poll%5Bmultiple%5D=true&poll%5Bhide_totals%5D=true",
+        )?;
+        let mut hidden_multiple = send_identically(&targets, &hidden_multiple_create).await?;
+        let mastodon_multiple_poll_id = normalize_poll_response(
+            &mut hidden_multiple.mastodon,
+            "Mastodon hidden multiple poll create",
+            true,
+        )?;
+        let rust_multiple_poll_id = normalize_poll_response(
+            &mut hidden_multiple.rust,
+            "Rust hidden multiple poll create",
+            true,
+        )?;
+        let mastodon_multiple_status_id = normalize_generated_status_response(
+            &mut hidden_multiple.mastodon,
+            "Mastodon hidden multiple poll status",
+        )?;
+        let rust_multiple_status_id = normalize_generated_status_response(
+            &mut hidden_multiple.rust,
+            "Rust hidden multiple poll status",
+        )?;
+        mastodon_ids.push(mastodon_multiple_status_id);
+        rust_ids.push(rust_multiple_status_id);
+        compare_poll_http(
+            &hidden_multiple.mastodon,
+            &hidden_multiple.rust,
+            "hidden multiple poll create",
+        )?;
+        let mastodon_multiple_vote = poll_request(
+            Method::POST,
+            &format!("/api/v1/polls/{mastodon_multiple_poll_id}/votes"),
+            POLL_VOTER_TOKEN,
+            "choices%5B%5D=0&choices%5B%5D=1",
+        )?;
+        let rust_multiple_vote = poll_request(
+            Method::POST,
+            &format!("/api/v1/polls/{rust_multiple_poll_id}/votes"),
+            POLL_VOTER_TOKEN,
+            "choices%5B%5D=0&choices%5B%5D=1",
+        )?;
+        let (mut mastodon_multiple_vote, mut rust_multiple_vote) = tokio::join!(
+            send_single(
+                targets.mastodon(),
+                &mastodon_multiple_vote,
+                "Mastodon"
+            ),
+            send_single(targets.rust(), &rust_multiple_vote, "Rust")
+        );
+        let mastodon_multiple_vote = mastodon_multiple_vote
+            .as_mut()
+            .map_err(|error| error.to_string())?;
+        let rust_multiple_vote = rust_multiple_vote
+            .as_mut()
+            .map_err(|error| error.to_string())?;
+        normalize_poll_response(
+            mastodon_multiple_vote,
+            "Mastodon hidden multiple poll vote",
+            false,
+        )?;
+        normalize_poll_response(
+            rust_multiple_vote,
+            "Rust hidden multiple poll vote",
+            false,
+        )?;
+        compare_poll_http(
+            mastodon_multiple_vote,
+            rust_multiple_vote,
+            "hidden multiple poll vote",
+        )?;
+        let mastodon_multiple_state = poll_write_state(
+            mastodon_owner.url(),
+            mastodon_multiple_poll_id,
+            mastodon_multiple_status_id,
+        )
+        .await?;
+        let rust_multiple_state = poll_write_state(
+            rust_writer.url(),
+            rust_multiple_poll_id,
+            rust_multiple_status_id,
+        )
+        .await?;
+        if mastodon_multiple_state != rust_multiple_state {
+            return Err(format!(
+                "hidden multiple poll database state differs: Mastodon={mastodon_multiple_state:?}, Rust={rust_multiple_state:?}"
+            )
+            .into());
+        }
+
+        for (label, body) in [
+            (
+                "private poll",
+                "status=fixture+private+poll&visibility=private&poll%5Boptions%5D%5B%5D=Tea&poll%5Boptions%5D%5B%5D=Coffee&poll%5Bexpires_in%5D=300&poll%5Bmultiple%5D=false&poll%5Bhide_totals%5D=false",
+            ),
+            (
+                "direct poll",
+                "status=%40api_moderator+fixture+direct+poll&visibility=direct&poll%5Boptions%5D%5B%5D=Tea&poll%5Boptions%5D%5B%5D=Coffee&poll%5Bexpires_in%5D=300&poll%5Bmultiple%5D=false&poll%5Bhide_totals%5D=false",
+            ),
+        ] {
+            let create = status_request(Method::POST, "/api/v1/statuses", body)?;
+            let mut created = send_identically(&targets, &create).await?;
+            let mastodon_hidden_poll_id = normalize_poll_response(
+                &mut created.mastodon,
+                &format!("Mastodon {label} create"),
+                true,
+            )?;
+            let rust_hidden_poll_id = normalize_poll_response(
+                &mut created.rust,
+                &format!("Rust {label} create"),
+                true,
+            )?;
+            let mastodon_hidden_status_id = normalize_generated_status_response(
+                &mut created.mastodon,
+                &format!("Mastodon {label} status"),
+            )?;
+            let rust_hidden_status_id = normalize_generated_status_response(
+                &mut created.rust,
+                &format!("Rust {label} status"),
+            )?;
+            mastodon_ids.push(mastodon_hidden_status_id);
+            rust_ids.push(rust_hidden_status_id);
+            compare_poll_http(&created.mastodon, &created.rust, &format!("{label} create"))?;
+
+            for (method, suffix, request_body) in [
+                (Method::GET, "outsider show", ""),
+                (Method::POST, "outsider vote", "choices%5B%5D=0"),
+            ] {
+                let mastodon_path = if method == Method::GET {
+                    format!("/api/v1/polls/{mastodon_hidden_poll_id}")
+                } else {
+                    format!("/api/v1/polls/{mastodon_hidden_poll_id}/votes")
+                };
+                let rust_path = if method == Method::GET {
+                    format!("/api/v1/polls/{rust_hidden_poll_id}")
+                } else {
+                    format!("/api/v1/polls/{rust_hidden_poll_id}/votes")
+                };
+                let mastodon_request = poll_request(
+                    method.clone(),
+                    &mastodon_path,
+                    POLL_OUTSIDER_TOKEN,
+                    request_body,
+                )?;
+                let rust_request =
+                    poll_request(method, &rust_path, POLL_OUTSIDER_TOKEN, request_body)?;
+                let (mastodon, rust) = tokio::join!(
+                    send_single(targets.mastodon(), &mastodon_request, "Mastodon"),
+                    send_single(targets.rust(), &rust_request, "Rust")
+                );
+                compare_poll_http(&mastodon?, &rust?, &format!("{label} {suffix}"))?;
+            }
+
+            let mastodon_show = poll_request(
+                Method::GET,
+                &format!("/api/v1/polls/{mastodon_hidden_poll_id}"),
+                POLL_VOTER_TOKEN,
+                "",
+            )?;
+            let rust_show = poll_request(
+                Method::GET,
+                &format!("/api/v1/polls/{rust_hidden_poll_id}"),
+                POLL_VOTER_TOKEN,
+                "",
+            )?;
+            let (mut mastodon_show, mut rust_show) = tokio::join!(
+                send_single(targets.mastodon(), &mastodon_show, "Mastodon"),
+                send_single(targets.rust(), &rust_show, "Rust")
+            );
+            let mastodon_show = mastodon_show.as_mut().map_err(|error| error.to_string())?;
+            let rust_show = rust_show.as_mut().map_err(|error| error.to_string())?;
+            normalize_poll_response(mastodon_show, &format!("Mastodon {label} recipient show"), false)?;
+            normalize_poll_response(rust_show, &format!("Rust {label} recipient show"), false)?;
+            compare_poll_http(mastodon_show, rust_show, &format!("{label} recipient show"))?;
+
+            let mastodon_vote = poll_request(
+                Method::POST,
+                &format!("/api/v1/polls/{mastodon_hidden_poll_id}/votes"),
+                POLL_VOTER_TOKEN,
+                "choices%5B%5D=0",
+            )?;
+            let rust_vote = poll_request(
+                Method::POST,
+                &format!("/api/v1/polls/{rust_hidden_poll_id}/votes"),
+                POLL_VOTER_TOKEN,
+                "choices%5B%5D=0",
+            )?;
+            let (mut mastodon_vote, mut rust_vote) = tokio::join!(
+                send_single(targets.mastodon(), &mastodon_vote, "Mastodon"),
+                send_single(targets.rust(), &rust_vote, "Rust")
+            );
+            let mastodon_vote = mastodon_vote.as_mut().map_err(|error| error.to_string())?;
+            let rust_vote = rust_vote.as_mut().map_err(|error| error.to_string())?;
+            normalize_poll_response(mastodon_vote, &format!("Mastodon {label} recipient vote"), false)?;
+            normalize_poll_response(rust_vote, &format!("Rust {label} recipient vote"), false)?;
+            compare_poll_http(mastodon_vote, rust_vote, &format!("{label} recipient vote"))?;
+        }
+        Ok::<(), Box<dyn Error>>(())
+    }
+    .await;
+
+    let cleanup = async {
+        replace_access_token_scopes(
+            mastodon_owner.url(),
+            POLL_VOTER_TOKEN,
+            &mastodon_voter_scope,
+        )
+        .await?;
+        replace_access_token_scopes(rust_owner.url(), POLL_VOTER_TOKEN, &rust_voter_scope).await?;
+        replace_access_token_scopes(
+            mastodon_owner.url(),
+            POLL_OUTSIDER_TOKEN,
+            &mastodon_outsider_scope,
+        )
+        .await?;
+        replace_access_token_scopes(rust_owner.url(), POLL_OUTSIDER_TOKEN, &rust_outsider_scope)
+            .await?;
+        for (blocker, blocked) in [
+            (INTERACTION_ACCOUNT_ID, POLL_VOTER_ACCOUNT_ID),
+            (POLL_VOTER_ACCOUNT_ID, INTERACTION_ACCOUNT_ID),
+        ] {
+            set_poll_block(mastodon_owner.url(), blocker, blocked, false).await?;
+            set_poll_block(rust_writer.url(), blocker, blocked, false).await?;
+        }
+        restore_created_statuses(mastodon_owner.url(), &mastodon_ids).await?;
+        restore_created_statuses(rust_writer.url(), &rust_ids).await?;
+        restore_interaction_account_stat(
+            mastodon_owner.url(),
+            INTERACTION_ACCOUNT_ID,
+            mastodon_account_stats.as_ref(),
+        )
+        .await?;
+        restore_interaction_account_stat(
+            rust_owner.url(),
+            INTERACTION_ACCOUNT_ID,
+            rust_account_stats.as_ref(),
+        )
+        .await?;
+        Ok::<(), Box<dyn Error>>(())
+    }
+    .await;
+    operation_and_cleanup(operation, cleanup)
+}
+
+fn compare_poll_http(
+    mastodon: &CapturedResponse,
+    rust: &CapturedResponse,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    compare_responses(
+        mastodon,
+        rust,
+        &[
+            http::header::CONTENT_TYPE,
+            http::header::CACHE_CONTROL,
+            http::header::VARY,
+        ],
+        &[],
+        DEFAULT_MISMATCH_LIMIT,
+    )
+    .map_err(|error| format!("{label}: {error}").into())
+}
+
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run_status_creation_writes_case(
     config: DifferentialConfig,
     rust_url: &Url,
@@ -678,14 +1245,14 @@ pub(crate) async fn run_status_creation_writes_case(
             &media_request_body,
         )?;
         let mut media_responses = send_identically(&targets, &media_request).await?;
-        mastodon_ids.push(normalize_generated_status_response(
+        let media_mastodon_id = normalize_generated_status_response(
             &mut media_responses.mastodon,
             "Mastodon media status",
-        )?);
-        rust_ids.push(normalize_generated_status_response(
-            &mut media_responses.rust,
-            "Rust media status",
-        )?);
+        )?;
+        let media_rust_id =
+            normalize_generated_status_response(&mut media_responses.rust, "Rust media status")?;
+        mastodon_ids.push(media_mastodon_id);
+        rust_ids.push(media_rust_id);
         compare_responses(
             &media_responses.mastodon,
             &media_responses.rust,
@@ -698,6 +1265,7 @@ pub(crate) async fn run_status_creation_writes_case(
             DEFAULT_MISMATCH_LIMIT,
         )
         .map_err(|error| format!("status media create: {error}"))?;
+
         for (mastodon_id, rust_id) in mastodon_ids.iter().zip(&rust_ids) {
             let mut mastodon_connection = PgConnection::connect(mastodon_owner.url()).await?;
             let mastodon_row: DifferentialStatusFields = sqlx::query_as(
@@ -807,12 +1375,8 @@ pub(crate) async fn run_status_creation_writes_case(
         {
             return Err("identical status PUT replay changed persisted state".into());
         }
-        let edited_media_mastodon_id = *mastodon_ids
-            .last()
-            .ok_or("status creation did not return a media status id")?;
-        let edited_media_rust_id = *rust_ids
-            .last()
-            .ok_or("Rust status creation did not return a media status id")?;
+        let edited_media_mastodon_id = media_mastodon_id;
+        let edited_media_rust_id = media_rust_id;
         let media_attribute_edit_body = format!(
             "status=fixture+media+attributes+edited&media_ids%5B%5D={STATUS_MEDIA_ID}&media_attributes%5B%5D%5Bid%5D={STATUS_MEDIA_ID}&media_attributes%5B%5D%5Bdescription%5D=updated+media+description&media_attributes%5B%5D%5Bfocus%5D=0.25%2C-0.5"
         );
@@ -7561,6 +8125,60 @@ fn normalize_generated_reblog_document(document: &mut Value, side: &str) -> Resu
     Ok(())
 }
 
+fn normalize_poll_response(
+    response: &mut CapturedResponse,
+    side: &str,
+    nested: bool,
+) -> Result<i64, String> {
+    let mut document: Value = serde_json::from_slice(&response.body).map_err(|error| {
+        format!(
+            "{side} poll response is not JSON (status={}): {error}",
+            response.status
+        )
+    })?;
+    let poll = if nested {
+        document
+            .get_mut("poll")
+            .ok_or_else(|| format!("{side} status response has no poll"))?
+    } else {
+        &mut document
+    };
+    let poll = poll
+        .as_object_mut()
+        .ok_or_else(|| format!("{side} poll response is not an object"))?;
+    let id = poll
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{side} poll id is missing or not a string"))?
+        .parse::<i64>()
+        .map_err(|error| format!("{side} poll id is not decimal: {error}"))?;
+    if id <= 0 {
+        return Err(format!("{side} poll id is not positive"));
+    }
+    let expires_at = poll
+        .get("expires_at")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{side} poll expiry is missing or not a string"))?;
+    let expires_at = DateTime::parse_from_rfc3339(expires_at)
+        .map_err(|error| format!("{side} poll expiry is invalid: {error}"))?;
+    let remaining = expires_at.signed_duration_since(Utc::now()).num_seconds();
+    if !(240..=360).contains(&remaining) {
+        return Err(format!(
+            "{side} generated poll expiry is not approximately five minutes away"
+        ));
+    }
+    poll.insert(
+        "id".to_owned(),
+        Value::String("<generated-poll-id>".to_owned()),
+    );
+    poll.insert(
+        "expires_at".to_owned(),
+        Value::String("<generated-poll-expiry>".to_owned()),
+    );
+    response.body = serde_json::to_vec(&document).map_err(|error| error.to_string())?;
+    Ok(id)
+}
+
 fn normalize_generated_status_response(
     response: &mut CapturedResponse,
     side: &str,
@@ -7740,6 +8358,38 @@ fn browser_profile_multipart_body(csrf_token: &str, image: &[u8]) -> Vec<u8> {
     }
     body.extend_from_slice(format!("--{PROFILE_MEDIA_BOUNDARY}--\r\n").as_bytes());
     body
+}
+
+fn poll_request(
+    method: Method,
+    path: &str,
+    token: &str,
+    body: &str,
+) -> Result<RequestSpec, Box<dyn Error>> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HOST,
+        HeaderValue::from_static("fixture-v4-6-5.rustodon.invalid"),
+    );
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}"))?,
+    );
+    headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+    if !body.is_empty() {
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+    }
+    Ok(RequestSpec::new(
+        method,
+        path,
+        None,
+        headers,
+        body.as_bytes().to_owned(),
+    )?)
 }
 
 fn status_request(method: Method, path: &str, body: &str) -> Result<RequestSpec, Box<dyn Error>> {
@@ -8151,6 +8801,111 @@ async fn restore_relationship_target_rows(
     transaction.commit().await
 }
 
+async fn poll_write_state(
+    url: &str,
+    poll_id: i64,
+    status_id: i64,
+) -> Result<DifferentialPollState, sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    let poll = sqlx::query_as::<
+        _,
+        (
+            i64,
+            Vec<String>,
+            Vec<i64>,
+            i64,
+            Option<i64>,
+            bool,
+            bool,
+            bool,
+        ),
+    >(
+        "SELECT poll.account_id, poll.options, poll.cached_tallies, poll.votes_count,
+                poll.voters_count, poll.multiple, poll.hide_totals,
+                status.poll_id = poll.id AND poll.status_id = status.id
+           FROM public.polls poll JOIN public.statuses status ON status.id = $2
+          WHERE poll.id = $1",
+    )
+    .bind(poll_id)
+    .bind(status_id)
+    .fetch_one(&mut connection)
+    .await?;
+    let votes = sqlx::query_as::<_, (i64, i32, bool)>(
+        "SELECT account_id, choice, uri IS NULL FROM public.poll_votes \
+         WHERE poll_id = $1 ORDER BY account_id, choice, id",
+    )
+    .bind(poll_id)
+    .fetch_all(&mut connection)
+    .await?;
+    Ok((
+        poll.0, poll.1, poll.2, poll.3, poll.4, poll.5, poll.6, poll.7, votes,
+    ))
+}
+
+async fn set_poll_block(
+    url: &str,
+    account_id: i64,
+    target_account_id: i64,
+    present: bool,
+) -> Result<(), sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    if present {
+        sqlx::query(
+            "INSERT INTO public.blocks \
+                 (account_id, target_account_id, uri, created_at, updated_at) \
+             VALUES ($1, $2, NULL, clock_timestamp(), clock_timestamp()) \
+             ON CONFLICT (account_id, target_account_id) DO NOTHING",
+        )
+        .bind(account_id)
+        .bind(target_account_id)
+        .execute(&mut connection)
+        .await?;
+    } else {
+        sqlx::query("DELETE FROM public.blocks WHERE account_id = $1 AND target_account_id = $2")
+            .bind(account_id)
+            .bind(target_account_id)
+            .execute(&mut connection)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn expire_poll_for_differential(url: &str, poll_id: i64) -> Result<(), sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query(
+        "UPDATE public.polls
+            SET expires_at = clock_timestamp() - interval '1 second',
+                updated_at = clock_timestamp()
+          WHERE id = $1",
+    )
+    .bind(poll_id)
+    .execute(&mut connection)
+    .await?;
+    Ok(())
+}
+
+async fn replace_access_token_scopes(
+    url: &str,
+    token: &str,
+    scopes: &str,
+) -> Result<String, sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    let mut transaction = connection.begin().await?;
+    let previous = sqlx::query_scalar::<_, String>(
+        "SELECT scopes FROM public.oauth_access_tokens WHERE token = $1 FOR UPDATE",
+    )
+    .bind(token)
+    .fetch_one(&mut *transaction)
+    .await?;
+    sqlx::query("UPDATE public.oauth_access_tokens SET scopes = $2 WHERE token = $1")
+        .bind(token)
+        .bind(scopes)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(previous)
+}
+
 async fn restore_created_statuses(url: &str, status_ids: &[i64]) -> Result<(), sqlx::Error> {
     if status_ids.is_empty() {
         return Ok(());
@@ -8176,6 +8931,29 @@ async fn restore_created_statuses(url: &str, status_ids: &[i64]) -> Result<(), s
         .bind(status_ids)
         .execute(&mut *transaction)
         .await?;
+    let poll_ids =
+        sqlx::query_scalar::<_, i64>("SELECT id FROM public.polls WHERE status_id = ANY($1)")
+            .bind(status_ids)
+            .fetch_all(&mut *transaction)
+            .await?;
+    if !poll_ids.is_empty() {
+        sqlx::query("UPDATE public.statuses SET poll_id = NULL WHERE id = ANY($1)")
+            .bind(status_ids)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM public.poll_votes WHERE poll_id = ANY($1)")
+            .bind(&poll_ids)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM public.notifications WHERE activity_type = 'Poll' AND activity_id = ANY($1)")
+            .bind(&poll_ids)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM public.polls WHERE id = ANY($1)")
+            .bind(&poll_ids)
+            .execute(&mut *transaction)
+            .await?;
+    }
     sqlx::query("DELETE FROM public.statuses WHERE id = ANY($1)")
         .bind(status_ids)
         .execute(&mut *transaction)

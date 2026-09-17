@@ -91,14 +91,14 @@ run = "tools/mastodon-fixture cutover-test"
 
 [tasks.browser-integration]
 description = "Run Chromium startup and SPA navigation against the cutover fixture"
-run = "RUSTODON_BROWSER_SMOKE=true RUSTODON_BROWSER_AUTH=true RUSTODON_BROWSER_EMAIL=alice@fixture.invalid RUSTODON_BROWSER_PASSWORD=fixture-password RUSTODON_BROWSER_OTP=fixture-recovery-code tools/mastodon-fixture cutover-test"
+run = "RUSTODON_BROWSER_SMOKE=true RUSTODON_BROWSER_AUTH=true RUSTODON_BROWSER_EMAIL=alice@fixture.invalid RUSTODON_BROWSER_PASSWORD=fixture-password RUSTODON_BROWSER_OTP=fixture-recovery-code RUSTODON_BROWSER_VOTER_EMAIL=moderator@fixture.invalid RUSTODON_BROWSER_VOTER_PASSWORD=fixture-password RUSTODON_BROWSER_VOTER_OTP=fixture-no-otp tools/mastodon-fixture cutover-test"
 
 [tasks.differential]
 description = "Run all or one Rails-versus-Rust differential compatibility case"
 run = "tools/mastodon-fixture differential-test"
 
 [tasks.differential-ci]
-description = "Run nine high-value/security differential cases plus relative media-root mode"
+description = "Run ten high-value/security differential cases plus relative media-root mode"
 run = "tools/ci-differential"
 
 [tasks.differential-full]

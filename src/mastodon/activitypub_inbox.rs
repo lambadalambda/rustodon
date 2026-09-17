@@ -1,3 +1,5 @@
+use super::equals_or_includes;
+
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde_json::Value;
 use url::Url;
@@ -26,6 +28,15 @@ pub(crate) struct InboxJob {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InboxActivity {
+    CreateVote {
+        activity_uri: String,
+        actor_uri: String,
+        vote_uri: String,
+        question_uri: String,
+        option: String,
+        object: Value,
+        activity: Value,
+    },
     CreateNote {
         activity_uri: String,
         actor_uri: String,
@@ -174,8 +185,18 @@ pub(crate) fn parse_activity(body: &str) -> Result<InboxActivity, InboxParseErro
     let Value::Object(activity) = value else {
         return Err(InboxParseError::Activity);
     };
-    let Some(kind) = activity.get("type").and_then(Value::as_str) else {
-        return Err(InboxParseError::Activity);
+    let kind = [
+        "Create", "Update", "Delete", "Like", "Announce", "Follow", "Flag", "Block", "Accept",
+        "Reject", "Undo",
+    ]
+    .into_iter()
+    .find(|kind| equals_or_includes(activity.get("type"), kind));
+    let Some(kind) = kind else {
+        return if activity.get("type").is_some() {
+            Ok(InboxActivity::Unsupported)
+        } else {
+            Err(InboxParseError::Activity)
+        };
     };
     match kind {
         "Create" => parse_note_create(&activity),
@@ -222,7 +243,33 @@ fn parse_note_create(
     let Value::Object(object) = object else {
         return Err(InboxParseError::Activity);
     };
-    if object.get("type").and_then(Value::as_str) != Some("Note") {
+    if equals_or_includes(object.get("type"), "Note")
+        && object.get("name").and_then(Value::as_str).is_some()
+        && object.get("inReplyTo").is_some()
+    {
+        let attributed_to = required_uri(object.get("attributedTo"))?;
+        if attributed_to != actor_uri {
+            return Err(InboxParseError::Activity);
+        }
+        let option = object
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(InboxParseError::Activity)?
+            .to_owned();
+        return Ok(InboxActivity::CreateVote {
+            activity_uri,
+            actor_uri,
+            vote_uri: required_uri(object.get("id"))?,
+            question_uri: required_uri(object.get("inReplyTo"))?,
+            option,
+            object: Value::Object(object.clone()),
+            activity: Value::Object(activity.clone()),
+        });
+    }
+    if !equals_or_includes(object.get("type"), "Note")
+        && !equals_or_includes(object.get("type"), "Question")
+    {
         return Ok(InboxActivity::Unsupported);
     }
     validate_note_object(&actor_uri, object)?;
@@ -241,20 +288,24 @@ fn parse_update(
     let Some(Value::Object(object)) = activity.get("object") else {
         return Ok(InboxActivity::Unsupported);
     };
-    match object.get("type").and_then(Value::as_str) {
-        Some("Note") => {
-            validate_note_object(&actor_uri, object)?;
-            Ok(InboxActivity::UpdateNote {
-                actor_uri,
-                object: Value::Object(object.clone()),
-                activity: Value::Object(activity.clone()),
-            })
-        }
-        Some("Application" | "Group" | "Organization" | "Person" | "Service") => {
-            parse_actor_update_parts(actor_uri, object)
-        }
-        Some(_) => Ok(InboxActivity::Unsupported),
-        None => Err(InboxParseError::Activity),
+    if equals_or_includes(object.get("type"), "Note")
+        || equals_or_includes(object.get("type"), "Question")
+    {
+        validate_note_object(&actor_uri, object)?;
+        Ok(InboxActivity::UpdateNote {
+            actor_uri,
+            object: Value::Object(object.clone()),
+            activity: Value::Object(activity.clone()),
+        })
+    } else if ["Application", "Group", "Organization", "Person", "Service"]
+        .into_iter()
+        .any(|kind| equals_or_includes(object.get("type"), kind))
+    {
+        parse_actor_update_parts(actor_uri, object)
+    } else if object.get("type").is_some() {
+        Ok(InboxActivity::Unsupported)
+    } else {
+        Err(InboxParseError::Activity)
     }
 }
 
@@ -302,7 +353,9 @@ fn parse_interaction(
     } else {
         let embedded_note = match object {
             Some(Value::Object(object))
-                if object.get("type").and_then(Value::as_str) == Some("Note")
+                if ["Note", "Question"]
+                    .into_iter()
+                    .any(|kind| equals_or_includes(object.get("type"), kind))
                     && validate_note_object(&actor_uri, object).is_ok() =>
             {
                 Some(Value::Object(object.clone()))
@@ -517,7 +570,7 @@ pub(crate) fn parse_note_emojis(object: &Value, actor_uri: &str) -> Vec<RemoteEm
     for tag in tags.into_iter().take(MAX_REMOTE_TAGS) {
         let Some(tag) = tag
             .as_object()
-            .filter(|tag| value_includes_text(tag.get("type"), "Emoji"))
+            .filter(|tag| equals_or_includes(tag.get("type"), "Emoji"))
         else {
             continue;
         };
@@ -616,14 +669,6 @@ pub(crate) fn parse_note_emojis(object: &Value, actor_uri: &str) -> Vec<RemoteEm
         }
     }
     emojis
-}
-
-fn value_includes_text(value: Option<&Value>, expected: &str) -> bool {
-    match value {
-        Some(Value::String(value)) => value == expected,
-        Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some(expected)),
-        _ => false,
-    }
 }
 
 fn parse_follow_decision(
@@ -1110,6 +1155,48 @@ mod tests {
     }
 
     #[test]
+    fn parses_poll_votes_before_ordinary_notes() {
+        let vote = parse_activity(
+            r#"{"id":"https://remote.example/activities/vote-1","type":"Create","actor":"https://remote.example/users/alice","object":{"id":"https://remote.example/users/alice#votes/1","type":"Note","name":"Option A","attributedTo":"https://remote.example/users/alice","inReplyTo":"https://local.example/users/bob/statuses/7","to":"https://local.example/users/bob"}}"#,
+        )
+        .expect("poll vote should parse");
+
+        assert!(matches!(
+            vote,
+            InboxActivity::CreateVote {
+                activity_uri,
+                actor_uri,
+                vote_uri,
+                question_uri,
+                option,
+                object,
+                activity,
+            } if activity_uri == "https://remote.example/activities/vote-1"
+                && actor_uri == "https://remote.example/users/alice"
+                && vote_uri == "https://remote.example/users/alice#votes/1"
+                && question_uri == "https://local.example/users/bob/statuses/7"
+                && option == "Option A"
+                && object["type"] == "Note"
+                && activity["type"] == "Create"
+        ));
+
+        let vote_with_content = parse_activity(
+            r#"{"id":"https://remote.example/activities/vote-content","type":"Create","actor":"https://remote.example/users/alice","object":{"id":"https://remote.example/users/alice#votes/content","type":"Note","name":"Option A","content":"","attributedTo":"https://remote.example/users/alice","inReplyTo":"https://local.example/users/bob/statuses/7"}}"#,
+        )
+        .expect("poll vote content should not alter classification");
+        assert!(matches!(
+            vote_with_content,
+            InboxActivity::CreateVote { .. }
+        ));
+
+        let mismatched_actor = r#"{"id":"https://remote.example/activities/vote-2","type":"Create","actor":"https://remote.example/users/alice","object":{"id":"https://remote.example/votes/2","type":"Note","name":"Option A","attributedTo":"https://remote.example/users/mallory","inReplyTo":"https://local.example/users/bob/statuses/7"}}"#;
+        assert_eq!(
+            parse_activity(mismatched_actor),
+            Err(InboxParseError::Activity)
+        );
+    }
+
+    #[test]
     fn parses_note_create_update_and_atom_uri_delete() {
         let create = parse_activity(
             r#"{"id":"https://remote.example/activities/create-1","type":"Create","actor":"https://remote.example/users/alice","object":{"id":"https://remote.example/statuses/1","type":"Note","attributedTo":"https://remote.example/users/alice","published":"2026-08-25T12:00:00Z","content":"<p>Hello</p>","to":["https://www.w3.org/ns/activitystreams#Public"],"cc":[],"tag":[],"attachment":[]}}"#,
@@ -1147,6 +1234,21 @@ mod tests {
                 && atom_uri == "https://remote.example/objects/1"
                 && activity["type"] == "Delete"
         ));
+    }
+
+    #[test]
+    fn activitystreams_type_arrays_are_accepted_for_activities_and_objects() {
+        let create = parse_activity(
+            r#"{"id":"https://remote.example/activities/create-array","type":["Create"],"actor":"https://remote.example/users/alice","object":{"id":"https://remote.example/statuses/question-array","type":["Question"],"attributedTo":"https://remote.example/users/alice","published":"2026-08-25T12:00:00Z","content":"<p>Choose</p>","oneOf":[{"type":"Note","name":"Tea"},{"type":"Note","name":"Coffee"}],"to":["https://www.w3.org/ns/activitystreams#Public"],"cc":[]}}"#,
+        )
+        .expect("array-valued Create and Question types should parse");
+        assert!(matches!(create, InboxActivity::CreateNote { .. }));
+
+        let update = parse_activity(
+            r#"{"type":["Update"],"actor":"https://remote.example/users/alice","object":{"id":"https://remote.example/statuses/question-array","type":["Question"],"attributedTo":"https://remote.example/users/alice","updated":"2026-08-25T12:01:00Z","content":"<p>Choose again</p>","oneOf":[{"type":"Note","name":"Tea"},{"type":"Note","name":"Coffee"}],"to":[],"cc":[]}}"#,
+        )
+        .expect("array-valued Update and Question types should parse");
+        assert!(matches!(update, InboxActivity::UpdateNote { .. }));
     }
 
     #[test]
