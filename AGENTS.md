@@ -17,6 +17,28 @@
   boundaries. A synthetic or image-only check is not a substitute for its named
   source, database, browser, or peer gate.
 
+## Prototype operating mode
+
+- Rustodon is in the prototype phase. Optimize for learning, shipping ordinary
+  Mastodon-compatible workflows, and keeping the code understandable—not for
+  exhaustive production ceremony or hypothetical scale.
+- `rustodon.social` is the single project-owned experimental instance. Treat its
+  data with care, but do not apply multi-tenant production standards to every
+  reversible application deployment; brief planned downtime is acceptable.
+- Use safeguards proportional to the actual risk. Routine, reversible app-only
+  changes normally need focused tests, an immutable candidate, a retained
+  rollback image/container, and health/readiness checks—not a full fixture
+  matrix, disaster-recovery rehearsal, or exhaustive edge-case proof.
+- Require stronger backup, restore, and rollback work for destructive data
+  changes, irreversible migrations, identity/credential changes, or operations
+  with a credible risk of losing the only instance's state. Do not perform such
+  work merely for procedural completeness when the change is additive and
+  recoverable.
+- Heavy database, browser, differential, cutover, and peer lanes are milestone
+  evidence. Run them when requested, before a release claim, or when the changed
+  behavior specifically needs them; do not make every prototype fix wait for all
+  lanes.
+
 ## Mastodon reference source
 
 - The compatibility target is Mastodon 4.6.5 revision
