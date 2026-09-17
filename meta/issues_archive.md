@@ -99,3 +99,4 @@
 - [x] [Reconcile streamed remote media after caching](issues/reconcile-streamed-remote-media.md)
 - [x] [Audit everyday Mastodon frontend parity](issues/audit-everyday-frontend-parity.md)
 - [x] [Support quote posts from the bundled frontend](issues/support-frontend-quote-posts.md)
+- [x] [Repair operational schema v3 to v4 deployment upgrade](issues/repair-operational-v3-v4-upgrade-catalog.md)
