@@ -53,7 +53,11 @@ enum AdminCommand {
         account_id: i64,
     },
     /// Create or upgrade the separately owned Rustodon operational schema
-    MigrateOperationalSchema,
+    MigrateOperationalSchema {
+        /// Writer role whose operational grants should be normalized without exposing credentials
+        #[arg(long)]
+        writer_role: Option<String>,
+    },
     /// Report worker lane coverage, scheduler liveness, queue depth, and dead letters
     WorkerReadiness,
     /// List bounded dead-letter metadata without job arguments
@@ -252,11 +256,13 @@ async fn run_admin(command: AdminCommand) -> ExitCode {
         return ExitCode::FAILURE;
     };
     match command {
-        AdminCommand::MigrateOperationalSchema => {
-            let writer_role = config
-                .write_database
-                .as_ref()
-                .and_then(preflight::postgres_username_for);
+        AdminCommand::MigrateOperationalSchema { writer_role } => {
+            let writer_role = writer_role.or_else(|| {
+                config
+                    .write_database
+                    .as_ref()
+                    .and_then(preflight::postgres_username_for)
+            });
             if let Err(error) = operational_schema::migrate_with_writer_role(
                 &mut connection,
                 writer_role.as_deref(),

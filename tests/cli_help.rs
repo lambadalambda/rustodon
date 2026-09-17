@@ -108,6 +108,18 @@ fn admin_help_exposes_operational_schema_migration() {
 }
 
 #[test]
+fn migration_help_exposes_writer_role_without_loading_configuration() {
+    let output = rustodon()
+        .args(["admin", "migrate-operational-schema", "--help"])
+        .env_clear()
+        .output()
+        .expect("migration help should run");
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("--writer-role"));
+}
+
+#[test]
 fn web_requires_valid_configuration_without_exposing_secrets() {
     let output = rustodon()
         .arg("web")

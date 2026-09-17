@@ -37,11 +37,15 @@ record; `PF_*` codes are intended for remediation and rollback diagnostics.
 2. Run the operational-schema migration with the dedicated migrator role:
 
    ```console
-   rustodon admin migrate-operational-schema
+   rustodon admin migrate-operational-schema \
+     --writer-role "$RUSTODON_WRITER_ROLE"
    ```
 
-   This creates only Rustodon's `rustodon` schema. It does not migrate or
-   alter Mastodon-owned tables.
+   Supplying the role name lets catalog validation normalize its existing grants
+   without giving the migrator the writer role's credentials. When omitted, the
+   command uses the role from `WRITE_DATABASE_URL` if configured. This creates
+   only Rustodon's `rustodon` schema. It does not migrate or alter Mastodon-owned
+   tables.
 3. As the owner of Mastodon's `public.instances` materialized view, provision
    `docs/mastodon-refresh-instances.sql`:
 
