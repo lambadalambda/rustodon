@@ -27,3 +27,23 @@
   wrong-revision tree, or substitute another Mastodon version.
 - Reuse an existing verified checkout when available instead of fetching a
   replacement. The source-contract lane verifies the revision before use.
+
+## Compatibility and scope management
+
+- Target observable Mastodon compatibility for ordinary user workflows, APIs,
+  wire protocols, persistence invariants, and peer interoperability. Bug-for-bug
+  or implementation-level parity is not required.
+- Do not reproduce known Mastodon races, security or privacy defects, or
+  incidental quirks unless a real client or peer demonstrably depends on that
+  behavior. Prefer safer correctness while preserving required external
+  contracts.
+- Before a focused fix expands into a new protocol, durable job type,
+  schema/privilege boundary, or changes across more than three subsystems, stop
+  for a scope checkpoint. State the minimum fix, proposed expansion, exclusions,
+  and verification level; split follow-up work where practical.
+- Pause and report after two substantive review/fix rounds. Fix directly relevant
+  blockers and high-severity defects; normally record scope-expanding medium or
+  unrelated findings as follow-up issues instead of growing the current change.
+- Treat deferred fixture execution as an evidence boundary, not an invitation to
+  expand implementation or harness scope indefinitely. Clearly distinguish
+  executable test source from gates actually run on the current tree.
