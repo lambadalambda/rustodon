@@ -30,3 +30,4 @@
 - [ ] [Restore status search in the bundled frontend](issues/restore-frontend-status-search.md)
 - [ ] [Compute real instance activity metrics](issues/compute-real-instance-activity-metrics.md)
 - [ ] [Support hashtag and featured-tag controls](issues/support-hashtag-and-featured-tag-controls.md)
+- [ ] [Repair operational schema v3 to v4 deployment upgrade](issues/repair-operational-v3-v4-upgrade-catalog.md)

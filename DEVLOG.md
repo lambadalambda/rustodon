@@ -2,6 +2,14 @@
 
 ## 2026-09-16
 
+- Repaired the operational schema v3-to-v4 deployment blocker by registering the
+  221-entry PostgreSQL 14.23 catalog hash produced by the exact physical-clone
+  rehearsal. The superseded hash came from a newer PostgreSQL catalog whose
+  statistics/null, NOT NULL constraint, and `MAINTAIN` representations are
+  version-sensitive. The catalog query, ACL/security detail, migration DDL, and
+  PostgreSQL 14 support boundary remain unchanged; focused provenance coverage
+  pins the exact v4 hash and keeps column statistics in drift detection.
+
 - Added bundled-frontend quote-post creation and federation lifecycle support:
   POST-only `quoted_status_id` parsing and idempotency binding, transactional target
   policy/visibility/block/direct validation, canonical reblog targets, local accepted
