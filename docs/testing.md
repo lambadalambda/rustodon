@@ -99,7 +99,11 @@ regenerates all artifacts and compares them recursively byte for byte.
 Fixture identities, key/media provenance, normalization, and release-update
 instructions are in the [fixture README](../fixtures/mastodon/v4.6.5/README.md).
 Vendored worker media has its own manifest and verification command; an image
-extract is not a substitute for the full source-contract lane.
+extract is not a substitute for the full source-contract lane. Quote contracts
+inspect the exact compose, controller/service, ActivityPub lifecycle, counter,
+and serializer files at the pinned revision. A source checkout is configuration,
+not a pass: record compile or platform failures separately from executed contract
+results.
 
 ## Differential testing
 
@@ -124,11 +128,36 @@ mise run differential -- status_authorization_matrix
 mise run differential -- rest_protocol_contracts
 mise run differential -- federation_discovery
 mise run differential -- poll_lifecycle
+mise run differential -- quote_lifecycle
 mise run differential -- local_web_client_shell
 ```
 
 Each isolated invocation gets fresh marked databases, media roots, Redis state,
-and ports. Production-looking URLs and unmarked paths are rejected.
+and ports. Production-looking URLs and unmarked paths are rejected. Quote-specific
+schema/privilege and worker selectors are also available without broadening their
+heavy lanes:
+
+```console
+tools/mastodon-fixture schema-read-test quote_lifecycle
+tools/mastodon-fixture worker-test quote_federation_lifecycle
+```
+
+These selectors are executable intended evidence. The `schema-read-test` selector
+checks the restored quote schema/default and narrow writer privileges; it is not a
+quote lifecycle execution. The differential checks exact durable quote-notification,
+QuoteRequest, author-stream, update, rollback, and persisted-state effects. The worker
+selector uses the restricted writer role and checks allowed/denied embedded imports,
+signed target-owner scalar dereference with same-job retry, replay, signed outbound
+QuoteRequest/Accept/Reject HTTP delivery, transition-specific
+acceptance/rejection/revocation streams and status updates, legacy counter stability,
+remote quoting-Note deletion cleanup, conflicting replay, signed original-payload
+forwarding, and block/terminal-transition suppression of reclaimed active leases.
+Quote-related delivery jobs carry exact request/quote/status metadata; the
+final database fence retains its row lock through the bounded HTTP attempt, while
+terminal transitions cancel only safe unleased or expired work. Their registration in
+the required inventory prevents quote regressions from being silently skipped, but they
+do not count as passing final-tree evidence until the corresponding disposable
+PostgreSQL/worker lanes have actually completed.
 
 ## Browser testing
 
@@ -136,11 +165,16 @@ The browser lane starts the HTTPS cutover fixture and drives the pinned frontend
 through `agent-browser`. It covers anonymous and authenticated shells, React
 mounting, SPA navigation, password/backup-code session setup, settings and
 logout, Home boost/reply controls, leading/trailing web-settings updates,
-persistence after reload, a two-account poll composer → vote → refresh lifecycle,
-unexpected API failures, and the enclosing rollback comparison. The poll scenario
-is executable intended acceptance coverage, but its final-tree browser run (and
-the corresponding restored-schema and worker fixtures) is explicitly deferred;
-source presence alone is not acceptance evidence.
+persistence after reload, an Alice quote create → nested timeline/permalink →
+reload lifecycle, and a two-account poll composer → vote → refresh lifecycle.
+The quote smoke uses the pinned frontend's `Boost or quote` menu and stable quote
+container selectors, captures both generated status IDs, fails closed at every
+checkpoint, and deletes the quote before its target. Unexpected API failures and
+the enclosing exact rollback comparison are also covered. The quote and poll
+scenarios are executable intended acceptance coverage, but their final-tree
+browser run (and the corresponding restored-schema and worker fixtures) is
+explicitly deferred; source presence and passing offline harness contracts alone
+are not acceptance evidence.
 
 Optional evidence paths:
 

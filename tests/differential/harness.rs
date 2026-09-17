@@ -88,6 +88,15 @@ impl RequestSpec {
         self.query = Some(query.into());
         self
     }
+
+    pub(crate) fn with_header(
+        mut self,
+        name: impl http::header::IntoHeaderName,
+        value: http::HeaderValue,
+    ) -> Self {
+        self.headers.insert(name, value);
+        self
+    }
 }
 
 #[derive(Clone, Debug)]

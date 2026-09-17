@@ -128,7 +128,7 @@ case "$*" in
   *' eval '*rustodon-smoke:*)
     checkpoint=$(printf '%s\n' "$*" | sed -n 's/.*\/\* rustodon-smoke: \([a-z-]*\) \*\/.*/\1/p')
     case "$checkpoint" in
-      api-observer-ready|settings-ui-ready|settings-leading-observed|settings-trailing-observed|settings-reload-persisted|poll-compose-ready|poll-created|poll-voted|poll-refreshed|api-responses-acceptable) ;;
+      api-observer-ready|settings-ui-ready|settings-leading-observed|settings-trailing-observed|settings-reload-persisted|poll-compose-ready|poll-created|quote-target-created|quote-compose-ready|quote-created|quote-reload-persisted|poll-voted|poll-refreshed|api-responses-acceptable) ;;
       *) printf 'unknown smoke checkpoint: %s\n' "$checkpoint" >&2; exit 71 ;;
     esac
     printf '%s\n' "$checkpoint" >> "$BROWSER_TEST_EVENTS"
@@ -158,6 +158,10 @@ case "$*" in
       printf '%s\n' true
     fi
     ;;
+  *' click article[data-id="223456789"] button[aria-label="Boost or quote"]')
+    printf '%s\n' quote-action >> "$BROWSER_TEST_EVENTS" ;;
+  *' click .reblog-menu-item button[data-index="1"]')
+    printf '%s\n' quote-choice >> "$BROWSER_TEST_EVENTS" ;;
   *' click label[for="setting-toggle-home_timeline-shows-reblog"]')
     printf '%s\n' toggle-boosts >> "$BROWSER_TEST_EVENTS" ;;
   *' click label[for="setting-toggle-home_timeline-shows-reply"]')
@@ -174,7 +178,10 @@ case "$*" in
   *' get count #mastodon') printf '%s\n' 1 ;;
   *' eval document.body.className') printf '%s\n' app-body ;;
   *' eval '*"sessionStorage.getItem('rustodon-smoke-poll-status')"*) printf '%s\n' 123456789 ;;
+  *' eval '*"sessionStorage.getItem('rustodon-smoke-quote-target')"*) printf '%s\n' 223456789 ;;
+  *' eval '*"sessionStorage.getItem('rustodon-smoke-quote-status')"*) printf '%s\n' 323456789 ;;
   *' eval '*"sessionStorage.removeItem('rustodon-smoke-poll-status')"*) printf '%s\n' true ;;
+  *' eval '*"sessionStorage.removeItem('rustodon-smoke-quote-status')"*) printf '%s\n' true ;;
   *' eval '*initial-state*'116844606259201001'*)
     : > "$BROWSER_TEST_SESSION.auth"
     printf '%s\n' true
@@ -284,6 +291,14 @@ case "$url:$dump_header:$data" in
     [ "$cookie" = '_mastodon_session=browser-session' ] || exit 84
     printf '%s\n' '302|https://fixture.invalid/auth/sign_in'
     ;;
+  */api/v1/statuses/323456789::)
+    printf '%s\n' quote-cleanup >> "$BROWSER_TEST_EVENTS"
+    printf '%s\n' 200
+    ;;
+  */api/v1/statuses/223456789::)
+    printf '%s\n' quote-target-cleanup >> "$BROWSER_TEST_EVENTS"
+    printf '%s\n' 200
+    ;;
   */api/v1/statuses/123456789::)
     printf '%s\n' poll-cleanup >> "$BROWSER_TEST_EVENTS"
     printf '%s\n' 200
@@ -330,9 +345,11 @@ run_smoke() {
   output="$test_root/$case_name.output"
   curl_calls="$test_root/$case_name.curl-calls"
   poll_status_capture=''
+  quote_status_capture=''
   if [ "$auth" = true ]; then
     poll_status_capture="$test_root/$case_name.poll-status"
-    rm -f "$poll_status_capture"
+    quote_status_capture="$test_root/$case_name.quote-statuses"
+    rm -f "$poll_status_capture" "$quote_status_capture"
   fi
   : > "$events"
   : > "$commands"
@@ -363,6 +380,7 @@ run_smoke() {
     RUSTODON_BROWSER_VOTER_PASSWORD="$voter_password" \
     RUSTODON_BROWSER_VOTER_OTP="$voter_otp" \
     RUSTODON_BROWSER_POLL_STATUS_FILE="$poll_status_capture" \
+    RUSTODON_BROWSER_QUOTE_STATUS_FILE="$quote_status_capture" \
     RUSTODON_BROWSER_DEBUG=false \
     RUSTODON_BROWSER_RECORD='' \
     RUSTODON_BROWSER_SCREENSHOT='' \
@@ -393,6 +411,8 @@ run_smoke authenticated '' true true
 [ "$status" -eq 0 ] || fail_test 'authenticated fixture flow failed'
 grep -q 'browser web-client smoke passed' "$output" || fail_test 'success output missing'
 [ "$(cat "$poll_status_capture")" = 123456789 ] || fail_test 'generated poll status ID was not captured for exact cleanup'
+printf '223456789\n323456789\n' > "$test_root/expected.quote-statuses"
+cmp -s "$test_root/expected.quote-statuses" "$quote_status_capture" || fail_test 'generated quote target/status IDs were not captured for exact cleanup'
 cat > "$test_root/expected.events" <<'EOF'
 api-observer-ready
 csrf-sign-in
@@ -406,6 +426,13 @@ reload
 settings-reload-persisted
 poll-compose-ready
 poll-created
+quote-target-created
+quote-action
+quote-choice
+quote-compose-ready
+quote-created
+reload
+quote-reload-persisted
 profile-settings
 csrf-logout
 sign-out
@@ -416,6 +443,8 @@ poll-option
 poll-vote-submit
 poll-voted
 poll-refreshed
+quote-cleanup
+quote-target-cleanup
 poll-cleanup
 api-responses-acceptable
 EOF
@@ -449,7 +478,7 @@ for pin_case in standard plus slash; do
   run_smoke "tls-authenticated-$pin_case" '' true true "$tls_url" fixture.invalid "$tls_ca" "$pin"
   [ "$status" -eq 0 ] || fail_test "$case_name: valid scoped TLS adapter failed"
   cmp -s "$test_root/expected.events" "$events" || fail_test "$case_name: HTTPS lost the authenticated settings/logout flow"
-  [ "$(wc -l < "$curl_calls" | tr -d ' ')" -eq 8 ] || fail_test "$case_name: must verify CA on all eight curl calls"
+  [ "$(wc -l < "$curl_calls" | tr -d ' ')" -eq 10 ] || fail_test "$case_name: must verify CA on all ten curl calls"
   if grep -Fq "$pin" "$output" || grep -Fq "$tls_ca" "$output"; then
     fail_test "$case_name: TLS diagnostics exposed pin or CA path"
   fi
@@ -553,6 +582,7 @@ assert_cleanup
 # eval JavaScript or claim that true means any real response was inspected.
 for checkpoint in api-observer-ready settings-ui-ready settings-leading-observed \
   settings-trailing-observed settings-reload-persisted poll-compose-ready poll-created \
+  quote-target-created quote-compose-ready quote-created quote-reload-persisted \
   poll-voted poll-refreshed api-responses-acceptable; do
   for result in false empty '"true"' malformed '{"success":true,"data":{"result":true}}' command-error; do
     run_smoke "$checkpoint-$result" "$checkpoint" "$result" true
@@ -567,7 +597,7 @@ for checkpoint in api-observer-ready settings-ui-ready settings-leading-observed
       esac
       grep -Fq "result=$shape" "$output" || fail_test "$case_name: missing safe result classification"
       case "$checkpoint" in
-        api-observer-ready|poll-*|api-responses-acceptable)
+        api-observer-ready|poll-*|quote-*|api-responses-acceptable)
           grep -Fq 'browser API diagnostic:' "$output" || fail_test "$case_name: missing API diagnostic"
           ;;
       esac
@@ -578,7 +608,7 @@ for checkpoint in api-observer-ready settings-ui-ready settings-leading-observed
       [ "$status" -eq 1 ] || fail_test "$case_name: evaluation failure exit changed"
       grep -Fq 'result=eval-error' "$output" || fail_test "$case_name: missing eval-error classification"
       case "$checkpoint" in
-        api-observer-ready|poll-*|api-responses-acceptable)
+        api-observer-ready|poll-*|quote-*|api-responses-acceptable)
           grep -Fq "browser smoke failed: $checkpoint evaluation failed" "$output" || fail_test "$case_name: lost evaluation failure"
           grep -Fq 'browser API diagnostic:' "$output" || fail_test "$case_name: missing diagnostic after evaluation error"
           ;;
@@ -696,7 +726,9 @@ for (const file of files) {
 assert.deepEqual([...readiness.keys()].sort(), [
   'initial-app', 'authenticated-app', 'reloaded-app', 'post-logout-app',
   'home-controls', 'sign-in-form', 'profile-form', 'poll-composer',
-  'poll-options', 'poll-created', 'poll-vote', 'poll-vote-enabled', 'poll-voted', 'poll-refreshed', 'about-app',
+  'poll-options', 'poll-created', 'poll-vote', 'poll-vote-enabled', 'poll-voted', 'poll-refreshed',
+  'quote-target-composer', 'quote-target-created', 'quote-menu', 'quote-compose', 'quote-created',
+  'quote-permalink', 'quote-reload', 'about-app',
 ].sort(), 'every navigation uses explicit readiness');
 const ready = (label, overrides = {}) => {
   const fixture = { installed: true, state: 'interactive', present: true,
@@ -708,6 +740,14 @@ const ready = (label, overrides = {}) => {
   const timelineArticle = {
     textContent: 'Rustodon browser poll lifecycle 1 vote', dataset: { id: '123456789' },
     querySelector: selector => selector === '.poll' && has('article[data-id]') ? {} : null,
+  };
+  const quoteTargetArticle = {
+    textContent: 'Rustodon browser quote target', dataset: { id: '223456789' },
+    querySelector: () => null,
+  };
+  const quoteArticle = {
+    textContent: 'Rustodon browser quote commentary', dataset: { id: '323456789' },
+    querySelector: selector => selector === '.status__quote [data-id="223456789"]' ? {} : null,
   };
   const detailedStatus = {
     textContent: 'Rustodon browser poll lifecycle 1 vote',
@@ -737,11 +777,12 @@ const ready = (label, overrides = {}) => {
         if (selector === '.detailed-status__wrapper .detailed-status') return fixture.present ? detailedStatus : null;
         return has(selector) ? { disabled: fixture.disabled } : null;
       },
-      querySelectorAll: selector => has(selector)
-        ? (selector === 'article[data-id]'
-          ? [timelineArticle]
-          : [{}, {}])
-        : [],
+      querySelectorAll: selector => {
+        if (!fixture.present || (fixture.selectors && !fixture.selectors.includes(selector))) return [];
+        if (selector === 'article[data-id]') return [timelineArticle, quoteTargetArticle];
+        if (selector === 'article[data-id].status--has-quote') return [quoteArticle];
+        return [{}, {}];
+      },
     },
   });
 };
@@ -779,7 +820,7 @@ assert.equal(ready('poll-refreshed', { resources: [] }), false, 'poll refresh re
 assert.equal(ready('home-controls', { path: '/about' }), false);
 assert.equal(ready('about-app', { path: '/home' }), false);
 assert.equal(ready('about-app', { selectors: ['#mastodon > :not(noscript)'] }), false, 'stale React shell is not rendered About');
-assert.equal(expanded.size, 10, 'all ten browser checkpoint scripts must parse');
+assert.equal(expanded.size, 14, 'all fourteen browser checkpoint scripts must parse');
 const checkpoint = (label, context) => vm.runInNewContext(expanded.get(label), context);
 assert.equal(checkpoint('poll-compose-ready', {
   document: { querySelector: selector => selector === '.compose-form__poll__select__value'

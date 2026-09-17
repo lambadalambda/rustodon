@@ -62,6 +62,26 @@ pub(crate) enum InboxActivity {
         atom_uri: Option<String>,
         activity: Value,
     },
+    DeleteQuoteAuthorization {
+        actor_uri: String,
+        authorization_uri: String,
+        activity: Value,
+    },
+    QuoteRequest {
+        request_uri: String,
+        actor_uri: String,
+        object_uri: String,
+        instrument: Value,
+    },
+    QuoteDecision {
+        accepted: bool,
+        actor_uri: String,
+        request_uri: String,
+        request_actor_uri: Option<String>,
+        object_uri: Option<String>,
+        instrument_uri: Option<String>,
+        result_uri: Option<String>,
+    },
     Like {
         activity_uri: String,
         actor_uri: String,
@@ -186,8 +206,18 @@ pub(crate) fn parse_activity(body: &str) -> Result<InboxActivity, InboxParseErro
         return Err(InboxParseError::Activity);
     };
     let kind = [
-        "Create", "Update", "Delete", "Like", "Announce", "Follow", "Flag", "Block", "Accept",
-        "Reject", "Undo",
+        "Create",
+        "Update",
+        "Delete",
+        "QuoteRequest",
+        "Like",
+        "Announce",
+        "Follow",
+        "Flag",
+        "Block",
+        "Accept",
+        "Reject",
+        "Undo",
     ]
     .into_iter()
     .find(|kind| equals_or_includes(activity.get("type"), kind));
@@ -202,6 +232,7 @@ pub(crate) fn parse_activity(body: &str) -> Result<InboxActivity, InboxParseErro
         "Create" => parse_note_create(&activity),
         "Update" => parse_update(&activity),
         "Delete" => parse_delete(&activity),
+        "QuoteRequest" => parse_quote_request(&activity),
         "Like" => parse_interaction(&activity, true),
         "Announce" => parse_interaction(&activity, false),
         "Follow" => Ok(InboxActivity::Follow {
@@ -328,11 +359,40 @@ fn parse_delete(
             object_uri,
         });
     }
+    if object
+        .as_object()
+        .is_some_and(|object| equals_or_includes(object.get("type"), "QuoteAuthorization"))
+    {
+        return Ok(InboxActivity::DeleteQuoteAuthorization {
+            actor_uri,
+            authorization_uri: object_uri,
+            activity: Value::Object(activity.clone()),
+        });
+    }
     Ok(InboxActivity::DeleteNote {
         actor_uri,
         object_uri,
         atom_uri,
         activity: Value::Object(activity.clone()),
+    })
+}
+
+fn parse_quote_request(
+    activity: &serde_json::Map<String, Value>,
+) -> Result<InboxActivity, InboxParseError> {
+    let request_uri = required_uri(activity.get("id"))?;
+    let actor_uri = required_uri(activity.get("actor"))?;
+    let object_uri = required_uri(activity.get("object"))?;
+    let instrument = activity
+        .get("instrument")
+        .filter(|instrument| instrument.is_string() || instrument.is_object())
+        .ok_or(InboxParseError::Activity)?;
+    required_uri(Some(instrument))?;
+    Ok(InboxActivity::QuoteRequest {
+        request_uri,
+        actor_uri,
+        object_uri,
+        instrument: instrument.clone(),
     })
 }
 
@@ -677,6 +737,49 @@ fn parse_follow_decision(
 ) -> Result<InboxActivity, InboxParseError> {
     let actor_uri = required_uri(activity.get("actor"))?;
     let object = activity.get("object").ok_or(InboxParseError::Activity)?;
+    if let Value::Object(request) = object
+        && equals_or_includes(request.get("type"), "QuoteRequest")
+    {
+        let result_uri = activity
+            .get("result")
+            .map(|_| first_uri(activity.get("result")))
+            .transpose()?;
+        if accepted && result_uri.is_none() {
+            return Err(InboxParseError::Activity);
+        }
+        return Ok(InboxActivity::QuoteDecision {
+            accepted,
+            actor_uri,
+            request_uri: required_uri(request.get("id"))?,
+            request_actor_uri: request
+                .get("actor")
+                .map(|actor| required_uri(Some(actor)))
+                .transpose()?,
+            object_uri: request
+                .get("object")
+                .map(|object| required_uri(Some(object)))
+                .transpose()?,
+            instrument_uri: request
+                .get("instrument")
+                .map(|instrument| required_uri(Some(instrument)))
+                .transpose()?,
+            result_uri,
+        });
+    }
+    if object.is_string() && activity.get("result").is_some() {
+        if !accepted {
+            return Err(InboxParseError::Activity);
+        }
+        return Ok(InboxActivity::QuoteDecision {
+            accepted: true,
+            actor_uri,
+            request_uri: required_uri(Some(object))?,
+            request_actor_uri: None,
+            object_uri: None,
+            instrument_uri: None,
+            result_uri: Some(first_uri(activity.get("result"))?),
+        });
+    }
     let (follow_uri, target_uri, nested_actor_uri) = match object {
         Value::String(_) => (required_uri(Some(object))?, None, None),
         Value::Object(object) => match object.get("type").and_then(Value::as_str) {
@@ -1527,6 +1630,84 @@ mod tests {
         )
         .expect("Mastodon scalar metadata should parse");
         assert!(matches!(create, InboxActivity::CreateNote { .. }));
+    }
+
+    #[test]
+    fn parses_quote_request_decisions_and_authorization_delete() {
+        let request = parse_activity(
+            r#"{"id":"https://remote.example/quote_requests/1","type":"QuoteRequest","actor":"https://remote.example/users/alice","object":"https://local.example/statuses/7","instrument":{"id":"https://remote.example/statuses/9","type":"Note","attributedTo":"https://remote.example/users/alice","content":"quoted","quote":"https://local.example/statuses/7"}}"#,
+        )
+        .expect("QuoteRequest should parse");
+        assert!(matches!(
+            request,
+            InboxActivity::QuoteRequest {
+                request_uri,
+                actor_uri,
+                object_uri,
+                instrument,
+            } if request_uri == "https://remote.example/quote_requests/1"
+                && actor_uri == "https://remote.example/users/alice"
+                && object_uri == "https://local.example/statuses/7"
+                && instrument["id"] == "https://remote.example/statuses/9"
+        ));
+
+        let accept = parse_activity(
+            r#"{"type":"Accept","actor":"https://local.example/users/bob","object":{"id":"https://remote.example/quote_requests/1","type":"QuoteRequest","actor":"https://remote.example/users/alice","object":"https://local.example/statuses/7","instrument":"https://remote.example/statuses/9"},"result":{"id":"https://local.example/users/bob/quote_authorizations/3"}}"#,
+        )
+        .expect("embedded quote Accept should parse");
+        assert_eq!(
+            accept,
+            InboxActivity::QuoteDecision {
+                accepted: true,
+                actor_uri: "https://local.example/users/bob".to_owned(),
+                request_uri: "https://remote.example/quote_requests/1".to_owned(),
+                request_actor_uri: Some("https://remote.example/users/alice".to_owned()),
+                object_uri: Some("https://local.example/statuses/7".to_owned()),
+                instrument_uri: Some("https://remote.example/statuses/9".to_owned()),
+                result_uri: Some(
+                    "https://local.example/users/bob/quote_authorizations/3".to_owned()
+                ),
+            }
+        );
+
+        let reject = parse_activity(
+            r#"{"type":"Reject","actor":"https://local.example/users/bob","object":{"id":"https://remote.example/quote_requests/1","type":"QuoteRequest","actor":"https://remote.example/users/alice","object":"https://local.example/statuses/7","instrument":"https://remote.example/statuses/9"}}"#,
+        )
+        .expect("embedded quote Reject should parse");
+        assert!(matches!(
+            reject,
+            InboxActivity::QuoteDecision {
+                accepted: false,
+                result_uri: None,
+                ..
+            }
+        ));
+
+        let delete = parse_activity(
+            r#"{"type":"Delete","actor":"https://local.example/users/bob","object":{"id":"https://local.example/users/bob/quote_authorizations/3","type":"QuoteAuthorization"}}"#,
+        )
+        .expect("QuoteAuthorization Delete should parse");
+        assert!(matches!(
+            delete,
+            InboxActivity::DeleteQuoteAuthorization { actor_uri, authorization_uri, .. }
+                if actor_uri == "https://local.example/users/bob"
+                    && authorization_uri == "https://local.example/users/bob/quote_authorizations/3"
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_quote_activity_identifiers() {
+        for body in [
+            r#"{"id":"tag:remote:quote","type":"QuoteRequest","actor":"https://remote.example/users/alice","object":"https://local.example/statuses/7","instrument":"https://remote.example/statuses/9"}"#,
+            r#"{"id":"https://remote.example/quote_requests/1","type":"QuoteRequest","actor":"https://remote.example/users/alice","object":"file:///tmp/status","instrument":"https://remote.example/statuses/9"}"#,
+            r#"{"type":"Accept","actor":"https://local.example/users/bob","object":{"id":"https://remote.example/quote_requests/1","type":"QuoteRequest","actor":"https://remote.example/users/alice","object":"https://local.example/statuses/7","instrument":"not a URI"},"result":"https://local.example/authorization/1"}"#,
+        ] {
+            assert_eq!(
+                parse_activity(body),
+                Err(InboxParseError::Activity),
+                "{body}"
+            );
+        }
     }
 
     #[test]

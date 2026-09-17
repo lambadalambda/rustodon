@@ -27,6 +27,7 @@ BASE_CASES = {
     "rest_protocol_contracts",
     "federation_discovery",
     "actor_media_root_url",
+    "quote_lifecycle",
 }
 
 

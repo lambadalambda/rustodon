@@ -574,6 +574,1452 @@ pub(crate) async fn run_write_transactions_case(
     Ok(())
 }
 
+#[derive(Debug, PartialEq, sqlx::FromRow)]
+struct QuoteWriteState {
+    account_id: i64,
+    quoted_account_id: Option<i64>,
+    quoted_status_id: Option<i64>,
+    state: i32,
+    approval_present: bool,
+    activity_present: bool,
+    legacy: bool,
+    quotes_count: i64,
+}
+
+/// Bounded HTTP/database differential for the quote paths driven by the bundled
+/// composer. Signed remote approval/denial and revoke delivery are owned by the
+/// focused worker selector; this case proves their REST-visible persisted state.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn run_quote_lifecycle_case(
+    config: DifferentialConfig,
+    rust_url: &Url,
+) -> Result<(), Box<dyn Error>> {
+    const SELF_TARGET: i64 = 116_844_842_188_805_001;
+    const REBLOG_TARGET: i64 = 116_845_321_912_325_301;
+    const REMOTE_TARGET: i64 = 116_845_093_847_045_103;
+    const BLOCK_TARGET: i64 = 116_845_078_118_405_101;
+    const PRIVATE_TARGET: i64 = 116_844_850_053_125_003;
+    const POLICY_DENIED_TARGET: i64 = -315;
+    const NON_SELF_PRIVATE_TARGET: i64 = -403;
+    const DELETED_TARGET: i64 = 116_846_257_766_400_501;
+    const LOCAL_ACCOUNT: i64 = 116_844_606_259_201_001;
+    const BLOCK_TARGET_ACCOUNT: i64 = 116_844_606_259_202_001;
+    const REMOTE_TARGET_DOMAIN: &str = "remote.fixture.invalid";
+
+    config.validate_database_comments().await?;
+    let mastodon_owner = config
+        .mastodon_owner_database
+        .as_ref()
+        .expect("quote differential configuration must include a Mastodon owner URL");
+    let rust_writer = config
+        .rust_write_database
+        .as_ref()
+        .expect("quote differential configuration must include a Rust writer URL");
+    let targets = HttpTargets::new(config.mastodon_http.as_str(), rust_url.as_str())?;
+    let mut mastodon_ids = Vec::new();
+    let mut rust_ids = Vec::new();
+    let mastodon_self_quotes_before =
+        status_quotes_count(mastodon_owner.url(), SELF_TARGET).await?;
+    let rust_self_quotes_before = status_quotes_count(rust_writer.url(), SELF_TARGET).await?;
+    let mastodon_remote_quotes_before =
+        status_quotes_count(mastodon_owner.url(), REMOTE_TARGET).await?;
+    let rust_remote_quotes_before = status_quotes_count(rust_writer.url(), REMOTE_TARGET).await?;
+    let mastodon_private_quotes_before =
+        status_quotes_count(mastodon_owner.url(), PRIVATE_TARGET).await?;
+    let rust_private_quotes_before = status_quotes_count(rust_writer.url(), PRIVATE_TARGET).await?;
+    let mastodon_account_before = account_status_state(mastodon_owner.url(), LOCAL_ACCOUNT).await?;
+    let rust_account_before = account_status_state(rust_writer.url(), LOCAL_ACCOUNT).await?;
+    if mastodon_self_quotes_before != rust_self_quotes_before
+        || mastodon_remote_quotes_before != rust_remote_quotes_before
+        || mastodon_private_quotes_before != rust_private_quotes_before
+        || mastodon_account_before != rust_account_before
+    {
+        return Err("quote target/account baseline differs".into());
+    }
+    let mastodon_block_states = [
+        block_exists(mastodon_owner.url(), LOCAL_ACCOUNT, BLOCK_TARGET_ACCOUNT).await?,
+        block_exists(mastodon_owner.url(), BLOCK_TARGET_ACCOUNT, LOCAL_ACCOUNT).await?,
+    ];
+    let rust_block_states = [
+        block_exists(rust_writer.url(), LOCAL_ACCOUNT, BLOCK_TARGET_ACCOUNT).await?,
+        block_exists(rust_writer.url(), BLOCK_TARGET_ACCOUNT, LOCAL_ACCOUNT).await?,
+    ];
+    let mastodon_viewer_domain_block =
+        account_domain_block_exists(mastodon_owner.url(), LOCAL_ACCOUNT, REMOTE_TARGET_DOMAIN)
+            .await?;
+    let rust_viewer_domain_block =
+        account_domain_block_exists(rust_writer.url(), LOCAL_ACCOUNT, REMOTE_TARGET_DOMAIN).await?;
+    let mastodon_non_self_policy =
+        status_quote_approval_policy(mastodon_owner.url(), NON_SELF_PRIVATE_TARGET).await?;
+    let rust_non_self_policy =
+        status_quote_approval_policy(rust_writer.url(), NON_SELF_PRIVATE_TARGET).await?;
+    if mastodon_non_self_policy != rust_non_self_policy {
+        return Err("non-self private quote policy baseline differs".into());
+    }
+    set_status_quote_approval_policy(mastodon_owner.url(), NON_SELF_PRIVATE_TARGET, 2 << 16)
+        .await?;
+    if let Err(error) =
+        set_status_quote_approval_policy(rust_writer.url(), NON_SELF_PRIVATE_TARGET, 2 << 16).await
+    {
+        set_status_quote_approval_policy(
+            mastodon_owner.url(),
+            NON_SELF_PRIVATE_TARGET,
+            mastodon_non_self_policy,
+        )
+        .await?;
+        return Err(error.into());
+    }
+    let replay_key = format!(
+        "rustodon-differential-quote-lifecycle-{}",
+        std::process::id()
+    );
+
+    let operation = async {
+        // Local/self acceptance, reblog-to-original normalization, and remote
+        // pending/approval-required state all use the exact frontend field.
+        for (label, target, expected_target, expected_state, activity_present, expected_count) in [
+            (
+                "local self quote",
+                SELF_TARGET,
+                SELF_TARGET,
+                1,
+                false,
+                mastodon_self_quotes_before + 1,
+            ),
+            (
+                "reblog target normalization",
+                REBLOG_TARGET,
+                SELF_TARGET,
+                1,
+                false,
+                mastodon_self_quotes_before + 2,
+            ),
+            (
+                "remote approval quote",
+                REMOTE_TARGET,
+                REMOTE_TARGET,
+                0,
+                true,
+                mastodon_remote_quotes_before,
+            ),
+        ] {
+            let request = status_request(
+                Method::POST,
+                "/api/v1/statuses",
+                &format!(
+                    "status=fixture+{label}&visibility=public&quoted_status_id={target}"
+                ),
+            )?;
+            let mut responses = send_identically(&targets, &request).await?;
+            let mastodon_id = normalize_generated_status_response(
+                &mut responses.mastodon,
+                &format!("Mastodon {label}"),
+            )?;
+            let rust_id = normalize_generated_status_response(
+                &mut responses.rust,
+                &format!("Rust {label}"),
+            )?;
+            mastodon_ids.push(mastodon_id);
+            rust_ids.push(rust_id);
+            compare_responses(
+                &responses.mastodon,
+                &responses.rust,
+                &[CONTENT_TYPE, CACHE_CONTROL, VARY],
+                &[],
+                DEFAULT_MISMATCH_LIMIT,
+            )
+            .map_err(|error| format!("{label}: {error}"))?;
+            let mastodon_state = quote_write_state(mastodon_owner.url(), mastodon_id).await?;
+            let rust_state = quote_write_state(rust_writer.url(), rust_id).await?;
+            if mastodon_state != rust_state {
+                return Err(format!(
+                    "{label} database state differs: Mastodon={mastodon_state:?}, Rust={rust_state:?}"
+                )
+                .into());
+            }
+            if mastodon_state.quoted_status_id != Some(expected_target)
+                || mastodon_state.state != expected_state
+                || mastodon_state.activity_present != activity_present
+                || mastodon_state.approval_present
+                || mastodon_state.quotes_count != expected_count
+            {
+                return Err(format!(
+                    "{label} did not match pinned Mastodon semantics: {mastodon_state:?}"
+                )
+                .into());
+            }
+        }
+
+        assert_quote_creation_effects(rust_writer.url(), rust_ids[0], rust_ids[2]).await?;
+
+        // Public commentary quoting an own followers-only target is downgraded
+        // to private by Mastodon instead of disclosing the target publicly.
+        let private_request = status_request(
+            Method::POST,
+            "/api/v1/statuses",
+            &format!(
+                "status=fixture+private+quote&visibility=public&quoted_status_id={PRIVATE_TARGET}"
+            ),
+        )?;
+        let mut private = send_identically(&targets, &private_request).await?;
+        let mastodon_private_id =
+            normalize_generated_status_response(&mut private.mastodon, "Mastodon private quote")?;
+        let rust_private_id =
+            normalize_generated_status_response(&mut private.rust, "Rust private quote")?;
+        mastodon_ids.push(mastodon_private_id);
+        rust_ids.push(rust_private_id);
+        compare_responses(
+            &private.mastodon,
+            &private.rust,
+            &[CONTENT_TYPE, CACHE_CONTROL, VARY],
+            &[],
+            DEFAULT_MISMATCH_LIMIT,
+        )?;
+        if status_visibility(mastodon_owner.url(), mastodon_private_id).await? != 2
+            || status_visibility(rust_writer.url(), rust_private_id).await? != 2
+        {
+            return Err("private quote did not downgrade public commentary visibility".into());
+        }
+        let mastodon_private = quote_write_state(mastodon_owner.url(), mastodon_private_id).await?;
+        let rust_private = quote_write_state(rust_writer.url(), rust_private_id).await?;
+        if mastodon_private != rust_private
+            || mastodon_private.quoted_status_id != Some(PRIVATE_TARGET)
+            || mastodon_private.state != 1
+        {
+            return Err("private quote state differs from pinned Mastodon".into());
+        }
+
+        // Same-key replay must return the same quoted status rather than create
+        // commentary without (or against a different interpretation of) its quote.
+        let replay = status_request(
+            Method::POST,
+            "/api/v1/statuses",
+            &format!(
+                "status=fixture+idempotent+quote&visibility=public&quoted_status_id={SELF_TARGET}"
+            ),
+        )?
+        .with_header(
+            "idempotency-key",
+            HeaderValue::try_from(replay_key.as_str())?,
+        );
+        let first = send_identically(&targets, &replay).await?;
+        let second = send_identically(&targets, &replay).await?;
+        let mastodon_first = created_status_id(&first.mastodon.body)?;
+        let rust_first = created_status_id(&first.rust.body)?;
+        let mastodon_second = created_status_id(&second.mastodon.body)?;
+        let rust_second = created_status_id(&second.rust.body)?;
+        if mastodon_first != mastodon_second || rust_first != rust_second {
+            return Err("quote idempotency replay created a second status".into());
+        }
+        mastodon_ids.push(mastodon_first);
+        rust_ids.push(rust_first);
+        if quote_write_state(mastodon_owner.url(), mastodon_first).await?
+            != quote_write_state(rust_writer.url(), rust_first).await?
+        {
+            return Err("idempotent quote database state differs".into());
+        }
+
+        // Mastodon permits quoting a visible remote target even when the quoter
+        // domain-blocks its author. The block still hides the nested target in
+        // REST reads; only an explicit account block rejects the write.
+        set_account_domain_block(
+            mastodon_owner.url(),
+            LOCAL_ACCOUNT,
+            REMOTE_TARGET_DOMAIN,
+            true,
+        )
+        .await?;
+        set_account_domain_block(
+            rust_writer.url(),
+            LOCAL_ACCOUNT,
+            REMOTE_TARGET_DOMAIN,
+            true,
+        )
+        .await?;
+        let viewer_domain_block_result = async {
+            let request = status_request(
+                Method::POST,
+                "/api/v1/statuses",
+                &format!(
+                    "status=viewer+domain+blocked+quote&quoted_status_id={REMOTE_TARGET}"
+                ),
+            )?;
+            let mut responses = send_identically(&targets, &request).await?;
+            let mastodon_id = normalize_generated_status_response(
+                &mut responses.mastodon,
+                "Mastodon viewer-domain-block quote",
+            )?;
+            let rust_id = normalize_generated_status_response(
+                &mut responses.rust,
+                "Rust viewer-domain-block quote",
+            )?;
+            mastodon_ids.push(mastodon_id);
+            rust_ids.push(rust_id);
+            compare_responses(
+                &responses.mastodon,
+                &responses.rust,
+                &[CONTENT_TYPE, CACHE_CONTROL, VARY],
+                &[],
+                DEFAULT_MISMATCH_LIMIT,
+            )?;
+            let mastodon_state = quote_write_state(mastodon_owner.url(), mastodon_id).await?;
+            let rust_state = quote_write_state(rust_writer.url(), rust_id).await?;
+            if mastodon_state != rust_state
+                || mastodon_state.quoted_status_id != Some(REMOTE_TARGET)
+                || mastodon_state.state != 0
+            {
+                return Err("viewer-side domain block changed quote-write semantics".into());
+            }
+            Ok::<(), Box<dyn Error>>(())
+        }
+        .await;
+        set_account_domain_block(
+            mastodon_owner.url(),
+            LOCAL_ACCOUNT,
+            REMOTE_TARGET_DOMAIN,
+            mastodon_viewer_domain_block,
+        )
+        .await?;
+        set_account_domain_block(
+            rust_writer.url(),
+            LOCAL_ACCOUNT,
+            REMOTE_TARGET_DOMAIN,
+            rust_viewer_domain_block,
+        )
+        .await?;
+        viewer_domain_block_result?;
+
+        // Exercise the exact frontend revoke endpoint rather than proving only
+        // the repository transition. A fresh accepted self-quote makes the
+        // counter/state assertions independent of the later edit/delete case.
+        let revoke_create = status_request(
+            Method::POST,
+            "/api/v1/statuses",
+            &format!("status=fixture+revoke+quote&quoted_status_id={SELF_TARGET}"),
+        )?;
+        let mut revoke_created = send_identically(&targets, &revoke_create).await?;
+        let mastodon_revoke_id = normalize_generated_status_response(
+            &mut revoke_created.mastodon,
+            "Mastodon revocable quote",
+        )?;
+        let rust_revoke_id = normalize_generated_status_response(
+            &mut revoke_created.rust,
+            "Rust revocable quote",
+        )?;
+        mastodon_ids.push(mastodon_revoke_id);
+        rust_ids.push(rust_revoke_id);
+        compare_responses(
+            &revoke_created.mastodon,
+            &revoke_created.rust,
+            &[CONTENT_TYPE, CACHE_CONTROL, VARY],
+            &[],
+            DEFAULT_MISMATCH_LIMIT,
+        )?;
+        let mastodon_revoke_before =
+            quote_write_state(mastodon_owner.url(), mastodon_revoke_id).await?;
+        let rust_revoke_before = quote_write_state(rust_writer.url(), rust_revoke_id).await?;
+        for (label, token, expected_status) in [
+            ("quote revoke without authentication", None, 401),
+            (
+                "quote revoke with wrong scope",
+                Some("fixture-bearer-matrix-viewer-v4-6-5"),
+                403,
+            ),
+        ] {
+            let mastodon_denied = status_request_with_token(
+                Method::POST,
+                &format!(
+                    "/api/v1/statuses/{SELF_TARGET}/quotes/{mastodon_revoke_id}/revoke"
+                ),
+                "",
+                token,
+            )?;
+            let rust_denied = status_request_with_token(
+                Method::POST,
+                &format!("/api/v1/statuses/{SELF_TARGET}/quotes/{rust_revoke_id}/revoke"),
+                "",
+                token,
+            )?;
+            let (mastodon_denied, rust_denied) = tokio::join!(
+                send_single(targets.mastodon(), &mastodon_denied, "Mastodon"),
+                send_single(targets.rust(), &rust_denied, "Rust")
+            );
+            let (mastodon_status, rust_status) =
+                (mastodon_denied?.status, rust_denied?.status);
+            if mastodon_status != expected_status || rust_status != expected_status {
+                return Err(format!(
+                    "{label} differed: Mastodon={mastodon_status}, Rust={rust_status}, expected={expected_status}"
+                )
+                .into());
+            }
+        }
+        let mastodon_wrong_owner_before =
+            quote_write_state(mastodon_owner.url(), mastodon_ids[2]).await?;
+        let rust_wrong_owner_before = quote_write_state(rust_writer.url(), rust_ids[2]).await?;
+        let mastodon_wrong_owner = status_request(
+            Method::POST,
+            &format!(
+                "/api/v1/statuses/{REMOTE_TARGET}/quotes/{}/revoke",
+                mastodon_ids[2]
+            ),
+            "",
+        )?;
+        let rust_wrong_owner = status_request(
+            Method::POST,
+            &format!(
+                "/api/v1/statuses/{REMOTE_TARGET}/quotes/{}/revoke",
+                rust_ids[2]
+            ),
+            "",
+        )?;
+        let (mastodon_wrong_owner, rust_wrong_owner) = tokio::join!(
+            send_single(targets.mastodon(), &mastodon_wrong_owner, "Mastodon"),
+            send_single(targets.rust(), &rust_wrong_owner, "Rust")
+        );
+        if mastodon_wrong_owner?.status != 403 || rust_wrong_owner?.status != 403 {
+            return Err("quote revoke by a non-owner did not fail with 403".into());
+        }
+        if quote_write_state(mastodon_owner.url(), mastodon_revoke_id).await?
+            != mastodon_revoke_before
+            || quote_write_state(rust_writer.url(), rust_revoke_id).await? != rust_revoke_before
+            || quote_write_state(mastodon_owner.url(), mastodon_ids[2]).await?
+                != mastodon_wrong_owner_before
+            || quote_write_state(rust_writer.url(), rust_ids[2]).await? != rust_wrong_owner_before
+        {
+            return Err("denied quote revoke mutated quote state".into());
+        }
+        let mastodon_revoke = status_request(
+            Method::POST,
+            &format!(
+                "/api/v1/statuses/{SELF_TARGET}/quotes/{mastodon_revoke_id}/revoke"
+            ),
+            "",
+        )?;
+        let rust_revoke = status_request(
+            Method::POST,
+            &format!("/api/v1/statuses/{SELF_TARGET}/quotes/{rust_revoke_id}/revoke"),
+            "",
+        )?;
+        let (mastodon_revoke, rust_revoke) = tokio::join!(
+            send_single(targets.mastodon(), &mastodon_revoke, "Mastodon"),
+            send_single(targets.rust(), &rust_revoke, "Rust")
+        );
+        let mut mastodon_revoke = mastodon_revoke?;
+        let mut rust_revoke = rust_revoke?;
+        normalize_generated_status_response(&mut mastodon_revoke, "Mastodon quote revoke")?;
+        normalize_generated_status_response(&mut rust_revoke, "Rust quote revoke")?;
+        compare_responses(
+            &mastodon_revoke,
+            &rust_revoke,
+            &[CONTENT_TYPE, CACHE_CONTROL, VARY],
+            &[],
+            DEFAULT_MISMATCH_LIMIT,
+        )?;
+        let mastodon_revoked = quote_write_state(mastodon_owner.url(), mastodon_revoke_id).await?;
+        let rust_revoked = quote_write_state(rust_writer.url(), rust_revoke_id).await?;
+        if mastodon_revoked != rust_revoked
+            || mastodon_revoked.state != 3
+            || mastodon_revoked.approval_present
+            || mastodon_revoked.quotes_count != mastodon_self_quotes_before + 3
+        {
+            return Err("frontend quote revoke endpoint state/effects differ".into());
+        }
+
+        // The frontend's dedicated interaction-policy PUT validates policy,
+        // ownership and scope, and emits one update only for a real change.
+        let policy_create = status_request(
+            Method::POST,
+            "/api/v1/statuses",
+            "status=fixture+interaction+policy&visibility=public",
+        )?;
+        let mut policy_created = send_identically(&targets, &policy_create).await?;
+        let mastodon_policy_id = normalize_generated_status_response(
+            &mut policy_created.mastodon,
+            "Mastodon interaction-policy status",
+        )?;
+        let rust_policy_id = normalize_generated_status_response(
+            &mut policy_created.rust,
+            "Rust interaction-policy status",
+        )?;
+        mastodon_ids.push(mastodon_policy_id);
+        rust_ids.push(rust_policy_id);
+        compare_responses(
+            &policy_created.mastodon,
+            &policy_created.rust,
+            &[CONTENT_TYPE, CACHE_CONTROL, VARY],
+            &[],
+            DEFAULT_MISMATCH_LIMIT,
+        )?;
+        let mastodon_policy_request = status_request(
+            Method::PUT,
+            &format!("/api/v1/statuses/{mastodon_policy_id}/interaction_policy"),
+            "quote_approval_policy=followers",
+        )?;
+        let rust_policy_request = status_request(
+            Method::PUT,
+            &format!("/api/v1/statuses/{rust_policy_id}/interaction_policy"),
+            "quote_approval_policy=followers",
+        )?;
+        let (mastodon_policy, rust_policy) = tokio::join!(
+            send_single(targets.mastodon(), &mastodon_policy_request, "Mastodon"),
+            send_single(targets.rust(), &rust_policy_request, "Rust")
+        );
+        let mut mastodon_policy = mastodon_policy?;
+        let mut rust_policy = rust_policy?;
+        normalize_generated_status_response(&mut mastodon_policy, "Mastodon interaction policy")?;
+        normalize_generated_status_response(&mut rust_policy, "Rust interaction policy")?;
+        compare_responses(
+            &mastodon_policy,
+            &rust_policy,
+            &[CONTENT_TYPE, CACHE_CONTROL, VARY],
+            &[],
+            DEFAULT_MISMATCH_LIMIT,
+        )?;
+        if status_quote_approval_policy(mastodon_owner.url(), mastodon_policy_id).await?
+            != 4 << 16
+            || status_quote_approval_policy(rust_writer.url(), rust_policy_id).await? != 4 << 16
+            || interaction_policy_effect_counts(rust_writer.url(), rust_policy_id).await?
+                != (1, 1)
+        {
+            return Err("interaction-policy change did not persist and emit exact update effects".into());
+        }
+        let before_noop = interaction_policy_effect_counts(rust_writer.url(), rust_policy_id).await?;
+        let (mastodon_noop, rust_noop) = tokio::join!(
+            send_single(targets.mastodon(), &mastodon_policy_request, "Mastodon"),
+            send_single(targets.rust(), &rust_policy_request, "Rust")
+        );
+        if !(200..300).contains(&mastodon_noop?.status)
+            || !(200..300).contains(&rust_noop?.status)
+            || interaction_policy_effect_counts(rust_writer.url(), rust_policy_id).await?
+                != before_noop
+        {
+            return Err("interaction-policy no-op emitted duplicate effects".into());
+        }
+        let mastodon_blank = status_request(
+            Method::PUT,
+            &format!("/api/v1/statuses/{mastodon_policy_id}/interaction_policy"),
+            "quote_approval_policy=",
+        )?;
+        let rust_blank = status_request(
+            Method::PUT,
+            &format!("/api/v1/statuses/{rust_policy_id}/interaction_policy"),
+            "quote_approval_policy=",
+        )?;
+        let (mastodon_blank, rust_blank) = tokio::join!(
+            send_single(targets.mastodon(), &mastodon_blank, "Mastodon"),
+            send_single(targets.rust(), &rust_blank, "Rust")
+        );
+        let mut mastodon_blank = mastodon_blank?;
+        let mut rust_blank = rust_blank?;
+        normalize_generated_status_response(&mut mastodon_blank, "Mastodon blank quote policy")?;
+        normalize_generated_status_response(&mut rust_blank, "Rust blank quote policy")?;
+        compare_responses(
+            &mastodon_blank,
+            &rust_blank,
+            &[CONTENT_TYPE, CACHE_CONTROL, VARY],
+            &[],
+            DEFAULT_MISMATCH_LIMIT,
+        )?;
+        if status_quote_approval_policy(mastodon_owner.url(), mastodon_policy_id).await?
+            != 2 << 16
+            || status_quote_approval_policy(rust_writer.url(), rust_policy_id).await? != 2 << 16
+            || interaction_policy_effect_counts(rust_writer.url(), rust_policy_id).await?
+                != (2, 2)
+        {
+            return Err("blank interaction policy did not apply the user default".into());
+        }
+        let mastodon_omitted = status_request(
+            Method::PUT,
+            &format!("/api/v1/statuses/{mastodon_policy_id}/interaction_policy"),
+            "",
+        )?;
+        let rust_omitted = status_request(
+            Method::PUT,
+            &format!("/api/v1/statuses/{rust_policy_id}/interaction_policy"),
+            "",
+        )?;
+        let (mastodon_omitted, rust_omitted) = tokio::join!(
+            send_single(targets.mastodon(), &mastodon_omitted, "Mastodon"),
+            send_single(targets.rust(), &rust_omitted, "Rust")
+        );
+        if !(200..300).contains(&mastodon_omitted?.status)
+            || !(200..300).contains(&rust_omitted?.status)
+            || interaction_policy_effect_counts(rust_writer.url(), rust_policy_id).await?
+                != (2, 2)
+        {
+            return Err("omitted interaction policy did not remain an exact no-op".into());
+        }
+
+        for (label, mastodon_status_id, rust_status_id) in [
+            ("private status", PRIVATE_TARGET, PRIVATE_TARGET),
+            ("reblog status", REBLOG_TARGET, REBLOG_TARGET),
+        ] {
+            let mastodon_before =
+                status_quote_approval_policy(mastodon_owner.url(), mastodon_status_id).await?;
+            let rust_before = status_quote_approval_policy(rust_writer.url(), rust_status_id).await?;
+            let mastodon_invalid = status_request(
+                Method::PUT,
+                &format!("/api/v1/statuses/{mastodon_status_id}/interaction_policy"),
+                "quote_approval_policy=invalid",
+            )?;
+            let rust_invalid = status_request(
+                Method::PUT,
+                &format!("/api/v1/statuses/{rust_status_id}/interaction_policy"),
+                "quote_approval_policy=invalid",
+            )?;
+            let (mastodon_invalid, rust_invalid) = tokio::join!(
+                send_single(targets.mastodon(), &mastodon_invalid, "Mastodon"),
+                send_single(targets.rust(), &rust_invalid, "Rust")
+            );
+            let (mastodon_status, rust_status) =
+                (mastodon_invalid?.status, rust_invalid?.status);
+            if mastodon_status != 422
+                || rust_status != 422
+                || status_quote_approval_policy(mastodon_owner.url(), mastodon_status_id).await?
+                    != mastodon_before
+                || status_quote_approval_policy(rust_writer.url(), rust_status_id).await?
+                    != rust_before
+            {
+                return Err(format!("invalid interaction policy mutated a {label}").into());
+            }
+        }
+        for (label, request, expected_status) in [
+            (
+                "invalid interaction policy",
+                status_request(
+                    Method::PUT,
+                    &format!("/api/v1/statuses/{rust_policy_id}/interaction_policy"),
+                    "quote_approval_policy=invalid",
+                )?,
+                422,
+            ),
+            (
+                "interaction policy without authentication",
+                status_request_with_token(
+                    Method::PUT,
+                    &format!("/api/v1/statuses/{rust_policy_id}/interaction_policy"),
+                    "quote_approval_policy=public",
+                    None,
+                )?,
+                401,
+            ),
+            (
+                "interaction policy with wrong scope",
+                status_request_with_token(
+                    Method::PUT,
+                    &format!("/api/v1/statuses/{rust_policy_id}/interaction_policy"),
+                    "quote_approval_policy=public",
+                    Some("fixture-bearer-matrix-viewer-v4-6-5"),
+                )?,
+                403,
+            ),
+            (
+                "interaction policy for another owner",
+                status_request(
+                    Method::PUT,
+                    &format!("/api/v1/statuses/{REMOTE_TARGET}/interaction_policy"),
+                    "quote_approval_policy=public",
+                )?,
+                403,
+            ),
+        ] {
+            let response = send_single(targets.rust(), &request, "Rust").await?;
+            if response.status != expected_status {
+                return Err(format!(
+                    "{label} returned {}, expected {expected_status}",
+                    response.status
+                )
+                .into());
+            }
+        }
+
+        // Invalid targets, blocked pairs, and direct posts without a non-silent
+        // target-author mention must fail without leaving status/quote residue.
+        for (label, body, block) in [
+            (
+                "missing target rollback",
+                "status=missing+quote&quoted_status_id=9223372036854775807".to_owned(),
+                None,
+            ),
+            (
+                "policy denied target",
+                format!("status=policy+denied+quote&quoted_status_id={POLICY_DENIED_TARGET}"),
+                None,
+            ),
+            (
+                "non-self followers-only target",
+                format!(
+                    "status=private+target+quote&quoted_status_id={NON_SELF_PRIVATE_TARGET}"
+                ),
+                None,
+            ),
+            (
+                "deleted target rollback",
+                format!("status=deleted+quote&quoted_status_id={DELETED_TARGET}"),
+                None,
+            ),
+            (
+                "direct target author omitted",
+                format!(
+                    "status=direct+quote&visibility=direct&quoted_status_id={BLOCK_TARGET}"
+                ),
+                None,
+            ),
+            (
+                "quoter blocks quotee",
+                format!("status=blocked+quote&quoted_status_id={BLOCK_TARGET}"),
+                Some((LOCAL_ACCOUNT, BLOCK_TARGET_ACCOUNT)),
+            ),
+            (
+                "quotee blocks quoter",
+                format!("status=blocked+quote&quoted_status_id={BLOCK_TARGET}"),
+                Some((BLOCK_TARGET_ACCOUNT, LOCAL_ACCOUNT)),
+            ),
+        ] {
+            if let Some((blocker, blocked)) = block {
+                set_poll_block(mastodon_owner.url(), blocker, blocked, true).await?;
+                set_poll_block(rust_writer.url(), blocker, blocked, true).await?;
+            }
+            let mastodon_before = quote_lifecycle_snapshot(mastodon_owner.url()).await?;
+            let rust_before = quote_lifecycle_snapshot(rust_writer.url()).await?;
+            let rust_operational_before = quote_operational_snapshot(rust_writer.url()).await?;
+            let result = async {
+                let request = status_request(Method::POST, "/api/v1/statuses", &body)?;
+                let responses = send_identically(&targets, &request).await?;
+                compare_responses(
+                    &responses.mastodon,
+                    &responses.rust,
+                    &[CONTENT_TYPE, CACHE_CONTROL, VARY],
+                    &[],
+                    DEFAULT_MISMATCH_LIMIT,
+                )
+                .map_err(|error| format!("{label}: {error}"))?;
+                if (200..300).contains(&responses.mastodon.status)
+                    || (200..300).contains(&responses.rust.status)
+                {
+                    return Err(format!("{label} unexpectedly created a status").into());
+                }
+                let mastodon_after = quote_lifecycle_snapshot(mastodon_owner.url()).await?;
+                let rust_after = quote_lifecycle_snapshot(rust_writer.url()).await?;
+                let rust_operational_after = quote_operational_snapshot(rust_writer.url()).await?;
+                if mastodon_after != mastodon_before
+                    || rust_after != rust_before
+                    || rust_operational_after != rust_operational_before
+                {
+                    return Err(format!("{label} left transactional quote side effects after failure").into());
+                }
+                Ok::<(), Box<dyn Error>>(())
+            }
+            .await;
+            if let Some((blocker, blocked)) = block {
+                let index = usize::from(blocker == BLOCK_TARGET_ACCOUNT);
+                set_poll_block(
+                    mastodon_owner.url(),
+                    blocker,
+                    blocked,
+                    mastodon_block_states[index],
+                )
+                .await?;
+                set_poll_block(
+                    rust_writer.url(),
+                    blocker,
+                    blocked,
+                    rust_block_states[index],
+                )
+                .await?;
+            }
+            result?;
+        }
+
+        // Direct quotes succeed only when the target author has an explicit,
+        // non-silent mention; quote access' silent mention is not sufficient.
+        let direct_request = status_request(
+            Method::POST,
+            "/api/v1/statuses",
+            &format!(
+                "status=%40bob%40remote.fixture.invalid+direct+quote&visibility=direct&quoted_status_id={REMOTE_TARGET}"
+            ),
+        )?;
+        let mut direct = send_identically(&targets, &direct_request).await?;
+        let mastodon_direct_id =
+            normalize_generated_status_response(&mut direct.mastodon, "Mastodon direct quote")?;
+        let rust_direct_id =
+            normalize_generated_status_response(&mut direct.rust, "Rust direct quote")?;
+        mastodon_ids.push(mastodon_direct_id);
+        rust_ids.push(rust_direct_id);
+        compare_responses(
+            &direct.mastodon,
+            &direct.rust,
+            &[CONTENT_TYPE, CACHE_CONTROL, VARY],
+            &[],
+            DEFAULT_MISMATCH_LIMIT,
+        )?;
+        let mastodon_direct = quote_write_state(mastodon_owner.url(), mastodon_direct_id).await?;
+        let rust_direct = quote_write_state(rust_writer.url(), rust_direct_id).await?;
+        if mastodon_direct != rust_direct
+            || mastodon_direct.state != 0
+            || !has_non_silent_mention(mastodon_owner.url(), mastodon_direct_id, BLOCK_TARGET_ACCOUNT)
+                .await?
+            || !has_non_silent_mention(rust_writer.url(), rust_direct_id, BLOCK_TARGET_ACCOUNT).await?
+        {
+            return Err("direct quote mention or pending state differs".into());
+        }
+
+        // Editing commentary preserves the quote; deleting the quoting status
+        // retires the relationship and its accepted-target counter atomically.
+        let mastodon_edit_id = mastodon_ids[0];
+        let rust_edit_id = rust_ids[0];
+        let mastodon_edit = status_request(
+            Method::PATCH,
+            &format!("/api/v1/statuses/{mastodon_edit_id}"),
+            "status=fixture+edited+quote",
+        )?;
+        let rust_edit = status_request(
+            Method::PATCH,
+            &format!("/api/v1/statuses/{rust_edit_id}"),
+            "status=fixture+edited+quote",
+        )?;
+        let (mastodon_edit, rust_edit) = tokio::join!(
+            send_single(targets.mastodon(), &mastodon_edit, "Mastodon"),
+            send_single(targets.rust(), &rust_edit, "Rust")
+        );
+        let mut mastodon_edit = mastodon_edit?;
+        let mut rust_edit = rust_edit?;
+        if !(200..300).contains(&mastodon_edit.status)
+            || !(200..300).contains(&rust_edit.status)
+        {
+            return Err("quote commentary update was not successful".into());
+        }
+        if normalize_generated_status_response(&mut mastodon_edit, "Mastodon quote update")?
+            != mastodon_edit_id
+            || normalize_generated_status_response(&mut rust_edit, "Rust quote update")?
+                != rust_edit_id
+        {
+            return Err("quote update returned the wrong status".into());
+        }
+        compare_responses(
+            &mastodon_edit,
+            &rust_edit,
+            &[CONTENT_TYPE, CACHE_CONTROL, VARY],
+            &[],
+            DEFAULT_MISMATCH_LIMIT,
+        )?;
+        let mastodon_update = quote_update_state(mastodon_owner.url(), mastodon_edit_id).await?;
+        let rust_update = quote_update_state(rust_writer.url(), rust_edit_id).await?;
+        if mastodon_update != rust_update
+            || mastodon_update.0 != "fixture edited quote"
+            || !mastodon_update.1
+            || mastodon_update.2 == 0
+            || quote_write_state(mastodon_owner.url(), mastodon_edit_id).await?
+                != quote_write_state(rust_writer.url(), rust_edit_id).await?
+        {
+            return Err("quote commentary update state differs".into());
+        }
+        assert_quote_update_effects(rust_writer.url(), rust_edit_id).await?;
+
+        let mastodon_delete = status_request(
+            Method::DELETE,
+            &format!("/api/v1/statuses/{mastodon_edit_id}"),
+            "",
+        )?;
+        let rust_delete = status_request(
+            Method::DELETE,
+            &format!("/api/v1/statuses/{rust_edit_id}"),
+            "",
+        )?;
+        let (mastodon_delete, rust_delete) = tokio::join!(
+            send_single(targets.mastodon(), &mastodon_delete, "Mastodon"),
+            send_single(targets.rust(), &rust_delete, "Rust")
+        );
+        if mastodon_delete?.status != rust_delete?.status {
+            return Err("quote delete response differs".into());
+        }
+        if active_quote_exists(mastodon_owner.url(), mastodon_edit_id).await?
+            || active_quote_exists(rust_writer.url(), rust_edit_id).await?
+        {
+            return Err("deleted quoting status retained an active quote relationship".into());
+        }
+        let mastodon_target_count =
+            status_quotes_count(mastodon_owner.url(), SELF_TARGET).await?;
+        let rust_target_count = status_quotes_count(rust_writer.url(), SELF_TARGET).await?;
+        if mastodon_target_count != mastodon_self_quotes_before + 2
+            || rust_target_count != rust_self_quotes_before + 2
+        {
+            return Err(format!(
+                "quote delete did not restore the exact target counter: Mastodon={mastodon_target_count}, Rust={rust_target_count}"
+            )
+            .into());
+        }
+        if !status_is_deleted(mastodon_owner.url(), mastodon_edit_id).await?
+            || !status_is_deleted(rust_writer.url(), rust_edit_id).await?
+        {
+            return Err("quote delete did not retire the quoting status".into());
+        }
+        Ok::<(), Box<dyn Error>>(())
+    }
+    .await;
+
+    let cleanup = async {
+        for (index, (blocker, blocked)) in [
+            (LOCAL_ACCOUNT, BLOCK_TARGET_ACCOUNT),
+            (BLOCK_TARGET_ACCOUNT, LOCAL_ACCOUNT),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            set_poll_block(
+                mastodon_owner.url(),
+                blocker,
+                blocked,
+                mastodon_block_states[index],
+            )
+            .await?;
+            set_poll_block(
+                rust_writer.url(),
+                blocker,
+                blocked,
+                rust_block_states[index],
+            )
+            .await?;
+        }
+        set_account_domain_block(
+            mastodon_owner.url(),
+            LOCAL_ACCOUNT,
+            REMOTE_TARGET_DOMAIN,
+            mastodon_viewer_domain_block,
+        )
+        .await?;
+        set_account_domain_block(
+            rust_writer.url(),
+            LOCAL_ACCOUNT,
+            REMOTE_TARGET_DOMAIN,
+            rust_viewer_domain_block,
+        )
+        .await?;
+        set_status_quote_approval_policy(
+            mastodon_owner.url(),
+            NON_SELF_PRIVATE_TARGET,
+            mastodon_non_self_policy,
+        )
+        .await?;
+        set_status_quote_approval_policy(
+            rust_writer.url(),
+            NON_SELF_PRIVATE_TARGET,
+            rust_non_self_policy,
+        )
+        .await?;
+        restore_created_statuses(mastodon_owner.url(), &mastodon_ids).await?;
+        restore_created_statuses(rust_writer.url(), &rust_ids).await?;
+        set_status_quotes_count(
+            mastodon_owner.url(),
+            SELF_TARGET,
+            mastodon_self_quotes_before,
+        )
+        .await?;
+        set_status_quotes_count(rust_writer.url(), SELF_TARGET, rust_self_quotes_before).await?;
+        set_status_quotes_count(
+            mastodon_owner.url(),
+            REMOTE_TARGET,
+            mastodon_remote_quotes_before,
+        )
+        .await?;
+        set_status_quotes_count(rust_writer.url(), REMOTE_TARGET, rust_remote_quotes_before)
+            .await?;
+        set_status_quotes_count(
+            mastodon_owner.url(),
+            PRIVATE_TARGET,
+            mastodon_private_quotes_before,
+        )
+        .await?;
+        set_status_quotes_count(
+            rust_writer.url(),
+            PRIVATE_TARGET,
+            rust_private_quotes_before,
+        )
+        .await?;
+        restore_account_status_state(
+            mastodon_owner.url(),
+            LOCAL_ACCOUNT,
+            &mastodon_account_before,
+        )
+        .await?;
+        restore_account_status_state(rust_writer.url(), LOCAL_ACCOUNT, &rust_account_before)
+            .await?;
+        cleanup_quote_operational(rust_writer.url(), &rust_ids, &replay_key).await?;
+        Ok::<(), Box<dyn Error>>(())
+    }
+    .await;
+    operation_and_cleanup(operation, cleanup)
+}
+
+async fn quote_update_state(url: &str, status_id: i64) -> Result<(String, bool, i64), sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query_as(
+        "SELECT status.text, status.edited_at IS NOT NULL,
+                (SELECT count(*) FROM public.status_edits edit WHERE edit.status_id = status.id)
+           FROM public.statuses status WHERE status.id = $1",
+    )
+    .bind(status_id)
+    .fetch_one(&mut connection)
+    .await
+}
+
+async fn interaction_policy_effect_counts(
+    url: &str,
+    status_id: i64,
+) -> Result<(i64, i64), sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query_as(
+        "SELECT
+           (SELECT count(*) FROM rustodon.outbox_events
+             WHERE kind = 'rustodon.activitypub.distribute_status'
+               AND (payload #>> '{arguments,status_id}')::bigint = $1
+               AND payload #>> '{arguments,activity_type}' = 'Update'
+               AND payload #>> '{arguments,update_kind}' = 'interaction_policy')
+           +
+           (SELECT count(*) FROM rustodon.durable_jobs
+             WHERE kind = 'rustodon.activitypub.distribute_status'
+               AND (arguments ->> 'status_id')::bigint = $1
+               AND arguments ->> 'activity_type' = 'Update'
+               AND arguments ->> 'update_kind' = 'interaction_policy'),
+           (SELECT count(*) FROM rustodon.outbox_events
+             WHERE kind = 'rustodon.mastodon.stream_event'
+               AND (payload ->> 'object_id')::bigint = $1
+               AND payload ->> 'event' = 'status.update')",
+    )
+    .bind(status_id)
+    .fetch_one(&mut connection)
+    .await
+}
+
+async fn assert_quote_update_effects(url: &str, status_id: i64) -> Result<(), Box<dyn Error>> {
+    let mut connection = PgConnection::connect(url).await?;
+    let distribution: i64 = sqlx::query_scalar(
+        "SELECT
+           (SELECT count(*) FROM rustodon.outbox_events
+             WHERE kind = 'rustodon.activitypub.distribute_status'
+               AND (payload #>> '{arguments,status_id}')::bigint = $1
+               AND payload #>> '{arguments,activity_type}' = 'Update')
+           +
+           (SELECT count(*) FROM rustodon.durable_jobs
+             WHERE kind = 'rustodon.activitypub.distribute_status'
+               AND (arguments ->> 'status_id')::bigint = $1
+               AND arguments ->> 'activity_type' = 'Update')",
+    )
+    .bind(status_id)
+    .fetch_one(&mut connection)
+    .await?;
+    let stream: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM rustodon.outbox_events
+          WHERE kind = 'rustodon.mastodon.stream_event'
+            AND logical_key LIKE $1
+            AND (payload ->> 'account_id')::bigint = $2
+            AND (payload ->> 'object_id')::bigint = $3
+            AND payload ->> 'event' = 'status.update'",
+    )
+    .bind(format!(
+        "stream:{NOTIFICATION_ACCOUNT_ID}:status.update:{status_id}:%"
+    ))
+    .bind(NOTIFICATION_ACCOUNT_ID)
+    .bind(status_id)
+    .fetch_one(&mut connection)
+    .await?;
+    if distribution != 1 || stream != 1 {
+        return Err(
+            "quote commentary update did not record exact durable distribution and author stream intents"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+async fn assert_quote_creation_effects(
+    url: &str,
+    accepted_status_id: i64,
+    pending_status_id: i64,
+) -> Result<(), Box<dyn Error>> {
+    let mut connection = PgConnection::connect(url).await?;
+    let accepted_quote_id: i64 =
+        sqlx::query_scalar("SELECT id FROM public.quotes WHERE status_id = $1")
+            .bind(accepted_status_id)
+            .fetch_one(&mut connection)
+            .await?;
+    let quote_notification: i64 = sqlx::query_scalar(
+        "SELECT
+           (SELECT count(*) FROM rustodon.outbox_events
+             WHERE kind = 'rustodon.mastodon.notify_activity'
+               AND logical_key = $2
+               AND (payload #>> '{arguments,recipient_account_id}')::bigint = $3
+               AND payload #>> '{arguments,activity_type}' = 'quote'
+               AND (payload #>> '{arguments,activity_id}')::bigint = $1
+               AND (payload #>> '{arguments,silenced}')::boolean IS FALSE)
+           +
+           (SELECT count(*) FROM rustodon.durable_jobs
+             WHERE kind = 'rustodon.mastodon.notify_activity'
+               AND logical_key = $2
+               AND (arguments ->> 'recipient_account_id')::bigint = $3
+               AND arguments ->> 'activity_type' = 'quote'
+               AND (arguments ->> 'activity_id')::bigint = $1
+               AND (arguments ->> 'silenced')::boolean IS FALSE)",
+    )
+    .bind(accepted_quote_id)
+    .bind(format!(
+        "notification:quote:{NOTIFICATION_ACCOUNT_ID}:{accepted_quote_id}"
+    ))
+    .bind(NOTIFICATION_ACCOUNT_ID)
+    .fetch_one(&mut connection)
+    .await?;
+    if quote_notification != 1 {
+        return Err("accepted quote did not record one exact durable quote notification".into());
+    }
+    let (pending_quote_id, request_uri, target_account_id, target_uri): (i64, String, i64, String) =
+        sqlx::query_as(
+            "SELECT quote.id, quote.activity_uri, quote.quoted_account_id,
+                COALESCE(target.uri, target.url)
+           FROM public.quotes quote
+           JOIN public.statuses target ON target.id = quote.quoted_status_id
+          WHERE quote.status_id = $1",
+        )
+        .bind(pending_status_id)
+        .fetch_one(&mut connection)
+        .await?;
+    let quote_request: i64 = sqlx::query_scalar(
+        "SELECT
+           (SELECT count(*) FROM rustodon.outbox_events
+             WHERE kind = 'rustodon.activitypub.distribute_status'
+               AND logical_key = $2
+               AND (payload #>> '{arguments,status_id}')::bigint = $1
+               AND payload #>> '{arguments,activity_type}' = 'QuoteRequest'
+               AND payload #>> '{arguments,quote_request_uri}' = $3
+               AND payload #>> '{arguments,quoted_status_uri}' = $4
+               AND (payload #>> '{arguments,quoted_account_id}')::bigint = $5)
+           +
+           (SELECT count(*) FROM rustodon.durable_jobs
+             WHERE kind = 'rustodon.activitypub.distribute_status'
+               AND logical_key = $2
+               AND (arguments ->> 'status_id')::bigint = $1
+               AND arguments ->> 'activity_type' = 'QuoteRequest'
+               AND arguments ->> 'quote_request_uri' = $3
+               AND arguments ->> 'quoted_status_uri' = $4
+               AND (arguments ->> 'quoted_account_id')::bigint = $5)",
+    )
+    .bind(pending_status_id)
+    .bind(format!("activitypub:quote-request:{pending_quote_id}"))
+    .bind(request_uri)
+    .bind(target_uri)
+    .bind(target_account_id)
+    .fetch_one(&mut connection)
+    .await?;
+    if quote_request != 1 {
+        return Err("pending remote quote did not record one exact durable QuoteRequest".into());
+    }
+    for status_id in [accepted_status_id, pending_status_id] {
+        assert_quote_creation_stream(&mut connection, status_id).await?;
+    }
+    Ok(())
+}
+
+async fn assert_quote_creation_stream(
+    connection: &mut PgConnection,
+    status_id: i64,
+) -> Result<(), Box<dyn Error>> {
+    let stream_events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM rustodon.outbox_events
+          WHERE kind = 'rustodon.mastodon.stream_event'
+            AND logical_key LIKE $1
+            AND (payload ->> 'account_id')::bigint = $2
+            AND (payload ->> 'object_id')::bigint = $3
+            AND payload ->> 'event' = 'update'",
+    )
+    .bind(format!(
+        "stream:{NOTIFICATION_ACCOUNT_ID}:update:{status_id}:%"
+    ))
+    .bind(NOTIFICATION_ACCOUNT_ID)
+    .bind(status_id)
+    .fetch_one(connection)
+    .await?;
+    if stream_events != 1 {
+        return Err(format!(
+            "quote status {status_id} recorded no exact author creation stream event"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+async fn quote_write_state(url: &str, status_id: i64) -> Result<QuoteWriteState, sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query_as(
+        "SELECT quote.account_id, quote.quoted_account_id, \
+                quote.quoted_status_id, quote.state, quote.approval_uri IS NOT NULL AS approval_present, \
+                quote.activity_uri IS NOT NULL AS activity_present, quote.legacy, \
+                COALESCE(stats.quotes_count, 0) AS quotes_count \
+           FROM public.quotes quote \
+           LEFT JOIN public.status_stats stats ON stats.status_id = quote.quoted_status_id \
+          WHERE quote.status_id = $1",
+    )
+    .bind(status_id)
+    .fetch_one(&mut connection)
+    .await
+}
+
+async fn has_non_silent_mention(
+    url: &str,
+    status_id: i64,
+    account_id: i64,
+) -> Result<bool, sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM public.mentions
+              WHERE status_id = $1 AND account_id = $2 AND silent IS FALSE)",
+    )
+    .bind(status_id)
+    .bind(account_id)
+    .fetch_one(&mut connection)
+    .await
+}
+
+type AccountStatusState = (i64, Option<NaiveDateTime>, NaiveDateTime);
+
+async fn account_status_state(
+    url: &str,
+    account_id: i64,
+) -> Result<AccountStatusState, sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query_as(
+        "SELECT statuses_count, last_status_at, updated_at
+           FROM public.account_stats WHERE account_id = $1",
+    )
+    .bind(account_id)
+    .fetch_one(&mut connection)
+    .await
+}
+
+async fn restore_account_status_state(
+    url: &str,
+    account_id: i64,
+    state: &AccountStatusState,
+) -> Result<(), sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query(
+        "UPDATE public.account_stats
+            SET statuses_count = $2, last_status_at = $3, updated_at = $4
+          WHERE account_id = $1",
+    )
+    .bind(account_id)
+    .bind(state.0)
+    .bind(state.1)
+    .bind(state.2)
+    .execute(&mut connection)
+    .await?;
+    Ok(())
+}
+
+async fn active_quote_exists(url: &str, status_id: i64) -> Result<bool, sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM public.quotes quote \
+         JOIN public.statuses status ON status.id = quote.status_id \
+         WHERE quote.status_id = $1 AND status.deleted_at IS NULL)",
+    )
+    .bind(status_id)
+    .fetch_one(&mut connection)
+    .await
+}
+
+async fn status_is_deleted(url: &str, status_id: i64) -> Result<bool, sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query_scalar(
+        "SELECT COALESCE((SELECT deleted_at IS NOT NULL FROM public.statuses WHERE id = $1), true)",
+    )
+    .bind(status_id)
+    .fetch_one(&mut connection)
+    .await
+}
+
+async fn status_visibility(url: &str, status_id: i64) -> Result<i32, sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query_scalar("SELECT visibility FROM public.statuses WHERE id = $1")
+        .bind(status_id)
+        .fetch_one(&mut connection)
+        .await
+}
+
+async fn status_quote_approval_policy(url: &str, status_id: i64) -> Result<i32, sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query_scalar("SELECT quote_approval_policy FROM public.statuses WHERE id = $1")
+        .bind(status_id)
+        .fetch_one(&mut connection)
+        .await
+}
+
+async fn set_status_quote_approval_policy(
+    url: &str,
+    status_id: i64,
+    policy: i32,
+) -> Result<(), sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query("UPDATE public.statuses SET quote_approval_policy = $2 WHERE id = $1")
+        .bind(status_id)
+        .bind(policy)
+        .execute(&mut connection)
+        .await?;
+    Ok(())
+}
+
+async fn status_quotes_count(url: &str, status_id: i64) -> Result<i64, sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query_scalar(
+        "SELECT COALESCE(quotes_count, 0) FROM public.status_stats WHERE status_id = $1",
+    )
+    .bind(status_id)
+    .fetch_optional(&mut connection)
+    .await
+    .map(|count| count.unwrap_or(0))
+}
+
+async fn set_status_quotes_count(
+    url: &str,
+    status_id: i64,
+    quotes_count: i64,
+) -> Result<(), sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query("UPDATE public.status_stats SET quotes_count = $2 WHERE status_id = $1")
+        .bind(status_id)
+        .bind(quotes_count)
+        .execute(&mut connection)
+        .await?;
+    Ok(())
+}
+
+async fn cleanup_quote_operational(
+    url: &str,
+    status_ids: &[i64],
+    replay_key: &str,
+) -> Result<(), sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    let mut transaction = connection.begin().await?;
+    sqlx::query("DELETE FROM rustodon.idempotency_keys WHERE scope = $1 AND key = $2")
+        .bind("status:create:116844606259201001")
+        .bind(replay_key)
+        .execute(&mut *transaction)
+        .await?;
+    for status_id in status_ids {
+        sqlx::query("DELETE FROM rustodon.outbox_events WHERE logical_key LIKE $1")
+            .bind(format!("%{status_id}%"))
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM rustodon.durable_jobs WHERE logical_key LIKE $1")
+            .bind(format!("%{status_id}%"))
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await
+}
+
+async fn quote_lifecycle_snapshot(url: &str) -> Result<Value, sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query_scalar(
+        "SELECT jsonb_build_object(
+            'statuses', (SELECT count(*) FROM public.statuses),
+            'quotes', (SELECT count(*) FROM public.quotes),
+            'mentions', (SELECT count(*) FROM public.mentions),
+            'conversations', (SELECT count(*) FROM public.conversations),
+            'status_stats', (SELECT count(*) FROM public.status_stats),
+            'status_edits', (SELECT count(*) FROM public.status_edits),
+            'notifications', (SELECT count(*) FROM public.notifications),
+            'notification_requests', (SELECT count(*) FROM public.notification_requests),
+            'account', (SELECT to_jsonb(stat) FROM public.account_stats stat
+                         WHERE account_id = 116844606259201001),
+            'targets', (SELECT jsonb_agg(to_jsonb(stat) ORDER BY status_id)
+                        FROM public.status_stats stat
+                        WHERE status_id = ANY($1)))",
+    )
+    .bind(vec![
+        116_844_842_188_805_001_i64,
+        116_845_093_847_045_103,
+        116_844_850_053_125_003,
+        -403,
+    ])
+    .fetch_one(&mut connection)
+    .await
+}
+
+async fn quote_operational_snapshot(url: &str) -> Result<(i64, i64), sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM rustodon.outbox_events),
+                (SELECT count(*) FROM rustodon.durable_jobs)",
+    )
+    .fetch_one(&mut connection)
+    .await
+}
+
+async fn block_exists(
+    url: &str,
+    account_id: i64,
+    target_account_id: i64,
+) -> Result<bool, sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM public.blocks
+              WHERE account_id = $1 AND target_account_id = $2)",
+    )
+    .bind(account_id)
+    .bind(target_account_id)
+    .fetch_one(&mut connection)
+    .await
+}
+
+async fn account_domain_block_exists(
+    url: &str,
+    account_id: i64,
+    domain: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM public.account_domain_blocks
+              WHERE account_id = $1 AND domain = $2)",
+    )
+    .bind(account_id)
+    .bind(domain)
+    .fetch_one(&mut connection)
+    .await
+}
+
+async fn set_account_domain_block(
+    url: &str,
+    account_id: i64,
+    domain: &str,
+    present: bool,
+) -> Result<(), sqlx::Error> {
+    let mut connection = PgConnection::connect(url).await?;
+    if present {
+        sqlx::query(
+            "INSERT INTO public.account_domain_blocks
+                 (account_id, domain, created_at, updated_at)
+             VALUES ($1, $2, clock_timestamp(), clock_timestamp())
+             ON CONFLICT (account_id, domain) DO NOTHING",
+        )
+        .bind(account_id)
+        .bind(domain)
+        .execute(&mut connection)
+        .await?;
+    } else {
+        sqlx::query(
+            "DELETE FROM public.account_domain_blocks WHERE account_id = $1 AND domain = $2",
+        )
+        .bind(account_id)
+        .bind(domain)
+        .execute(&mut connection)
+        .await?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run_poll_lifecycle_case(
     config: DifferentialConfig,
@@ -8393,16 +9839,27 @@ fn poll_request(
 }
 
 fn status_request(method: Method, path: &str, body: &str) -> Result<RequestSpec, Box<dyn Error>> {
+    status_request_with_token(method, path, body, Some("fixture-bearer-token-v4-6-5"))
+}
+
+fn status_request_with_token(
+    method: Method,
+    path: &str,
+    body: &str,
+    token: Option<&str>,
+) -> Result<RequestSpec, Box<dyn Error>> {
     let mut headers = HeaderMap::new();
     headers.insert(
         HOST,
         HeaderValue::from_static("fixture-v4-6-5.rustodon.invalid"),
     );
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_static("Bearer fixture-bearer-token-v4-6-5"),
-    );
+    if let Some(token) = token {
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::try_from(format!("Bearer {token}"))?,
+        );
+    }
     headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
     if !body.is_empty() {
         headers.insert(

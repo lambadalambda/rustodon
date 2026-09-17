@@ -21,8 +21,8 @@ use super::{
 };
 use crate::mastodon::StatusVisibility;
 use crate::mastodon::policy::{
-    AuthenticatedViewerFacts, AuthorRestriction, StatusAccessFacts, StatusAvailability,
-    ViewerFacts, status_access,
+    AuthenticatedViewerFacts, AuthorRestriction, QuotePolicyFacts, QuotePolicyViewerFacts,
+    StatusAccessFacts, StatusAvailability, ViewerFacts, status_access, status_quote_policy,
 };
 use crate::mastodon::repository::normalize_hashtag;
 use crate::mastodon::{
@@ -1121,14 +1121,14 @@ impl RestProjectionLoader {
         let Some(current) = self.authorized_status(id).await? else {
             return Ok(None);
         };
+        let quote_row = self.repository.rest_quotes(&[id]).await?.into_iter().next();
+        let current_quote_id = quote_row.as_ref().map(|quote| quote.id);
         let history_quote = if current.quote.is_some() {
             current.quote.clone()
         } else {
-            self.repository
-                .rest_quotes(&[id])
-                .await?
-                .into_iter()
-                .find(|quote| quote.legacy && quote.state.0 != 1)
+            quote_row
+                .as_ref()
+                .filter(|quote| quote.legacy && quote.state.0 != 1)
                 .map(|quote| QuoteProjection {
                     state: quote_state(quote.state.0).to_owned(),
                     accepted: false,
@@ -1202,7 +1202,21 @@ impl RestProjectionLoader {
                 created_at: edit.created_at,
                 media_attachments,
                 emojis: current.emojis.clone(),
-                quote: edit.quote_id.and_then(|_| history_quote.clone()),
+                quote: match edit.quote_id {
+                    Some(edit_quote_id) if Some(edit_quote_id) == current_quote_id => {
+                        history_quote.clone()
+                    }
+                    Some(_) => Some(QuoteProjection {
+                        state: "pending".to_owned(),
+                        accepted: false,
+                        quoted_status_id: None,
+                        target_access: QuoteTargetAccess::Deleted,
+                        target_serializable: false,
+                        target_link: None,
+                        quoted_status: None,
+                    }),
+                    None => None,
+                },
                 poll_options: edit.poll_options,
             });
         }
@@ -3375,32 +3389,18 @@ fn quote_state(value: i32) -> &'static str {
 }
 
 fn quote_policy_for(row: &RestStatusRow, viewer_account_id: Option<i64>) -> String {
-    let Some(viewer_account_id) = viewer_account_id else {
-        return "denied".to_owned();
-    };
-    if row.visibility == 3 || row.reblog_of_id.is_some() {
-        return "denied".to_owned();
-    }
-    if viewer_account_id == row.account_id {
-        return "automatic".to_owned();
-    }
-    if policy_allows(
-        row.quote_approval_policy >> 16,
-        row.viewer_follows_author,
-        row.author_follows_viewer,
-    ) {
-        "automatic".to_owned()
-    } else if policy_allows(
-        row.quote_approval_policy & 0xffff,
-        row.viewer_follows_author,
-        row.author_follows_viewer,
-    ) {
-        "manual".to_owned()
-    } else if row.quote_approval_policy & 0x0001_0001 != 0 {
-        "unknown".to_owned()
-    } else {
-        "denied".to_owned()
-    }
+    status_quote_policy(QuotePolicyFacts {
+        visibility: StatusVisibility::from(row.visibility),
+        is_reblog: row.reblog_of_id.is_some(),
+        approval_policy: row.quote_approval_policy,
+        viewer: viewer_account_id.map(|viewer_account_id| QuotePolicyViewerFacts {
+            is_author: viewer_account_id == row.account_id,
+            follows_author: row.viewer_follows_author,
+            author_follows_viewer: row.author_follows_viewer,
+        }),
+    })
+    .as_str()
+    .to_owned()
 }
 
 #[allow(clippy::too_many_lines)]

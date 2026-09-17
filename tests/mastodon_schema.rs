@@ -3076,6 +3076,7 @@ async fn write_repository_applies_account_and_domain_moderation_transactionally(
     for statement in [
         "GRANT USAGE ON SCHEMA rustodon TO rustodon_differential_writer",
         "GRANT SELECT, DELETE ON TABLE rustodon.durable_jobs TO rustodon_differential_writer",
+        "GRANT UPDATE (lease_expires_at, updated_at) ON TABLE rustodon.durable_jobs TO rustodon_differential_writer",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE rustodon.idempotency_keys, rustodon.outbox_events, rustodon.ordering_markers TO rustodon_differential_writer",
         "GRANT USAGE, SELECT ON SEQUENCE rustodon.outbox_events_id_seq TO rustodon_differential_writer",
     ] {
@@ -7407,6 +7408,7 @@ async fn write_repository_runs_local_poll_lifecycle_transactionally() -> Result<
     for statement in [
         "GRANT USAGE ON SCHEMA rustodon TO rustodon_differential_writer",
         "GRANT SELECT, DELETE ON TABLE rustodon.durable_jobs TO rustodon_differential_writer",
+        "GRANT UPDATE (lease_expires_at, updated_at) ON TABLE rustodon.durable_jobs TO rustodon_differential_writer",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE rustodon.idempotency_keys, rustodon.outbox_events, rustodon.ordering_markers TO rustodon_differential_writer",
         "GRANT USAGE, SELECT ON SEQUENCE rustodon.outbox_events_id_seq TO rustodon_differential_writer",
     ] {

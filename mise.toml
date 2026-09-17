@@ -98,7 +98,7 @@ description = "Run all or one Rails-versus-Rust differential compatibility case"
 run = "tools/mastodon-fixture differential-test"
 
 [tasks.differential-ci]
-description = "Run ten high-value/security differential cases plus relative media-root mode"
+description = "Run eleven high-value/security differential cases plus relative media-root mode"
 run = "tools/ci-differential"
 
 [tasks.differential-full]

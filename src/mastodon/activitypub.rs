@@ -1063,6 +1063,97 @@ pub fn status_activity(
 }
 
 #[must_use]
+pub fn quote_request_with_uris(
+    request_uri: &str,
+    actor_uri: &str,
+    quoted_status_uri: &str,
+    instrument: Value,
+) -> Value {
+    let mut context = note_context();
+    context
+        .as_array_mut()
+        .expect("note context is an array")
+        .push(json!({"QuoteRequest": "https://w3id.org/fep/044f#QuoteRequest"}));
+    json!({
+        "@context": context,
+        "id": request_uri,
+        "type": "QuoteRequest",
+        "actor": actor_uri,
+        "object": quoted_status_uri,
+        "instrument": instrument
+    })
+}
+
+#[must_use]
+pub fn quote_request_decision_logical_key(request_uri: &str) -> String {
+    let digest = Sha256::digest(request_uri.as_bytes());
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    format!("activitypub:quote-decision:{encoded}")
+}
+
+#[must_use]
+pub fn quote_request_rejection_id(request_uri: &str) -> i64 {
+    let digest = Sha256::digest(request_uri.as_bytes());
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    (i64::from_be_bytes(bytes) & i64::MAX).max(1)
+}
+
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn quote_decision_with_uris(
+    actor_uri: &str,
+    quote_id: i64,
+    request_uri: &str,
+    request_actor_uri: &str,
+    quoted_status_uri: &str,
+    instrument_uri: &str,
+    result_uri: Option<&str>,
+    accepted: bool,
+) -> Value {
+    let decision = if accepted { "Accept" } else { "Reject" };
+    let fragment = if accepted { "accepts" } else { "rejects" };
+    let mut value = json!({
+        "@context": [
+            ACTIVITY_STREAMS_CONTEXT,
+            {"QuoteRequest": "https://w3id.org/fep/044f#QuoteRequest"}
+        ],
+        "id": format!("{actor_uri}#{fragment}/quote_requests/{quote_id}"),
+        "type": decision,
+        "actor": actor_uri,
+        "object": {
+            "id": request_uri,
+            "type": "QuoteRequest",
+            "actor": request_actor_uri,
+            "object": quoted_status_uri,
+            "instrument": instrument_uri
+        }
+    });
+    if let Some(result_uri) = result_uri {
+        value["result"] = json!(result_uri);
+    }
+    value
+}
+
+#[must_use]
+pub fn delete_quote_authorization_with_uris(actor_uri: &str, authorization_uri: &str) -> Value {
+    json!({
+        "@context": quote_authorization_context(),
+        "id": format!("{authorization_uri}#delete"),
+        "type": "Delete",
+        "actor": actor_uri,
+        "to": PUBLIC_ADDRESS,
+        "object": {
+            "id": authorization_uri,
+            "type": "QuoteAuthorization"
+        }
+    })
+}
+
+#[must_use]
 pub fn vote_with_uris(
     vote_uri: &str,
     actor_uri: &str,
@@ -1657,14 +1748,118 @@ mod tests {
 
     use super::{
         CustomEmoji, PUBLIC_ADDRESS, accept, actor, actor_url, actor_with_media,
-        announce_with_uris, block_with_uris, create, delete_actor_with_uris, delete_with_uris,
-        follow_with_uris, host_meta, like_with_uris, note, note_context, question,
-        quote_authorization, quote_authorization_url, reject_with_uris, status_activity,
-        status_url, undo_announce_with_uris, undo_block_with_uris, undo_follow_with_uris,
-        undo_like_with_uris, update_actor, update_with_uris, vote_with_uris,
+        announce_with_uris, block_with_uris, create, delete_actor_with_uris,
+        delete_quote_authorization_with_uris, delete_with_uris, follow_with_uris, host_meta,
+        like_with_uris, note, note_context, question, quote_authorization, quote_authorization_url,
+        quote_decision_with_uris, quote_request_decision_logical_key, quote_request_rejection_id,
+        quote_request_with_uris, reject_with_uris, status_activity, status_url,
+        undo_announce_with_uris, undo_block_with_uris, undo_follow_with_uris, undo_like_with_uris,
+        update_actor, update_with_uris, vote_with_uris,
     };
     use crate::mastodon::records::{Account, MediaAttachment, Mention, Poll, Status};
     use crate::mastodon::types::{AccountIdScheme, RawI32, RawString, StatusVisibility};
+
+    #[test]
+    fn quote_request_references_the_stable_request_target_and_inline_instrument() {
+        let instrument = json!({
+            "id": "https://local.example/users/alice/statuses/2",
+            "type": "Note",
+            "quote": "https://remote.example/users/bob/statuses/1"
+        });
+        let value = quote_request_with_uris(
+            "https://local.example/users/alice/quote_requests/request-id",
+            "https://local.example/users/alice",
+            "https://remote.example/users/bob/statuses/1",
+            instrument,
+        );
+        assert_eq!(value["type"], "QuoteRequest");
+        assert_eq!(
+            value["id"],
+            "https://local.example/users/alice/quote_requests/request-id"
+        );
+        assert_eq!(
+            value["object"],
+            "https://remote.example/users/bob/statuses/1"
+        );
+        assert_eq!(value["instrument"]["type"], "Note");
+        assert_eq!(
+            value["instrument"]["id"],
+            "https://local.example/users/alice/statuses/2"
+        );
+        assert_eq!(
+            value["instrument"]["quote"],
+            "https://remote.example/users/bob/statuses/1"
+        );
+    }
+
+    #[test]
+    fn quote_decisions_and_authorization_deletes_have_stable_bound_objects() {
+        assert_eq!(
+            quote_request_decision_logical_key("https://remote.example/quote_requests/1"),
+            quote_request_decision_logical_key("https://remote.example/quote_requests/1")
+        );
+        assert_ne!(
+            quote_request_decision_logical_key("https://remote.example/quote_requests/1"),
+            quote_request_decision_logical_key("https://remote.example/quote_requests/2")
+        );
+        assert_ne!(
+            quote_request_rejection_id("https://remote.example/quote_requests/1"),
+            quote_request_rejection_id("https://remote.example/quote_requests/2")
+        );
+        let accepted = quote_decision_with_uris(
+            "https://local.example/users/bob",
+            3,
+            "https://remote.example/quote_requests/1",
+            "https://remote.example/users/alice",
+            "https://local.example/statuses/7",
+            "https://remote.example/statuses/9",
+            Some("https://local.example/users/bob/quote_authorizations/3"),
+            true,
+        );
+        assert_eq!(
+            accepted["id"],
+            "https://local.example/users/bob#accepts/quote_requests/3"
+        );
+        assert_eq!(accepted["type"], "Accept");
+        assert_eq!(accepted["object"]["type"], "QuoteRequest");
+        assert_eq!(
+            accepted["object"]["id"],
+            "https://remote.example/quote_requests/1"
+        );
+        assert_eq!(
+            accepted["result"],
+            "https://local.example/users/bob/quote_authorizations/3"
+        );
+
+        let rejected = quote_decision_with_uris(
+            "https://local.example/users/bob",
+            3,
+            "https://remote.example/quote_requests/1",
+            "https://remote.example/users/alice",
+            "https://local.example/statuses/7",
+            "https://remote.example/statuses/9",
+            None,
+            false,
+        );
+        assert_eq!(rejected["type"], "Reject");
+        assert!(rejected.get("result").is_none());
+
+        let deleted = delete_quote_authorization_with_uris(
+            "https://local.example/users/bob",
+            "https://local.example/users/bob/quote_authorizations/3",
+        );
+        assert_eq!(deleted["type"], "Delete");
+        assert_eq!(
+            deleted["id"],
+            "https://local.example/users/bob/quote_authorizations/3#delete"
+        );
+        assert_eq!(deleted["actor"], "https://local.example/users/bob");
+        assert_eq!(deleted["object"]["type"], "QuoteAuthorization");
+        assert_eq!(
+            deleted["object"]["id"],
+            "https://local.example/users/bob/quote_authorizations/3"
+        );
+    }
 
     #[test]
     fn local_announce_audiences_preserve_visibility() {

@@ -434,6 +434,9 @@ SELECT
         AND pg_catalog.has_table_privilege(role.oid, 'public.polls', 'SELECT')
         AND pg_catalog.has_table_privilege(role.oid, 'public.polls', 'INSERT')
         AND pg_catalog.has_table_privilege(role.oid, 'public.quotes', 'SELECT')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.quotes', 'INSERT')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.quotes', 'UPDATE')
+        AND pg_catalog.has_sequence_privilege(role.oid, 'public.quotes_id_seq', 'USAGE')
         AND pg_catalog.has_table_privilege(role.oid, 'public.polls', 'UPDATE')
        AND pg_catalog.has_table_privilege(role.oid, 'public.polls', 'DELETE')
        AND pg_catalog.has_sequence_privilege(role.oid, 'public.polls_id_seq', 'USAGE')
@@ -717,6 +720,8 @@ SELECT
    AND pg_catalog.has_table_privilege(role.oid, 'rustodon.outbox_events', 'UPDATE')
    AND pg_catalog.has_table_privilege(role.oid, 'rustodon.outbox_events', 'DELETE')
    AND pg_catalog.has_table_privilege(role.oid, 'rustodon.durable_jobs', 'SELECT')
+   AND pg_catalog.has_column_privilege(role.oid, 'rustodon.durable_jobs', 'lease_expires_at', 'UPDATE')
+   AND pg_catalog.has_column_privilege(role.oid, 'rustodon.durable_jobs', 'updated_at', 'UPDATE')
    AND pg_catalog.has_table_privilege(role.oid, 'rustodon.durable_jobs', 'DELETE')
    AND pg_catalog.has_table_privilege(role.oid, 'rustodon.idempotency_keys', 'SELECT')
    AND pg_catalog.has_table_privilege(role.oid, 'rustodon.idempotency_keys', 'INSERT')
@@ -1151,7 +1156,7 @@ SELECT
                  'users_id_seq'))
                OR (namespace.nspname = 'public' AND relation.relname IN (
                     'custom_emojis_id_seq', 'polls_id_seq', 'poll_votes_id_seq',
-                    'web_settings_id_seq')
+                    'quotes_id_seq', 'web_settings_id_seq')
                    AND acl.privilege_type = 'USAGE')
                OR (namespace.nspname = 'rustodon' AND relation.relname = 'outbox_events_id_seq')
              )
@@ -1208,7 +1213,7 @@ SELECT
                 'media_attachments', 'mentions', 'mutes', 'notification_permissions',
                 'notification_policies', 'notification_requests', 'notifications',
                 'oauth_access_grants', 'oauth_access_tokens', 'oauth_applications',
-                'poll_votes', 'polls', 'reports', 'relationship_severance_events',
+                'poll_votes', 'polls', 'quotes', 'reports', 'relationship_severance_events',
                 'severed_relationships',
                 'session_activations', 'status_edits', 'status_pins', 'status_stats',
                 'statuses', 'statuses_tags', 'tags', 'tombstones'))
@@ -1219,7 +1224,7 @@ SELECT
           (acl.privilege_type = 'UPDATE' AND NOT (
              (namespace.nspname = 'public' AND relation.relname IN (
                 'account_stats', 'accounts_tags', 'account_conversations',
-                'account_deletion_requests', 'polls', 'bookmarks',
+                'account_deletion_requests', 'polls', 'quotes', 'bookmarks',
                'conversations', 'conversation_mutes', 'domain_blocks', 'favourites',
                'featured_tags', 'follows', 'follow_requests', 'keypairs', 'markers', 'media_attachments',
                'mutes', 'notifications', 'notification_policies', 'notification_requests',
@@ -1315,6 +1320,8 @@ SELECT
                 AND attribute.attname IN ('data', 'updated_at'))
             OR (namespace.nspname = 'public' AND relation.relname = 'mentions'
                 AND attribute.attname IN ('silent', 'updated_at'))
+            OR (namespace.nspname = 'rustodon' AND relation.relname = 'durable_jobs'
+                AND attribute.attname IN ('lease_expires_at', 'updated_at'))
           ))
         )
     )

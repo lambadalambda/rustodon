@@ -98,3 +98,4 @@
 - [x] [Restore frontend WebSocket streaming connection](issues/restore-frontend-websocket-streaming.md)
 - [x] [Reconcile streamed remote media after caching](issues/reconcile-streamed-remote-media.md)
 - [x] [Audit everyday Mastodon frontend parity](issues/audit-everyday-frontend-parity.md)
+- [x] [Support quote posts from the bundled frontend](issues/support-frontend-quote-posts.md)

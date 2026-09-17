@@ -39,8 +39,10 @@ use super::oauth::{
     WRITE_REPORTS, WRITE_STATUSES,
 };
 use super::policy::{
-    AuthenticatedViewerFacts, AuthorRestriction, StatusAccessFacts, StatusAvailability,
-    ViewerFacts, global_domain_policy, status_access, status_favourite_access,
+    AuthenticatedViewerFacts, AuthorRestriction, QuotePolicy, QuotePolicyFacts,
+    QuotePolicyViewerFacts, StatusAccessFacts, StatusAvailability, ViewerFacts,
+    direct_quote_allowed, global_domain_policy, quote_post_has_content, quote_post_visibility,
+    quote_target_visibility_allowed, status_access, status_favourite_access, status_quote_policy,
     status_reblog_access,
 };
 use super::records::{BrowserLoginUser, DomainBlock, Marker, MediaAttachment, NotificationPolicy};
@@ -100,6 +102,7 @@ const NOTIFICATION_FAVOURITE: &str = "favourite";
 const NOTIFICATION_FOLLOW: &str = "follow";
 const NOTIFICATION_FOLLOW_REQUEST: &str = "follow_request";
 const NOTIFICATION_MENTION: &str = "mention";
+const NOTIFICATION_QUOTE: &str = "quote";
 const NOTIFICATION_REBLOG: &str = "reblog";
 const NOTIFICATION_QUOTED_UPDATE: &str = "quoted_update";
 const NOTIFICATION_UPDATE: &str = "update";
@@ -3463,6 +3466,40 @@ impl WriteRepository {
         Ok(relevant)
     }
 
+    pub(crate) async fn remote_quote_target_is_local(
+        &self,
+        target_uri: &str,
+        origin: &str,
+    ) -> Result<Option<bool>, WriteError> {
+        let mut transaction = self.pool.begin().await?;
+        let target = resolve_quote_target(&mut transaction, target_uri, origin)
+            .await?
+            .map(|(_, _, local, _)| local);
+        transaction.commit().await?;
+        Ok(target)
+    }
+
+    pub(crate) async fn remote_domain_allowed_in_transaction(
+        transaction: &mut Transaction<'_, Postgres>,
+        domain: &str,
+        limited_federation: bool,
+    ) -> Result<bool, WriteError> {
+        remote_domain_allowed_in_transaction(transaction, domain, limited_federation).await
+    }
+
+    pub(crate) async fn remote_quote_target_matches_status(
+        &self,
+        status_id: i64,
+        target_uri: &str,
+        origin: &str,
+    ) -> Result<bool, WriteError> {
+        let mut transaction = self.pool.begin().await?;
+        let matches =
+            quote_target_matches_uri(&mut transaction, status_id, target_uri, origin).await?;
+        transaction.commit().await?;
+        Ok(matches)
+    }
+
     pub(crate) async fn remote_note_exists(
         &self,
         account_id: i64,
@@ -4400,7 +4437,6 @@ impl WriteRepository {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn apply_remote_note_create(
         &self,
         account_id: i64,
@@ -4409,23 +4445,155 @@ impl WriteRepository {
         delivery_target_account_id: Option<i64>,
         origin: &str,
     ) -> Result<Option<RemoteNoteWriteOutcome>, WriteError> {
-        let note = RemoteNoteData::parse(object, actor_uri)?;
+        self.apply_remote_note_create_with_quote_guard(
+            account_id,
+            actor_uri,
+            object,
+            delivery_target_account_id,
+            origin,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn apply_remote_quote_request_instrument(
+        &self,
+        account_id: i64,
+        actor_uri: &str,
+        object: &Value,
+        delivery_target_account_id: Option<i64>,
+        origin: &str,
+        request_uri: &str,
+        quoted_status_uri: &str,
+        instrument_uri: &str,
+        expected_target_status_id: i64,
+        expected_target_account_id: i64,
+    ) -> Result<Option<RemoteNoteWriteOutcome>, WriteError> {
+        let guard = RemoteQuoteImportGuard {
+            request_uri,
+            quoted_status_uri,
+            instrument_uri,
+            expected_target_status_id,
+            expected_target_account_id,
+        };
+        self.apply_remote_note_create_with_quote_guard(
+            account_id,
+            actor_uri,
+            object,
+            delivery_target_account_id,
+            origin,
+            Some(&guard),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn apply_remote_note_create_with_quote_guard(
+        &self,
+        account_id: i64,
+        actor_uri: &str,
+        object: &Value,
+        delivery_target_account_id: Option<i64>,
+        origin: &str,
+        quote_guard: Option<&RemoteQuoteImportGuard<'_>>,
+    ) -> Result<Option<RemoteNoteWriteOutcome>, WriteError> {
+        let mut note = RemoteNoteData::parse(object, actor_uri)?;
         let mut transaction = self.pool.begin().await?;
         let mut pending_stream_events = Vec::new();
         lock_remote_note(&mut transaction, &note.uri).await?;
-        let account = sqlx::query_as::<_, (Option<String>, String, String, Option<NaiveDateTime>)>(
-            "SELECT domain, uri, followers_url, suspended_at FROM accounts
+        if let Some(guard) = quote_guard {
+            if !same_remote_note_host(actor_uri, guard.request_uri)?
+                || !same_remote_note_host(actor_uri, guard.instrument_uri)?
+            {
+                return Err(WriteError::InvalidInput(
+                    "remote QuoteRequest identifiers do not match its actor host",
+                ));
+            }
+            lock_remote_interaction(&mut transaction, guard.request_uri).await?;
+            if remote_quote_request_decision_in(
+                &mut transaction,
+                guard.request_uri,
+                actor_uri,
+                guard.quoted_status_uri,
+                guard.instrument_uri,
+            )
+            .await?
+            .is_some()
+            {
+                transaction.commit().await?;
+                return Ok(None);
+            }
+            let target =
+                resolve_quote_target(&mut transaction, guard.quoted_status_uri, origin).await?;
+            if target
+                .as_ref()
+                .is_none_or(|(status_id, account_id, local, _)| {
+                    *status_id != guard.expected_target_status_id
+                        || *account_id != guard.expected_target_account_id
+                        || !*local
+                        || delivery_target_account_id.is_some_and(|id| id != *account_id)
+                })
+            {
+                transaction.commit().await?;
+                return Ok(None);
+            }
+            let existing_status_id = remote_note_status_id_for_account(
+                &mut transaction,
+                account_id,
+                &note.uri,
+                note.atom_uri.as_deref(),
+            )
+            .await?;
+            let mut guarded_status_ids = existing_status_id.into_iter().collect::<Vec<_>>();
+            guarded_status_ids.push(guard.expected_target_status_id);
+            lock_statuses_in_order(&mut transaction, &guarded_status_ids).await?;
+            match writable_quote_target(
+                &mut transaction,
+                account_id,
+                guard.expected_target_status_id,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(WriteError::NotFound | WriteError::Forbidden) => {
+                    transaction.commit().await?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let account = sqlx::query_as::<
+            _,
+            (
+                Option<String>,
+                String,
+                String,
+                String,
+                Option<NaiveDateTime>,
+            ),
+        >(
+            "SELECT domain, uri, followers_url, following_url, suspended_at FROM accounts
              WHERE id = $1 FOR UPDATE",
         )
         .bind(account_id)
         .fetch_optional(&mut *transaction)
         .await?;
-        let Some((domain, current_actor_uri, followers_url, suspended_at)) = account else {
+        let Some((domain, current_actor_uri, followers_url, following_url, suspended_at)) = account
+        else {
             return Ok(None);
         };
         if domain.is_none() || current_actor_uri != actor_uri || suspended_at.is_some() {
             return Ok(None);
         }
+        note.quote_approval_policy = remote_quote_approval_policy_with_collections(
+            object
+                .as_object()
+                .ok_or(WriteError::InvalidInput("remote Note is not an object"))?,
+            actor_uri,
+            &followers_url,
+            &following_url,
+        )?;
         if !same_remote_note_host(actor_uri, &note.uri)? {
             return Err(WriteError::InvalidInput(
                 "remote Note URI does not match its actor host",
@@ -4442,6 +4610,15 @@ impl WriteRepository {
             transaction.commit().await?;
             return Ok(None);
         }
+        let existing_status_id = remote_note_status_id_for_account(
+            &mut transaction,
+            account_id,
+            &note.uri,
+            note.atom_uri.as_deref(),
+        )
+        .await?;
+        prelock_remote_note_quote_targets(&mut transaction, existing_status_id, &note, origin)
+            .await?;
         let existing =
             remote_note_status(&mut transaction, &note.uri, note.atom_uri.as_deref()).await?;
         if let Some((existing_status_id, existing_account_id, _, _, _)) = existing {
@@ -4530,6 +4707,7 @@ impl WriteRepository {
             origin,
         )
         .await?;
+        reconcile_remote_note_quote(&mut transaction, status_id, account_id, &note, origin).await?;
         // Classify only after resolving mentions, including an implicit inbox recipient.
         // An explicitly mentioned Note is direct only when no silent recipient was added.
         let visibility = if visibility == 4
@@ -4676,74 +4854,15 @@ impl WriteRepository {
             transaction.commit().await?;
             return Ok(());
         };
-        let shared_account_ids = sqlx::query_scalar::<_, i64>(
-            "SELECT shared.account_id
-               FROM (
-                 SELECT reblog.account_id, 0 AS share_kind, reblog.id AS share_id
-                   FROM statuses reblog
-                   JOIN accounts account ON account.id = reblog.account_id
-                                        AND account.domain IS NULL
-                  WHERE reblog.reblog_of_id = $1
-                    AND reblog.deleted_at IS NULL
-                 UNION ALL
-                 SELECT quote.account_id, 1 AS share_kind, quote.id AS share_id
-                   FROM quotes quote
-                   JOIN accounts account ON account.id = quote.account_id
-                                        AND account.domain IS NULL
-                  WHERE quote.quoted_status_id = $1
-               ) shared
-              ORDER BY shared.share_kind, shared.share_id DESC, shared.account_id",
+        record_remote_activity_forwarding_for_status_in(
+            &mut transaction,
+            status_id,
+            parent_account_id,
+            &source_inbox,
+            activity_uri,
+            activity,
         )
-        .bind(status_id)
-        .fetch_all(&mut *transaction)
         .await?;
-        let source_account_id = parent_account_id.or_else(|| shared_account_ids.first().copied());
-        let Some(source_account_id) = source_account_id else {
-            transaction.commit().await?;
-            return Ok(());
-        };
-        let mut target_account_ids = shared_account_ids;
-        if let Some(parent_account_id) = parent_account_id {
-            target_account_ids.push(parent_account_id);
-        }
-        target_account_ids.sort_unstable();
-        target_account_ids.dedup();
-        let followers = sqlx::query_as::<_, (String, String)>(
-            "SELECT DISTINCT
-                    COALESCE(NULLIF(follower.shared_inbox_url, ''), follower.inbox_url),
-                    follower.domain
-               FROM follows follow
-               JOIN accounts follower ON follower.id = follow.account_id
-                                     AND follower.domain IS NOT NULL
-                                     AND follower.protocol = 1
-                                     AND follower.suspended_at IS NULL
-              WHERE follow.target_account_id = ANY($1)
-                AND COALESCE(NULLIF(follower.shared_inbox_url, ''), follower.inbox_url) <> ''
-                AND COALESCE(NULLIF(follower.shared_inbox_url, ''), follower.inbox_url) <> $2
-               ORDER BY 1, 2",
-        )
-        .bind(&target_account_ids)
-        .bind(&source_inbox)
-        .fetch_all(&mut *transaction)
-        .await?;
-        for (inbox_url, remote_domain) in followers {
-            let delivery = JobSpec::new(
-                Lane::Push,
-                ACTIVITYPUB_DELIVERY_JOB_KIND,
-                json!({
-                    "source_account_id": source_account_id,
-                    "inbox_url": inbox_url,
-                    "remote_domain": remote_domain,
-                    "body": activity
-                }),
-            )
-            .logical_key(activitypub::forward_delivery_logical_key(
-                source_account_id,
-                activity_uri,
-                &inbox_url,
-            ));
-            record_outbox_once_in(&mut transaction, &delivery).await?;
-        }
         transaction.commit().await?;
         Ok(())
     }
@@ -4939,7 +5058,7 @@ impl WriteRepository {
         authority: RemoteUpdateAuthority,
         expected_poll: Option<(i64, i32)>,
     ) -> Result<Option<RemoteNoteWriteOutcome>, WriteError> {
-        let note = RemoteNoteData::parse(object, actor_uri)?;
+        let mut note = RemoteNoteData::parse(object, actor_uri)?;
         let mut transaction = self.pool.begin().await?;
         let mut pending_stream_events = Vec::new();
         lock_remote_note(&mut transaction, &note.uri).await?;
@@ -4948,19 +5067,46 @@ impl WriteRepository {
                 "remote Note URI does not match its actor host",
             ));
         }
-        let account = sqlx::query_as::<_, (Option<String>, String, Option<NaiveDateTime>)>(
-            "SELECT domain, uri, suspended_at FROM accounts
+        let account = sqlx::query_as::<
+            _,
+            (
+                Option<String>,
+                String,
+                String,
+                String,
+                Option<NaiveDateTime>,
+            ),
+        >(
+            "SELECT domain, uri, followers_url, following_url, suspended_at FROM accounts
              WHERE id = $1 FOR UPDATE",
         )
         .bind(account_id)
         .fetch_optional(&mut *transaction)
         .await?;
-        let Some((domain, current_actor_uri, suspended_at)) = account else {
+        let Some((domain, current_actor_uri, followers_url, following_url, suspended_at)) = account
+        else {
             return Ok(None);
         };
         if domain.is_none() || current_actor_uri != actor_uri || suspended_at.is_some() {
             return Ok(None);
         }
+        note.quote_approval_policy = remote_quote_approval_policy_with_collections(
+            object
+                .as_object()
+                .ok_or(WriteError::InvalidInput("remote Note is not an object"))?,
+            actor_uri,
+            &followers_url,
+            &following_url,
+        )?;
+        let existing_status_id = remote_note_status_id_for_account(
+            &mut transaction,
+            account_id,
+            &note.uri,
+            note.atom_uri.as_deref(),
+        )
+        .await?;
+        prelock_remote_note_quote_targets(&mut transaction, existing_status_id, &note, origin)
+            .await?;
         let Some((
             status_id,
             existing_account_id,
@@ -5022,6 +5168,9 @@ impl WriteRepository {
                 transaction.commit().await?;
                 return Ok(None);
             }
+            let quote_changed =
+                reconcile_remote_note_quote(&mut transaction, status_id, account_id, &note, origin)
+                    .await?;
             let poll_reconcile =
                 if authority == RemoteUpdateAuthority::SignedRefresh && note.poll.is_none() {
                     RemotePollReconcile::Unchanged
@@ -5038,6 +5187,16 @@ impl WriteRepository {
                     .await?
                 };
             update_remote_note_stats(&mut transaction, status_id, &note).await?;
+            if quote_changed {
+                collect_status_stream_events(
+                    &mut transaction,
+                    &mut pending_stream_events,
+                    status_id,
+                    "status.update",
+                    note.updated_at.and_utc().timestamp_micros(),
+                )
+                .await?;
+            }
             if let RemotePollReconcile::Tally(updated_at) = poll_reconcile {
                 collect_status_stream_events(
                     &mut transaction,
@@ -5047,8 +5206,8 @@ impl WriteRepository {
                     updated_at.and_utc().timestamp_micros(),
                 )
                 .await?;
-                flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
             }
+            flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
             transaction.commit().await?;
             return Ok(None);
         }
@@ -5058,6 +5217,9 @@ impl WriteRepository {
             return Ok(None);
         }
         if note.updated_at == current_version {
+            let quote_changed =
+                reconcile_remote_note_quote(&mut transaction, status_id, account_id, &note, origin)
+                    .await?;
             let poll_reconcile =
                 if authority == RemoteUpdateAuthority::SignedRefresh && note.poll.is_none() {
                     RemotePollReconcile::Unchanged
@@ -5074,6 +5236,16 @@ impl WriteRepository {
                     .await?
                 };
             update_remote_note_stats(&mut transaction, status_id, &note).await?;
+            if quote_changed {
+                collect_status_stream_events(
+                    &mut transaction,
+                    &mut pending_stream_events,
+                    status_id,
+                    "status.update",
+                    note.updated_at.and_utc().timestamp_micros(),
+                )
+                .await?;
+            }
             if let RemotePollReconcile::Tally(updated_at) = poll_reconcile {
                 collect_status_stream_events(
                     &mut transaction,
@@ -5083,8 +5255,8 @@ impl WriteRepository {
                     updated_at.and_utc().timestamp_micros(),
                 )
                 .await?;
-                flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
             }
+            flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
             transaction.commit().await?;
             return Ok(None);
         }
@@ -5113,7 +5285,7 @@ impl WriteRepository {
         .await?;
         sqlx::query(
             "UPDATE statuses SET text = $2, spoiler_text = $3, sensitive = $4,
-                language = $5, updated_at = clock_timestamp()
+                language = $5, quote_approval_policy = $6, updated_at = clock_timestamp()
               WHERE id = $1",
         )
         .bind(status_id)
@@ -5121,6 +5293,7 @@ impl WriteRepository {
         .bind(&note.summary)
         .bind(note.sensitive)
         .bind(&note.language)
+        .bind(note.quote_approval_policy)
         .execute(&mut *transaction)
         .await?;
         remove_remote_note_media_not_in(&mut transaction, status_id, &note.attachments).await?;
@@ -5161,6 +5334,9 @@ impl WriteRepository {
             origin,
         )
         .await?;
+        let quote_changed =
+            reconcile_remote_note_quote(&mut transaction, status_id, account_id, &note, origin)
+                .await?;
         update_remote_note_tags(&mut transaction, status_id, &note.hashtags).await?;
         update_remote_note_stats(&mut transaction, status_id, &note).await?;
         for (mention_id, recipient_account_id) in &mention_ids {
@@ -5175,7 +5351,8 @@ impl WriteRepository {
         let route_after = status_timeline_snapshot(&mut transaction, status_id).await?;
         // Route-only edits (for example hashtag or language changes) still need a timeline
         // transition even when the rendered status projection is byte-for-byte unchanged.
-        let meaningful_update = projection_changed
+        let meaningful_update = quote_changed
+            || projection_changed
             || route_after != route_before
             || poll_reconcile == RemotePollReconcile::Significant;
         if !meaningful_update {
@@ -5236,8 +5413,10 @@ impl WriteRepository {
         actor_uri: &str,
         object_uri: &str,
         atom_uri: Option<&str>,
+        origin: &str,
     ) -> Result<(), WriteError> {
         let mut transaction = self.pool.begin().await?;
+        lock_quote_status_deletion(&mut transaction).await?;
         let mut pending_stream_events = Vec::new();
         lock_remote_note(&mut transaction, object_uri).await?;
         let account = sqlx::query_as::<_, (Option<String>, String, Option<NaiveDateTime>)>(
@@ -5268,6 +5447,17 @@ impl WriteRepository {
             remote_note_status_id_for_account(&mut transaction, account_id, object_uri, atom_uri)
                 .await?;
         if let Some(status_id) = status_id {
+            let mut quote_lifecycle_status_ids = sqlx::query_scalar::<_, i64>(
+                "SELECT quote.status_id FROM quotes quote
+                   JOIN statuses quoting ON quoting.id = quote.status_id
+                  WHERE quote.quoted_status_id = $1 AND quoting.deleted_at IS NULL
+                  ORDER BY quote.status_id",
+            )
+            .bind(status_id)
+            .fetch_all(&mut *transaction)
+            .await?;
+            quote_lifecycle_status_ids.push(status_id);
+            lock_statuses_in_order(&mut transaction, &quote_lifecycle_status_ids).await?;
             let status = sqlx::query_as::<_, (i64, Option<NaiveDateTime>, i32, Option<i64>)>(
                 "SELECT account_id, deleted_at, visibility, in_reply_to_id
                    FROM statuses WHERE id = $1 FOR UPDATE",
@@ -5278,6 +5468,71 @@ impl WriteRepository {
             if let Some((existing_account_id, deleted_at, visibility, in_reply_to_id)) = status {
                 if existing_account_id != account_id {
                     return Err(WriteError::Conflict);
+                }
+                let owned_quote = sqlx::query_as::<
+                    _,
+                    (i64, Option<i64>, Option<i64>, i32, Option<String>, bool),
+                >(
+                    "SELECT quote.id, quote.quoted_status_id, quote.quoted_account_id,
+                                quote.state, quote.activity_uri,
+                                COALESCE(target.domain IS NULL, false)
+                           FROM quotes quote
+                      LEFT JOIN accounts target ON target.id = quote.quoted_account_id
+                          WHERE quote.status_id = $1 FOR UPDATE OF quote",
+                )
+                .bind(status_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+                let quoting_quotes = sqlx::query_as::<_, (i64, i64, Option<String>)>(
+                    "SELECT quote.id, quote.status_id, quote.activity_uri FROM quotes quote \
+                       JOIN statuses quoting ON quoting.id = quote.status_id \
+                      WHERE quote.quoted_status_id = $1 AND quoting.deleted_at IS NULL \
+                      ORDER BY quote.id FOR UPDATE OF quote",
+                )
+                .bind(status_id)
+                .fetch_all(&mut *transaction)
+                .await?;
+                if !quoting_quotes.is_empty() {
+                    sqlx::query(
+                        "UPDATE quotes SET quoted_status_id = NULL, approval_uri = NULL, \
+                                updated_at = clock_timestamp() \
+                         WHERE quoted_status_id = $1",
+                    )
+                    .bind(status_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                    for (quote_id, quoting_status_id, request_uri) in quoting_quotes {
+                        cancel_quote_request_outbox(
+                            &mut transaction,
+                            quote_id,
+                            request_uri.as_deref(),
+                        )
+                        .await?;
+                        let version = if sqlx::query_scalar::<_, bool>(
+                            "SELECT account.domain IS NULL FROM statuses quoting \
+                             JOIN accounts account ON account.id = quoting.account_id \
+                             WHERE quoting.id = $1",
+                        )
+                        .bind(quoting_status_id)
+                        .fetch_one(&mut *transaction)
+                        .await?
+                        {
+                            record_quote_status_update(&mut transaction, quoting_status_id)
+                                .await?
+                                .and_utc()
+                                .timestamp_micros()
+                        } else {
+                            Utc::now().timestamp_micros()
+                        };
+                        collect_status_stream_events(
+                            &mut transaction,
+                            &mut pending_stream_events,
+                            quoting_status_id,
+                            "status.update",
+                            version,
+                        )
+                        .await?;
+                    }
                 }
                 let reblogs = sqlx::query_as::<_, (i64, i64, i32)>(
                     "SELECT id, account_id, visibility FROM statuses
@@ -5338,6 +5593,49 @@ impl WriteRepository {
                     record_status_delete_distribution(&mut transaction, reblog_id, &[]).await?;
                 }
                 if deleted_at.is_none() {
+                    if let Some((
+                        quote_id,
+                        quoted_status_id,
+                        quoted_account_id,
+                        state,
+                        request_uri,
+                        quoted_account_local,
+                    )) = owned_quote
+                    {
+                        if state == 1
+                            && let Some(quoted_status_id) = quoted_status_id
+                        {
+                            decrement_quote_count(&mut transaction, quoted_status_id).await?;
+                            if quoted_account_local
+                                && let Some(quoted_account_id) = quoted_account_id
+                            {
+                                record_quote_authorization_delete(
+                                    &mut transaction,
+                                    quote_id,
+                                    status_id,
+                                    quoted_status_id,
+                                    quoted_account_id,
+                                    origin,
+                                )
+                                .await?;
+                            }
+                        }
+                        if let Some(quoted_account_id) = quoted_account_id {
+                            delete_activity_notifications(
+                                &mut transaction,
+                                quoted_account_id,
+                                quote_id,
+                                "Quote",
+                            )
+                            .await?;
+                        }
+                        cancel_quote_request_outbox(
+                            &mut transaction,
+                            quote_id,
+                            request_uri.as_deref(),
+                        )
+                        .await?;
+                    }
                     sqlx::query(
                         "UPDATE statuses SET deleted_at = clock_timestamp(), updated_at = clock_timestamp()
                          WHERE id = $1",
@@ -6788,6 +7086,9 @@ impl WriteRepository {
             None,
             in_reply_to_id,
             None,
+            None,
+            None,
+            false,
             idempotency,
         )
         .await
@@ -6818,7 +7119,10 @@ impl WriteRepository {
             language,
             None,
             in_reply_to_id,
+            None,
             poll,
+            None,
+            false,
             idempotency,
         )
         .await
@@ -6836,7 +7140,10 @@ impl WriteRepository {
         language: Option<&str>,
         quote_approval_policy: Option<&str>,
         in_reply_to_id: Option<i64>,
+        quoted_status_id: Option<i64>,
         poll: Option<&PollCreate>,
+        origin: Option<&str>,
+        limited_federation: bool,
         idempotency: Option<IdempotencyKey<'_>>,
     ) -> Result<StatusWriteOutcome, WriteError> {
         let poll = poll
@@ -6858,7 +7165,11 @@ impl WriteRepository {
         let media_ids = unique_media_ids(media_ids);
         validate_idempotency(idempotency)?;
         let text = text.trim();
-        if text.is_empty() && media_ids.is_empty() {
+        if !quote_post_has_content(
+            !text.is_empty(),
+            !media_ids.is_empty(),
+            quoted_status_id.is_some(),
+        ) {
             return Err(WriteError::Validation("status must not be empty"));
         }
         let spoiler_text = spoiler_text.unwrap_or("").trim();
@@ -6892,7 +7203,42 @@ impl WriteRepository {
         .fetch_optional(&mut *transaction)
         .await?
         .unwrap_or_else(|| ("public".to_owned(), false, Some("en".to_owned()), "public".to_owned()));
-        let visibility = parse_status_visibility(visibility.unwrap_or(&defaults.0))?;
+        let mut visibility = parse_status_visibility(visibility.unwrap_or(&defaults.0))?;
+        let quote_target = if let Some(quoted_status_id) = quoted_status_id {
+            let target =
+                writable_quote_target(&mut transaction, account_id, quoted_status_id).await?;
+            visibility = quote_post_visibility(
+                StatusVisibility::from(visibility),
+                StatusVisibility::from(target.visibility),
+            )
+            .raw();
+            Some(target)
+        } else {
+            None
+        };
+        let quote_delivery = match quote_target.as_ref() {
+            Some(target) if !target.local => {
+                let origin = origin.ok_or(WriteError::NotFound)?;
+                Some(
+                    remote_status_delivery(&mut transaction, account_id, target.status_id, origin)
+                        .await?
+                        .ok_or(WriteError::NotFound)?,
+                )
+            }
+            Some(_) | None => None,
+        };
+        if let Some(delivery) = quote_delivery.as_ref()
+            && !remote_domain_allowed_in_transaction(
+                &mut transaction,
+                &delivery.domain,
+                limited_federation,
+            )
+            .await?
+        {
+            return Err(WriteError::Validation(
+                "remote status domain is not allowed",
+            ));
+        }
         let sensitive = sensitive.unwrap_or(defaults.1) || !spoiler_text.is_empty();
         let requested_language = language
             .filter(|value| !value.trim().is_empty())
@@ -6922,7 +7268,7 @@ impl WriteRepository {
         .bind(text)
         .bind(spoiler_text)
         .bind(visibility)
-        .bind(language)
+        .bind(language.as_deref())
         .bind(sensitive)
         .bind(reply_target.is_some())
         .bind(media_ids.clone())
@@ -7007,6 +7353,57 @@ impl WriteRepository {
             self.local_domain.as_deref(),
         )
         .await?;
+        let quote = if let Some(target) = quote_target.as_ref() {
+            let explicitly_mentions_target = mention_targets
+                .iter()
+                .any(|(_, recipient_account_id)| *recipient_account_id == target.account_id);
+            if !direct_quote_allowed(
+                StatusVisibility::from(visibility),
+                target.account_id == account_id,
+                explicitly_mentions_target,
+            ) {
+                return Err(WriteError::Validation(
+                    "direct quote posts must mention the quoted account",
+                ));
+            }
+            let accepted = target.local;
+            let activity_uri = quote_delivery.as_ref().map(|delivery| {
+                format!(
+                    "{}/quote_requests/{}",
+                    delivery.source_uri.trim_end_matches('/'),
+                    random_uuid()
+                )
+            });
+            let quote_id = sqlx::query_scalar::<_, i64>(
+                "INSERT INTO quotes (account_id, activity_uri, approval_uri, created_at, legacy, \
+                   quoted_account_id, quoted_status_id, state, status_id, updated_at) \
+                 VALUES ($1, $2, NULL, clock_timestamp(), false, $3, $4, $5, $6, clock_timestamp()) \
+                 RETURNING id",
+            )
+            .bind(account_id)
+            .bind(&activity_uri)
+            .bind(target.account_id)
+            .bind(target.status_id)
+            .bind(i32::from(accepted))
+            .bind(status_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "INSERT INTO mentions (id, account_id, created_at, silent, status_id, updated_at) \
+                 VALUES (nextval('mentions_id_seq'), $1, clock_timestamp(), true, $2, clock_timestamp()) \
+                 ON CONFLICT (account_id, status_id) DO NOTHING",
+            )
+            .bind(target.account_id)
+            .bind(status_id)
+            .execute(&mut *transaction)
+            .await?;
+            if accepted {
+                increment_quote_count(&mut transaction, target.status_id).await?;
+            }
+            Some((quote_id, activity_uri, accepted))
+        } else {
+            None
+        };
         if visibility == 3
             && let Some((conversation_id, lock_version)) =
                 upsert_notification_conversation(&mut transaction, account_id, Some(status_id))
@@ -7053,6 +7450,37 @@ impl WriteRepository {
                 &notification_job(*recipient_account_id, NOTIFICATION_MENTION, *mention_id),
             )
             .await?;
+        }
+        if let (Some(target), Some((quote_id, activity_uri, accepted))) =
+            (quote_target.as_ref(), quote.as_ref())
+        {
+            if *accepted {
+                record_outbox_in(
+                    &mut transaction,
+                    &notification_job(target.account_id, NOTIFICATION_QUOTE, *quote_id),
+                )
+                .await?;
+            } else if !target.local {
+                let delivery = quote_delivery.as_ref().ok_or(WriteError::NotFound)?;
+                let request_uri = activity_uri.as_deref().ok_or(WriteError::NotFound)?;
+                let quote_request_job = JobSpec::new(
+                    Lane::Push,
+                    ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
+                    json!({
+                        "status_id": status_id,
+                        "activity_type": "QuoteRequest",
+                        "quote_id": quote_id,
+                        "quote_request_uri": request_uri,
+                        "quoting_status_id": status_id,
+                        "quoted_status_id": target.status_id,
+                        "quoted_status_uri": delivery.target_uri,
+                        "quoted_status_url": delivery.target_url,
+                        "quoted_account_id": target.account_id
+                    }),
+                )
+                .logical_key(format!("activitypub:quote-request:{quote_id}"));
+                record_outbox_once_in(&mut transaction, &quote_request_job).await?;
+            }
         }
         let status_distribution_job = JobSpec::new(
             Lane::Push,
@@ -7846,6 +8274,198 @@ impl WriteRepository {
         Ok(())
     }
 
+    pub async fn update_status_interaction_policy(
+        &self,
+        authenticated: &AuthenticatedBearer,
+        status_id: i64,
+        requested_policy: Option<&str>,
+    ) -> Result<StatusWriteOutcome, WriteError> {
+        let (account_id, mut transaction) = self
+            .begin_account_write(authenticated, WRITE_STATUSES)
+            .await?;
+        let mut pending_stream_events = Vec::new();
+        let (owner_id, visibility, reblog_of_id, current_policy) =
+            sqlx::query_as::<_, (i64, i32, Option<i64>, i32)>(
+                "SELECT account_id, visibility, reblog_of_id, quote_approval_policy
+                   FROM statuses
+                  WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+            )
+            .bind(status_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(WriteError::NotFound)?;
+        if owner_id != account_id {
+            return Err(WriteError::Forbidden);
+        }
+        let default_policy = if requested_policy.is_none() {
+            sqlx::query_scalar::<_, String>(
+                "SELECT COALESCE(NULLIF(account_user.settings, '')::jsonb ->> 'default_quote_policy', 'public')
+                   FROM users account_user
+                  WHERE account_user.account_id = $1
+                  ORDER BY account_user.id LIMIT 1",
+            )
+            .bind(account_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .unwrap_or_else(|| "public".to_owned())
+        } else {
+            "public".to_owned()
+        };
+        let requested_policy =
+            quote_approval_policy_for_status(visibility, requested_policy, &default_policy)
+                .map_err(|_| WriteError::Validation("Quote approval policy is invalid"))?;
+        let next_policy = if reblog_of_id.is_some() {
+            0
+        } else {
+            requested_policy
+        };
+        if next_policy == current_policy {
+            transaction.commit().await?;
+            return Ok(StatusWriteOutcome { status_id });
+        }
+        let timeline_before = status_timeline_snapshot(&mut transaction, status_id).await?;
+        let updated_at = sqlx::query_scalar::<_, NaiveDateTime>(
+            "UPDATE statuses
+                SET quote_approval_policy = $2, updated_at = clock_timestamp()
+              WHERE id = $1
+              RETURNING updated_at",
+        )
+        .bind(status_id)
+        .bind(next_policy)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let poll_updated_at = sqlx::query_scalar::<_, NaiveDateTime>(
+            "SELECT updated_at FROM polls WHERE status_id = $1 ORDER BY id LIMIT 1",
+        )
+        .bind(status_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let version = updated_at.and_utc().timestamp_micros();
+        let update = JobSpec::new(
+            Lane::Push,
+            ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
+            json!({
+                "status_id": status_id,
+                "activity_type": "Update",
+                "update_kind": "interaction_policy",
+                "update_version_micros": version,
+                "edited_at_micros": version,
+                "poll_updated_at_micros": poll_updated_at.map(|value| value.and_utc().timestamp_micros()),
+                "skip_notifications": true
+            }),
+        )
+        .logical_key(format!(
+            "activitypub:status:{status_id}:interaction-policy:{version}"
+        ));
+        record_outbox_once_in(&mut transaction, &update).await?;
+        let timeline_after = status_timeline_snapshot(&mut transaction, status_id).await?;
+        collect_status_stream_transition(
+            &mut transaction,
+            &mut pending_stream_events,
+            status_id,
+            "status.update",
+            StreamEventLogicalKey::Version(version),
+            Some(timeline_before),
+            Some(timeline_after),
+        )
+        .await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
+        transaction.commit().await?;
+        Ok(StatusWriteOutcome { status_id })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub async fn revoke_quote(
+        &self,
+        authenticated: &AuthenticatedBearer,
+        quoted_status_id: i64,
+        quoting_status_id: i64,
+        origin: &str,
+    ) -> Result<StatusWriteOutcome, WriteError> {
+        let (account_id, mut transaction) = self
+            .begin_account_write(authenticated, WRITE_STATUSES)
+            .await?;
+        let mut pending_stream_events = Vec::new();
+        lock_statuses_in_order(&mut transaction, &[quoted_status_id, quoting_status_id]).await?;
+        let target_owner = sqlx::query_scalar::<_, i64>(
+            "SELECT account_id FROM statuses \
+             WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+        )
+        .bind(quoted_status_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(WriteError::NotFound)?;
+        if target_owner != account_id {
+            return Err(WriteError::Forbidden);
+        }
+        let quote = sqlx::query_as::<_, (i64, i32, bool, Option<String>)>(
+            "SELECT quote.id, quote.state, quote.legacy, quote.activity_uri FROM quotes quote \
+               JOIN statuses quoting ON quoting.id = quote.status_id \
+              WHERE quote.quoted_status_id = $1 AND quote.status_id = $2 \
+                AND quote.quoted_account_id = $3 AND quoting.deleted_at IS NULL \
+              FOR UPDATE OF quote, quoting",
+        )
+        .bind(quoted_status_id)
+        .bind(quoting_status_id)
+        .bind(account_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(WriteError::NotFound)?;
+        let (quote_id, old_state, legacy, request_uri) = quote;
+        cancel_quote_request_outbox(&mut transaction, quote_id, request_uri.as_deref()).await?;
+        let next_state = if matches!(old_state, 1 | 3) { 3 } else { 2 };
+        if next_state != old_state {
+            sqlx::query(
+                "UPDATE quotes SET state = $2, approval_uri = NULL, updated_at = clock_timestamp() \
+                 WHERE id = $1",
+            )
+            .bind(quote_id)
+            .bind(next_state)
+            .execute(&mut *transaction)
+            .await?;
+            if quote_state_update_counter_delta(legacy, old_state, next_state) < 0 {
+                decrement_quote_count(&mut transaction, quoted_status_id).await?;
+            }
+            delete_activity_notifications(&mut transaction, account_id, quote_id, "Quote").await?;
+            let quoting_local = sqlx::query_scalar::<_, bool>(
+                "SELECT account.domain IS NULL FROM statuses status \
+                 JOIN accounts account ON account.id = status.account_id WHERE status.id = $1",
+            )
+            .bind(quoting_status_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            let update_at = if quoting_local {
+                record_quote_status_update(&mut transaction, quoting_status_id).await?
+            } else {
+                sqlx::query_scalar::<_, NaiveDateTime>("SELECT clock_timestamp()::timestamp")
+                    .fetch_one(&mut *transaction)
+                    .await?
+            };
+            collect_status_stream_events(
+                &mut transaction,
+                &mut pending_stream_events,
+                quoting_status_id,
+                "status.update",
+                update_at.and_utc().timestamp_micros(),
+            )
+            .await?;
+            record_quote_authorization_delete(
+                &mut transaction,
+                quote_id,
+                quoting_status_id,
+                quoted_status_id,
+                account_id,
+                origin,
+            )
+            .await?;
+        }
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
+        transaction.commit().await?;
+        Ok(StatusWriteOutcome {
+            status_id: quoting_status_id,
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     pub async fn delete_status(
         &self,
@@ -7853,8 +8473,19 @@ impl WriteRepository {
         status_id: i64,
         delete_media: bool,
     ) -> Result<Vec<MediaAttachment>, WriteError> {
+        self.delete_status_with_origin(authenticated, status_id, delete_media, None)
+            .await
+    }
+
+    pub async fn delete_status_with_origin(
+        &self,
+        authenticated: &AuthenticatedBearer,
+        status_id: i64,
+        delete_media: bool,
+        origin: Option<&str>,
+    ) -> Result<Vec<MediaAttachment>, WriteError> {
         let account_id = write_account(authenticated, WRITE_STATUSES)?;
-        self.delete_status_for_owner(account_id, status_id, delete_media, None, true)
+        self.delete_status_for_owner(account_id, status_id, delete_media, None, true, origin)
             .await
     }
 
@@ -7905,6 +8536,7 @@ impl WriteRepository {
             delete_media,
             Some(acting_account_id),
             false,
+            None,
         )
         .await
     }
@@ -7917,12 +8549,25 @@ impl WriteRepository {
         delete_media: bool,
         audit_account_id: Option<i64>,
         require_active_owner: bool,
+        origin: Option<&str>,
     ) -> Result<Vec<MediaAttachment>, WriteError> {
         let mut transaction = self.pool.begin().await?;
+        lock_quote_status_deletion(&mut transaction).await?;
         let mut pending_stream_events = Vec::new();
         if require_active_owner {
             ensure_account_write_allowed_in(&mut transaction, account_id).await?;
         }
+        let mut quote_lifecycle_status_ids = sqlx::query_scalar::<_, i64>(
+            "SELECT quote.status_id FROM quotes quote
+               JOIN statuses quoting ON quoting.id = quote.status_id
+              WHERE quote.quoted_status_id = $1 AND quoting.deleted_at IS NULL
+              ORDER BY quote.status_id",
+        )
+        .bind(status_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        quote_lifecycle_status_ids.push(status_id);
+        lock_statuses_in_order(&mut transaction, &quote_lifecycle_status_ids).await?;
         let (reblog_of_id, in_reply_to_id, visibility, reported, human_identifier) =
             sqlx::query_as::<_, (Option<i64>, Option<i64>, i32, bool, String)>(
             "SELECT status.reblog_of_id, status.in_reply_to_id, status.visibility, ( \
@@ -7942,6 +8587,25 @@ impl WriteRepository {
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(WriteError::NotFound)?;
+        let owned_quote =
+            sqlx::query_as::<_, (i64, Option<i64>, Option<i64>, i32, Option<String>, bool)>(
+                "SELECT quote.id, quote.quoted_status_id, quote.quoted_account_id, quote.state, \
+                    quote.activity_uri, COALESCE(target.domain IS NULL, false) \
+               FROM quotes quote LEFT JOIN accounts target ON target.id = quote.quoted_account_id \
+              WHERE quote.status_id = $1 FOR UPDATE OF quote",
+            )
+            .bind(status_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        let quoted_by_statuses = sqlx::query_as::<_, (i64, i64, Option<String>)>(
+            "SELECT quote.id, quote.status_id, quote.activity_uri FROM quotes quote \
+               JOIN statuses quoting ON quoting.id = quote.status_id \
+              WHERE quote.quoted_status_id = $1 AND quoting.deleted_at IS NULL \
+              ORDER BY quote.id FOR UPDATE OF quote",
+        )
+        .bind(status_id)
+        .fetch_all(&mut *transaction)
+        .await?;
         let removed_attachments = if delete_media && !reported {
             let query = format!(
                 "SELECT {MEDIA_ATTACHMENT_COLUMNS} FROM media_attachments media
@@ -8019,6 +8683,91 @@ impl WriteRepository {
             sqlx::query_scalar::<_, NaiveDateTime>("SELECT clock_timestamp()::timestamp")
                 .fetch_one(&mut *transaction)
                 .await?;
+        if let Some((
+            quote_id,
+            quoted_status_id,
+            quoted_account_id,
+            state,
+            request_uri,
+            quoted_account_local,
+        )) = owned_quote
+        {
+            if state == 1
+                && let Some(quoted_status_id) = quoted_status_id
+            {
+                decrement_quote_count(&mut transaction, quoted_status_id).await?;
+                if quoted_account_local
+                    && let (Some(quoted_account_id), Some(origin)) = (quoted_account_id, origin)
+                {
+                    record_quote_authorization_delete(
+                        &mut transaction,
+                        quote_id,
+                        status_id,
+                        quoted_status_id,
+                        quoted_account_id,
+                        origin,
+                    )
+                    .await?;
+                }
+            }
+            if let Some(quoted_account_id) = quoted_account_id {
+                delete_activity_notifications(
+                    &mut transaction,
+                    quoted_account_id,
+                    quote_id,
+                    "Quote",
+                )
+                .await?;
+            }
+            cancel_quote_request_outbox(&mut transaction, quote_id, request_uri.as_deref()).await?;
+            // The status is soft-deleted below, so its quote becomes unreachable without
+            // requiring DELETE on the Mastodon-owned quotes table.
+        }
+        if !quoted_by_statuses.is_empty() {
+            let quoting_status_ids = quoted_by_statuses
+                .iter()
+                .map(|(_, quoting_status_id, _)| *quoting_status_id)
+                .collect::<Vec<_>>();
+            for (quote_id, _, request_uri) in &quoted_by_statuses {
+                cancel_quote_request_outbox(&mut transaction, *quote_id, request_uri.as_deref())
+                    .await?;
+            }
+            sqlx::query(
+                "UPDATE quotes SET quoted_status_id = NULL, approval_uri = NULL, \
+                        updated_at = clock_timestamp() WHERE id = ANY($1::bigint[])",
+            )
+            .bind(
+                quoted_by_statuses
+                    .iter()
+                    .map(|(quote_id, _, _)| *quote_id)
+                    .collect::<Vec<_>>(),
+            )
+            .execute(&mut *transaction)
+            .await?;
+            for quoting_status_id in quoting_status_ids {
+                collect_status_stream_events(
+                    &mut transaction,
+                    &mut pending_stream_events,
+                    quoting_status_id,
+                    "status.update",
+                    deleted_at.and_utc().timestamp_micros(),
+                )
+                .await?;
+                if sqlx::query_scalar::<_, bool>(
+                    "SELECT account.domain IS NULL FROM statuses status \
+                     JOIN accounts account ON account.id = status.account_id \
+                     WHERE status.id = $1 AND status.deleted_at IS NULL",
+                )
+                .bind(quoting_status_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .unwrap_or(false)
+                {
+                    record_quote_status_update(&mut transaction, quoting_status_id).await?;
+                }
+            }
+        }
+        cancel_quote_decision_outbox_for_target(&mut transaction, status_id).await?;
         if reblog_of_id.is_none() {
             sqlx::query(
                 "UPDATE statuses SET deleted_at = $2, updated_at = $2 \
@@ -8467,6 +9216,745 @@ impl WriteRepository {
             request: request_follow,
             activity_uri,
         })
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(crate) async fn apply_remote_quote_decision(
+        &self,
+        source_account_id: i64,
+        actor_uri: &str,
+        request_uri: &str,
+        request_actor_uri: Option<&str>,
+        quoted_status_uri: Option<&str>,
+        instrument_uri: Option<&str>,
+        result_uri: Option<&str>,
+        accepted: bool,
+        origin: &str,
+        delivery_target_account_id: Option<i64>,
+    ) -> Result<bool, WriteError> {
+        if accepted {
+            let result_uri = result_uri.ok_or(WriteError::InvalidInput(
+                "quote Accept has no authorization result",
+            ))?;
+            if !same_remote_note_host(actor_uri, result_uri)? {
+                return Err(WriteError::InvalidInput(
+                    "quote authorization host does not match its actor",
+                ));
+            }
+        }
+        let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
+        lock_remote_interaction(&mut transaction, request_uri).await?;
+        if accepted {
+            lock_remote_interaction(
+                &mut transaction,
+                result_uri.expect("accepted quote decision has a result"),
+            )
+            .await?;
+        }
+        if !remote_interaction_actor_matches(&mut transaction, source_account_id, actor_uri, true)
+            .await?
+        {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        let quote = sqlx::query_as::<_, (i64, i64, i64, i64, i32, Option<String>, bool)>(
+            "SELECT quote.id, quote.status_id, quote.account_id, quote.quoted_status_id, \
+                    quote.state, quote.approval_uri, quote.legacy \
+               FROM quotes quote \
+               JOIN statuses instrument ON instrument.id = quote.status_id \
+               JOIN accounts quoter ON quoter.id = quote.account_id \
+              WHERE quote.activity_uri = $1 AND quote.quoted_account_id = $2 \
+                AND instrument.local IS TRUE AND instrument.deleted_at IS NULL \
+              ORDER BY quote.id LIMIT 1 FOR UPDATE OF quote, instrument",
+        )
+        .bind(request_uri)
+        .bind(source_account_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some((
+            quote_id,
+            status_id,
+            quoting_account_id,
+            quoted_status_id,
+            old_state,
+            old_approval_uri,
+            legacy,
+        )) = quote
+        else {
+            transaction.commit().await?;
+            return Ok(false);
+        };
+        if delivery_target_account_id.is_some_and(|id| id != quoting_account_id) {
+            transaction.commit().await?;
+            return Ok(true);
+        }
+        if let Some(request_actor_uri) = request_actor_uri {
+            let expected =
+                local_actor_uri_for_account(&mut transaction, quoting_account_id, origin).await?;
+            if request_actor_uri != expected {
+                return Err(WriteError::InvalidInput(
+                    "embedded QuoteRequest actor does not match the quote author",
+                ));
+            }
+        }
+        if let Some(instrument_uri) = instrument_uri
+            && !quote_target_matches_uri(&mut transaction, status_id, instrument_uri, origin)
+                .await?
+        {
+            return Err(WriteError::InvalidInput(
+                "embedded QuoteRequest instrument does not match the quote",
+            ));
+        }
+        if let Some(quoted_status_uri) = quoted_status_uri
+            && !quote_target_matches_uri(
+                &mut transaction,
+                quoted_status_id,
+                quoted_status_uri,
+                origin,
+            )
+            .await?
+        {
+            return Err(WriteError::InvalidInput(
+                "embedded QuoteRequest object does not match the quote target",
+            ));
+        }
+        if accepted
+            && remote_interaction_tombstoned(
+                &mut transaction,
+                source_account_id,
+                result_uri.expect("accepted quote decision has a result"),
+            )
+            .await?
+        {
+            let next_state = match old_state {
+                0 => 2,
+                1 => 3,
+                _ => old_state,
+            };
+            if next_state != old_state || old_approval_uri.is_some() {
+                sqlx::query(
+                    "UPDATE quotes SET state = $2, approval_uri = NULL, updated_at = clock_timestamp() \
+                     WHERE id = $1",
+                )
+                .bind(quote_id)
+                .bind(next_state)
+                .execute(&mut *transaction)
+                .await?;
+                if quote_state_update_counter_delta(legacy, old_state, next_state) < 0 {
+                    decrement_quote_count(&mut transaction, quoted_status_id).await?;
+                }
+                delete_activity_notifications(
+                    &mut transaction,
+                    source_account_id,
+                    quote_id,
+                    "Quote",
+                )
+                .await?;
+                let edited_at = record_quote_status_update(&mut transaction, status_id).await?;
+                collect_status_stream_events(
+                    &mut transaction,
+                    &mut pending_stream_events,
+                    status_id,
+                    "status.update",
+                    edited_at.and_utc().timestamp_micros(),
+                )
+                .await?;
+            }
+            cancel_quote_request_outbox(&mut transaction, quote_id, Some(request_uri)).await?;
+            flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
+            transaction.commit().await?;
+            return Ok(true);
+        }
+        if accepted && !matches!(old_state, 0 | 1) {
+            return Err(WriteError::Conflict);
+        }
+        let next_state = if accepted {
+            if old_state == 0 { 1 } else { old_state }
+        } else if matches!(old_state, 1 | 3) {
+            3
+        } else {
+            2
+        };
+        let next_approval_uri = if accepted && next_state == 1 {
+            result_uri.map(ToOwned::to_owned)
+        } else {
+            None
+        };
+        if accepted && old_state == 1 && old_approval_uri != next_approval_uri {
+            return Err(WriteError::Conflict);
+        }
+        if next_state != old_state || next_approval_uri != old_approval_uri {
+            sqlx::query(
+                "UPDATE quotes SET state = $2, approval_uri = $3, updated_at = clock_timestamp() \
+                 WHERE id = $1",
+            )
+            .bind(quote_id)
+            .bind(next_state)
+            .bind(&next_approval_uri)
+            .execute(&mut *transaction)
+            .await?;
+            if old_state != 1 && next_state == 1 {
+                increment_quote_count(&mut transaction, quoted_status_id).await?;
+            } else if old_state == 1 && next_state != 1 {
+                decrement_quote_count(&mut transaction, quoted_status_id).await?;
+            }
+            if next_state == 1 {
+                let quoted_account_local = sqlx::query_scalar::<_, bool>(
+                    "SELECT domain IS NULL FROM accounts WHERE id = $1",
+                )
+                .bind(source_account_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+                if quoted_account_local {
+                    record_outbox_in(
+                        &mut transaction,
+                        &notification_job(source_account_id, NOTIFICATION_QUOTE, quote_id),
+                    )
+                    .await?;
+                }
+            } else {
+                delete_activity_notifications(
+                    &mut transaction,
+                    source_account_id,
+                    quote_id,
+                    "Quote",
+                )
+                .await?;
+            }
+            let edited_at = record_quote_status_update(&mut transaction, status_id).await?;
+            collect_status_stream_events(
+                &mut transaction,
+                &mut pending_stream_events,
+                status_id,
+                "status.update",
+                edited_at.and_utc().timestamp_micros(),
+            )
+            .await?;
+        }
+        cancel_quote_request_outbox(&mut transaction, quote_id, Some(request_uri)).await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn apply_remote_quote_authorization(
+        &self,
+        quoting_account_id: i64,
+        quoting_uri: &str,
+        approval_uri: &str,
+        document: &Value,
+        origin: &str,
+    ) -> Result<bool, WriteError> {
+        let authorization = remote_quote_authorization_data(document)?;
+        if authorization.uri != approval_uri || !authorization.typed {
+            return Err(WriteError::InvalidInput(
+                "remote QuoteAuthorization identity or type is invalid",
+            ));
+        }
+        let attributed_to =
+            authorization
+                .attributed_to
+                .as_deref()
+                .ok_or(WriteError::InvalidInput(
+                    "remote QuoteAuthorization has no attributed actor",
+                ))?;
+        if !same_remote_note_host(attributed_to, approval_uri)? {
+            return Err(WriteError::InvalidInput(
+                "remote QuoteAuthorization host does not match its actor",
+            ));
+        }
+        let interacting_object =
+            authorization
+                .interacting_object
+                .as_deref()
+                .ok_or(WriteError::InvalidInput(
+                    "remote QuoteAuthorization has no interacting object",
+                ))?;
+        let interaction_target =
+            authorization
+                .interaction_target
+                .as_deref()
+                .ok_or(WriteError::InvalidInput(
+                    "remote QuoteAuthorization has no interaction target",
+                ))?;
+        let mut transaction = self.pool.begin().await?;
+        lock_remote_interaction(&mut transaction, approval_uri).await?;
+        let status_id = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM statuses \
+             WHERE account_id = $2 AND deleted_at IS NULL AND (uri = $1 OR url = $1) \
+             ORDER BY id LIMIT 1",
+        )
+        .bind(quoting_uri)
+        .bind(quoting_account_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(WriteError::NotFound)?;
+        let quoted_status_id = sqlx::query_scalar::<_, i64>(
+            "SELECT quoted_status_id FROM quotes \
+             WHERE status_id = $1 AND quoted_status_id IS NOT NULL",
+        )
+        .bind(status_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(WriteError::NotFound)?;
+        sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM statuses WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+        )
+        .bind(vec![status_id, quoted_status_id])
+        .fetch_all(&mut *transaction)
+        .await?;
+        let (
+            quote_id,
+            state,
+            old_approval_uri,
+            quoted_account_id,
+            quoted_actor_uri,
+            legacy,
+            request_uri,
+        ) = sqlx::query_as::<_, (i64, i32, Option<String>, i64, String, bool, Option<String>)>(
+            "SELECT quote.id, quote.state, quote.approval_uri, quote.quoted_account_id, \
+                        quoted_account.uri, quote.legacy, quote.activity_uri \
+                   FROM quotes quote \
+                   JOIN statuses quoting ON quoting.id = quote.status_id \
+                   JOIN statuses quoted ON quoted.id = quote.quoted_status_id \
+                   JOIN accounts quoted_account ON quoted_account.id = quote.quoted_account_id \
+                  WHERE quote.status_id = $1 AND quote.quoted_status_id = $2 \
+                    AND quoting.deleted_at IS NULL AND quoted.deleted_at IS NULL \
+                    AND quoted_account.domain IS NOT NULL \
+                  FOR UPDATE OF quote",
+        )
+        .bind(status_id)
+        .bind(quoted_status_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(WriteError::NotFound)?;
+        if attributed_to != quoted_actor_uri
+            || !quote_target_matches_uri(&mut transaction, status_id, interacting_object, origin)
+                .await?
+            || !quote_target_matches_uri(
+                &mut transaction,
+                quoted_status_id,
+                interaction_target,
+                origin,
+            )
+            .await?
+        {
+            return Err(WriteError::InvalidInput(
+                "remote QuoteAuthorization does not match its quote",
+            ));
+        }
+        if remote_interaction_tombstoned(&mut transaction, quoted_account_id, approval_uri).await? {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        cancel_quote_request_outbox(&mut transaction, quote_id, request_uri.as_deref()).await?;
+        if state == 1 {
+            let replay = old_approval_uri.as_deref() == Some(approval_uri);
+            transaction.commit().await?;
+            return Ok(replay);
+        }
+        if state != 0 {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE quotes SET state = 1, approval_uri = $2, updated_at = clock_timestamp() \
+             WHERE id = $1 AND state = 0",
+        )
+        .bind(quote_id)
+        .bind(approval_uri)
+        .execute(&mut *transaction)
+        .await?;
+        if quote_state_update_counter_delta(legacy, state, 1) > 0 {
+            increment_quote_count(&mut transaction, quoted_status_id).await?;
+        }
+        if sqlx::query_scalar::<_, bool>("SELECT domain IS NULL FROM accounts WHERE id = $1")
+            .bind(quoted_account_id)
+            .fetch_one(&mut *transaction)
+            .await?
+        {
+            record_outbox_in(
+                &mut transaction,
+                &notification_job(quoted_account_id, NOTIFICATION_QUOTE, quote_id),
+            )
+            .await?;
+        }
+        let mut pending_stream_events = Vec::new();
+        collect_status_stream_events(
+            &mut transaction,
+            &mut pending_stream_events,
+            status_id,
+            "status.update",
+            Utc::now().timestamp_micros(),
+        )
+        .await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn apply_remote_quote_authorization_delete(
+        &self,
+        source_account_id: i64,
+        actor_uri: &str,
+        authorization_uri: &str,
+        forwarding_activity: Option<&Value>,
+    ) -> Result<bool, WriteError> {
+        if !same_remote_note_host(actor_uri, authorization_uri)? {
+            return Err(WriteError::InvalidInput(
+                "QuoteAuthorization Delete host does not match its actor",
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
+        lock_remote_interaction(&mut transaction, authorization_uri).await?;
+        if !remote_interaction_actor_matches(&mut transaction, source_account_id, actor_uri, false)
+            .await?
+        {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        insert_remote_note_tombstone(&mut transaction, source_account_id, authorization_uri)
+            .await?;
+        let quote = sqlx::query_as::<_, (i64, i64, i64, i32, bool, Option<String>)>(
+            "SELECT quote.id, quote.status_id, quote.quoted_status_id, quote.state, quote.legacy, \
+                    quote.activity_uri \
+               FROM quotes quote \
+               JOIN statuses status ON status.id = quote.status_id \
+              WHERE quote.approval_uri = $1 AND quote.quoted_account_id = $2 \
+                AND quote.state IN (0, 1) AND status.deleted_at IS NULL \
+              ORDER BY quote.id LIMIT 1 FOR UPDATE OF quote, status",
+        )
+        .bind(authorization_uri)
+        .bind(source_account_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some((quote_id, status_id, quoted_status_id, old_state, legacy, request_uri)) = quote
+        else {
+            transaction.commit().await?;
+            return Ok(false);
+        };
+        cancel_quote_request_outbox(&mut transaction, quote_id, request_uri.as_deref()).await?;
+        if let Some(activity) = forwarding_activity {
+            record_remote_quote_authorization_forwarding_in(
+                &mut transaction,
+                source_account_id,
+                actor_uri,
+                status_id,
+                activity,
+            )
+            .await?;
+        }
+        let next_state = if old_state == 1 { 3 } else { 2 };
+        sqlx::query(
+            "UPDATE quotes SET state = $2, approval_uri = NULL, updated_at = clock_timestamp() \
+             WHERE id = $1",
+        )
+        .bind(quote_id)
+        .bind(next_state)
+        .execute(&mut *transaction)
+        .await?;
+        if quote_state_update_counter_delta(legacy, old_state, next_state) < 0 {
+            decrement_quote_count(&mut transaction, quoted_status_id).await?;
+        }
+        delete_activity_notifications(&mut transaction, source_account_id, quote_id, "Quote")
+            .await?;
+        let status_is_local = sqlx::query_scalar::<_, bool>(
+            "SELECT account.domain IS NULL FROM statuses status \
+             JOIN accounts account ON account.id = status.account_id WHERE status.id = $1",
+        )
+        .bind(status_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let updated_at = if status_is_local {
+            record_quote_status_update(&mut transaction, status_id).await?
+        } else {
+            sqlx::query_scalar::<_, NaiveDateTime>("SELECT clock_timestamp()::timestamp")
+                .fetch_one(&mut *transaction)
+                .await?
+        };
+        collect_status_stream_events(
+            &mut transaction,
+            &mut pending_stream_events,
+            status_id,
+            "status.update",
+            updated_at.and_utc().timestamp_micros(),
+        )
+        .await?;
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn remote_quote_request_may_import(
+        &self,
+        source_account_id: i64,
+        request_uri: &str,
+        actor_uri: &str,
+        quoted_status_uri: &str,
+        instrument_uri: &str,
+        origin: &str,
+        delivery_target_account_id: Option<i64>,
+    ) -> Result<Option<(i64, i64)>, WriteError> {
+        if !same_remote_note_host(actor_uri, request_uri)?
+            || !same_remote_note_host(actor_uri, instrument_uri)?
+        {
+            return Err(WriteError::InvalidInput(
+                "remote QuoteRequest identifiers do not match its actor host",
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        lock_remote_interaction(&mut transaction, request_uri).await?;
+        if !remote_interaction_actor_matches(&mut transaction, source_account_id, actor_uri, true)
+            .await?
+        {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        if remote_quote_request_decision_in(
+            &mut transaction,
+            request_uri,
+            actor_uri,
+            quoted_status_uri,
+            instrument_uri,
+        )
+        .await?
+        .is_some()
+        {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        let Some((target_status_id, target_account_id, target_local, _)) =
+            resolve_quote_target(&mut transaction, quoted_status_uri, origin).await?
+        else {
+            transaction.commit().await?;
+            return Ok(None);
+        };
+        if !target_local || delivery_target_account_id.is_some_and(|id| id != target_account_id) {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        match writable_quote_target(&mut transaction, source_account_id, target_status_id).await {
+            Ok(_) => {
+                transaction.commit().await?;
+                Ok(Some((target_status_id, target_account_id)))
+            }
+            Err(WriteError::NotFound | WriteError::Forbidden) => {
+                transaction.commit().await?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(crate) async fn apply_remote_quote_request(
+        &self,
+        source_account_id: i64,
+        request_uri: &str,
+        actor_uri: &str,
+        quoted_status_uri: &str,
+        instrument_uri: &str,
+        origin: &str,
+        delivery_target_account_id: Option<i64>,
+    ) -> Result<(), WriteError> {
+        if !same_remote_note_host(actor_uri, request_uri)?
+            || !same_remote_note_host(actor_uri, instrument_uri)?
+        {
+            return Err(WriteError::InvalidInput(
+                "remote QuoteRequest identifiers do not match its actor host",
+            ));
+        }
+        let mut transaction = self.pool.begin().await?;
+        let mut pending_stream_events = Vec::new();
+        lock_remote_interaction(&mut transaction, request_uri).await?;
+        if !remote_interaction_actor_matches(&mut transaction, source_account_id, actor_uri, true)
+            .await?
+        {
+            transaction.commit().await?;
+            return Ok(());
+        }
+        if remote_quote_request_decision_in(
+            &mut transaction,
+            request_uri,
+            actor_uri,
+            quoted_status_uri,
+            instrument_uri,
+        )
+        .await?
+        .is_some()
+        {
+            transaction.commit().await?;
+            return Ok(());
+        }
+        let Some((target_status_id, target_account_id, target_local, target_actor_uri)) =
+            resolve_quote_target(&mut transaction, quoted_status_uri, origin).await?
+        else {
+            transaction.commit().await?;
+            return Ok(());
+        };
+        if !target_local || delivery_target_account_id.is_some_and(|id| id != target_account_id) {
+            transaction.commit().await?;
+            return Ok(());
+        }
+        let decision_allowed =
+            writable_quote_target(&mut transaction, source_account_id, target_status_id)
+                .await
+                .is_ok();
+        let source_delivery = sqlx::query_as::<_, (String, String)>(
+            "SELECT inbox_url, domain FROM accounts \
+             WHERE id = $1 AND domain IS NOT NULL AND uri = $2 AND protocol = 1 \
+               AND suspended_at IS NULL FOR UPDATE",
+        )
+        .bind(source_account_id)
+        .bind(actor_uri)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some((inbox_url, remote_domain)) = source_delivery else {
+            transaction.commit().await?;
+            return Ok(());
+        };
+        let quote = sqlx::query_as::<_, (i64, i64, i32, Option<String>, bool)>(
+            "SELECT quote.id, quote.status_id, quote.state, quote.activity_uri, quote.legacy \
+               FROM quotes quote \
+               JOIN statuses instrument ON instrument.id = quote.status_id \
+              WHERE instrument.account_id = $1 AND instrument.deleted_at IS NULL \
+                AND (instrument.uri = $2 OR instrument.url = $2) \
+                AND quote.quoted_status_id = $3 \
+              ORDER BY quote.id LIMIT 1 FOR UPDATE OF quote",
+        )
+        .bind(source_account_id)
+        .bind(instrument_uri)
+        .bind(target_status_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let decision_quote_identity = quote
+            .as_ref()
+            .map(|(quote_id, quoting_status_id, _, _, _)| (*quote_id, *quoting_status_id));
+        let mut accepted = false;
+        if let Some((quote_id, quoting_status_id, state, activity_uri, legacy)) = quote.as_ref() {
+            if activity_uri
+                .as_deref()
+                .is_some_and(|uri| uri != request_uri)
+            {
+                return Err(WriteError::Conflict);
+            }
+            if decision_allowed && matches!(*state, 0 | 1) {
+                accepted = true;
+                if *state == 0 {
+                    sqlx::query(
+                        "UPDATE quotes SET state = 1, activity_uri = $2, approval_uri = NULL, \
+                                updated_at = clock_timestamp() WHERE id = $1 AND state = 0",
+                    )
+                    .bind(quote_id)
+                    .bind(request_uri)
+                    .execute(&mut *transaction)
+                    .await?;
+                    if quote_state_update_counter_delta(*legacy, *state, 1) > 0 {
+                        increment_quote_count(&mut transaction, target_status_id).await?;
+                    }
+                    record_outbox_in(
+                        &mut transaction,
+                        &notification_job(target_account_id, NOTIFICATION_QUOTE, *quote_id),
+                    )
+                    .await?;
+                    collect_status_stream_events(
+                        &mut transaction,
+                        &mut pending_stream_events,
+                        *quoting_status_id,
+                        "status.update",
+                        Utc::now().timestamp_micros(),
+                    )
+                    .await?;
+                } else if activity_uri.is_none() {
+                    sqlx::query(
+                        "UPDATE quotes SET activity_uri = $2, updated_at = clock_timestamp() \
+                         WHERE id = $1 AND activity_uri IS NULL",
+                    )
+                    .bind(quote_id)
+                    .bind(request_uri)
+                    .execute(&mut *transaction)
+                    .await?;
+                }
+            } else if !decision_allowed && matches!(*state, 0 | 1) {
+                let next_state = if *state == 1 { 3 } else { 2 };
+                sqlx::query(
+                    "UPDATE quotes SET state = $2, activity_uri = $3, approval_uri = NULL, \
+                            updated_at = clock_timestamp() WHERE id = $1",
+                )
+                .bind(quote_id)
+                .bind(next_state)
+                .bind(request_uri)
+                .execute(&mut *transaction)
+                .await?;
+                if quote_state_update_counter_delta(*legacy, *state, next_state) < 0 {
+                    decrement_quote_count(&mut transaction, target_status_id).await?;
+                }
+                delete_activity_notifications(
+                    &mut transaction,
+                    target_account_id,
+                    *quote_id,
+                    "Quote",
+                )
+                .await?;
+                collect_status_stream_events(
+                    &mut transaction,
+                    &mut pending_stream_events,
+                    *quoting_status_id,
+                    "status.update",
+                    Utc::now().timestamp_micros(),
+                )
+                .await?;
+            }
+        }
+        let quote_id = if accepted {
+            decision_quote_identity
+                .map(|(quote_id, _)| quote_id)
+                .expect("accepted QuoteRequest has a persisted quote")
+        } else {
+            activitypub::quote_request_rejection_id(request_uri)
+        };
+        let authorization_uri = accepted.then(|| {
+            format!(
+                "{}/quote_authorizations/{quote_id}",
+                target_actor_uri.trim_end_matches('/')
+            )
+        });
+        let body = activitypub::quote_decision_with_uris(
+            &target_actor_uri,
+            quote_id,
+            request_uri,
+            actor_uri,
+            quoted_status_uri,
+            instrument_uri,
+            authorization_uri.as_deref(),
+            accepted,
+        );
+        let delivery = JobSpec::new(
+            Lane::Push,
+            ACTIVITYPUB_DELIVERY_JOB_KIND,
+            json!({
+                "source_account_id": target_account_id,
+                "inbox_url": inbox_url,
+                "remote_domain": remote_domain,
+                "body": body,
+                "quote_delivery_kind": if accepted { "accept" } else { "reject" },
+                "quote_request_uri": request_uri,
+                "quote_id": decision_quote_identity.map(|(quote_id, _)| quote_id),
+                "quoting_status_id": decision_quote_identity.map(|(_, status_id)| status_id),
+                "quoted_status_id": target_status_id
+            }),
+        )
+        .logical_key(activitypub::quote_request_decision_logical_key(request_uri));
+        if !record_outbox_once_in(&mut transaction, &delivery).await? {
+            return Err(WriteError::Conflict);
+        }
+        flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -12171,6 +13659,129 @@ fn remote_actor_account_id(
         .ok_or(WriteError::Conflict)
 }
 
+async fn record_quote_authorization_delete(
+    transaction: &mut Transaction<'_, Postgres>,
+    quote_id: i64,
+    quoting_status_id: i64,
+    quoted_status_id: i64,
+    quoted_account_id: i64,
+    origin: &str,
+) -> Result<(), WriteError> {
+    let actor_uri = local_actor_uri_for_account(transaction, quoted_account_id, origin).await?;
+    let authorization_uri = format!(
+        "{}/quote_authorizations/{quote_id}",
+        actor_uri.trim_end_matches('/')
+    );
+    let body = activitypub::delete_quote_authorization_with_uris(&actor_uri, &authorization_uri);
+    let destinations = sqlx::query_as::<_, (String, String)>(
+        "WITH reached(account_id) AS ( \
+           SELECT quoting.account_id FROM statuses quoting WHERE quoting.id = $1 \
+           UNION SELECT follow.account_id FROM follows follow \
+            WHERE follow.target_account_id IN ( \
+              SELECT account_id FROM statuses WHERE id IN ($1, $2)) \
+           UNION SELECT mention.account_id FROM mentions mention \
+            WHERE mention.status_id IN ($1, $2) \
+         ) SELECT DISTINCT COALESCE(NULLIF(account.shared_inbox_url, ''), account.inbox_url), \
+                  account.domain \
+             FROM reached JOIN accounts account ON account.id = reached.account_id \
+            WHERE account.domain IS NOT NULL AND account.protocol = 1 \
+              AND account.suspended_at IS NULL \
+              AND COALESCE(NULLIF(account.shared_inbox_url, ''), account.inbox_url) <> '' \
+            ORDER BY 1, 2",
+    )
+    .bind(quoting_status_id)
+    .bind(quoted_status_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for (inbox_url, remote_domain) in destinations {
+        let delivery = JobSpec::new(
+            Lane::Push,
+            ACTIVITYPUB_DELIVERY_JOB_KIND,
+            json!({
+                "source_account_id": quoted_account_id,
+                "inbox_url": inbox_url,
+                "remote_domain": remote_domain,
+                "body": body.clone()
+            }),
+        )
+        .logical_key(format!(
+            "activitypub:quote-authorization-delete:{quote_id}:{inbox_url}"
+        ));
+        record_outbox_once_in(transaction, &delivery).await?;
+    }
+    Ok(())
+}
+
+async fn cancel_quote_request_outbox(
+    transaction: &mut Transaction<'_, Postgres>,
+    quote_id: i64,
+    request_uri: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM rustodon.outbox_events WHERE dispatched_at IS NULL AND ( \
+           (kind = $1 AND logical_key = $2) OR \
+           (kind = $3 AND $4::text IS NOT NULL AND ( \
+             (payload -> 'arguments' ->> 'quote_request_uri' = $4 \
+               AND payload -> 'arguments' ->> 'quote_id' = $5::text) \
+             OR payload #>> '{arguments,body,id}' = $4 \
+             OR payload #>> '{arguments,body,object,id}' = $4)))",
+    )
+    .bind(ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND)
+    .bind(format!("activitypub:quote-request:{quote_id}"))
+    .bind(ACTIVITYPUB_DELIVERY_JOB_KIND)
+    .bind(request_uri)
+    .bind(quote_id)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        "DELETE FROM rustodon.durable_jobs WHERE dead_at IS NULL \
+           AND (lease_owner IS NULL OR lease_expires_at <= clock_timestamp()) AND ( \
+           (kind = $1 AND logical_key = $2) OR \
+           (kind = $3 AND $4::text IS NOT NULL AND ( \
+             (arguments ->> 'quote_request_uri' = $4 \
+               AND arguments ->> 'quote_id' = $5::text) \
+             OR arguments #>> '{body,id}' = $4 \
+             OR arguments #>> '{body,object,id}' = $4)))",
+    )
+    .bind(ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND)
+    .bind(format!("activitypub:quote-request:{quote_id}"))
+    .bind(ACTIVITYPUB_DELIVERY_JOB_KIND)
+    .bind(request_uri)
+    .bind(quote_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn cancel_quote_decision_outbox_for_target(
+    transaction: &mut Transaction<'_, Postgres>,
+    quoted_status_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM rustodon.outbox_events \
+          WHERE dispatched_at IS NULL AND kind = $1 \
+            AND payload -> 'arguments' ->> 'quote_delivery_kind' IN ('accept', 'reject') \
+            AND payload -> 'arguments' ->> 'quoted_status_id' = $2::text",
+    )
+    .bind(ACTIVITYPUB_DELIVERY_JOB_KIND)
+    .bind(quoted_status_id)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        "DELETE FROM rustodon.durable_jobs \
+          WHERE dead_at IS NULL \
+            AND (lease_owner IS NULL OR lease_expires_at <= clock_timestamp()) \
+            AND kind = $1 \
+            AND arguments ->> 'quote_delivery_kind' IN ('accept', 'reject') \
+            AND arguments ->> 'quoted_status_id' = $2::text",
+    )
+    .bind(ACTIVITYPUB_DELIVERY_JOB_KIND)
+    .bind(quoted_status_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 async fn cancel_status_outbox(
     transaction: &mut Transaction<'_, Postgres>,
     status_id: i64,
@@ -12644,7 +14255,7 @@ async fn resolve_notification_activity(
                 "SELECT quote.account_id, quote.quoted_account_id, quote.status_id, quote.created_at \
                  FROM quotes quote JOIN statuses status ON status.id = quote.status_id \
                  WHERE quote.id = $1 AND quote.quoted_account_id IS NOT NULL \
-                   AND status.deleted_at IS NULL",
+                   AND quote.state = 1 AND status.deleted_at IS NULL",
             )
             .bind(id)
             .fetch_optional(&mut **transaction)
@@ -13051,6 +14662,7 @@ struct RemoteNoteData {
     summary: String,
     language: Option<String>,
     sensitive: bool,
+    quote_approval_policy: i32,
     published_at: NaiveDateTime,
     updated_at: NaiveDateTime,
     edited_at: Option<NaiveDateTime>,
@@ -13063,6 +14675,30 @@ struct RemoteNoteData {
     favourites_count: Option<i64>,
     reblogs_count: Option<i64>,
     poll: Option<RemotePollData>,
+    quote: Option<RemoteQuoteData>,
+}
+
+struct RemoteQuoteImportGuard<'a> {
+    request_uri: &'a str,
+    quoted_status_uri: &'a str,
+    instrument_uri: &'a str,
+    expected_target_status_id: i64,
+    expected_target_account_id: i64,
+}
+
+struct RemoteQuoteData {
+    target_uri: Option<String>,
+    authorization_uri: Option<String>,
+    legacy: bool,
+    deleted: bool,
+}
+
+struct RemoteQuoteAuthorizationData {
+    uri: String,
+    attributed_to: Option<String>,
+    interacting_object: Option<String>,
+    interaction_target: Option<String>,
+    typed: bool,
 }
 
 struct RemotePollData {
@@ -13187,6 +14823,7 @@ impl RemoteNoteData {
                 .get("sensitive")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            quote_approval_policy: remote_quote_approval_policy(object, actor_uri)?,
             published_at,
             updated_at,
             edited_at,
@@ -13199,8 +14836,165 @@ impl RemoteNoteData {
             favourites_count: remote_note_interaction_count(object, "likes", "favouritesCount")?,
             reblogs_count: remote_note_interaction_count(object, "shares", "reblogsCount")?,
             poll: is_question.then(|| remote_poll_data(object)).transpose()?,
+            quote: remote_quote_data(object)?,
         })
     }
+}
+
+fn remote_quote_approval_policy(
+    object: &serde_json::Map<String, Value>,
+    actor_uri: &str,
+) -> Result<i32, WriteError> {
+    let actor_uri = actor_uri.trim_end_matches('/');
+    remote_quote_approval_policy_with_collections(
+        object,
+        actor_uri,
+        &format!("{actor_uri}/followers"),
+        &format!("{actor_uri}/following"),
+    )
+}
+
+fn remote_quote_approval_policy_with_collections(
+    object: &serde_json::Map<String, Value>,
+    actor_uri: &str,
+    followers_uri: &str,
+    following_uri: &str,
+) -> Result<i32, WriteError> {
+    let Some(policy) = object
+        .get("interactionPolicy")
+        .and_then(Value::as_object)
+        .and_then(|policy| policy.get("canQuote"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(0);
+    };
+    let automatic = remote_quote_subpolicy(
+        policy.get("automaticApproval"),
+        actor_uri,
+        followers_uri,
+        following_uri,
+    )?;
+    let manual = remote_quote_subpolicy(
+        policy.get("manualApproval"),
+        actor_uri,
+        followers_uri,
+        following_uri,
+    )?;
+    Ok((automatic << 16) | manual)
+}
+
+fn remote_quote_subpolicy(
+    value: Option<&Value>,
+    actor_uri: &str,
+    followers_uri: &str,
+    following_uri: &str,
+) -> Result<i32, WriteError> {
+    let values = match value {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(values)) if values.len() <= 100 => values.iter().collect(),
+        Some(Value::Array(_)) => {
+            return Err(WriteError::InvalidInput(
+                "remote quote interaction policy is too large",
+            ));
+        }
+        Some(value) => vec![value],
+    };
+    let actor_uri = actor_uri.trim_end_matches('/');
+    Ok(values.into_iter().fold(0, |flags, value| {
+        let uri = value
+            .as_str()
+            .or_else(|| value.as_object()?.get("id")?.as_str());
+        flags
+            | match uri {
+                Some("as:Public" | "Public" | "https://www.w3.org/ns/activitystreams#Public") => 2,
+                Some(uri) if uri == followers_uri => 4,
+                Some(uri) if uri == following_uri => 8,
+                Some(uri) if uri == actor_uri => 0,
+                _ => 1,
+            }
+    }))
+}
+
+fn remote_quote_authorization_data(
+    value: &Value,
+) -> Result<RemoteQuoteAuthorizationData, WriteError> {
+    let uri = remote_note_uri(Some(value))?.ok_or(WriteError::InvalidInput(
+        "remote quote authorization has no ID",
+    ))?;
+    let embedded = value.as_object();
+    Ok(RemoteQuoteAuthorizationData {
+        uri,
+        attributed_to: embedded
+            .map(|value| remote_note_optional_uri(value.get("attributedTo")))
+            .transpose()?
+            .flatten(),
+        interacting_object: embedded
+            .map(|value| remote_note_optional_uri(value.get("interactingObject")))
+            .transpose()?
+            .flatten(),
+        interaction_target: embedded
+            .map(|value| remote_note_optional_uri(value.get("interactionTarget")))
+            .transpose()?
+            .flatten(),
+        typed: embedded
+            .is_some_and(|value| equals_or_includes(value.get("type"), "QuoteAuthorization")),
+    })
+}
+
+fn remote_quote_data(
+    object: &serde_json::Map<String, Value>,
+) -> Result<Option<RemoteQuoteData>, WriteError> {
+    let Some((field, value)) = ["quote", "_misskey_quote", "quoteUrl", "quoteUri"]
+        .into_iter()
+        .find_map(|field| object.get(field).map(|value| (field, value)))
+    else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let legacy = field != "quote";
+    let deleted = value
+        .as_object()
+        .is_some_and(|quote| equals_or_includes(quote.get("type"), "Tombstone"));
+    if let Some(quote) = value.as_object()
+        && !deleted
+        && !equals_or_includes(quote.get("type"), "Note")
+        && !equals_or_includes(quote.get("type"), "Question")
+    {
+        return Err(WriteError::InvalidInput(
+            "remote quote object type is invalid",
+        ));
+    }
+    let target_uri = if deleted
+        && value
+            .as_object()
+            .is_some_and(|quote| quote.get("id").or_else(|| quote.get("href")).is_none())
+    {
+        None
+    } else {
+        remote_note_uri(Some(value))?
+    };
+    if target_uri.is_none() && !deleted {
+        return Err(WriteError::InvalidInput("remote quote has no target"));
+    }
+    let authorization = object
+        .get("quoteAuthorization")
+        .and_then(|value| {
+            value
+                .as_array()
+                .and_then(|values| values.first())
+                .or(Some(value))
+        })
+        .filter(|value| !value.is_null())
+        .map(remote_quote_authorization_data)
+        .transpose()?;
+    Ok(Some(RemoteQuoteData {
+        target_uri,
+        authorization_uri: authorization.map(|authorization| authorization.uri),
+        legacy,
+        deleted,
+    }))
 }
 
 fn remote_poll_data(object: &serde_json::Map<String, Value>) -> Result<RemotePollData, WriteError> {
@@ -13397,6 +15191,44 @@ async fn lock_remote_interaction(
     .execute(&mut **transaction)
     .await?;
     Ok(())
+}
+
+async fn remote_quote_request_decision_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    request_uri: &str,
+    actor_uri: &str,
+    quoted_status_uri: &str,
+    instrument_uri: &str,
+) -> Result<Option<bool>, WriteError> {
+    let logical_key = activitypub::quote_request_decision_logical_key(request_uri);
+    let body = sqlx::query_scalar::<_, Value>(
+        "SELECT payload -> 'arguments' -> 'body' FROM rustodon.outbox_events \
+         WHERE kind = $1 AND logical_key = $2",
+    )
+    .bind(ACTIVITYPUB_DELIVERY_JOB_KIND)
+    .bind(logical_key)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(body) = body else {
+        return Ok(None);
+    };
+    let accepted = match body.get("type").and_then(Value::as_str) {
+        Some("Accept") => true,
+        Some("Reject") => false,
+        _ => return Err(WriteError::Conflict),
+    };
+    let request = body
+        .get("object")
+        .and_then(Value::as_object)
+        .ok_or(WriteError::Conflict)?;
+    if request.get("id").and_then(Value::as_str) != Some(request_uri)
+        || request.get("actor").and_then(Value::as_str) != Some(actor_uri)
+        || request.get("object").and_then(Value::as_str) != Some(quoted_status_uri)
+        || request.get("instrument").and_then(Value::as_str) != Some(instrument_uri)
+    {
+        return Err(WriteError::Conflict);
+    }
+    Ok(Some(accepted))
 }
 
 async fn remote_interaction_actor_matches(
@@ -13800,6 +15632,636 @@ async fn remote_note_thread(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn local_actor_uri_for_account(
+    transaction: &mut Transaction<'_, Postgres>,
+    account_id: i64,
+    origin: &str,
+) -> Result<String, WriteError> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT CASE WHEN id = -99 THEN $2 || '/actor' \
+                     WHEN id_scheme = 1 THEN $2 || '/ap/users/' || id::text \
+                     ELSE $2 || '/users/' || username END \
+           FROM accounts WHERE id = $1 AND domain IS NULL",
+    )
+    .bind(account_id)
+    .bind(origin.trim_end_matches('/'))
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(WriteError::NotFound)
+}
+
+async fn quote_target_matches_uri(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_id: i64,
+    uri: &str,
+    origin: &str,
+) -> Result<bool, WriteError> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM statuses status \
+           JOIN accounts author ON author.id = status.account_id \
+          WHERE status.id = $1 AND status.deleted_at IS NULL AND ( \
+                status.uri = $2 OR status.url = $2 OR (author.domain IS NULL AND ( \
+                $2 = $3 || '/actor/statuses/' || status.id::text \
+                OR $2 = $3 || '/@' || author.username || '/' || status.id::text \
+                OR $2 = $3 || '/users/' || author.username || '/statuses/' || status.id::text \
+                OR $2 = $3 || '/ap/users/' || author.id::text || '/statuses/' || status.id::text))))",
+    )
+    .bind(status_id)
+    .bind(uri)
+    .bind(origin.trim_end_matches('/'))
+    .fetch_one(&mut **transaction)
+    .await?)
+}
+
+async fn resolve_quote_target(
+    transaction: &mut Transaction<'_, Postgres>,
+    target_uri: &str,
+    origin: &str,
+) -> Result<Option<(i64, i64, bool, String)>, WriteError> {
+    Ok(sqlx::query_as::<_, (i64, i64, bool, String)>(
+        "SELECT status.id, status.account_id, author.domain IS NULL, \
+                CASE WHEN author.domain IS NULL THEN \
+                  CASE WHEN author.id = -99 THEN $2 || '/actor' \
+                       WHEN author.id_scheme = 1 THEN $2 || '/ap/users/' || author.id::text \
+                       ELSE $2 || '/users/' || author.username END \
+                ELSE author.uri END \
+           FROM statuses status \
+           JOIN accounts author ON author.id = status.account_id \
+          WHERE status.deleted_at IS NULL AND status.reblog_of_id IS NULL AND ( \
+                status.uri = $1 OR status.url = $1 OR (author.domain IS NULL AND ( \
+                $1 = $2 || '/actor/statuses/' || status.id::text \
+                OR $1 = $2 || '/@' || author.username || '/' || status.id::text \
+                OR $1 = $2 || '/users/' || author.username || '/statuses/' || status.id::text \
+                OR $1 = $2 || '/ap/users/' || author.id::text || '/statuses/' || status.id::text))) \
+          ORDER BY status.id LIMIT 1",
+    )
+    .bind(target_uri)
+    .bind(origin.trim_end_matches('/'))
+    .fetch_optional(&mut **transaction)
+    .await?)
+}
+
+async fn quote_target_id_for_status(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_id: i64,
+) -> Result<Option<i64>, WriteError> {
+    Ok(sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT quoted_status_id FROM quotes WHERE status_id = $1",
+    )
+    .bind(status_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .flatten())
+}
+
+async fn lock_quote_status_deletion(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<(), WriteError> {
+    // Discovering every status in a quote component requires locking one endpoint first.
+    // Serialize status deletions so two endpoint removals cannot each hold that first row
+    // while waiting for the other's quote/status lock.
+    sqlx::query("SELECT pg_advisory_xact_lock(7640897321347509341::bigint)")
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
+async fn lock_statuses_in_order(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_ids: &[i64],
+) -> Result<(), WriteError> {
+    let mut status_ids = status_ids.to_vec();
+    status_ids.sort_unstable();
+    status_ids.dedup();
+    if !status_ids.is_empty() {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM statuses WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+        )
+        .bind(status_ids)
+        .fetch_all(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn record_remote_quote_authorization_forwarding_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    source_account_id: i64,
+    actor_uri: &str,
+    status_id: i64,
+    activity: &Value,
+) -> Result<(), WriteError> {
+    let (visibility, parent_account_id, source_inbox) =
+        sqlx::query_as::<_, (i32, Option<i64>, String)>(
+            "SELECT status.visibility, parent.id,
+                    COALESCE(NULLIF(source.shared_inbox_url, ''), source.inbox_url)
+               FROM statuses status
+               JOIN accounts source ON source.id = $2 AND source.uri = $3
+                                   AND source.domain IS NOT NULL
+          LEFT JOIN statuses parent_status ON parent_status.id = status.in_reply_to_id
+                                           AND parent_status.deleted_at IS NULL
+          LEFT JOIN accounts parent ON parent.id = parent_status.account_id
+                                    AND parent.domain IS NULL
+              WHERE status.id = $1 AND status.deleted_at IS NULL",
+        )
+        .bind(status_id)
+        .bind(source_account_id)
+        .bind(actor_uri)
+        .fetch_one(&mut **transaction)
+        .await?;
+    if !matches!(visibility, 0 | 1) {
+        return Ok(());
+    }
+    let activity_uri = activity
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|uri| !uri.trim().is_empty())
+        .ok_or(WriteError::InvalidInput("signed remote activity has no ID"))?;
+    record_remote_activity_forwarding_for_status_in(
+        transaction,
+        status_id,
+        parent_account_id,
+        &source_inbox,
+        activity_uri,
+        activity,
+    )
+    .await
+}
+
+async fn record_remote_activity_forwarding_for_status_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_id: i64,
+    parent_account_id: Option<i64>,
+    source_inbox: &str,
+    activity_uri: &str,
+    activity: &Value,
+) -> Result<(), WriteError> {
+    let shared_account_ids = sqlx::query_scalar::<_, i64>(
+        "SELECT shared.account_id
+           FROM (
+             SELECT reblog.account_id, 0 AS share_kind, reblog.id AS share_id
+               FROM statuses reblog
+               JOIN accounts account ON account.id = reblog.account_id
+                                    AND account.domain IS NULL
+              WHERE reblog.reblog_of_id = $1
+                AND reblog.deleted_at IS NULL
+             UNION ALL
+             SELECT quote.account_id, 1 AS share_kind, quote.id AS share_id
+               FROM quotes quote
+               JOIN accounts account ON account.id = quote.account_id
+                                    AND account.domain IS NULL
+              WHERE quote.quoted_status_id = $1 AND quote.state = 1
+                AND EXISTS (SELECT 1 FROM statuses quoting
+                             WHERE quoting.id = quote.status_id
+                               AND quoting.deleted_at IS NULL)
+           ) shared
+          ORDER BY shared.share_kind, shared.share_id DESC, shared.account_id",
+    )
+    .bind(status_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let source_account_id = parent_account_id.or_else(|| shared_account_ids.first().copied());
+    let Some(source_account_id) = source_account_id else {
+        return Ok(());
+    };
+    let mut target_account_ids = shared_account_ids;
+    if let Some(parent_account_id) = parent_account_id {
+        target_account_ids.push(parent_account_id);
+    }
+    target_account_ids.sort_unstable();
+    target_account_ids.dedup();
+    let followers = sqlx::query_as::<_, (String, String)>(
+        "SELECT DISTINCT
+                COALESCE(NULLIF(follower.shared_inbox_url, ''), follower.inbox_url),
+                follower.domain
+           FROM follows follow
+           JOIN accounts follower ON follower.id = follow.account_id
+                                 AND follower.domain IS NOT NULL
+                                 AND follower.protocol = 1
+                                 AND follower.suspended_at IS NULL
+          WHERE follow.target_account_id = ANY($1)
+            AND COALESCE(NULLIF(follower.shared_inbox_url, ''), follower.inbox_url) <> ''
+            AND COALESCE(NULLIF(follower.shared_inbox_url, ''), follower.inbox_url) <> $2
+           ORDER BY 1, 2",
+    )
+    .bind(&target_account_ids)
+    .bind(source_inbox)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for (inbox_url, remote_domain) in followers {
+        let delivery = JobSpec::new(
+            Lane::Push,
+            ACTIVITYPUB_DELIVERY_JOB_KIND,
+            json!({
+                "source_account_id": source_account_id,
+                "inbox_url": inbox_url,
+                "remote_domain": remote_domain,
+                "body": activity
+            }),
+        )
+        .logical_key(activitypub::forward_delivery_logical_key(
+            source_account_id,
+            activity_uri,
+            &inbox_url,
+        ));
+        record_outbox_once_in(transaction, &delivery).await?;
+    }
+    Ok(())
+}
+
+async fn locked_quote_for_status(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_id: i64,
+) -> Result<
+    Option<(
+        i64,
+        Option<i64>,
+        Option<i64>,
+        i32,
+        Option<String>,
+        bool,
+        Option<String>,
+    )>,
+    WriteError,
+> {
+    Ok(sqlx::query_as::<
+        _,
+        (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            i32,
+            Option<String>,
+            bool,
+            Option<String>,
+        ),
+    >(
+        "SELECT id, quoted_status_id, quoted_account_id, state, approval_uri, legacy, \
+                    activity_uri \
+           FROM quotes WHERE status_id = $1 FOR UPDATE",
+    )
+    .bind(status_id)
+    .fetch_optional(&mut **transaction)
+    .await?)
+}
+
+fn quote_state_update_counter_delta(legacy: bool, old_state: i32, new_state: i32) -> i8 {
+    if legacy || old_state == new_state {
+        0
+    } else if old_state != 1 && new_state == 1 {
+        1
+    } else if old_state == 1 && new_state != 1 {
+        -1
+    } else {
+        0
+    }
+}
+
+fn reconciled_remote_quote_state(
+    target_changed: bool,
+    old_state: i32,
+    old_approval_uri: Option<&str>,
+    advertised_approval_uri: Option<&str>,
+    computed_state: i32,
+) -> (i32, Option<String>) {
+    if target_changed {
+        return (computed_state, None);
+    }
+    if old_state == 1 && old_approval_uri.is_some() && old_approval_uri != advertised_approval_uri {
+        (0, None)
+    } else {
+        (old_state, old_approval_uri.map(str::to_owned))
+    }
+}
+
+async fn prelock_remote_note_quote_targets(
+    transaction: &mut Transaction<'_, Postgres>,
+    existing_status_id: Option<i64>,
+    note: &RemoteNoteData,
+    origin: &str,
+) -> Result<(), WriteError> {
+    let mut target_status_ids = existing_status_id.into_iter().collect::<Vec<_>>();
+    if let Some(existing_status_id) = existing_status_id
+        && let Some(target_status_id) =
+            quote_target_id_for_status(transaction, existing_status_id).await?
+    {
+        target_status_ids.push(target_status_id);
+    }
+    if let Some(quote) = note.quote.as_ref()
+        && !quote.deleted
+        && let Some(target_uri) = quote.target_uri.as_deref()
+        && let Some((target_status_id, ..)) =
+            resolve_quote_target(transaction, target_uri, origin).await?
+    {
+        target_status_ids.push(target_status_id);
+    }
+    lock_statuses_in_order(transaction, &target_status_ids).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_reconciled_remote_quote(
+    transaction: &mut Transaction<'_, Postgres>,
+    account_id: i64,
+    status_id: i64,
+    quoted_status_id: Option<i64>,
+    quoted_account_id: Option<i64>,
+    state: i32,
+    approval_uri: Option<&str>,
+    legacy: bool,
+) -> Result<i64, WriteError> {
+    let quote_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO quotes (account_id, activity_uri, approval_uri, created_at, legacy, \
+             quoted_account_id, quoted_status_id, state, status_id, updated_at) \
+         VALUES ($1, NULL, $2, clock_timestamp(), $3, $4, $5, $6, $7, clock_timestamp()) \
+         RETURNING id",
+    )
+    .bind(account_id)
+    .bind(approval_uri)
+    .bind(legacy)
+    .bind(quoted_account_id)
+    .bind(quoted_status_id)
+    .bind(state)
+    .bind(status_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if let Some(quoted_account_id) = quoted_account_id {
+        sqlx::query(
+            "INSERT INTO mentions (id, account_id, created_at, silent, status_id, updated_at) \
+             VALUES (nextval('mentions_id_seq'), $1, clock_timestamp(), true, $2, clock_timestamp()) \
+             ON CONFLICT (account_id, status_id) DO NOTHING",
+        )
+        .bind(quoted_account_id)
+        .bind(status_id)
+        .execute(&mut **transaction)
+        .await?;
+        if state == 1 {
+            if !legacy {
+                increment_quote_count(
+                    transaction,
+                    quoted_status_id.expect("accepted quote has a target"),
+                )
+                .await?;
+            }
+            record_outbox_in(
+                transaction,
+                &notification_job(quoted_account_id, NOTIFICATION_QUOTE, quote_id),
+            )
+            .await?;
+        }
+    }
+    Ok(quote_id)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn reconcile_remote_note_quote(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_id: i64,
+    account_id: i64,
+    note: &RemoteNoteData,
+    origin: &str,
+) -> Result<bool, WriteError> {
+    let existing_target_id = quote_target_id_for_status(transaction, status_id).await?;
+    let Some(quote) = note.quote.as_ref() else {
+        if let Some(existing_target_id) = existing_target_id {
+            lock_statuses_in_order(transaction, &[existing_target_id]).await?;
+        }
+        let existing = locked_quote_for_status(transaction, status_id).await?;
+        if let Some((quote_id, quoted_status_id, quoted_account_id, state, _, _, request_uri)) =
+            existing
+        {
+            cancel_quote_request_outbox(transaction, quote_id, request_uri.as_deref()).await?;
+            if state == 1
+                && let (Some(quoted_status_id), Some(quoted_account_id)) =
+                    (quoted_status_id, quoted_account_id)
+                && sqlx::query_scalar::<_, bool>(
+                    "SELECT domain IS NULL FROM accounts WHERE id = $1",
+                )
+                .bind(quoted_account_id)
+                .fetch_one(&mut **transaction)
+                .await?
+            {
+                record_quote_authorization_delete(
+                    transaction,
+                    quote_id,
+                    status_id,
+                    quoted_status_id,
+                    quoted_account_id,
+                    origin,
+                )
+                .await?;
+            }
+            if state == 1
+                && let Some(quoted_status_id) = quoted_status_id
+            {
+                decrement_quote_count(transaction, quoted_status_id).await?;
+            }
+            if let Some(quoted_account_id) = quoted_account_id {
+                delete_activity_notifications(transaction, quoted_account_id, quote_id, "Quote")
+                    .await?;
+                sqlx::query(
+                    "DELETE FROM mentions WHERE status_id = $1 AND account_id = $2 AND silent = true",
+                )
+                .bind(status_id)
+                .bind(quoted_account_id)
+                .execute(&mut **transaction)
+                .await?;
+            }
+            sqlx::query(
+                "UPDATE quotes SET quoted_status_id = NULL, quoted_account_id = NULL, \
+                        approval_uri = NULL, activity_uri = NULL, state = 4, legacy = true, \
+                        updated_at = clock_timestamp() WHERE id = $1",
+            )
+            .bind(quote_id)
+            .execute(&mut **transaction)
+            .await?;
+            return Ok(true);
+        }
+        return Ok(false);
+    };
+    let target = if quote.deleted {
+        None
+    } else {
+        let target_uri = quote
+            .target_uri
+            .as_deref()
+            .ok_or(WriteError::InvalidInput("remote quote has no target"))?;
+        resolve_quote_target(transaction, target_uri, origin).await?
+    };
+    if target.is_none() && !quote.deleted {
+        // There is no safe generic quote-target fetch path. Do not dereference an arbitrary URI.
+        return Ok(false);
+    }
+    let mut target_status_ids = target
+        .as_ref()
+        .map(|(target_status_id, ..)| *target_status_id)
+        .into_iter()
+        .collect::<Vec<_>>();
+    target_status_ids.extend(existing_target_id);
+    lock_statuses_in_order(transaction, &target_status_ids).await?;
+    let existing = locked_quote_for_status(transaction, status_id).await?;
+    let (quoted_status_id, quoted_account_id, mut state, mut approval_uri) =
+        if let Some((target_status_id, target_account_id, _, _)) = target {
+            let approval_uri = None;
+            let accepted = target_account_id == account_id;
+            (
+                Some(target_status_id),
+                Some(target_account_id),
+                i32::from(accepted),
+                approval_uri,
+            )
+        } else {
+            (None, None, 4, None)
+        };
+    if let Some((
+        quote_id,
+        old_target_id,
+        old_account_id,
+        old_state,
+        old_approval,
+        old_legacy,
+        old_request_uri,
+    )) = existing
+    {
+        let target_changed =
+            old_target_id != quoted_status_id || old_account_id != quoted_account_id;
+        let (reconciled_state, reconciled_approval_uri) = reconciled_remote_quote_state(
+            target_changed,
+            old_state,
+            old_approval.as_deref(),
+            quote.authorization_uri.as_deref(),
+            state,
+        );
+        state = reconciled_state;
+        approval_uri = reconciled_approval_uri;
+        if old_target_id == quoted_status_id
+            && old_account_id == quoted_account_id
+            && old_state == state
+            && old_approval == approval_uri
+            && old_legacy == quote.legacy
+        {
+            return Ok(false);
+        }
+        cancel_quote_request_outbox(transaction, quote_id, old_request_uri.as_deref()).await?;
+        if target_changed
+            && old_state == 1
+            && let (Some(old_target_id), Some(old_account_id)) = (old_target_id, old_account_id)
+            && sqlx::query_scalar::<_, bool>("SELECT domain IS NULL FROM accounts WHERE id = $1")
+                .bind(old_account_id)
+                .fetch_one(&mut **transaction)
+                .await?
+        {
+            record_quote_authorization_delete(
+                transaction,
+                quote_id,
+                status_id,
+                old_target_id,
+                old_account_id,
+                origin,
+            )
+            .await?;
+        }
+        if ((target_changed && old_state == 1)
+            || (!target_changed
+                && quote_state_update_counter_delta(quote.legacy, old_state, state) < 0))
+            && let Some(old_target_id) = old_target_id
+        {
+            decrement_quote_count(transaction, old_target_id).await?;
+        }
+        if let Some(old_account_id) = old_account_id {
+            if target_changed || old_state != state {
+                delete_activity_notifications(transaction, old_account_id, quote_id, "Quote")
+                    .await?;
+            }
+            if target_changed && Some(old_account_id) != quoted_account_id {
+                sqlx::query(
+                    "DELETE FROM mentions WHERE status_id = $1 AND account_id = $2 AND silent = true",
+                )
+                .bind(status_id)
+                .bind(old_account_id)
+                .execute(&mut **transaction)
+                .await?;
+            }
+        }
+        if target_changed {
+            sqlx::query(
+                "UPDATE quotes SET quoted_status_id = $2, quoted_account_id = $3, state = $4, \
+                        approval_uri = $5, activity_uri = NULL, legacy = $6, \
+                        updated_at = clock_timestamp() WHERE id = $1",
+            )
+            .bind(quote_id)
+            .bind(quoted_status_id)
+            .bind(quoted_account_id)
+            .bind(state)
+            .bind(&approval_uri)
+            .bind(quote.legacy)
+            .execute(&mut **transaction)
+            .await?;
+            if let Some(quoted_account_id) = quoted_account_id {
+                sqlx::query(
+                    "INSERT INTO mentions (id, account_id, created_at, silent, status_id, updated_at) \
+                     VALUES (nextval('mentions_id_seq'), $1, clock_timestamp(), true, $2, clock_timestamp()) \
+                     ON CONFLICT (account_id, status_id) DO NOTHING",
+                )
+                .bind(quoted_account_id)
+                .bind(status_id)
+                .execute(&mut **transaction)
+                .await?;
+                if state == 1 {
+                    if !quote.legacy {
+                        increment_quote_count(
+                            transaction,
+                            quoted_status_id.expect("accepted quote has a target"),
+                        )
+                        .await?;
+                    }
+                    record_outbox_in(
+                        transaction,
+                        &notification_job(quoted_account_id, NOTIFICATION_QUOTE, quote_id),
+                    )
+                    .await?;
+                }
+            }
+            return Ok(true);
+        }
+        sqlx::query(
+            "UPDATE quotes SET state = $2, approval_uri = $3, legacy = $4, \
+                    updated_at = clock_timestamp() WHERE id = $1",
+        )
+        .bind(quote_id)
+        .bind(state)
+        .bind(&approval_uri)
+        .bind(quote.legacy)
+        .execute(&mut **transaction)
+        .await?;
+        if quote_state_update_counter_delta(quote.legacy, old_state, state) > 0
+            && let Some(quoted_status_id) = quoted_status_id
+        {
+            increment_quote_count(transaction, quoted_status_id).await?;
+            if let Some(quoted_account_id) = quoted_account_id {
+                record_outbox_in(
+                    transaction,
+                    &notification_job(quoted_account_id, NOTIFICATION_QUOTE, quote_id),
+                )
+                .await?;
+            }
+        }
+    } else {
+        insert_reconciled_remote_quote(
+            transaction,
+            account_id,
+            status_id,
+            quoted_status_id,
+            quoted_account_id,
+            state,
+            approval_uri.as_deref(),
+            quote.legacy,
+        )
+        .await?;
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn ensure_remote_note_conversation(
     transaction: &mut Transaction<'_, Postgres>,
     status_id: i64,
@@ -13843,8 +16305,8 @@ async fn insert_remote_note(
         "INSERT INTO statuses (
             account_id, text, spoiler_text, visibility, local, language, sensitive, reply,
             uri, url, in_reply_to_id, in_reply_to_account_id, conversation_id,
-            created_at, updated_at, edited_at
-         ) VALUES ($1, $2, $3, $4, false, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            quote_approval_policy, created_at, updated_at, edited_at
+         ) VALUES ($1, $2, $3, $4, false, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
          RETURNING id",
     )
     .bind(account_id)
@@ -13859,6 +16321,7 @@ async fn insert_remote_note(
     .bind(in_reply_to_id)
     .bind(in_reply_to_account_id)
     .bind(conversation_id)
+    .bind(note.quote_approval_policy)
     .bind(note.published_at)
     .bind(note.updated_at)
     .bind(note.edited_at)
@@ -16219,6 +18682,7 @@ struct RemoteRelationshipDelivery {
 struct RemoteStatusDelivery {
     source_uri: String,
     target_uri: String,
+    target_url: String,
     target_actor_uri: String,
     inbox_url: String,
     preferred_inbox_url: String,
@@ -16231,13 +18695,25 @@ async fn remote_status_delivery(
     target_status_id: i64,
     origin: &str,
 ) -> Result<Option<RemoteStatusDelivery>, WriteError> {
-    let delivery = sqlx::query_as::<_, (String, String, String, String, String, Option<String>)>(
+    let delivery = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        ),
+    >(
         "SELECT CASE
                   WHEN source.id = -99 THEN $3 || '/actor'
                   WHEN source.id_scheme = 1 THEN $3 || '/ap/users/' || source.id::text
                   ELSE $3 || '/users/' || source.username
                 END,
                   COALESCE(NULLIF(status.uri, ''), NULLIF(status.url, ''), ''),
+                  COALESCE(NULLIF(status.url, ''), NULLIF(status.uri, ''), ''),
                   target.uri,
                   COALESCE(NULLIF(target.inbox_url, ''), target.shared_inbox_url),
                   COALESCE(NULLIF(target.shared_inbox_url, ''), target.inbox_url),
@@ -16257,6 +18733,7 @@ async fn remote_status_delivery(
     let Some((
         source_uri,
         target_uri,
+        target_web_url,
         target_actor_uri,
         inbox_url,
         preferred_inbox_url,
@@ -16267,6 +18744,7 @@ async fn remote_status_delivery(
     };
     if source_uri.is_empty()
         || target_uri.is_empty()
+        || target_web_url.is_empty()
         || target_actor_uri.is_empty()
         || inbox_url.is_empty()
         || preferred_inbox_url.is_empty()
@@ -16276,6 +18754,7 @@ async fn remote_status_delivery(
     Ok(Some(RemoteStatusDelivery {
         source_uri,
         target_uri,
+        target_url: target_web_url,
         target_actor_uri,
         inbox_url,
         preferred_inbox_url,
@@ -16409,6 +18888,51 @@ fn local_status_activity_uri(source_uri: &str, status_id: i64) -> String {
 
 fn local_undo_announce_activity_uri(source_uri: &str, status_id: i64) -> String {
     format!("{source_uri}#announces/{status_id}/undo")
+}
+
+async fn record_quote_status_update(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_id: i64,
+) -> Result<NaiveDateTime, WriteError> {
+    let (edited_at, poll_updated_at, quote_updated_at, update_at) = sqlx::query_as::<
+        _,
+        (
+            NaiveDateTime,
+            Option<NaiveDateTime>,
+            NaiveDateTime,
+            NaiveDateTime,
+        ),
+    >(
+        "SELECT COALESCE(status.edited_at, status.updated_at), poll.updated_at, \
+                quote.updated_at, clock_timestamp()::timestamp \
+           FROM statuses status \
+           JOIN accounts account ON account.id = status.account_id \
+           JOIN quotes quote ON quote.status_id = status.id \
+           LEFT JOIN polls poll ON poll.id = status.poll_id \
+          WHERE status.id = $1 AND account.domain IS NULL AND status.deleted_at IS NULL \
+          ORDER BY quote.id LIMIT 1 FOR UPDATE OF status, quote",
+    )
+    .bind(status_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(WriteError::NotFound)?;
+    let version = update_at.and_utc().timestamp_micros();
+    let update = JobSpec::new(
+        Lane::Push,
+        ACTIVITYPUB_STATUS_DISTRIBUTION_JOB_KIND,
+        json!({
+            "status_id": status_id,
+            "activity_type": "Update",
+            "update_kind": "quote",
+            "update_version_micros": version,
+            "edited_at_micros": edited_at.and_utc().timestamp_micros(),
+            "poll_updated_at_micros": poll_updated_at.map(|value| value.and_utc().timestamp_micros()),
+            "quote_updated_at_micros": quote_updated_at.and_utc().timestamp_micros()
+        }),
+    )
+    .logical_key(format!("activitypub:status:{status_id}:quote:{version}"));
+    record_outbox_once_in(transaction, &update).await?;
+    Ok(update_at)
 }
 
 async fn status_federation_version(
@@ -18637,6 +21161,124 @@ async fn writable_reply_target(
     Ok((account_id, conversation_id, language))
 }
 
+#[derive(sqlx::FromRow)]
+#[allow(clippy::struct_excessive_bools)]
+struct WritableQuoteTargetRow {
+    status_id: i64,
+    account_id: i64,
+    visibility: i32,
+    quote_approval_policy: i32,
+    is_reblog: bool,
+    local: bool,
+    author_suspended: bool,
+    viewer_is_author: bool,
+    viewer_follows_author: bool,
+    author_follows_viewer: bool,
+    viewer_is_mentioned: bool,
+    author_blocks_viewer: bool,
+    author_domain_blocks_viewer: bool,
+    viewer_blocks_author: bool,
+}
+
+struct WritableQuoteTarget {
+    status_id: i64,
+    account_id: i64,
+    visibility: i32,
+    local: bool,
+}
+
+async fn writable_quote_target(
+    transaction: &mut Transaction<'_, Postgres>,
+    viewer_account_id: i64,
+    requested_status_id: i64,
+) -> Result<WritableQuoteTarget, WriteError> {
+    let target_status_id = writable_status_id(transaction, requested_status_id).await?;
+    let row = sqlx::query_as::<_, WritableQuoteTargetRow>(
+        "SELECT status.id AS status_id, status.account_id, status.visibility, \
+                status.quote_approval_policy, status.reblog_of_id IS NOT NULL AS is_reblog, \
+                author.domain IS NULL AS local, author.suspended_at IS NOT NULL AS author_suspended, \
+                status.account_id = $2 AS viewer_is_author, \
+                EXISTS (SELECT 1 FROM follows follow WHERE follow.account_id = $2 \
+                  AND follow.target_account_id = status.account_id) AS viewer_follows_author, \
+                EXISTS (SELECT 1 FROM follows follow WHERE follow.account_id = status.account_id \
+                  AND follow.target_account_id = $2) AS author_follows_viewer, \
+                EXISTS (SELECT 1 FROM mentions mention WHERE mention.status_id = status.id \
+                  AND mention.account_id = $2) AS viewer_is_mentioned, \
+                EXISTS (SELECT 1 FROM blocks block WHERE block.account_id = status.account_id \
+                  AND block.target_account_id = $2) AS author_blocks_viewer, \
+                EXISTS (SELECT 1 FROM account_domain_blocks domain_block \
+                  JOIN accounts viewer ON viewer.id = $2 \
+                  WHERE domain_block.account_id = status.account_id \
+                    AND domain_block.domain = viewer.domain) AS author_domain_blocks_viewer, \
+                EXISTS (SELECT 1 FROM blocks block WHERE block.account_id = $2 \
+                  AND block.target_account_id = status.account_id) AS viewer_blocks_author \
+           FROM statuses status JOIN accounts author ON author.id = status.account_id \
+          WHERE status.id = $1 AND status.deleted_at IS NULL FOR UPDATE OF status",
+    )
+    .bind(target_status_id)
+    .bind(viewer_account_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(WriteError::NotFound)?;
+    let canonical_after_lock = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(reblog_of_id, id) FROM statuses \
+         WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(requested_status_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(WriteError::NotFound)?;
+    if canonical_after_lock != row.status_id {
+        return Err(WriteError::NotFound);
+    }
+    let author_restriction = if row.author_blocks_viewer {
+        AuthorRestriction::BlocksViewer
+    } else if row.author_domain_blocks_viewer {
+        AuthorRestriction::BlocksViewerDomain
+    } else {
+        AuthorRestriction::None
+    };
+    let policy = status_quote_policy(QuotePolicyFacts {
+        visibility: StatusVisibility::from(row.visibility),
+        is_reblog: row.is_reblog,
+        approval_policy: row.quote_approval_policy,
+        viewer: Some(QuotePolicyViewerFacts {
+            is_author: row.viewer_is_author,
+            follows_author: row.viewer_follows_author,
+            author_follows_viewer: row.author_follows_viewer,
+        }),
+    });
+    if !quote_target_visibility_allowed(
+        row.viewer_is_author,
+        StatusVisibility::from(row.visibility),
+    ) || !status_access(StatusAccessFacts {
+        visibility: StatusVisibility::from(row.visibility),
+        availability: if row.author_suspended {
+            StatusAvailability::AuthorSuspended
+        } else {
+            StatusAvailability::Available
+        },
+        viewer: ViewerFacts::Authenticated(AuthenticatedViewerFacts {
+            is_author: row.viewer_is_author,
+            follows_author: row.viewer_follows_author,
+            is_mentioned: row.viewer_is_mentioned,
+            author_restriction,
+        }),
+    })
+    .is_allowed()
+        || row.viewer_blocks_author
+        || policy == QuotePolicy::Denied
+    {
+        return Err(WriteError::NotFound);
+    }
+    Ok(WritableQuoteTarget {
+        status_id: row.status_id,
+        account_id: row.account_id,
+        visibility: row.visibility,
+        local: row.local,
+    })
+}
+
 async fn writable_status_id(
     transaction: &mut Transaction<'_, Postgres>,
     requested_status_id: i64,
@@ -18750,18 +21392,20 @@ fn quote_approval_policy_for_status(
     requested_policy: Option<&str>,
     default_policy: &str,
 ) -> Result<i32, WriteError> {
-    if !matches!(visibility, 0 | 1) {
-        return Ok(0);
-    }
-    match requested_policy.unwrap_or(default_policy) {
-        "public" => Ok(2 << 16),
-        "followers" => Ok(4 << 16),
-        "nobody" => Ok(0),
+    let policy = match requested_policy.unwrap_or(default_policy) {
+        "public" => 2 << 16,
+        "followers" => 4 << 16,
+        "nobody" => 0,
         _ if requested_policy.is_some() => {
-            Err(WriteError::InvalidInput("invalid quote approval policy"))
+            return Err(WriteError::InvalidInput("invalid quote approval policy"));
         }
-        _ => Ok(2 << 16),
-    }
+        _ => 2 << 16,
+    };
+    Ok(if matches!(visibility, 0 | 1) {
+        policy
+    } else {
+        0
+    })
 }
 
 fn report_account_label(username: &str, domain: Option<&str>) -> String {
@@ -18971,6 +21615,37 @@ async fn decrement_favourite_count(
              ELSE GREATEST(untrusted_favourites_count - 1, 0) END, \
            updated_at = clock_timestamp() \
          WHERE status_id = $1",
+    )
+    .bind(status_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn decrement_quote_count(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_id: i64,
+) -> Result<(), WriteError> {
+    sqlx::query(
+        "UPDATE status_stats SET quotes_count = GREATEST(quotes_count - 1, 0), \
+                updated_at = clock_timestamp() WHERE status_id = $1",
+    )
+    .bind(status_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn increment_quote_count(
+    transaction: &mut Transaction<'_, Postgres>,
+    status_id: i64,
+) -> Result<(), WriteError> {
+    sqlx::query(
+        "INSERT INTO status_stats (status_id, created_at, updated_at, quotes_count) \
+         VALUES ($1, clock_timestamp(), clock_timestamp(), 1) \
+         ON CONFLICT (status_id) DO UPDATE SET \
+           quotes_count = GREATEST(status_stats.quotes_count + 1, 0), \
+           updated_at = clock_timestamp()",
     )
     .bind(status_id)
     .execute(&mut **transaction)
@@ -19999,6 +22674,17 @@ async fn purge_account_statuses(
         .iter()
         .map(|(status_id, ..)| *status_id)
         .collect::<Vec<_>>();
+    let affected_quotes = sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT id, activity_uri FROM quotes \
+          WHERE status_id = ANY($1::bigint[]) OR quoted_status_id = ANY($1::bigint[]) \
+          ORDER BY id FOR UPDATE",
+    )
+    .bind(&status_ids)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for (quote_id, request_uri) in affected_quotes {
+        cancel_quote_request_outbox(transaction, quote_id, request_uri.as_deref()).await?;
+    }
     let mut timeline_snapshots = if emit_stream_events {
         status_timeline_snapshots(transaction, &status_ids).await?
     } else {
@@ -20035,6 +22721,7 @@ async fn purge_account_statuses(
     remove_statuses_from_account_conversations(transaction, &status_ids).await?;
     for status_id in &status_ids {
         cancel_status_outbox(transaction, *status_id).await?;
+        cancel_quote_decision_outbox_for_target(transaction, *status_id).await?;
         if emit_stream_events && let Some(snapshot) = timeline_snapshots.remove(status_id) {
             collect_status_delete_stream_events_with_snapshot(
                 transaction,
@@ -20763,11 +23450,13 @@ mod tests {
         normalize_domain_block_domain, normalize_status_language, notification_policy_decision,
         notification_policy_decision_for_type, oauth_grant_pkce_is_valid, oauth_pkce_matches,
         parse_user_active_days, password_reset_digest, prepare_local_poll,
-        quote_approval_policy_for_status, random_urlsafe_base64, remote_actor_account_id,
-        remote_domain_lock_scopes, remote_emoji_update_decision, remote_note_attachments,
-        remote_note_object_is_too_old, remote_note_visibility, remote_poll_expiration_change,
+        quote_approval_policy_for_status, quote_state_update_counter_delta, random_urlsafe_base64,
+        reconciled_remote_quote_state, remote_actor_account_id, remote_domain_lock_scopes,
+        remote_emoji_update_decision, remote_note_attachments, remote_note_object_is_too_old,
+        remote_note_visibility, remote_poll_expiration_change,
         remote_poll_previous_expiration_is_due_change, remote_poll_tallies_are_monotonic,
-        remote_poll_votes_count, report_category_value, report_email_enabled,
+        remote_poll_votes_count, remote_quote_approval_policy_with_collections,
+        remote_quote_authorization_data, report_category_value, report_email_enabled,
         report_uri_matches_domain, status_mention_candidates, two_factor_attempt_is_rate_limited,
         validate_local_password, validate_oauth_application_registration,
     };
@@ -20801,6 +23490,147 @@ mod tests {
         assert!(report_email_enabled(None));
         assert!(report_email_enabled(Some("{}")));
         assert!(report_email_enabled(Some("not json")));
+    }
+
+    #[test]
+    fn remote_notes_parse_quote_aliases_tombstones_and_inline_authorizations() {
+        let actor = "https://remote.example/users/alice";
+        let base = || {
+            json!({
+                "id": "https://remote.example/statuses/9",
+                "type": "Note",
+                "attributedTo": actor,
+                "content": "quote",
+                "published": "2026-01-01T00:00:00Z"
+            })
+        };
+        for (field, legacy) in [
+            ("quote", false),
+            ("_misskey_quote", true),
+            ("quoteUrl", true),
+            ("quoteUri", true),
+        ] {
+            let mut object = base();
+            object[field] = json!("https://target.example/statuses/7");
+            let note = RemoteNoteData::parse(&object, actor).expect("quote alias should parse");
+            let quote = note.quote.expect("quote should be retained");
+            assert_eq!(
+                quote.target_uri.as_deref(),
+                Some("https://target.example/statuses/7")
+            );
+            assert_eq!(quote.legacy, legacy);
+            assert!(!quote.deleted);
+        }
+
+        let mut policy = base();
+        policy["interactionPolicy"] = json!({
+            "canQuote": {
+                "automaticApproval": [
+                    "https://www.w3.org/ns/activitystreams#Public",
+                    "https://remote.example/users/alice/followers"
+                ],
+                "manualApproval": [
+                    "https://remote.example/users/alice/following",
+                    "https://unsupported.example/group"
+                ]
+            }
+        });
+        assert_eq!(
+            RemoteNoteData::parse(&policy, actor)
+                .expect("quote interaction policy should parse")
+                .quote_approval_policy,
+            ((2 | 4) << 16) | 8 | 1,
+        );
+        policy["interactionPolicy"]["canQuote"] = json!({
+            "automaticApproval": "https://remote.example/custom-followers",
+            "manualApproval": "https://remote.example/custom-following"
+        });
+        assert_eq!(
+            remote_quote_approval_policy_with_collections(
+                policy.as_object().expect("policy is an object"),
+                actor,
+                "https://remote.example/custom-followers",
+                "https://remote.example/custom-following",
+            )
+            .expect("custom collection policy should parse"),
+            (4 << 16) | 8,
+        );
+
+        let mut tombstone = base();
+        tombstone["quote"] = json!({
+            "id": "https://target.example/statuses/deleted",
+            "type": "Tombstone"
+        });
+        assert!(
+            RemoteNoteData::parse(&tombstone, actor)
+                .expect("quote tombstone should parse")
+                .quote
+                .expect("quote should be retained")
+                .deleted
+        );
+        tombstone["quote"] = json!({ "type": "Tombstone" });
+        let idless_tombstone = RemoteNoteData::parse(&tombstone, actor)
+            .expect("id-less quote tombstone should parse")
+            .quote
+            .expect("id-less quote tombstone should be retained");
+        assert!(idless_tombstone.deleted);
+        assert!(idless_tombstone.target_uri.is_none());
+
+        let mut authorized = base();
+        authorized["quote"] = json!("https://target.example/statuses/7");
+        authorized["quoteAuthorization"] = json!({
+            "id": "https://target.example/quote_authorizations/3",
+            "type": "QuoteAuthorization",
+            "attributedTo": "https://target.example/users/bob",
+            "interactingObject": "https://remote.example/statuses/9",
+            "interactionTarget": "https://target.example/statuses/7"
+        });
+        RemoteNoteData::parse(&authorized, actor).expect("inline authorization should parse");
+        let authorization = remote_quote_authorization_data(&authorized["quoteAuthorization"])
+            .expect("authorization should parse");
+        assert!(authorization.typed);
+        assert_eq!(
+            authorization.interacting_object.as_deref(),
+            Some("https://remote.example/statuses/9")
+        );
+    }
+
+    #[test]
+    fn legacy_quote_state_updates_do_not_change_counters() {
+        assert_eq!(quote_state_update_counter_delta(false, 0, 1), 1);
+        assert_eq!(quote_state_update_counter_delta(false, 1, 3), -1);
+        assert_eq!(quote_state_update_counter_delta(false, 1, 1), 0);
+        assert_eq!(quote_state_update_counter_delta(true, 0, 1), 0);
+        assert_eq!(quote_state_update_counter_delta(true, 1, 3), 0);
+    }
+
+    #[test]
+    fn remote_quote_authorization_changes_return_accepted_quotes_to_pending() {
+        let old = "https://target.example/quote_authorizations/1";
+        let replacement = "https://target.example/quote_authorizations/2";
+
+        assert_eq!(
+            reconciled_remote_quote_state(false, 1, Some(old), Some(old), 0),
+            (1, Some(old.to_owned()))
+        );
+        assert_eq!(
+            reconciled_remote_quote_state(false, 1, Some(old), None, 0),
+            (0, None)
+        );
+        assert_eq!(
+            reconciled_remote_quote_state(false, 1, Some(old), Some(replacement), 0),
+            (0, None)
+        );
+        assert_eq!(
+            reconciled_remote_quote_state(false, 1, None, Some(replacement), 0),
+            (1, None),
+            "locally accepted QuoteRequests do not depend on a remote approval URI"
+        );
+        assert_eq!(
+            reconciled_remote_quote_state(true, 1, Some(old), Some(old), 0),
+            (0, None),
+            "a changed target starts a new quote lifecycle"
+        );
     }
 
     #[test]
@@ -21195,6 +24025,10 @@ mod tests {
         );
         assert!(matches!(
             quote_approval_policy_for_status(0, Some("invalid"), "public"),
+            Err(WriteError::InvalidInput("invalid quote approval policy"))
+        ));
+        assert!(matches!(
+            quote_approval_policy_for_status(2, Some("invalid"), "public"),
             Err(WriteError::InvalidInput("invalid quote approval policy"))
         ));
     }

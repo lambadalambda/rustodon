@@ -172,25 +172,39 @@ health, and SSRF/TLS/signature protections.
 
 Core activities include Follow/Accept/Reject/Undo, Create/Update/Delete, Like,
 Announce, Block, actor updates/deletes, audiences, replies, mentions, media,
-custom emoji, and tombstones. Ordering, deduplication, retries, parent/thread
-repair, and no-op edit behavior are covered by isolated fixture tests.
+custom emoji, tombstones, and the QuoteRequest, Accept/Reject,
+QuoteAuthorization, and authorization-Delete lifecycle. Scalar QuoteRequest
+instruments use target-owner-signed bounded SSRF-safe fetches and are reauthorized
+under target locks before import. Quote request/decision delivery carries exact
+quote, status, request, and durable-lease identity into a final send-time fence;
+relationship/account/status/quote locks span the bounded HTTP attempt, blocking
+concurrent relationship changes and suppressing sends after either-direction blocks,
+while terminal transitions cancel only safe unleased or expired work. Quote delivery and other imports use the
+same signed, bounded SSRF-safe transport and durable retry model.
+Ordering, deduplication, retries, parent/thread repair, and no-op edit behavior
+have executable isolated-fixture test coverage; the final-tree quote fixtures
+have not been run.
 
 ## Read and preserve without creating
 
 Rustodon preserves scheduled-status rows when none are pending, lists, pins,
 featured/followed tags, filters, preview cards, custom emoji, announcements,
 reports, warnings, appeals, severance events, migrations, imports, backups, Web
-Push rows, quotes, collections, and unknown future values. Polls and votes have
-an implemented REST and ActivityPub lifecycle, including exact-generation expiry
-repair. Final-tree restored-fixture, worker, and browser acceptance for that poll
-lifecycle remains explicitly deferred; executable test source is not a recorded
-pass. Preflight rejects remaining active unsupported workflows instead of
-transforming them.
+Push rows, collections, and unknown future values. Polls/votes and quotes have
+implemented REST and ActivityPub lifecycles. Quotes include frontend creation,
+policy updates, local revocation, counters/notifications/streams, QuoteRequest
+decisions, authorization verification/revocation, and deletion reconciliation.
+Final-tree restored-fixture, worker, differential, browser, cutover, and peer
+acceptance for the quote lifecycle remains explicitly deferred; executable test
+source is not a recorded pass. Poll exact-generation expiry repair is likewise
+implemented, while its final restored-fixture, worker, and browser acceptance
+remains deferred. Preflight rejects remaining active unsupported workflows
+instead of transforming them.
 
 Object storage, Elasticsearch, open registration, LDAP/PAM/CAS/SAML/OIDC and
-other SSO providers, scheduled posts, quote creation, relays, advanced
-federation extensions, and the complete administration surface are outside the
-initial boundary.
+other SSO providers, scheduled posts, relays, other advanced federation
+extensions, and the complete administration surface are outside the initial
+boundary.
 
 ## Support and acceptance status
 

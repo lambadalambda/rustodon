@@ -201,12 +201,16 @@ $$;
 GRANT EXECUTE ON FUNCTION public.rustodon_refresh_instances() TO rustodon_differential_writer",
     ),
     (
-        "GRANT INSERT ON TABLE public.quotes TO rustodon_differential_writer",
         "REVOKE INSERT ON TABLE public.quotes FROM rustodon_differential_writer",
+        "GRANT INSERT ON TABLE public.quotes TO rustodon_differential_writer",
     ),
     (
-        "GRANT INSERT (id) ON TABLE public.quotes TO rustodon_differential_writer",
-        "REVOKE INSERT (id) ON TABLE public.quotes FROM rustodon_differential_writer",
+        "REVOKE UPDATE ON TABLE public.quotes FROM rustodon_differential_writer",
+        "GRANT UPDATE ON TABLE public.quotes TO rustodon_differential_writer",
+    ),
+    (
+        "GRANT DELETE ON TABLE public.quotes TO rustodon_differential_writer",
+        "REVOKE DELETE ON TABLE public.quotes FROM rustodon_differential_writer",
     ),
     (
         "GRANT TRUNCATE ON TABLE public.quotes TO rustodon_differential_writer",
@@ -338,8 +342,16 @@ GRANT EXECUTE ON FUNCTION public.rustodon_refresh_instances() TO rustodon_differ
         "REVOKE CREATE ON SCHEMA pg_catalog FROM PUBLIC",
     ),
     (
-        "GRANT USAGE ON SEQUENCE public.quotes_id_seq TO rustodon_differential_writer",
         "REVOKE USAGE ON SEQUENCE public.quotes_id_seq FROM rustodon_differential_writer",
+        "GRANT USAGE ON SEQUENCE public.quotes_id_seq TO rustodon_differential_writer",
+    ),
+    (
+        "GRANT SELECT ON SEQUENCE public.quotes_id_seq TO rustodon_differential_writer",
+        "REVOKE SELECT ON SEQUENCE public.quotes_id_seq FROM rustodon_differential_writer",
+    ),
+    (
+        "GRANT UPDATE ON SEQUENCE public.quotes_id_seq TO rustodon_differential_writer",
+        "REVOKE UPDATE ON SEQUENCE public.quotes_id_seq FROM rustodon_differential_writer",
     ),
     (
         "GRANT EXECUTE ON FUNCTION public.writer_privilege_probe() TO rustodon_differential_writer",

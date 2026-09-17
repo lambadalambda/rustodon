@@ -14,6 +14,7 @@ usage() {
         'RUSTODON_BROWSER_EMAIL, _PASSWORD, and _OTP provide its test credentials.' \
         'RUSTODON_BROWSER_VOTER_EMAIL, _VOTER_PASSWORD, and _VOTER_OTP provide a second account for poll voting.' \
         'RUSTODON_BROWSER_POLL_STATUS_FILE may capture the generated fixture status ID for exact cleanup.' \
+        'RUSTODON_BROWSER_QUOTE_STATUS_FILE may capture target and quote status IDs for exact cleanup.' \
         'RUSTODON_BROWSER_RECORD may name a WebM recording path.' \
         'RUSTODON_BROWSER_SCREENSHOT may name a PNG screenshot path.'
 }
@@ -37,6 +38,7 @@ base_url=${1%/}
 host=$2
 auth=${RUSTODON_BROWSER_AUTH:-false}
 poll_status_file=${RUSTODON_BROWSER_POLL_STATUS_FILE:-}
+quote_status_file=${RUSTODON_BROWSER_QUOTE_STATUS_FILE:-}
 cookie_jar=''
 header_file=''
 csrf_body=''
@@ -842,6 +844,41 @@ if [ "$auth" = true ]; then
     assert_js poll-created '/* rustodon-smoke: poll-created */ (() => { const id = sessionStorage.getItem("rustodon-smoke-poll-status"); return /^[0-9]+$/.test(id || "") && Boolean(document.querySelector(`article[data-id="${id}"] .poll`)); })()' api
     audit_api
 
+    printf '%s\n' 'browser quote: creating target and quote through composer' >&2
+    browser open "$base_url/home" >/dev/null
+    wait_ready quote-target-composer "Boolean(document.querySelector('.compose-form textarea') && document.querySelector('.compose-form__submit button[type=\"submit\"]'))"
+    browser fill '.compose-form textarea' 'Rustodon browser quote target' >/dev/null
+    browser click '.compose-form__submit button[type="submit"]' >/dev/null
+    wait_ready quote-target-created "(() => { const node = [...document.querySelectorAll('article[data-id]')].find(article => article.textContent.includes('Rustodon browser quote target')); if (!node) return false; sessionStorage.setItem('rustodon-smoke-quote-target', node.dataset.id); return /^[0-9]+$/.test(node.dataset.id); })()"
+    quote_target_id=$(browser eval "sessionStorage.getItem('rustodon-smoke-quote-target')")
+    case "$quote_target_id" in
+        ''|*[!0-9]*) fail 'quote target did not expose a generated status id' ;;
+    esac
+    assert_js quote-target-created '/* rustodon-smoke: quote-target-created */ (() => { const id = sessionStorage.getItem("rustodon-smoke-quote-target"); return /^[0-9]+$/.test(id || "") && Boolean(document.querySelector(`article[data-id="${id}"]`)); })()' api
+    browser click "article[data-id=\"$quote_target_id\"] button[aria-label=\"Boost or quote\"]" >/dev/null
+    wait_ready quote-menu "Boolean(document.querySelector('.reblog-menu-item button[data-index=\"1\"]'))"
+    browser click '.reblog-menu-item button[data-index="1"]' >/dev/null
+    wait_ready quote-compose "Boolean(document.querySelector('.compose-form .status__quote [data-id=\"$quote_target_id\"]') && document.querySelector('.compose-form textarea') && document.querySelector('.compose-form__submit button[type=\"submit\"]'))"
+    browser fill '.compose-form textarea' 'Rustodon browser quote commentary' >/dev/null
+    assert_js quote-compose-ready '/* rustodon-smoke: quote-compose-ready */ (() => { const target = sessionStorage.getItem("rustodon-smoke-quote-target"); const nested = document.querySelector(`.compose-form .status__quote [data-id="${target}"]`); const submit = document.querySelector(".compose-form__submit button[type=submit]"); return /^[0-9]+$/.test(target || "") && Boolean(nested && submit && !submit.disabled); })()' api
+    browser click '.compose-form__submit button[type="submit"]' >/dev/null
+    wait_ready quote-created "(() => { const node = [...document.querySelectorAll('article[data-id].status--has-quote')].find(article => article.textContent.includes('Rustodon browser quote commentary') && article.querySelector('.status__quote [data-id=\"$quote_target_id\"]')); if (!node) return false; sessionStorage.setItem('rustodon-smoke-quote-status', node.dataset.id); return /^[0-9]+$/.test(node.dataset.id); })()"
+    quote_status_id=$(browser eval "sessionStorage.getItem('rustodon-smoke-quote-status')")
+    case "$quote_status_id" in
+        ''|*[!0-9]*) fail 'quote composer did not expose a generated status id' ;;
+    esac
+    assert_js quote-created '/* rustodon-smoke: quote-created */ (() => { const quote = sessionStorage.getItem("rustodon-smoke-quote-status"); const target = sessionStorage.getItem("rustodon-smoke-quote-target"); return /^[0-9]+$/.test(quote || "") && /^[0-9]+$/.test(target || "") && Boolean(document.querySelector(`article[data-id="${quote}"].status--has-quote .status__quote [data-id="${target}"]`)); })()' api
+    browser open "$base_url/@alice/$quote_status_id" >/dev/null
+    wait_ready quote-permalink "Boolean(document.querySelector('.detailed-status__wrapper .status__quote [data-id=\"$quote_target_id\"]'))"
+    browser reload >/dev/null
+    wait_ready quote-reload "Boolean(document.querySelector('.detailed-status__wrapper .status__quote [data-id=\"$quote_target_id\"]'))"
+    assert_js quote-reload-persisted '/* rustodon-smoke: quote-reload-persisted */ (() => { const target = sessionStorage.getItem("rustodon-smoke-quote-target"); const quote = sessionStorage.getItem("rustodon-smoke-quote-status"); return location.pathname === `/@alice/${quote}` && Boolean(document.querySelector(`.detailed-status__wrapper .status__quote [data-id="${target}"]`)); })()' api
+    if [ -n "$quote_status_file" ]; then
+        (umask 077; printf '%s\n%s\n' "$quote_target_id" "$quote_status_id" > "$quote_status_file") ||
+            fail 'quote status IDs could not be written for fixture cleanup'
+    fi
+    audit_api
+
     printf '%s\n' 'browser auth: checking profile settings' >&2
     browser open "$base_url/settings/profile" >/dev/null
     wait_ready profile-form "Boolean(document.querySelector('form[action=\"/settings/profile\"] #display_name') && document.querySelector('form[action=\"/settings/profile\"] button[type=\"submit\"]'))"
@@ -971,6 +1008,21 @@ if [ "$auth" = true ]; then
     assert_js poll-refreshed '/* rustodon-smoke: poll-refreshed */ (() => { const state = window.__rustodonPollSmoke; if (!state?.pollPath || !Number.isInteger(state.getBefore)) return false; const count = performance.getEntriesByType("resource").filter(entry => { const url = new URL(entry.name, location.href); return url.origin === location.origin && url.search === "" && url.pathname === state.pollPath && entry.responseStatus >= 200 && entry.responseStatus < 300; }).length; const status = document.querySelector(".detailed-status__wrapper .detailed-status"); const datetime = status?.querySelector("a.detailed-status__datetime"); let permalink; try { permalink = new URL(datetime?.href || "", location.href); } catch { return false; } return permalink.origin === location.origin && permalink.search === "" && permalink.hash === "" && permalink.pathname === `/@alice/${state.expectedStatusId}` && Boolean(status?.querySelector(".poll .poll__voted")) && count > state.getBefore; })()' api
     audit_api
 
+    for cleanup_id in "$quote_status_id" "$quote_target_id"; do
+        cleanup_status=$(fixture_curl --silent --show-error --max-time 30 \
+            --resolve "$base_host:$base_port:127.0.0.1" \
+            --header "Host: $host" \
+            --header 'X-Forwarded-Proto: https' \
+            --header 'Authorization: Bearer fixture-bearer-token-v4-6-5' \
+            --request DELETE \
+            --write-out '%{http_code}' \
+            --output /dev/null \
+            "$base_url/api/v1/statuses/$cleanup_id")
+        [ "$cleanup_status" = 200 ] || fail "browser quote cleanup returned HTTP $cleanup_status"
+    done
+    quote_session_cleanup=$(browser eval "sessionStorage.removeItem('rustodon-smoke-quote-status'); sessionStorage.removeItem('rustodon-smoke-quote-target'); true")
+    [ "$quote_session_cleanup" = true ] || fail 'browser quote session cleanup failed'
+
     cleanup_status=$(fixture_curl --silent --show-error --max-time 30 \
         --resolve "$base_host:$base_port:127.0.0.1" \
         --header "Host: $host" \
@@ -1014,7 +1066,7 @@ if [ "$recording" = true ]; then
 fi
 
 if [ "$auth" = true ]; then
-    printf 'browser web-client smoke passed: mount, server-authenticated shell/settings/logout, frontend debounced PUT/reload, two-account poll create/vote/refresh, SPA deep link, API responses, and page errors\n'
+    printf 'browser web-client smoke passed: mount, server-authenticated shell/settings/logout, frontend debounced PUT/reload, quote create/reload, two-account poll create/vote/refresh, SPA deep link, API responses, and page errors\n'
 else
     printf 'browser web-client smoke passed: mount, app body, SPA deep link, API responses, and page errors\n'
 fi

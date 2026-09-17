@@ -19,10 +19,11 @@ authenticated REST, browser authentication and settings, local media, streaming,
 durable work, moderation, and ActivityPub paths required by that target. The
 matching Mastodon web bundle is packaged and served.
 
-Automated and isolated-fixture evidence covers ordinary quality gates, schema
-and startup safety, the required Rails-versus-Rust differential lane, browser
-settings and logout, cutover/rollback, durable workers, and five bounded
-Mastodon peer scenarios. This is not production certification.
+Retained pre-final-tree evidence covers ordinary quality gates, earlier
+Rails-versus-Rust differential and browser runs, cutover/rollback, durable workers,
+and five bounded Mastodon peer scenarios. The current quote-expanded
+restored-schema, worker, differential, browser, cutover, and peer sweep has not
+been run. This is not production certification.
 
 V1 remains incomplete. Outstanding acceptance includes a recorded mobile-client
 run, broader browser and interactive-TOTP coverage, a production cutover and
@@ -47,8 +48,11 @@ state.
   cutover with rollback compatibility.
 
 Object storage, Elasticsearch, open registration, SSO providers, scheduled posts,
-quote creation, relays, advanced federation extensions, and the full Mastodon
-administration surface are deferred. Existing unsupported data is preserved or
+relays, other advanced federation extensions, and the full Mastodon administration
+surface are deferred. Quote posts now include the bundled frontend REST lifecycle,
+interaction-policy and revoke routes, and QuoteRequest/QuoteAuthorization federation;
+the final restored-schema, worker, differential, browser, cutover, and peer evidence
+for that lifecycle remains deferred. Existing unsupported data is preserved or
 rejected by preflight rather than silently discarded.
 
 ## Documentation

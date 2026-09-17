@@ -26,7 +26,7 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, Uri};
 use axum::middleware::{self, Next};
-use axum::routing::{any, delete, get, patch, post};
+use axum::routing::{any, delete, get, patch, post, put};
 use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -2016,6 +2016,20 @@ pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
         AssociationId,
         Private
     ),
+    put_route!(
+        "/api/v1/statuses/{id}/interaction_policy",
+        Implemented,
+        ApiAuthentication::Required(WRITE_STATUSES.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/statuses/{quoted_status_id}/quotes/{id}/revoke",
+        Implemented,
+        ApiAuthentication::Required(WRITE_STATUSES.as_slice()),
+        None,
+        Private
+    ),
     route!(
         "/api/v1/statuses/{id}/favourited_by",
         Implemented,
@@ -2228,6 +2242,21 @@ pub const V1_REQUIRED_API_ROUTES: &[(&str, ApiMethod, ApiRouteSupport)] = &[
     (
         "/api/v1/statuses/{id}/history",
         ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{id}/quotes",
+        ApiMethod::Get,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{id}/interaction_policy",
+        ApiMethod::Put,
+        ApiRouteSupport::Implemented,
+    ),
+    (
+        "/api/v1/statuses/{quoted_status_id}/quotes/{id}/revoke",
+        ApiMethod::Post,
         ApiRouteSupport::Implemented,
     ),
     (
@@ -3741,6 +3770,14 @@ pub fn router(state: WebState) -> Router {
         .route("/api/v1/statuses/{id}/source", get(status_source))
         .route("/api/v1/statuses/{id}/history", get(status_history))
         .route("/api/v1/statuses/{id}/quotes", get(status_quotes))
+        .route(
+            "/api/v1/statuses/{id}/interaction_policy",
+            put(status_interaction_policy_update),
+        )
+        .route(
+            "/api/v1/statuses/{quoted_status_id}/quotes/{id}/revoke",
+            post(revoke_quote),
+        )
         .route("/api/v1/statuses/{id}/favourited_by", get(favourited_by))
         .route("/api/v1/statuses/{id}/reblogged_by", get(reblogged_by))
         .route("/api/v1/statuses/{id}/context", get(status_context))
@@ -3971,6 +4008,14 @@ pub fn router(state: WebState) -> Router {
         .route("/api/v1/statuses/{id}/source/", get(status_source))
         .route("/api/v1/statuses/{id}/history/", get(status_history))
         .route("/api/v1/statuses/{id}/quotes/", get(status_quotes))
+        .route(
+            "/api/v1/statuses/{id}/interaction_policy/",
+            put(status_interaction_policy_update),
+        )
+        .route(
+            "/api/v1/statuses/{quoted_status_id}/quotes/{id}/revoke/",
+            post(revoke_quote),
+        )
         .route("/api/v1/statuses/{id}/favourited_by/", get(favourited_by))
         .route("/api/v1/statuses/{id}/reblogged_by/", get(reblogged_by))
         .route("/api/v1/statuses/{id}/context/", get(status_context))
@@ -12605,6 +12650,9 @@ async fn status_create(
     let Ok(in_reply_to_id) = integer_parameter(&rack, "in_reply_to_id") else {
         return error_response(StatusCode::BAD_REQUEST, "Invalid in_reply_to_id");
     };
+    let Ok(quoted_status_id) = strict_optional_id_parameter(&rack, "quoted_status_id") else {
+        return error_response(StatusCode::BAD_REQUEST, "Invalid quoted_status_id");
+    };
     let owner = match authenticated.require_user() {
         Ok(owner) => owner.account_id(),
         Err(error) => return error.into_http_response().map(Body::from),
@@ -12626,6 +12674,7 @@ async fn status_create(
             quote_approval_policy.as_deref(),
             sensitive,
             in_reply_to_id,
+            quoted_status_id,
             poll.as_ref(),
         )
     });
@@ -12665,7 +12714,10 @@ async fn status_create(
             language.as_deref(),
             quote_approval_policy.as_deref(),
             in_reply_to_id,
+            quoted_status_id,
             poll.as_ref(),
+            Some(state.origin.as_str()),
+            state.instance_runtime.limited_federation,
             idempotency,
         )
         .await
@@ -12786,9 +12838,11 @@ fn status_idempotency_fingerprint(
     quote_approval_policy: Option<&str>,
     sensitive: Option<bool>,
     in_reply_to_id: Option<i64>,
+    quoted_status_id: Option<i64>,
     poll: Option<&PollCreate>,
 ) -> [u8; 32] {
     let reply_id = in_reply_to_id.map(|id| id.to_string());
+    let quote_id = quoted_status_id.map(|id| id.to_string());
     let values = [
         Some(text.trim()),
         spoiler_text.map(str::trim),
@@ -12797,6 +12851,7 @@ fn status_idempotency_fingerprint(
         quote_approval_policy,
         sensitive.map(|value| if value { "true" } else { "false" }),
         reply_id.as_deref(),
+        quote_id.as_deref(),
     ];
     let mut digest = Sha256::new();
     for value in values {
@@ -17459,6 +17514,113 @@ async fn status_source(
     }
 }
 
+async fn status_interaction_policy_update(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_STATUSES).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let viewer = match authenticated.require_user() {
+        Ok(owner) => owner.account_id(),
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    let Ok(Some(status_id)) = strict_optional_id_parameter(&rack, "id") else {
+        return record_not_found();
+    };
+    let quote_approval_policy = match rack.get("quote_approval_policy") {
+        None | Some(RackValue::Null) => None,
+        Some(RackValue::Scalar(value)) if value.trim().is_empty() => None,
+        Some(RackValue::Scalar(value)) => Some(value.as_str()),
+        Some(_) => {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Validation failed: Quote approval policy is invalid",
+            );
+        }
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let outcome = match writer
+        .update_status_interaction_policy(&authenticated, status_id, quote_approval_policy)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => return status_saved_write_error(&error),
+    };
+    let status = match state
+        .loader(Some(viewer))
+        .authorized_status(outcome.status_id)
+        .await
+    {
+        Ok(Some(status)) => status,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    match state.serializer().status(&status, StatusShape::Full) {
+        Ok(value) => json_response(
+            StatusCode::OK,
+            serde_json::to_vec(&value).expect("status response is serializable"),
+        ),
+        Err(_) => internal_error(),
+    }
+}
+
+async fn revoke_quote(
+    State(state): State<WebState>,
+    Extension(rack): Extension<RackParameters>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let authenticated = match required_write_viewer(&state, &headers, WRITE_STATUSES).await {
+        Ok(authenticated) => authenticated,
+        Err(response) => return response,
+    };
+    let viewer = match authenticated.require_user() {
+        Ok(owner) => owner.account_id(),
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    let Ok(Some(quoted_status_id)) = strict_optional_id_parameter(&rack, "quoted_status_id") else {
+        return record_not_found();
+    };
+    let Ok(Some(quoting_status_id)) = strict_optional_id_parameter(&rack, "id") else {
+        return record_not_found();
+    };
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let outcome = match writer
+        .revoke_quote(
+            &authenticated,
+            quoted_status_id,
+            quoting_status_id,
+            state.origin.as_str(),
+        )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => return status_saved_write_error(&error),
+    };
+    let status = match state
+        .loader(Some(viewer))
+        .authorized_status(outcome.status_id)
+        .await
+    {
+        Ok(Some(status)) => status,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    match state.serializer().status(&status, StatusShape::Full) {
+        Ok(value) => json_response(
+            StatusCode::OK,
+            serde_json::to_vec(&value).expect("status response is serializable"),
+        ),
+        Err(_) => internal_error(),
+    }
+}
+
 async fn status_quotes(
     State(state): State<WebState>,
     Extension(rack): Extension<RackParameters>,
@@ -18332,10 +18494,11 @@ async fn status_delete(
         return internal_error();
     };
     match writer
-        .delete_status(
+        .delete_status_with_origin(
             &authenticated,
             status_id,
             boolean_parameter(&rack, "delete_media"),
+            Some(state.origin.as_str()),
         )
         .await
     {
@@ -19461,6 +19624,24 @@ enum CursorParameterError {
 }
 
 type CursorTriplet = (Option<i64>, Option<i64>, Option<i64>);
+
+fn strict_optional_id_parameter(
+    parameters: &RackParameters,
+    name: &str,
+) -> Result<Option<i64>, ()> {
+    match parameters.get(name) {
+        None | Some(RackValue::Null) => Ok(None),
+        Some(RackValue::Scalar(value)) if value.trim().is_empty() => Ok(None),
+        Some(RackValue::Scalar(value)) => value.trim().parse::<i64>().map(Some).map_err(|_| ()),
+        Some(RackValue::Number(value)) => json_number_integer(value).map(Some),
+        Some(
+            RackValue::Boolean(_)
+            | RackValue::Array(_)
+            | RackValue::Object(_)
+            | RackValue::Upload(_),
+        ) => Err(()),
+    }
+}
 
 fn integer_parameter(
     parameters: &RackParameters,
@@ -20916,28 +21097,27 @@ mod tests {
     }
 
     #[test]
-    fn status_idempotency_binds_account_and_reply_target() {
-        let base = status_idempotency_fingerprint(
-            "fixture status",
-            &[],
-            None,
-            Some("public"),
-            Some("en"),
-            None,
-            Some(false),
-            None,
-            None,
-        );
-        let reply = status_idempotency_fingerprint(
-            "fixture status",
-            &[],
-            None,
-            Some("public"),
-            Some("en"),
-            None,
-            Some(false),
-            Some(42),
-            None,
+    fn status_idempotency_binds_account_reply_and_quote_targets() {
+        let fingerprint = |reply, quote, poll: Option<&PollCreate>| {
+            status_idempotency_fingerprint(
+                "fixture status",
+                &[],
+                None,
+                Some("public"),
+                Some("en"),
+                None,
+                Some(false),
+                reply,
+                quote,
+                poll,
+            )
+        };
+        let base = fingerprint(None, None, None);
+        assert_ne!(base, fingerprint(Some(42), None, None));
+        assert_ne!(base, fingerprint(None, Some(42), None));
+        assert_ne!(
+            fingerprint(None, Some(42), None),
+            fingerprint(None, Some(43), None)
         );
         let trimmed = status_idempotency_fingerprint(
             " fixture status ",
@@ -20949,8 +21129,8 @@ mod tests {
             Some(false),
             None,
             None,
+            None,
         );
-        assert_ne!(base, reply);
         assert_eq!(base, trimmed);
         let poll = PollCreate {
             options: vec!["Tea".to_owned(), "Coffee".to_owned()],
@@ -20958,20 +21138,7 @@ mod tests {
             multiple: false,
             hide_totals: false,
         };
-        let poll_fingerprint = |poll: &PollCreate| {
-            status_idempotency_fingerprint(
-                "fixture status",
-                &[],
-                None,
-                Some("public"),
-                Some("en"),
-                None,
-                Some(false),
-                None,
-                Some(poll),
-            )
-        };
-        assert_ne!(base, poll_fingerprint(&poll));
+        assert_ne!(base, fingerprint(None, None, Some(&poll)));
         for changed in [
             PollCreate {
                 options: vec!["Tea".to_owned(), "Water".to_owned()],
@@ -20990,7 +21157,10 @@ mod tests {
                 ..poll.clone()
             },
         ] {
-            assert_ne!(poll_fingerprint(&poll), poll_fingerprint(&changed));
+            assert_ne!(
+                fingerprint(None, None, Some(&poll)),
+                fingerprint(None, None, Some(&changed))
+            );
         }
         assert_ne!(
             base,
@@ -21002,6 +21172,7 @@ mod tests {
                 Some("en"),
                 Some("nobody"),
                 Some(false),
+                None,
                 None,
                 None,
             )
@@ -21232,8 +21403,9 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn api_route_inventory_is_unique_and_declares_protocol_contracts() {
-        assert_eq!(API_ROUTE_INVENTORY.len(), 121);
+        assert_eq!(API_ROUTE_INVENTORY.len(), 123);
         assert_eq!(REST_BODY_LIMIT_BYTES, 103_809_024);
         assert_eq!(
             API_ROUTE_INVENTORY
@@ -21313,14 +21485,36 @@ mod tests {
                 .iter()
                 .filter(|route| route.method == ApiMethod::Put)
                 .count(),
-            5
+            6
+        );
+        assert_eq!(
+            API_ROUTE_INVENTORY
+                .iter()
+                .find(|route| {
+                    route.path == "/api/v1/statuses/{id}/interaction_policy"
+                        && route.method == ApiMethod::Put
+                })
+                .expect("status interaction-policy PUT is inventoried")
+                .authentication,
+            ApiAuthentication::Required(WRITE_STATUSES.as_slice())
+        );
+        assert_eq!(
+            API_ROUTE_INVENTORY
+                .iter()
+                .find(|route| {
+                    route.path == "/api/v1/statuses/{quoted_status_id}/quotes/{id}/revoke"
+                        && route.method == ApiMethod::Post
+                })
+                .expect("frontend quote revoke POST is inventoried")
+                .authentication,
+            ApiAuthentication::Required(WRITE_STATUSES.as_slice())
         );
         assert_eq!(
             API_ROUTE_INVENTORY
                 .iter()
                 .filter(|route| route.method == ApiMethod::Post)
                 .count(),
-            36
+            37
         );
         assert!(api_route("/api/v1/markers").is_some());
     }

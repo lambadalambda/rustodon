@@ -248,6 +248,128 @@ pub(crate) enum StatusAccessDenied {
     UnsupportedVisibility,
 }
 
+#[must_use]
+pub(crate) const fn quote_post_visibility(
+    requested: StatusVisibility,
+    target: StatusVisibility,
+) -> StatusVisibility {
+    if matches!(target, StatusVisibility::Private)
+        && matches!(
+            requested,
+            StatusVisibility::Public | StatusVisibility::Unlisted
+        )
+    {
+        StatusVisibility::Private
+    } else {
+        requested
+    }
+}
+
+#[must_use]
+pub(crate) const fn quote_target_visibility_allowed(
+    viewer_is_author: bool,
+    visibility: StatusVisibility,
+) -> bool {
+    viewer_is_author
+        || matches!(
+            visibility,
+            StatusVisibility::Public | StatusVisibility::Unlisted
+        )
+}
+
+#[must_use]
+pub(crate) const fn quote_post_has_content(
+    has_text: bool,
+    has_media: bool,
+    has_quote: bool,
+) -> bool {
+    has_text || has_media || has_quote
+}
+
+#[must_use]
+pub(crate) const fn direct_quote_allowed(
+    visibility: StatusVisibility,
+    quotes_self: bool,
+    explicitly_mentions_target: bool,
+) -> bool {
+    !matches!(visibility, StatusVisibility::Direct) || quotes_self || explicitly_mentions_target
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct QuotePolicyFacts {
+    pub visibility: StatusVisibility,
+    pub is_reblog: bool,
+    pub approval_policy: i32,
+    pub viewer: Option<QuotePolicyViewerFacts>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct QuotePolicyViewerFacts {
+    pub is_author: bool,
+    pub follows_author: bool,
+    pub author_follows_viewer: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QuotePolicy {
+    Automatic,
+    Manual,
+    Unknown,
+    Denied,
+}
+
+impl QuotePolicy {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Manual => "manual",
+            Self::Unknown => "unknown",
+            Self::Denied => "denied",
+        }
+    }
+}
+
+#[must_use]
+pub(crate) const fn status_quote_policy(facts: QuotePolicyFacts) -> QuotePolicy {
+    let Some(viewer) = facts.viewer else {
+        return QuotePolicy::Denied;
+    };
+    if matches!(facts.visibility, StatusVisibility::Direct) || facts.is_reblog {
+        return QuotePolicy::Denied;
+    }
+    if viewer.is_author {
+        return QuotePolicy::Automatic;
+    }
+    if quote_policy_allows(
+        facts.approval_policy >> 16,
+        viewer.follows_author,
+        viewer.author_follows_viewer,
+    ) {
+        QuotePolicy::Automatic
+    } else if quote_policy_allows(
+        facts.approval_policy & 0xffff,
+        viewer.follows_author,
+        viewer.author_follows_viewer,
+    ) {
+        QuotePolicy::Manual
+    } else if facts.approval_policy & 0x0001_0001 != 0 {
+        QuotePolicy::Unknown
+    } else {
+        QuotePolicy::Denied
+    }
+}
+
+const fn quote_policy_allows(
+    bitmap: i32,
+    viewer_follows_author: bool,
+    author_follows_viewer: bool,
+) -> bool {
+    bitmap & (1 << 1) != 0
+        || (bitmap & (1 << 2) != 0 && viewer_follows_author)
+        || (bitmap & (1 << 3) != 0 && author_follows_viewer)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StatusActionAccess {
     Allowed,
@@ -591,6 +713,109 @@ mod tests {
         facts.access.viewer = ViewerFacts::Authenticated(viewer);
         facts.viewer_restriction = ViewerRestriction::BlocksAuthor;
         assert_eq!(status_context_access(facts), StatusContextAccess::Allowed);
+    }
+
+    #[test]
+    fn quote_policy_preserves_owner_relationship_and_fail_closed_semantics() {
+        assert!(quote_post_has_content(false, false, true));
+        assert!(!quote_post_has_content(false, false, false));
+        assert_eq!(
+            quote_post_visibility(StatusVisibility::Public, StatusVisibility::Private),
+            StatusVisibility::Private
+        );
+        assert_eq!(
+            quote_post_visibility(StatusVisibility::Unlisted, StatusVisibility::Public),
+            StatusVisibility::Unlisted
+        );
+        assert!(quote_target_visibility_allowed(
+            true,
+            StatusVisibility::Private
+        ));
+        assert!(quote_target_visibility_allowed(
+            false,
+            StatusVisibility::Public
+        ));
+        assert!(quote_target_visibility_allowed(
+            false,
+            StatusVisibility::Unlisted
+        ));
+        assert!(!quote_target_visibility_allowed(
+            false,
+            StatusVisibility::Private
+        ));
+        assert!(!quote_target_visibility_allowed(
+            false,
+            StatusVisibility::Limited
+        ));
+        assert!(direct_quote_allowed(StatusVisibility::Direct, true, false));
+        assert!(direct_quote_allowed(StatusVisibility::Direct, false, true));
+        assert!(!direct_quote_allowed(
+            StatusVisibility::Direct,
+            false,
+            false
+        ));
+        let facts = QuotePolicyFacts {
+            visibility: StatusVisibility::Public,
+            is_reblog: false,
+            approval_policy: 2 << 16,
+            viewer: Some(QuotePolicyViewerFacts {
+                is_author: false,
+                follows_author: false,
+                author_follows_viewer: false,
+            }),
+        };
+        assert_eq!(status_quote_policy(facts), QuotePolicy::Automatic);
+        assert_eq!(
+            status_quote_policy(QuotePolicyFacts {
+                approval_policy: 4,
+                viewer: Some(QuotePolicyViewerFacts {
+                    follows_author: true,
+                    ..facts.viewer.unwrap()
+                }),
+                ..facts
+            }),
+            QuotePolicy::Manual
+        );
+        assert_eq!(
+            status_quote_policy(QuotePolicyFacts {
+                approval_policy: 1,
+                ..facts
+            }),
+            QuotePolicy::Unknown
+        );
+        assert_eq!(
+            status_quote_policy(QuotePolicyFacts {
+                approval_policy: 0,
+                ..facts
+            }),
+            QuotePolicy::Denied
+        );
+        assert_eq!(
+            status_quote_policy(QuotePolicyFacts {
+                viewer: Some(QuotePolicyViewerFacts {
+                    is_author: true,
+                    ..facts.viewer.unwrap()
+                }),
+                ..facts
+            }),
+            QuotePolicy::Automatic
+        );
+        for denied in [
+            QuotePolicyFacts {
+                viewer: None,
+                ..facts
+            },
+            QuotePolicyFacts {
+                visibility: StatusVisibility::Direct,
+                ..facts
+            },
+            QuotePolicyFacts {
+                is_reblog: true,
+                ..facts
+            },
+        ] {
+            assert_eq!(status_quote_policy(denied), QuotePolicy::Denied);
+        }
     }
 
     #[test]

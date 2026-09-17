@@ -11,11 +11,13 @@ FIXTURE_DIR="$ROOT/fixtures/mastodon/v4.6.5"
 sed -n '/^case "$command" in$/,$p' "$repo/tools/mastodon-fixture" > "$work/dispatch.sh"
 # Real dispatch, but fixture provisioning is forbidden in this offline test.
 schema_read_test() { printf '%s\n' "${2:-mastodon_schema}" >> "$work/selected"; }
+worker_test() { printf '%s\n' "${1:-ALL}" >> "$work/worker-selected"; }
 run_podman() { echo 'unexpected container operation' >&2; exit 80; }
 dispatch() ( command=$1; shift; . "$work/dispatch.sh"; )
 dispatch schema-read-test
 cat > "$work/expected" <<'EOF'
 mastodon_schema
+quote_lifecycle
 account_stats_repair
 saved_status_authorization
 qualified_local_mentions
@@ -30,12 +32,16 @@ media_state
 batch_accounts
 EOF
 cmp "$work/expected" "$work/selected" || die 'default schema gate omits a required HTTP regression'
-for selector in v2_account_search api_empty_reads web_settings media_proxy media_state batch_accounts; do
+for selector in v2_account_search api_empty_reads web_settings media_proxy media_state batch_accounts quote_lifecycle; do
   : > "$work/selected"
   dispatch schema-read-test "$selector"
   [ "$(cat "$work/selected")" = "$selector" ] || die "wrong selector: $selector"
 done
 if dispatch schema-read-test unknown > "$work/error" 2>&1; then die 'unknown selector accepted'; fi
+: > "$work/worker-selected"
+dispatch worker-test quote_federation_lifecycle
+[ "$(cat "$work/worker-selected")" = quote_federation_lifecycle ] || die 'wrong worker selector'
+if dispatch worker-test one two > "$work/error" 2>&1; then die 'extra worker selector accepted'; fi
 
 cargo_mode=present
 cargo() {
@@ -59,6 +65,14 @@ done
 : > "$work/cargo"
 schema_read_rust_test media_state
 grep -F -- '--test media_state' "$work/cargo" >/dev/null || die 'incorrect media-state target'
+: > "$work/cargo"
+worker_rust_test quote_federation_lifecycle
+grep -F -- '--features test-support --test workers quote_lifecycle::quote_federation_lifecycle' "$work/cargo" >/dev/null || die 'incorrect quote worker target'
+[ "$(wc -l < "$work/cargo" | tr -d ' ')" = 2 ] || die 'expected worker list check then exact execution'
+if (worker_rust_test unknown) > "$work/error" 2>&1; then die 'unknown worker selector accepted'; fi
+: > "$work/cargo"
+schema_read_rust_test quote_lifecycle
+grep -F -- '--features test-support --test quote_lifecycle' "$work/cargo" >/dev/null || die 'incorrect quote-lifecycle target'
 : > "$work/cargo"
 schema_read_rust_test account_stats_repair
 grep -F -- '--features test-support --test account_stats_repair' "$work/cargo" >/dev/null || die 'incorrect account-stats-repair target'

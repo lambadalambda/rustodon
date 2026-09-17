@@ -171,8 +171,11 @@ Required status endpoints:
 
 - Create, show, edit, and delete status.
 - Status context, source, and edit history.
-- Existing quote and tagged-collection fields in status responses, without
-  enabling their creation workflows.
+- Quote fields in status responses; quote creation through `quoted_status_id`,
+  quote-policy updates, quote lists, and local revocation with visibility/block/
+  policy enforcement and atomic failure semantics.
+- Existing tagged-collection fields in status responses without enabling their
+  creation workflows.
 - Public, unlisted, followers-only, limited, and direct visibility.
 - Replies, content warnings, sensitive flag, language, mentions, and up to four
   image attachments.
@@ -258,6 +261,10 @@ Required activity handling:
 - `Announce` and `Undo Announce`.
 - `Block` and `Undo Block`.
 - Actor `Update` and `Delete`.
+- `QuoteRequest`, quote `Accept`/`Reject`, `QuoteAuthorization`, authorization
+  `Delete`, target-owner-signed scalar instrument fetch, quoted-Note
+  updates/Tombstone removal, final send-time lifecycle fencing, and signed
+  authorization forwarding.
 - Replies, mentions, public/unlisted/followers/direct audience handling, and
   tombstones that prevent deleted objects from reappearing.
 - Image attachment metadata and bounded remote image caching. Text remains
@@ -334,9 +341,9 @@ but it does not need to expose their mutation workflows:
 - Existing announcements.
 - Existing reports, warnings, appeals, severance records, account migrations,
   imports, backups, and web-push subscriptions.
-- Existing Mastodon 4.6.5 quote, collection, collection-item, and keypair rows.
-  They must be mapped and serialized where externally visible, but v1 does not
-  need to create or mutate quote and collection workflows.
+- Existing Mastodon 4.6.5 collection, collection-item, and keypair rows. They
+  must be mapped and serialized where externally visible, but v1 does not need
+  to create or mutate collection workflows.
 - Unknown notification types and future enum values. Preserve them; do not
   rewrite them into a known type.
 
@@ -367,7 +374,6 @@ feature work remain possible.
 ### User Features
 
 - Scheduled posts.
-- Quote posts and quote authorization.
 - Custom/featured collections.
 - New audio/video/GIF transcoding.
 - List CRUD and membership mutation.
@@ -383,7 +389,7 @@ feature work remain possible.
 ### Federation Extensions
 
 - Relays and generic shared-inbox forwarding.
-- Quote and featured-collection federation.
+- Featured-collection federation.
 - Follower synchronization.
 - Account `Move` migration.
 - Federated `Flag` reports.

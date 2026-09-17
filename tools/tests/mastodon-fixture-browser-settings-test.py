@@ -52,7 +52,8 @@ def connection(path):
     def setval(name, value, called):
         if name not in {f"public.{table}_id_seq" for table in (
                 "web_settings", "login_activities", "oauth_access_tokens", "session_activations",
-                "statuses", "status_stats", "conversations", "polls", "poll_votes")}:
+                "statuses", "status_stats", "conversations", "polls", "poll_votes", "quotes",
+                "mentions")}:
             raise ValueError("unexpected sequence write")
         if called not in ("t", "f"):
             raise ValueError("sequence is_called must be preserved, not inferred")
@@ -98,7 +99,8 @@ def psql_double():
                 rows.extend((postgres_format(
                     "INSERT INTO public.account_stats (account_id, statuses_count, followers_count) "
                     "VALUES (%s, %s, %s);", *row),) for row in stats)
-                for table in ("statuses", "status_stats", "conversations", "polls", "poll_votes"):
+                for table in ("statuses", "status_stats", "conversations", "polls", "poll_votes", "quotes",
+                              "mentions"):
                     value, called = database.execute(
                         f"SELECT last_value, is_called FROM public.{table}_id_seq"
                     ).fetchone()
@@ -141,7 +143,8 @@ class BrowserSettingsRollback(unittest.TestCase):
         self.database.execute("INSERT INTO public.account_stats VALUES "
                               "(116844606259201001, 7, 8), (999, 3, 4)")
         for table in ("web_settings", "login_activities", "oauth_access_tokens", "session_activations",
-                      "statuses", "status_stats", "conversations", "polls", "poll_votes"):
+                      "statuses", "status_stats", "conversations", "polls", "poll_votes", "quotes",
+                      "mentions"):
             self.database.execute(f"CREATE TABLE public.{table}_id_seq (last_value INTEGER, is_called TEXT)")
             self.database.execute(f"INSERT INTO public.{table}_id_seq VALUES (1, 'f')")
         self.database.commit()
@@ -165,6 +168,7 @@ PG_CONTAINER=offline-fixture
 RUSTODON_BROWSER_AUTH=true
 cutover_browser_user_restore=''
 cutover_browser_poll_status_file=''
+cutover_browser_quote_status_file=''
 # Capture script arguments before function arguments shadow them.
 test_python=$2
 test_program=$3
@@ -194,6 +198,8 @@ cutover_browser_user_restore=$(cat "$ROOT/restore-path")
   read -r cutover_browser_voter_token_max
 } < "$ROOT/auth-baselines"
 cutover_browser_poll_status_id=''
+cutover_browser_quote_target_id=''
+cutover_browser_quote_status_id=''
 '''
         return self.shell(body + self.restore + '\nprintf restored > "$ROOT/restored"\n', **environment)
 
@@ -241,11 +247,25 @@ cutover_browser_poll_status_id=''
         self.database.execute("UPDATE public.account_stats SET statuses_count = 99 "
                               "WHERE account_id = 116844606259201001")
         for table in ("web_settings", "login_activities", "oauth_access_tokens", "session_activations",
-                      "statuses", "status_stats", "conversations", "polls", "poll_votes"):
+                      "statuses", "status_stats", "conversations", "polls", "poll_votes", "quotes",
+                      "mentions"):
             self.database.execute(
                 f"UPDATE public.{table}_id_seq SET last_value = 19, is_called = 't'"
             )
         self.database.commit()
+
+    def test_quote_cleanup_is_exact_and_restores_quote_sequence(self):
+        self.assertIn("public.quotes_id_seq", self.snapshot)
+        self.assertIn("public.mentions_id_seq", self.snapshot)
+        self.assertIn("rustodon_browser_quote_statuses", self.restore)
+        self.assertIn(
+            "WHERE status_id = $cutover_browser_quote_status_id\n"
+            "   AND quoted_status_id = $cutover_browser_quote_target_id",
+            self.restore,
+        )
+        self.assertIn("WHERE id IN (SELECT id FROM rustodon_browser_quote_statuses)", self.restore)
+        self.assertNotIn("DELETE FROM public.quotes;", self.restore)
+        self.assertNotIn("DELETE FROM public.statuses;", self.restore)
 
     def test_absent_existing_and_null_settings_restore_all_columns_and_exact_sequence(self):
         for existing, sequence, data in [(False, (1, "f"), None), (False, (42, "t"), None),
@@ -260,7 +280,7 @@ cutover_browser_poll_status_id=''
                     table: self.sequence(table)
                     for table in ("web_settings", "login_activities", "oauth_access_tokens",
                                   "session_activations", "statuses", "status_stats", "conversations",
-                                  "polls", "poll_votes")
+                                  "polls", "poll_votes", "quotes", "mentions")
                 }
                 self.assertEqual(self.capture().returncode, 0)
                 self.browser_write()

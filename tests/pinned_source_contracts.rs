@@ -88,6 +88,33 @@ const FRONTEND_ROUTES: &[FrontendRouteContract] = &[
         router_handler: "post(poll_vote)",
     },
     FrontendRouteContract {
+        label: "quote list",
+        source: "app/javascript/mastodon/api/interactions.ts",
+        evidence: "url: url ?? `/api/v1/statuses/${statusId}/quotes`",
+        path: "/api/v1/statuses/{id}/quotes",
+        method: ApiMethod::Get,
+        support: ApiRouteSupport::Implemented,
+        router_handler: "get(status_quotes)",
+    },
+    FrontendRouteContract {
+        label: "quote interaction policy",
+        source: "app/javascript/mastodon/api/statuses.ts",
+        evidence: "`v1/statuses/${statusId}/interaction_policy`",
+        path: "/api/v1/statuses/{id}/interaction_policy",
+        method: ApiMethod::Put,
+        support: ApiRouteSupport::Implemented,
+        router_handler: "put(status_interaction_policy_update)",
+    },
+    FrontendRouteContract {
+        label: "quote revoke",
+        source: "app/javascript/mastodon/api/interactions.ts",
+        evidence: "`v1/statuses/${quotedStatusId}/quotes/${statusId}/revoke`",
+        path: "/api/v1/statuses/{quoted_status_id}/quotes/{id}/revoke",
+        method: ApiMethod::Post,
+        support: ApiRouteSupport::Implemented,
+        router_handler: "post(revoke_quote)",
+    },
+    FrontendRouteContract {
         label: "hashtag column search",
         source: "app/javascript/mastodon/features/hashtag_timeline/containers/column_settings_container.js",
         evidence: "api().get('/api/v2/search', { params: { q: value, type: 'hashtags' } })",
@@ -575,4 +602,363 @@ fn pinned_poll_backend_contract_covers_policy_delivery_refresh_and_expiry() {
     assert!(context.contains(
         "voters_count: { 'toot' => 'http://joinmastodon.org/ns#', 'votersCount' => 'toot:votersCount' }"
     ));
+}
+
+#[test]
+#[ignore = "requires the read-only pinned Mastodon source checkout"]
+fn pinned_quote_frontend_contract_covers_compose_submit_and_reload_rendering() {
+    let source = mastodon_source();
+    let boost_button =
+        read(&source.join("app/javascript/mastodon/components/status/boost_button.tsx"));
+    assert!(boost_button.contains("dispatch(quoteComposeById(statusId));"));
+
+    let typed_compose = read(&source.join("app/javascript/mastodon/actions/compose_typed.ts"));
+    for evidence in [
+        "dispatch(quoteComposeByStatus(status));",
+        "dispatch(quoteCompose(status));",
+    ] {
+        assert!(
+            typed_compose.contains(evidence),
+            "quote compose action drifted: {evidence}"
+        );
+    }
+
+    let reducer = read(&source.join("app/javascript/mastodon/reducers/compose.js"));
+    assert!(reducer.contains(".set('quoted_status_id', isDirect ? null : status.get('id'))"));
+    let compose_form =
+        read(&source.join("app/javascript/mastodon/features/compose/components/compose_form.jsx"));
+    assert!(compose_form.contains("<ComposeQuotedStatus />"));
+    let quoted_post =
+        read(&source.join("app/javascript/mastodon/features/compose/components/quoted_post.tsx"));
+    assert!(quoted_post.contains("['quoted_status', quotedStatusId]"));
+
+    let submit = read(&source.join("app/javascript/mastodon/actions/compose.js"));
+    for evidence in [
+        "url: statusId === null ? '/api/v1/statuses' : `/api/v1/statuses/${statusId}`",
+        "method: statusId === null ? 'post' : 'put'",
+        "quoted_status_id: getState().getIn(['compose', 'quoted_status_id']),",
+        "'Idempotency-Key': getState().getIn(['compose', 'idempotencyKey']),",
+    ] {
+        assert!(
+            submit.contains(evidence),
+            "quote request contract drifted: {evidence}"
+        );
+    }
+
+    let interactions = read(&source.join("app/javascript/mastodon/api/interactions.ts"));
+    assert!(interactions.contains("apiRequestPost<ApiStatusJSON>(\n    `v1/statuses/${quotedStatusId}/quotes/${statusId}/revoke`,"));
+    assert!(
+        interactions
+            .contains("method: 'GET',\n    url: url ?? `/api/v1/statuses/${statusId}/quotes`,")
+    );
+    let interaction_actions =
+        read(&source.join("app/javascript/mastodon/actions/interactions_typed.ts"));
+    assert!(interaction_actions.contains("apiRevokeQuote(quotedStatusId, statusId)"));
+    assert!(interaction_actions.contains("apiGetQuotes(statusId, next)"));
+    let revoke_modal = read(&source.join(
+        "app/javascript/mastodon/features/ui/components/confirmation_modals/revoke_quote.tsx",
+    ));
+    assert!(revoke_modal.contains("dispatch(revokeQuote({ quotedStatusId, statusId }))"));
+    let quotes_view = read(&source.join("app/javascript/mastodon/features/quotes/index.tsx"));
+    assert!(quotes_view.contains("dispatch(fetchQuotes({ statusId }))"));
+
+    let statuses_api = read(&source.join("app/javascript/mastodon/api/statuses.ts"));
+    assert!(statuses_api.contains(
+        "apiRequestPut<ApiStatusJSON>(\n    `v1/statuses/${statusId}/interaction_policy`,"
+    ));
+    assert!(statuses_api.contains("quote_approval_policy: policy"));
+    let status_actions = read(&source.join("app/javascript/mastodon/actions/statuses_typed.ts"));
+    assert!(status_actions.contains("apiSetQuotePolicy(statusId, policy)"));
+    let status_container =
+        read(&source.join("app/javascript/mastodon/containers/status_container.jsx"));
+    assert!(status_container.contains("setStatusQuotePolicy({ policy: quotePolicy, statusId })"));
+
+    // Reload has no special restore path: the fetched REST quote is normalized
+    // into IDs and rendered by the ordinary status import/render chain.
+    let normalizer = read(&source.join("app/javascript/mastodon/actions/importer/normalizer.js"));
+    assert!(normalizer.contains(
+        "quoted_status: status.quote.quoted_status?.id ?? status.quote?.quoted_status_id,"
+    ));
+    let rendered = read(&source.join("app/javascript/mastodon/components/status_quoted.tsx"));
+    for evidence in [
+        "<div className='status__quote'>",
+        "id={quotedStatusId}",
+        "const reblogId = status?.get('reblog') as string | undefined;",
+        "return reblogId ? state.statuses.get(reblogId) : status;",
+    ] {
+        assert!(
+            rendered.contains(evidence),
+            "quote rendering contract drifted: {evidence}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the read-only pinned Mastodon source checkout"]
+#[allow(clippy::too_many_lines)]
+fn pinned_quote_backend_contract_covers_create_policy_and_failure_boundaries() {
+    let source = mastodon_source();
+    let controller = read(&source.join("app/controllers/api/v1/statuses_controller.rb"));
+    for evidence in [
+        "before_action :set_quoted_status, only:    [:create]",
+        "quoted_status: @quoted_status,",
+        "idempotency: request.headers['Idempotency-Key'],",
+        "Status.find(status_params[:quoted_status_id])&.proper",
+        "authorize(@quoted_status, :quote?) if @quoted_status.present?",
+        ":quoted_status_id,",
+    ] {
+        assert!(
+            controller.contains(evidence),
+            "quote controller contract drifted: {evidence}"
+        );
+    }
+    let status = read(&source.join("app/models/status.rb"));
+    assert!(status.contains("reblog? ? reblog : self"));
+
+    let post = read(&source.join("app/services/post_status_service.rb"));
+    for evidence in [
+        "@visibility   = :private if @quoted_status&.private_visibility? && %i(public unlisted).include?(@visibility&.to_sym)",
+        "attach_quote!(@status)",
+        "status.quote = Quote.create(quoted_status: @quoted_status, status: status)",
+        "status.quote.ensure_quoted_access",
+        "status.quote.accept! if @quoted_status.local? && StatusPolicy.new(@status.account, @quoted_status).quote?",
+        "ActivityPub::QuoteRequestWorker.perform_async(@status.quote.id)",
+        "return if @quoted_status.nil? || @visibility.to_sym != :direct",
+        "status.errors.add(:base, I18n.t('statuses.errors.quoted_user_not_mentioned'))",
+        "with_redis_lock(\"idempotency:lock:status:#{@account.id}:#{@options[:idempotency]}\") do",
+        "return idempotency_duplicate if idempotency_duplicate?",
+    ] {
+        assert!(
+            post.contains(evidence),
+            "quote create contract drifted: {evidence}"
+        );
+    }
+
+    let interaction_policy_controller =
+        read(&source.join("app/controllers/api/v1/statuses/interaction_policies_controller.rb"));
+    for evidence in [
+        "doorkeeper_authorize! :write, :'write:statuses'",
+        "authorize @status, :update?",
+        "@status.update!(quote_approval_policy: quote_approval_policy)",
+        "broadcast_updates! if @status.quote_approval_policy_previously_changed?",
+        "'skip_notifications' => true",
+        "ActivityPub::StatusUpdateDistributionWorker.perform_async",
+    ] {
+        assert!(
+            interaction_policy_controller.contains(evidence),
+            "interaction-policy controller contract drifted: {evidence}"
+        );
+    }
+    let interaction_policy_params =
+        read(&source.join("app/controllers/concerns/api/interaction_policies_concern.rb"));
+    for evidence in [
+        "when 'public'",
+        "when 'followers'",
+        "when 'nobody'",
+        "raise ActiveRecord::RecordInvalid",
+    ] {
+        assert!(
+            interaction_policy_params.contains(evidence),
+            "interaction-policy validation contract drifted: {evidence}"
+        );
+    }
+
+    let policy = read(&source.join("app/policies/status_policy.rb"));
+    for evidence in [
+        "show? && !blocking_author? && record.quote_policy_for_account(current_account) != :denied",
+        "current_account.blocking?(author)",
+        "current_account.blocked_by?(author)",
+    ] {
+        assert!(
+            policy.contains(evidence),
+            "quote policy drifted: {evidence}"
+        );
+    }
+    let interaction =
+        read(&source.join("app/models/concerns/status/interaction_policy_concern.rb"));
+    for evidence in [
+        "return :denied if other_account.nil? || direct_visibility? || reblog?",
+        "return :automatic if account_id == other_account.id",
+        "return :automatic if automatic_policy.public?",
+        "return :manual if manual_policy.public?",
+    ] {
+        assert!(
+            interaction.contains(evidence),
+            "quote policy drifted: {evidence}"
+        );
+    }
+
+    let request_spec = read(&source.join("spec/requests/api/v1/statuses_spec.rb"));
+    for evidence in [
+        "context 'with a self-quote post' do",
+        "expect(response.parsed_body[:quote]).to be_present",
+        "expect(response.parsed_body[:quote][:quoted_status][:id]).to eq quoted_status.id.to_s",
+        "context 'with a quote to a non-mentioned user in a Private Mention' do",
+        "expect(response).to have_http_status(422)",
+        "context 'when the quoter is blocked by the quotee' do",
+        "context 'when the quotee is blocked by the quoter' do",
+    ] {
+        assert!(
+            request_spec.contains(evidence),
+            "quote request regression drifted: {evidence}"
+        );
+    }
+
+    let service_spec = read(&source.join("spec/services/post_status_service_spec.rb"));
+    for evidence in [
+        "it 'returns existing status when used twice with idempotency key' do",
+        "expect(status2.id).to eq status1.id",
+        ".to enqueue_sidekiq_job(ActivityPub::QuoteRequestWorker)",
+    ] {
+        assert!(
+            service_spec.contains(evidence),
+            "quote service regression drifted: {evidence}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the read-only pinned Mastodon source checkout"]
+#[allow(clippy::too_many_lines)]
+fn pinned_quote_federation_and_output_contract_covers_lifecycle_effects() {
+    let source = mastodon_source();
+    let create = read(&source.join("app/lib/activitypub/activity/create.rb"));
+    for evidence in [
+        "process_quote",
+        "@status = Status.create!(@params.merge(quote: @quote))",
+        "@quote = Quote.new(account: @account, approval_uri: nil, legacy: @status_parser.legacy_quote?",
+        "ActivityPub::VerifyQuoteService.new.call(@quote, @quote_approval_uri",
+        "ActivityPub::RefetchAndVerifyQuoteWorker.perform_in",
+    ] {
+        assert!(
+            create.contains(evidence),
+            "remote quote create drifted: {evidence}"
+        );
+    }
+
+    let verify = read(&source.join("app/services/activitypub/verify_quote_service.rb"));
+    for evidence in [
+        "return if fast_track_approval! || @approval_uri.blank?",
+        "return quote.reject! if @json.nil?",
+        "return unless matching_type? && matching_quote_uri?",
+        "return unless matching_quoted_post? && matching_quoted_author?",
+        "quote.accept!(approval_uri: @approval_uri)",
+        "if @quote.account_id == @quote.quoted_account_id",
+        "@quote.update(quoted_status: status) if status.present? && !status.reblog?",
+    ] {
+        assert!(
+            verify.contains(evidence),
+            "quote verification drifted: {evidence}"
+        );
+    }
+
+    let quote_request = read(&source.join("app/lib/activitypub/activity/quote_request.rb"));
+    for evidence in [
+        "!quoted_status.distributable? || quoted_status.reblog?",
+        "if StatusPolicy.new(@account, quoted_status).quote?",
+        "status.quote.accept!",
+        "LocalNotificationWorker.perform_async(quoted_status.account_id, status.quote.id, 'Quote', 'quote')",
+        "DistributionWorker.perform_async(status.id, { 'update' => true, 'skip_notifications' => true })",
+    ] {
+        assert!(
+            quote_request.contains(evidence),
+            "QuoteRequest drifted: {evidence}"
+        );
+    }
+
+    let accept = read(&source.join("app/lib/activitypub/activity/accept.rb"));
+    for evidence in [
+        "quote.quoted_account != @account || !quote.status.local? || !quote.pending?",
+        "quote.update!(state: :accepted, approval_uri: approval_uri)",
+        "ActivityPub::StatusUpdateDistributionWorker.perform_async",
+    ] {
+        assert!(
+            accept.contains(evidence),
+            "quote Accept drifted: {evidence}"
+        );
+    }
+    let reject = read(&source.join("app/lib/activitypub/activity/reject.rb"));
+    assert!(
+        reject.contains("return unless quote.quoted_account == @account && quote.status.local?")
+    );
+    assert!(reject.contains("quote.reject!"));
+
+    let update = read(&source.join("app/services/activitypub/process_status_update_service.rb"));
+    for evidence in [
+        "update_quote!",
+        "@status.quote.destroy!",
+        "RevokeQuoteService.new.call(@status.quote)",
+        "def update_quote_approval!",
+    ] {
+        assert!(
+            update.contains(evidence),
+            "quote update drifted: {evidence}"
+        );
+    }
+    let update_spec =
+        read(&source.join("spec/services/activitypub/process_status_update_service_spec.rb"));
+    for evidence in [
+        "when the status removes a verified quote through an implicit update",
+        "it 'does not remove the quote' do",
+        "when the status removes a verified quote through an explicit update",
+        "to change { status.reload.quote }.to(nil)",
+    ] {
+        assert!(
+            update_spec.contains(evidence),
+            "quote update regression drifted: {evidence}"
+        );
+    }
+
+    let delete = read(&source.join("app/lib/activitypub/activity/delete.rb"));
+    for evidence in [
+        "Quote.find_by(approval_uri: object_uri, quoted_account: @account, state: [:pending, :accepted])",
+        "@quote.reject!",
+        "DistributionWorker.perform_async(@quote.status_id, { 'update' => true }) if @quote.status.present?",
+    ] {
+        assert!(
+            delete.contains(evidence),
+            "quote authorization Delete drifted: {evidence}"
+        );
+    }
+    let revoke = read(&source.join("app/services/revoke_quote_service.rb"));
+    for evidence in [
+        "@quote.reject!",
+        "distribute_update!",
+        "distribute_stamp_deletion!",
+        "ActivityPub::DeliveryWorker.push_bulk(inboxes, limit: 1_000)",
+    ] {
+        assert!(
+            revoke.contains(evidence),
+            "quote revoke drifted: {evidence}"
+        );
+    }
+
+    let quote = read(&source.join("app/models/quote.rb"));
+    for evidence in [
+        "after_create_commit :increment_counter_caches!",
+        "after_destroy_commit :decrement_counter_caches!",
+        "after_update_commit :update_counter_caches!",
+        "quoted_status&.increment_count!(:quotes_count)",
+        "quoted_status&.decrement_count!(:quotes_count)",
+    ] {
+        assert!(
+            quote.contains(evidence),
+            "quote counter drifted: {evidence}"
+        );
+    }
+    let note = read(&source.join("app/serializers/activitypub/note_serializer.rb"));
+    for evidence in [
+        "attribute :quote, if: :quote?",
+        "attribute :quote, key: :_misskey_quote, if: :serializable_quote?",
+        "attribute :quote, key: :quote_uri, if: :serializable_quote?",
+        "attribute :quote_authorization, if: :quote_authorization?",
+    ] {
+        assert!(
+            note.contains(evidence),
+            "quote Note output drifted: {evidence}"
+        );
+    }
+    let rest = read(&source.join("app/serializers/rest/status_serializer.rb"));
+    assert!(rest.contains("has_one :quote, key: :quote, serializer: REST::QuoteSerializer"));
+    assert!(rest.contains(":favourites_count, :quotes_count, :edited_at"));
 }

@@ -2,6 +2,64 @@
 
 ## 2026-09-16
 
+- Added bundled-frontend quote-post creation and federation lifecycle support:
+  POST-only `quoted_status_id` parsing and idempotency binding, transactional target
+  policy/visibility/block/direct validation, canonical reblog targets, local accepted
+  and remote pending state, silent access, counters, streams, notifications, and
+  durable QuoteRequest/Accept/Reject/QuoteAuthorization effects. Incoming Notes now
+  reconcile quote aliases, authorization, updates, removal, deletion, and revocation
+  with actor/host/object/instrument bindings and accepted-boundary accounting.
+  Non-author quotes are restricted to distributable public/unlisted targets, and
+  QuoteRequest delivery rechecks the locked live pending relationship so deletion
+  cancels both outbox and unleased durable work without a stale-delivery race.
+  Centralized quote-policy semantics are shared by writes and REST projection.
+  Added exact Mastodon 4.6.5 source contracts, least-privilege quote grants,
+  restored-schema/worker selectors, a Rails-versus-Rust quote lifecycle differential,
+  and an Alice Chromium quote create/reload flow with exact rollback inventory.
+  Signed QuoteAuthorization Deletes retain the verified payload and use the quoting
+  status' forwarding reach before transactional revocation; legacy quote state
+  updates leave counters unchanged. Differential/worker selectors now assert exact
+  semantic quote notification, QuoteRequest, author-stream/update, full rollback,
+  transition-specific Accept/Reject/revoke effects, remote quoting-Note deletion,
+  conflicting replay, and signed forwarding intents; the offline rollback double
+  executes mention-sequence restoration. Focused offline selector/browser/rollback
+  contracts, pinned-source contracts, default-feature Rust tests, all-feature check,
+  and strict Clippy pass.
+  Native Rust commands use a temporary macOS Paperclip compatibility patch that is
+  restored byte-for-byte; restored database, worker, differential, browser, cutover,
+  and peer lanes remain intentionally unrun. The issue stays open pending the
+  requested final heavy sweep.
+
+- Hardened quote parity after independent review: viewer-side domain blocks no longer
+  reject otherwise writable quote targets (explicit account blocks and author-side
+  restrictions remain), while REST disclosure filtering is unchanged. Added the
+  frontend `PUT /api/v1/statuses/:id/interaction_policy` contract with pinned
+  public/followers/nobody validation, ownership/scope checks, no-op suppression,
+  status streams, and independently fenced ActivityPub updates, plus behavioral
+  differential coverage for the frontend revoke route. Remote quoted Tombstones now
+  include Mastodon's ID-less removal form without dereferencing deleted targets.
+  QuoteAuthorization Deletes persist durable URI/actor tombstones before attachment,
+  and stale authorization cannot resurrect rejected or revoked relationships.
+  The focused worker selector now uses the restricted worker-writer role and covers
+  allowed/denied embedded QuoteRequests, Note-before-request rejection, ID-less
+  Tombstone removal, stale authorization replay, and signed scalar-instrument fetch
+  with same-job retry. Scalar imports are reauthorized under the target-status lock
+  before any Note effects. Quote request/decision deliveries carry exact lifecycle
+  identity into account → status → quote locks held through bounded HTTP, recheck
+  domain policy and the exact durable-job lease generation, and cancel only safe
+  unleased/expired terminal work. Malformed delivery metadata dead-letters instead
+  of bypassing the fence; exhausted transient scalar fetches converge to Reject. Heavy
+  restored-schema, worker, differential, browser, cutover, and peer execution remains
+  deferred; no such final-tree pass is claimed. Follow-up review fixed the decision
+  fence's Reject-state discriminator and granted the writer only column-scoped
+  durable-job lease/timestamp `UPDATE` privileges. The final fence now serializes
+  against relationship changes and suppresses delivery after either account blocks
+  the other. The focused worker selector now drives signed QuoteRequest/Reject/Accept
+  HTTP deliveries and reclaims actively leased request/decision jobs after block or
+  terminal transitions to prove wire suppression.
+  Differential source now covers blank/omitted policy defaults, invalid private/reblog
+  validation, and denied revoke nonmutation; those heavy selectors remain unrun.
+
 - Added the complete bounded poll lifecycle used by the bundled Mastodon client:
   transactional poll creation and status idempotency, visibility-authorized show and
   vote routes, exact option/expiry/grapheme validation, serialized duplicate-safe

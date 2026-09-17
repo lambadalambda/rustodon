@@ -1,4 +1,8 @@
 #[cfg(feature = "test-support")]
+#[path = "workers/quote_lifecycle.rs"]
+mod quote_lifecycle;
+
+#[cfg(feature = "test-support")]
 #[path = "workers/reply_emoji_grants.rs"]
 mod reply_emoji_grants;
 

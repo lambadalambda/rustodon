@@ -68,13 +68,121 @@ const REMOTE_MEDIA_CONTENT_TYPES: &[&str] = &["image/jpeg", "image/png", "image/
 const REMOTE_MEDIA_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const NOTIFICATION_CLEANUP_BATCH_SIZE: i64 = 1_000;
 
+fn quote_reference(primary: Option<&str>, fallback: Option<&str>) -> Option<String> {
+    primary
+        .filter(|value| !crate::paperclip::rails_blank(value))
+        .or_else(|| fallback.filter(|value| !crate::paperclip::rails_blank(value)))
+        .map(ToOwned::to_owned)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RemoteQuoteFetchReferences {
+    target_uri: String,
+    approval_uri: Option<String>,
+}
+
+fn remote_uri_reference(value: Option<&Value>) -> Option<&str> {
+    let value = match value? {
+        Value::Array(values) => values.first()?,
+        value => value,
+    };
+    value
+        .as_str()
+        .or_else(|| value.as_object()?.get("id")?.as_str())
+        .filter(|uri| {
+            Url::parse(uri)
+                .ok()
+                .is_some_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
+        })
+}
+
+fn remote_note_quote_fetch_references(object: &Value) -> Option<RemoteQuoteFetchReferences> {
+    let object = object.as_object()?;
+    let quote = ["quote", "_misskey_quote", "quoteUrl", "quoteUri"]
+        .into_iter()
+        .find_map(|field| object.get(field))?;
+    if quote
+        .as_object()
+        .is_some_and(|quote| equals_or_includes(quote.get("type"), "Tombstone"))
+    {
+        return None;
+    }
+    let target_uri = remote_uri_reference(Some(quote))?;
+    let approval_uri = remote_uri_reference(object.get("quoteAuthorization")).map(str::to_owned);
+    Some(RemoteQuoteFetchReferences {
+        target_uri: target_uri.to_owned(),
+        approval_uri,
+    })
+}
+
+fn quote_request_instrument_target_uri(
+    instrument: &Value,
+    actor_uri: &str,
+    instrument_uri: &str,
+) -> Result<String, HandlerFailure> {
+    let object = instrument.as_object().ok_or_else(|| {
+        HandlerFailure::permanent("QuoteRequest instrument is not an embedded object")
+    })?;
+    if !equals_or_includes(object.get("type"), "Note")
+        && !equals_or_includes(object.get("type"), "Question")
+    {
+        return Err(HandlerFailure::permanent(
+            "QuoteRequest instrument is not a Note or Question",
+        ));
+    }
+    if remote_uri_value(object.get("id")) != Some(instrument_uri) {
+        return Err(HandlerFailure::permanent(
+            "QuoteRequest instrument ID does not match the requested URI",
+        ));
+    }
+    validate_note_object(actor_uri, object)
+        .map_err(|_| HandlerFailure::permanent("QuoteRequest instrument is not a valid Note"))?;
+    remote_note_quote_fetch_references(instrument)
+        .map(|references| references.target_uri)
+        .ok_or_else(|| {
+            HandlerFailure::permanent("QuoteRequest instrument has no valid quote target")
+        })
+}
+
+async fn validate_quote_request_instrument(
+    writer: &WriteRepository,
+    instrument: &Value,
+    actor_uri: &str,
+    instrument_uri: &str,
+    target_status_id: i64,
+    origin: &str,
+) -> Result<(), HandlerFailure> {
+    let target_uri = quote_request_instrument_target_uri(instrument, actor_uri, instrument_uri)?;
+    let target_matches = writer
+        .remote_quote_target_matches_status(target_status_id, &target_uri, origin)
+        .await
+        .map_err(|error| {
+            remote_note_write_failure(&error, "QuoteRequest target binding lookup failed")
+        })?;
+    if !target_matches {
+        return Err(HandlerFailure::permanent(
+            "QuoteRequest instrument quote target does not match the requested status",
+        ));
+    }
+    Ok(())
+}
+
+fn quote_decision_allows_follow_fallback(
+    accepted: bool,
+    request_actor_uri: Option<&str>,
+    object_uri: Option<&str>,
+    instrument_uri: Option<&str>,
+) -> bool {
+    accepted && request_actor_uri.is_none() && object_uri.is_none() && instrument_uri.is_none()
+}
+
 async fn activitypub_quote_parts(
     repository: &Repository,
     config: &ActivityPubDeliveryConfig,
     status_id: i64,
 ) -> Result<(Option<String>, Option<String>, Option<String>), HandlerFailure> {
     let Some(target) = repository
-        .activitypub_quote_target(status_id)
+        .activitypub_quote_target_for_delivery(status_id)
         .await
         .map_err(|_| HandlerFailure::retry("status quote lookup failed"))?
     else {
@@ -89,10 +197,7 @@ async fn activitypub_quote_parts(
                 .to_string(),
         )
     } else {
-        target
-            .url
-            .clone()
-            .filter(|url| !crate::paperclip::rails_blank(url))
+        quote_reference(target.url.as_deref(), target.uri.as_deref())
     };
     let quoted_identifier = target.uri.clone().or_else(|| {
         if target.local {
@@ -104,27 +209,28 @@ async fn activitypub_quote_parts(
                 target.id,
             ))
         } else {
-            target
-                .url
-                .clone()
-                .filter(|url| !crate::paperclip::rails_blank(url))
+            quote_reference(target.url.as_deref(), None)
         }
     });
-    let quote_authorization = quoted_identifier.as_ref().and_then(|_| {
-        if target.quoted_account_local {
-            Some(activitypub::local_quote_authorization_url(
-                &config.origin,
-                target.account_id,
-                &target.username,
-                target.id_scheme,
-                target.quote_id,
-            ))
-        } else {
-            target
-                .approval_uri
-                .filter(|uri| !crate::paperclip::rails_blank(uri))
-        }
-    });
+    let quote_authorization = if target.accepted {
+        quoted_identifier.as_ref().and_then(|_| {
+            if target.quoted_account_local {
+                Some(activitypub::local_quote_authorization_url(
+                    &config.origin,
+                    target.account_id,
+                    &target.username,
+                    target.id_scheme,
+                    target.quote_id,
+                ))
+            } else {
+                target
+                    .approval_uri
+                    .filter(|uri| !crate::paperclip::rails_blank(uri))
+            }
+        })
+    } else {
+        None
+    };
     Ok((quoted_url, quoted_identifier, quote_authorization))
 }
 
@@ -496,12 +602,19 @@ impl WorkerExecutor {
             tokio::select! {
                 result = &mut future => break Some(result?),
                 _ = ticker.tick() => {
-                    if !self.queue.renew(
+                    let renewal = self.queue.renew(
                         job.id,
                         &job.lease_owner,
                         job.generation,
                         lease_duration,
-                    ).await? {
+                    );
+                    tokio::pin!(renewal);
+                    let renewed = tokio::select! {
+                        biased;
+                        result = &mut future => break Some(result?),
+                        renewed = &mut renewal => renewed?,
+                    };
+                    if !renewed {
                         // Dropping the future stops a permit waiter or handler that lost its fence
                         // from continuing work under a stale lease.
                         break None;
@@ -556,6 +669,8 @@ impl WorkerExecutor {
 enum StatusUpdateKind {
     Status,
     Poll,
+    Quote,
+    InteractionPolicy,
     StatusRepair,
     PollRepair,
 }
@@ -565,6 +680,8 @@ impl StatusUpdateKind {
         match value {
             "status" => Some(Self::Status),
             "poll" => Some(Self::Poll),
+            "quote" => Some(Self::Quote),
+            "interaction_policy" => Some(Self::InteractionPolicy),
             "status_repair" => Some(Self::StatusRepair),
             "poll_repair" => Some(Self::PollRepair),
             _ => None,
@@ -583,6 +700,8 @@ impl StatusUpdateKind {
         match self {
             Self::Status => "status",
             Self::Poll => "poll",
+            Self::Quote => "quote",
+            Self::InteractionPolicy => "interaction_policy",
             Self::StatusRepair => "status_repair",
             Self::PollRepair => "poll_repair",
         }
@@ -628,11 +747,41 @@ fn status_update_versions(
         _ => return None,
     };
     let update_version = match update_kind {
-        StatusUpdateKind::Status | StatusUpdateKind::StatusRepair => edited_at,
+        StatusUpdateKind::Status
+        | StatusUpdateKind::InteractionPolicy
+        | StatusUpdateKind::StatusRepair => edited_at,
         StatusUpdateKind::Poll => poll_updated_at?,
         StatusUpdateKind::PollRepair => edited_at.max(poll_updated_at?),
+        StatusUpdateKind::Quote => return None,
     };
     Some((edited_at, poll_updated_at, update_version))
+}
+
+fn quote_revision_is_current(
+    current_quote_updated_at: Option<NaiveDateTime>,
+    requested_quote_updated_at_micros: Option<i64>,
+) -> bool {
+    current_quote_updated_at.map(|value| value.and_utc().timestamp_micros())
+        == requested_quote_updated_at_micros
+}
+
+fn quote_update_versions(
+    current_edited_at: NaiveDateTime,
+    current_poll_updated_at: Option<NaiveDateTime>,
+    current_quote_updated_at: Option<NaiveDateTime>,
+    requested_edited_at: Option<NaiveDateTime>,
+    requested_poll_updated_at: Option<NaiveDateTime>,
+    requested_quote_updated_at_micros: Option<i64>,
+    requested_update_version: Option<NaiveDateTime>,
+) -> Option<(NaiveDateTime, Option<NaiveDateTime>, NaiveDateTime)> {
+    (requested_edited_at == Some(current_edited_at)
+        && requested_poll_updated_at == current_poll_updated_at
+        && quote_revision_is_current(current_quote_updated_at, requested_quote_updated_at_micros))
+    .then_some((
+        current_edited_at,
+        current_poll_updated_at,
+        requested_update_version?,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -719,6 +868,15 @@ async fn queue_status_snapshot_repair(
         .map_err(|_| HandlerFailure::retry("poll snapshot repair commit failed"))
 }
 
+struct QuoteRequestDistribution {
+    quote_id: i64,
+    request_uri: String,
+    quoted_status_id: i64,
+    quoted_status_uri: String,
+    quoted_status_url: String,
+    quoted_account_id: i64,
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn distribute_status(
     pool: PgPool,
@@ -727,12 +885,15 @@ async fn distribute_status(
     activity_type: &str,
     edited_at_micros: Option<i64>,
     poll_updated_at_micros: Option<i64>,
+    quote_updated_at_micros: Option<i64>,
     update_kind: Option<&str>,
     update_version_micros: Option<i64>,
     explicit_recipient_ids: &[i64],
+    quote_request: Option<&QuoteRequestDistribution>,
 ) -> Result<(), HandlerFailure> {
+    let is_quote_request = activity_type == "QuoteRequest";
     let is_delete = match activity_type {
-        "Create" | "Update" => false,
+        "Create" | "Update" | "QuoteRequest" => false,
         "Delete" => true,
         _ => {
             return Err(HandlerFailure::permanent(
@@ -740,6 +901,11 @@ async fn distribute_status(
             ));
         }
     };
+    if is_quote_request != quote_request.is_some() {
+        return Err(HandlerFailure::permanent(
+            "status quote-request distribution arguments are invalid",
+        ));
+    }
     let requested_edited_at = edited_at_micros
         .map(|value| {
             DateTime::<Utc>::from_timestamp_micros(value)
@@ -752,6 +918,13 @@ async fn distribute_status(
             DateTime::<Utc>::from_timestamp_micros(value)
                 .map(|timestamp| timestamp.naive_utc())
                 .ok_or_else(|| HandlerFailure::permanent("poll update timestamp is invalid"))
+        })
+        .transpose()?;
+    let requested_update_version = update_version_micros
+        .map(|value| {
+            DateTime::<Utc>::from_timestamp_micros(value)
+                .map(|timestamp| timestamp.naive_utc())
+                .ok_or_else(|| HandlerFailure::permanent("status update version is invalid"))
         })
         .transpose()?;
     let explicit_update_kind = update_kind.is_some();
@@ -793,7 +966,16 @@ async fn distribute_status(
     if status.reblog_of_id.is_some() && activity_type == "Update" {
         return Ok(());
     }
-    let current_edited_at = status.edited_at.unwrap_or(status.updated_at);
+    if status.reblog_of_id.is_some() && is_quote_request {
+        return Err(HandlerFailure::permanent(
+            "quote-request instrument cannot be a reblog",
+        ));
+    }
+    let current_edited_at = if resolved_update_kind == StatusUpdateKind::InteractionPolicy {
+        status.updated_at
+    } else {
+        status.edited_at.unwrap_or(status.updated_at)
+    };
     let (requested_edited_at, requested_poll_updated_at, selected_update_version) = if activity_type
         == "Update"
     {
@@ -806,14 +988,40 @@ async fn distribute_status(
         } else {
             None
         };
-        match status_update_version_decision(
-            current_edited_at,
-            current_poll_updated_at,
-            requested_edited_at,
-            requested_poll_updated_at,
-            resolved_update_kind,
-            explicit_update_kind || resolved_update_kind.is_repair(),
-        ) {
+        let version_decision = if resolved_update_kind == StatusUpdateKind::Quote {
+            let current_quote_updated_at = sqlx::query_scalar::<_, NaiveDateTime>(
+                "SELECT updated_at FROM quotes WHERE status_id = $1 ORDER BY id LIMIT 1",
+            )
+            .bind(status_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|_| HandlerFailure::retry("quote update fence lookup failed"))?;
+            quote_update_versions(
+                current_edited_at,
+                current_poll_updated_at,
+                current_quote_updated_at,
+                requested_edited_at,
+                requested_poll_updated_at,
+                quote_updated_at_micros,
+                requested_update_version,
+            )
+            .map_or(
+                StatusUpdateVersionDecision::Stale,
+                |(edited_at, poll_updated_at, update_version)| {
+                    StatusUpdateVersionDecision::Deliver(edited_at, poll_updated_at, update_version)
+                },
+            )
+        } else {
+            status_update_version_decision(
+                current_edited_at,
+                current_poll_updated_at,
+                requested_edited_at,
+                requested_poll_updated_at,
+                resolved_update_kind,
+                explicit_update_kind || resolved_update_kind.is_repair(),
+            )
+        };
+        match version_decision {
             StatusUpdateVersionDecision::Deliver(edited_at, poll_updated_at, update_version) => {
                 (Some(edited_at), poll_updated_at, Some(update_version))
             }
@@ -1087,7 +1295,15 @@ async fn distribute_status(
             None => None,
         };
         let (quoted_link, quoted_identifier, quote_authorization) =
-            activitypub_quote_parts(&repository, config, status_id).await?;
+            if let Some(quote_request) = quote_request {
+                (
+                    Some(quote_request.quoted_status_url.clone()),
+                    Some(quote_request.quoted_status_uri.clone()),
+                    None,
+                )
+            } else {
+                activitypub_quote_parts(&repository, config, status_id).await?
+            };
         let emojis = repository
             .activitypub_status_emojis(status_id)
             .await
@@ -1122,7 +1338,14 @@ async fn distribute_status(
                 .ok_or_else(|| HandlerFailure::permanent("status poll is missing"))?;
             object = activitypub::question(object, &loaded_poll, Utc::now().naive_utc());
         }
-        if activity_type == "Update" {
+        if let Some(quote_request) = quote_request {
+            activitypub::quote_request_with_uris(
+                &quote_request.request_uri,
+                &activitypub::actor_url(&config.origin, &account),
+                &quote_request.quoted_status_uri,
+                object,
+            )
+        } else if activity_type == "Update" {
             let object_uri = object["id"]
                 .as_str()
                 .ok_or_else(|| HandlerFailure::permanent("status Note has no ID"))?
@@ -1153,40 +1376,45 @@ async fn distribute_status(
         }
     };
     let include_unsafe_reach = is_delete;
-    let follower_ids = if matches!(
-        status.visibility,
-        StatusVisibility::Public | StatusVisibility::Unlisted | StatusVisibility::Private
-    ) {
-        repository
-            .activitypub_remote_follower_ids(status.account_id, include_unsafe_reach)
-            .await
-            .map_err(|_| HandlerFailure::retry("remote follower lookup failed"))?
+    let recipient_ids = if let Some(quote_request) = quote_request {
+        BTreeSet::from([quote_request.quoted_account_id])
     } else {
-        Vec::new()
-    };
-    let mut recipient_ids = follower_ids.into_iter().collect::<BTreeSet<_>>();
-    recipient_ids.extend(explicit_recipient_ids.iter().copied());
-    let reached_account_ids = if status.reblog_of_id.is_some() {
-        repository
-            .activitypub_reblog_target_account_ids(status_id, include_unsafe_reach)
-            .await
-            .map_err(|_| HandlerFailure::retry("reblog target reach lookup failed"))?
-    } else {
-        repository
-            .activitypub_status_reach_account_ids(status_id, include_unsafe_reach)
-            .await
-            .map_err(|_| HandlerFailure::retry("status reach lookup failed"))?
-    };
-    recipient_ids.extend(reached_account_ids);
-    if poll_update {
-        recipient_ids.extend(
+        let follower_ids = if matches!(
+            status.visibility,
+            StatusVisibility::Public | StatusVisibility::Unlisted | StatusVisibility::Private
+        ) {
             repository
-                .activitypub_poll_voter_account_ids(status_id)
+                .activitypub_remote_follower_ids(status.account_id, include_unsafe_reach)
                 .await
-                .map_err(|_| HandlerFailure::retry("poll voter reach lookup failed"))?,
-        );
-    }
-    recipient_ids.extend(mentioned_recipient_ids);
+                .map_err(|_| HandlerFailure::retry("remote follower lookup failed"))?
+        } else {
+            Vec::new()
+        };
+        let mut recipient_ids = follower_ids.into_iter().collect::<BTreeSet<_>>();
+        recipient_ids.extend(explicit_recipient_ids.iter().copied());
+        let reached_account_ids = if status.reblog_of_id.is_some() {
+            repository
+                .activitypub_reblog_target_account_ids(status_id, include_unsafe_reach)
+                .await
+                .map_err(|_| HandlerFailure::retry("reblog target reach lookup failed"))?
+        } else {
+            repository
+                .activitypub_status_reach_account_ids(status_id, include_unsafe_reach)
+                .await
+                .map_err(|_| HandlerFailure::retry("status reach lookup failed"))?
+        };
+        recipient_ids.extend(reached_account_ids);
+        if poll_update {
+            recipient_ids.extend(
+                repository
+                    .activitypub_poll_voter_account_ids(status_id)
+                    .await
+                    .map_err(|_| HandlerFailure::retry("poll voter reach lookup failed"))?,
+            );
+        }
+        recipient_ids.extend(mentioned_recipient_ids);
+        recipient_ids
+    };
     let mut inboxes = BTreeMap::new();
     for recipient_id in recipient_ids {
         let Some(follower) = repository
@@ -1212,7 +1440,7 @@ async fn distribute_status(
         {
             continue;
         }
-        let inbox_url = if follower.shared_inbox_url.is_empty() {
+        let inbox_url = if is_quote_request || follower.shared_inbox_url.is_empty() {
             follower.inbox_url
         } else {
             follower.shared_inbox_url
@@ -1223,7 +1451,7 @@ async fn distribute_status(
                 .or_insert_with(|| domain.to_owned());
         }
     }
-    if status.visibility == StatusVisibility::Public {
+    if !is_quote_request && status.visibility == StatusVisibility::Public {
         let relay_inboxes = repository
             .activitypub_relay_inboxes()
             .await
@@ -1261,6 +1489,53 @@ async fn distribute_status(
     let activity_id = activity["id"]
         .as_str()
         .ok_or_else(|| HandlerFailure::permanent("status activity has no ID"))?;
+    if is_quote_request {
+        let quoted_status_id = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT quoted_status_id FROM quotes
+              WHERE id = $1 AND status_id = $2 AND quoted_status_id = $3
+                AND state = 0 AND activity_uri = $4
+              FOR UPDATE",
+        )
+        .bind(
+            quote_request
+                .expect("QuoteRequest has distribution metadata")
+                .quote_id,
+        )
+        .bind(status_id)
+        .bind(
+            quote_request
+                .expect("QuoteRequest has distribution metadata")
+                .quoted_status_id,
+        )
+        .bind(activity_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| HandlerFailure::retry("quote-request lifecycle fence failed"))?
+        .flatten();
+        let relationship_is_live = if let Some(quoted_status_id) = quoted_status_id {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (
+                   SELECT 1 FROM statuses quoting
+                   JOIN statuses quoted ON quoted.id = $2
+                  WHERE quoting.id = $1 AND quoting.local IS TRUE
+                    AND quoting.deleted_at IS NULL AND quoted.deleted_at IS NULL)",
+            )
+            .bind(status_id)
+            .bind(quoted_status_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| HandlerFailure::retry("quote-request status fence failed"))?
+        } else {
+            false
+        };
+        if !relationship_is_live {
+            transaction
+                .commit()
+                .await
+                .map_err(|_| HandlerFailure::retry("quote-request fence commit failed"))?;
+            return Ok(());
+        }
+    }
     for (inbox_url, remote_domain) in inboxes {
         let logical_key = match activity_type {
             "Create" => delivery_logical_key(status_id, &inbox_url),
@@ -1271,6 +1546,9 @@ async fn distribute_status(
                 &inbox_url,
             ),
             "Delete" => delete_delivery_logical_key(status_id, &inbox_url),
+            "QuoteRequest" => {
+                format!("activitypub:quote-request:{activity_id}:{inbox_url}")
+            }
             _ => unreachable!("activity type was validated above"),
         };
         let delivery = JobSpec::new(
@@ -1286,6 +1564,12 @@ async fn distribute_status(
                 "update_version_micros": selected_update_version_micros,
                 "edited_at_micros": requested_edited_at.map(|value| value.and_utc().timestamp_micros()),
                 "poll_updated_at_micros": requested_poll_updated_at.map(|value| value.and_utc().timestamp_micros()),
+                "quote_updated_at_micros": quote_updated_at_micros,
+                "quote_delivery_kind": is_quote_request.then_some("request"),
+                "quote_request_uri": quote_request.map(|request| request.request_uri.as_str()),
+                "quote_id": quote_request.map(|request| request.quote_id),
+                "quoting_status_id": is_quote_request.then_some(status_id),
+                "quoted_status_id": quote_request.map(|request| request.quoted_status_id),
                 "remote_domain": remote_domain
             }),
         )
@@ -2008,6 +2292,7 @@ async fn process_notification_job(pool: PgPool, arguments: &Value) -> Result<(),
         Some("poll") => NotificationActivity::Poll { id: activity_id },
         Some("update") => NotificationActivity::Update { id: activity_id },
         Some("quoted_update") => NotificationActivity::QuotedUpdate { id: activity_id },
+        Some("quote") => NotificationActivity::Quote { id: activity_id },
         Some("admin.report") => NotificationActivity::AdminReport { id: activity_id },
         Some("AccountWarning") => NotificationActivity::ModerationWarning { id: activity_id },
         _ => {
@@ -2256,7 +2541,9 @@ fn status_update_delivery_is_current(
         return false;
     }
     let expected_update_version = match update_kind {
-        StatusUpdateKind::Status | StatusUpdateKind::StatusRepair => current_edited_at,
+        StatusUpdateKind::Status
+        | StatusUpdateKind::InteractionPolicy
+        | StatusUpdateKind::StatusRepair => current_edited_at,
         StatusUpdateKind::Poll => {
             let Some(poll_updated_at) = current_poll_updated_at else {
                 return false;
@@ -2268,6 +2555,15 @@ fn status_update_delivery_is_current(
                 return false;
             };
             current_edited_at.max(poll_updated_at)
+        }
+        StatusUpdateKind::Quote => {
+            let Some(version_micros) = requested_update_version_micros else {
+                return false;
+            };
+            let Some(version) = DateTime::<Utc>::from_timestamp_micros(version_micros) else {
+                return false;
+            };
+            version.naive_utc()
         }
     };
     if requested_update_version_micros != Some(expected_update_version.and_utc().timestamp_micros())
@@ -2310,9 +2606,12 @@ fn complete_status_update_delivery_kind(
         return None;
     }
     let expected_update_version_micros = match update_kind {
-        StatusUpdateKind::Status | StatusUpdateKind::StatusRepair => edited_at_micros,
+        StatusUpdateKind::Status
+        | StatusUpdateKind::InteractionPolicy
+        | StatusUpdateKind::StatusRepair => edited_at_micros,
         StatusUpdateKind::Poll => requested_poll_updated_at_micros?,
         StatusUpdateKind::PollRepair => edited_at_micros.max(requested_poll_updated_at_micros?),
+        StatusUpdateKind::Quote => requested_update_version_micros?,
     };
     if requested_update_version_micros != Some(expected_update_version_micros)
         || published_version_micros != Some(expected_update_version_micros)
@@ -2345,14 +2644,385 @@ fn inferred_current_repair_delivery_kind(
     .then_some(update_kind)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuoteDeliveryKind {
+    Request,
+    Accept,
+    Reject,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct QuoteDeliveryIdentity {
+    kind: QuoteDeliveryKind,
+    request_uri: String,
+    quote_id: Option<i64>,
+    quoting_status_id: Option<i64>,
+    quoted_status_id: i64,
+}
+
+fn quote_delivery_identity(
+    arguments: &Value,
+    body: &Value,
+) -> Result<Option<QuoteDeliveryIdentity>, ()> {
+    let body_type = body.get("type").and_then(Value::as_str);
+    let nested_type = body
+        .get("object")
+        .and_then(|object| object.get("type"))
+        .and_then(Value::as_str);
+    let body_kind = match (body_type, nested_type) {
+        (Some("QuoteRequest"), _) => Some(QuoteDeliveryKind::Request),
+        (Some("Accept"), Some("QuoteRequest")) => Some(QuoteDeliveryKind::Accept),
+        (Some("Reject"), Some("QuoteRequest")) => Some(QuoteDeliveryKind::Reject),
+        _ => None,
+    };
+    let metadata_kind = match arguments.get("quote_delivery_kind").and_then(Value::as_str) {
+        Some("request") => Some(QuoteDeliveryKind::Request),
+        Some("accept") => Some(QuoteDeliveryKind::Accept),
+        Some("reject") => Some(QuoteDeliveryKind::Reject),
+        Some(_) => return Err(()),
+        None => None,
+    };
+    let Some(kind) = body_kind else {
+        return if metadata_kind.is_some() {
+            Err(())
+        } else {
+            Ok(None)
+        };
+    };
+    if metadata_kind != Some(kind) {
+        return Err(());
+    }
+    let request_uri = arguments
+        .get("quote_request_uri")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or(())?;
+    let body_request_uri = match kind {
+        QuoteDeliveryKind::Request => body.get("id").and_then(Value::as_str),
+        QuoteDeliveryKind::Accept | QuoteDeliveryKind::Reject => body
+            .get("object")
+            .and_then(|object| object.get("id"))
+            .and_then(Value::as_str),
+    };
+    if body_request_uri != Some(request_uri)
+        || (kind == QuoteDeliveryKind::Accept && body.get("result").is_none_or(Value::is_null))
+        || (kind == QuoteDeliveryKind::Reject
+            && body.get("result").is_some_and(|value| !value.is_null()))
+    {
+        return Err(());
+    }
+    let quote_id = arguments.get("quote_id").and_then(Value::as_i64);
+    let quoting_status_id = arguments.get("quoting_status_id").and_then(Value::as_i64);
+    let quoted_status_id = arguments
+        .get("quoted_status_id")
+        .and_then(Value::as_i64)
+        .ok_or(())?;
+    match kind {
+        QuoteDeliveryKind::Request | QuoteDeliveryKind::Accept
+            if quote_id.is_none() || quoting_status_id.is_none() =>
+        {
+            return Err(());
+        }
+        QuoteDeliveryKind::Reject if quote_id.is_some() != quoting_status_id.is_some() => {
+            return Err(());
+        }
+        _ => {}
+    }
+    Ok(Some(QuoteDeliveryIdentity {
+        kind,
+        request_uri: request_uri.to_owned(),
+        quote_id,
+        quoting_status_id,
+        quoted_status_id,
+    }))
+}
+
+fn quote_body_uri(value: Option<&Value>) -> Option<&str> {
+    remote_uri_value(value).filter(|value| !value.is_empty())
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn quote_delivery_is_current_and_locked(
+    transaction: &mut Transaction<'_, Postgres>,
+    identity: &QuoteDeliveryIdentity,
+    body: &Value,
+    source_account_id: i64,
+    source_actor_uri: &str,
+    inbox_url: &str,
+    configured_remote_domain: Option<&str>,
+    origin: &str,
+) -> Result<bool, sqlx::Error> {
+    if quote_body_uri(body.get("actor")) != Some(source_actor_uri) {
+        return Ok(false);
+    }
+    let request = if identity.kind == QuoteDeliveryKind::Request {
+        body
+    } else {
+        body.get("object").unwrap_or(&Value::Null)
+    };
+    let Some(request_actor_uri) = quote_body_uri(request.get("actor")) else {
+        return Ok(false);
+    };
+    let Some(request_target_uri) = quote_body_uri(request.get("object")) else {
+        return Ok(false);
+    };
+    let Some(request_instrument_uri) = quote_body_uri(request.get("instrument")) else {
+        return Ok(false);
+    };
+    let mut status_ids = vec![identity.quoted_status_id];
+    if let Some(quoting_status_id) = identity.quoting_status_id {
+        status_ids.push(quoting_status_id);
+    }
+    status_ids.sort_unstable();
+    status_ids.dedup();
+    let mut account_ids = sqlx::query_scalar::<_, i64>(
+        "SELECT DISTINCT account_id FROM statuses WHERE id = ANY($1::bigint[]) ORDER BY account_id",
+    )
+    .bind(&status_ids)
+    .fetch_all(&mut **transaction)
+    .await?;
+    account_ids.push(source_account_id);
+    let requester_id = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM accounts WHERE uri = $1 AND domain IS NOT NULL ORDER BY id LIMIT 1",
+    )
+    .bind(request_actor_uri)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if let Some(requester_id) = requester_id {
+        account_ids.push(requester_id);
+    }
+    let peer_account_id = if identity.kind == QuoteDeliveryKind::Request {
+        sqlx::query_scalar::<_, i64>("SELECT account_id FROM statuses WHERE id = $1")
+            .bind(identity.quoted_status_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+    } else {
+        requester_id
+    };
+    let Some(peer_account_id) = peer_account_id.filter(|id| *id != source_account_id) else {
+        return Ok(false);
+    };
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock( \
+           hashtextextended(LEAST($1, $2)::text || ':' || GREATEST($1, $2)::text, 0))",
+    )
+    .bind(source_account_id)
+    .bind(peer_account_id)
+    .execute(&mut **transaction)
+    .await?;
+    account_ids.sort_unstable();
+    account_ids.dedup();
+    sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM accounts WHERE id = ANY($1::bigint[]) ORDER BY id FOR SHARE",
+    )
+    .bind(&account_ids)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let locked_status_ids = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM statuses WHERE id = ANY($1::bigint[]) ORDER BY id FOR SHARE",
+    )
+    .bind(&status_ids)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if locked_status_ids.len() != status_ids.len() {
+        return Ok(false);
+    }
+    if sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS ( \
+           SELECT 1 FROM blocks \
+           WHERE (account_id = $1 AND target_account_id = $2) \
+              OR (account_id = $2 AND target_account_id = $1))",
+    )
+    .bind(source_account_id)
+    .bind(peer_account_id)
+    .fetch_one(&mut **transaction)
+    .await?
+    {
+        return Ok(false);
+    }
+    let origin = origin.trim_end_matches('/');
+    match identity.kind {
+        QuoteDeliveryKind::Request => {
+            let Some(quote_id) = identity.quote_id else {
+                return Ok(false);
+            };
+            let Some(quoting_status_id) = identity.quoting_status_id else {
+                return Ok(false);
+            };
+            let row = sqlx::query_as::<_, (bool, bool, String, String, String, String)>(
+                "SELECT \
+                   ($7 = quoting.uri OR $7 = quoting.url OR \
+                    $7 = $10 || '/actor/statuses/' || quoting.id::text OR \
+                    $7 = $10 || '/@' || source.username || '/' || quoting.id::text OR \
+                    $7 = $10 || '/users/' || source.username || '/statuses/' || quoting.id::text OR \
+                    $7 = $10 || '/ap/users/' || source.id::text || '/statuses/' || quoting.id::text), \
+                   ($8 = quoted.uri OR $8 = quoted.url), target.uri, target.inbox_url, \
+                   target.shared_inbox_url, target.domain \
+                 FROM quotes quote \
+                 JOIN statuses quoting ON quoting.id = quote.status_id \
+                 JOIN accounts source ON source.id = quoting.account_id \
+                 JOIN statuses quoted ON quoted.id = quote.quoted_status_id \
+                 JOIN accounts target ON target.id = quoted.account_id \
+                WHERE quote.id = $1 AND quote.status_id = $2 AND quote.quoted_status_id = $3 \
+                  AND quote.activity_uri = $4 AND quote.state = 0 \
+                  AND quote.approval_uri IS NULL AND quoting.deleted_at IS NULL \
+                  AND quoted.deleted_at IS NULL AND quoting.local IS TRUE \
+                  AND quoting.account_id = $5 AND source.domain IS NULL \
+                  AND source.suspended_at IS NULL \
+                  AND target.domain IS NOT NULL AND target.protocol = 1 \
+                  AND target.suspended_at IS NULL \
+                  AND quote.quoted_account_id = target.id AND $6 = $9 \
+                FOR SHARE OF quote",
+            )
+            .bind(quote_id)
+            .bind(quoting_status_id)
+            .bind(identity.quoted_status_id)
+            .bind(&identity.request_uri)
+            .bind(source_account_id)
+            .bind(request_actor_uri)
+            .bind(request_instrument_uri)
+            .bind(request_target_uri)
+            .bind(source_actor_uri)
+            .bind(origin)
+            .fetch_optional(&mut **transaction)
+            .await?;
+            Ok(row.is_some_and(
+                |(instrument_matches, target_matches, _, direct_inbox, shared_inbox, domain)| {
+                    instrument_matches
+                        && target_matches
+                        && (inbox_url == direct_inbox || inbox_url == shared_inbox)
+                        && configured_remote_domain.is_none_or(|value| value == domain)
+                },
+            ))
+        }
+        QuoteDeliveryKind::Accept | QuoteDeliveryKind::Reject
+            if identity.quote_id.is_some() && identity.quoting_status_id.is_some() =>
+        {
+            let expected_state = if identity.kind == QuoteDeliveryKind::Accept {
+                1
+            } else {
+                2
+            };
+            let row = sqlx::query_as::<_, (bool, bool, String, String, String, String)>(
+                "SELECT ($7 = instrument.uri OR $7 = instrument.url), \
+                        ($8 = target.uri OR $8 = target.url OR \
+                         $8 = $10 || '/actor/statuses/' || target.id::text OR \
+                         $8 = $10 || '/@' || source.username || '/' || target.id::text OR \
+                         $8 = $10 || '/users/' || source.username || '/statuses/' || target.id::text OR \
+                         $8 = $10 || '/ap/users/' || source.id::text || '/statuses/' || target.id::text), \
+                        requester.uri, requester.inbox_url, requester.shared_inbox_url, requester.domain \
+                   FROM quotes quote \
+                   JOIN statuses instrument ON instrument.id = quote.status_id \
+                   JOIN accounts requester ON requester.id = instrument.account_id \
+                   JOIN statuses target ON target.id = quote.quoted_status_id \
+                   JOIN accounts source ON source.id = target.account_id \
+                  WHERE quote.id = $1 AND quote.status_id = $2 AND quote.quoted_status_id = $3 \
+                    AND quote.activity_uri = $4 \
+                    AND (($11 = 1 AND quote.state = 1) \
+                      OR ($11 = 2 AND quote.state IN (2, 3))) \
+                    AND quote.approval_uri IS NULL AND quote.quoted_account_id = $5 \
+                    AND instrument.deleted_at IS NULL AND instrument.local IS NOT TRUE \
+                    AND target.deleted_at IS NULL AND target.local IS TRUE \
+                    AND target.account_id = $5 AND source.domain IS NULL \
+                    AND source.suspended_at IS NULL \
+                    AND requester.domain IS NOT NULL AND requester.protocol = 1 \
+                    AND requester.suspended_at IS NULL AND $6 = $9 \
+                  FOR SHARE OF quote",
+            )
+            .bind(identity.quote_id.expect("checked above"))
+            .bind(identity.quoting_status_id.expect("checked above"))
+            .bind(identity.quoted_status_id)
+            .bind(&identity.request_uri)
+            .bind(source_account_id)
+            .bind(request_actor_uri)
+            .bind(request_instrument_uri)
+            .bind(request_target_uri)
+            .bind(source_actor_uri)
+            .bind(origin)
+            .bind(expected_state)
+            .fetch_optional(&mut **transaction)
+            .await?;
+            let Some((
+                instrument_matches,
+                target_matches,
+                requester_uri,
+                direct_inbox,
+                shared_inbox,
+                domain,
+            )) = row
+            else {
+                return Ok(false);
+            };
+            if !instrument_matches
+                || !target_matches
+                || request_actor_uri != requester_uri
+                || (inbox_url != direct_inbox && inbox_url != shared_inbox)
+                || configured_remote_domain.is_some_and(|value| value != domain)
+            {
+                return Ok(false);
+            }
+            if identity.kind == QuoteDeliveryKind::Accept {
+                let expected_authorization = format!(
+                    "{}/quote_authorizations/{quote_id}",
+                    source_actor_uri.trim_end_matches('/'),
+                    quote_id = identity.quote_id.expect("checked above")
+                );
+                if quote_body_uri(body.get("result")) != Some(expected_authorization.as_str()) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        QuoteDeliveryKind::Reject => {
+            let row = sqlx::query_as::<_, (bool, String, String, String, String)>(
+                "SELECT ($3 = target.uri OR $3 = target.url OR \
+                         $3 = $5 || '/actor/statuses/' || target.id::text OR \
+                         $3 = $5 || '/@' || source.username || '/' || target.id::text OR \
+                         $3 = $5 || '/users/' || source.username || '/statuses/' || target.id::text OR \
+                         $3 = $5 || '/ap/users/' || source.id::text || '/statuses/' || target.id::text), \
+                        requester.uri, requester.inbox_url, requester.shared_inbox_url, requester.domain \
+                   FROM statuses target \
+                   JOIN accounts source ON source.id = target.account_id \
+                   JOIN accounts requester ON requester.uri = $4 AND requester.domain IS NOT NULL \
+                    AND requester.protocol = 1 AND requester.suspended_at IS NULL \
+                  WHERE target.id = $1 AND target.account_id = $2 \
+                    AND target.deleted_at IS NULL AND target.local IS TRUE \
+                    AND source.domain IS NULL AND source.suspended_at IS NULL \
+                  ORDER BY requester.id LIMIT 1",
+            )
+            .bind(identity.quoted_status_id)
+            .bind(source_account_id)
+            .bind(request_target_uri)
+            .bind(request_actor_uri)
+            .bind(origin)
+            .fetch_optional(&mut **transaction)
+            .await?;
+            Ok(row.is_some_and(
+                |(target_matches, requester_uri, direct_inbox, shared_inbox, domain)| {
+                    target_matches
+                        && request_actor_uri == requester_uri
+                        && (inbox_url == direct_inbox || inbox_url == shared_inbox)
+                        && configured_remote_domain.is_none_or(|value| value == domain)
+                        && Url::parse(request_instrument_uri).is_ok_and(|instrument| {
+                            Url::parse(request_actor_uri)
+                                .is_ok_and(|actor| same_url_origin(&instrument, &actor))
+                        })
+                },
+            ))
+        }
+        QuoteDeliveryKind::Accept => Ok(false),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn deliver_activity(
     pool: PgPool,
     operational_pool: PgPool,
     config: &ActivityPubDeliveryConfig,
     fetcher: &RemoteFetcher,
-    arguments: &Value,
+    job: &ClaimedJob,
 ) -> Result<(), HandlerFailure> {
+    let arguments = &job.arguments;
     let status_id = arguments.get("status_id").and_then(Value::as_i64);
     let source_account_id = arguments
         .get("source_account_id")
@@ -2370,12 +3040,20 @@ async fn deliver_activity(
             "delivery job activity must be a JSON object",
         ));
     }
+    let Ok(quote_delivery_identity) = quote_delivery_identity(arguments, body_value) else {
+        return Err(HandlerFailure::permanent(
+            "quote delivery metadata does not match its activity",
+        ));
+    };
     let body = serde_json::to_vec(body_value)
         .map_err(|_| HandlerFailure::permanent("delivery activity could not be serialized"))?;
     let repository = Repository::from_pool(pool.clone());
     let delivery_edited_at_micros = arguments.get("edited_at_micros").and_then(Value::as_i64);
     let delivery_poll_updated_at_micros = arguments
         .get("poll_updated_at_micros")
+        .and_then(Value::as_i64);
+    let delivery_quote_updated_at_micros = arguments
+        .get("quote_updated_at_micros")
         .and_then(Value::as_i64);
     let delivery_update_version_micros = arguments
         .get("update_version_micros")
@@ -2470,8 +3148,24 @@ async fn deliver_activity(
         } else {
             None
         };
-        let current_edited_at = status.edited_at.unwrap_or(status.updated_at);
+        let current_edited_at = if delivery_update_kind == Some("interaction_policy") {
+            status.updated_at
+        } else {
+            status.edited_at.unwrap_or(status.updated_at)
+        };
         let current_poll_updated_at = current_poll.map(|(_, updated_at)| updated_at);
+        let quote_delivery_is_current = if delivery_update_kind == Some("quote") {
+            let current_quote_updated_at = sqlx::query_scalar::<_, NaiveDateTime>(
+                "SELECT updated_at FROM quotes WHERE status_id = $1 ORDER BY id LIMIT 1",
+            )
+            .bind(status.id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|_| HandlerFailure::retry("quote delivery fence lookup failed"))?;
+            quote_revision_is_current(current_quote_updated_at, delivery_quote_updated_at_micros)
+        } else {
+            true
+        };
         let complete_delivery_kind = complete_status_update_delivery_kind(
             delivery_update_kind,
             current_poll.is_some(),
@@ -2489,19 +3183,23 @@ async fn deliver_activity(
                 delivery_published_version_micros,
             )
         });
-        let delivery_is_current = complete_delivery_kind.is_some_and(|delivery_kind| {
-            status_update_delivery_is_current(
-                delivery_kind,
-                body_value["id"].as_str(),
-                &object_uri,
-                current_edited_at,
-                current_poll_updated_at,
-                delivery_edited_at_micros,
-                delivery_poll_updated_at_micros,
-                delivery_update_version_micros,
-            )
-        }) || inferred_repair_kind.flatten().is_some();
+        let delivery_is_current = quote_delivery_is_current
+            && (complete_delivery_kind.is_some_and(|delivery_kind| {
+                status_update_delivery_is_current(
+                    delivery_kind,
+                    body_value["id"].as_str(),
+                    &object_uri,
+                    current_edited_at,
+                    current_poll_updated_at,
+                    delivery_edited_at_micros,
+                    delivery_poll_updated_at_micros,
+                    delivery_update_version_micros,
+                )
+            }) || inferred_repair_kind.flatten().is_some());
         if !delivery_is_current {
+            if delivery_update_kind == Some("quote") {
+                return Ok(());
+            }
             queue_status_snapshot_repair(
                 &pool,
                 status.id,
@@ -2518,10 +3216,8 @@ async fn deliver_activity(
         .as_ref()
         .filter(|key| key.is_present())
         .ok_or_else(|| HandlerFailure::permanent("delivery source has no private key"))?;
-    let key_id = format!(
-        "{}#main-key",
-        activitypub::actor_url(&config.origin, &source_account)
-    );
+    let source_actor_uri = activitypub::actor_url(&config.origin, &source_account);
+    let key_id = format!("{source_actor_uri}#main-key");
     let signer = HttpSignatureSigner {
         key_id: &key_id,
         private_key_pem: private_key.as_str(),
@@ -2548,7 +3244,94 @@ async fn deliver_activity(
             "remote delivery domain is cooling down",
         ));
     }
-    let delivery = if is_delete && status_id.is_none() {
+    let delivery = if let Some(identity) = quote_delivery_identity.as_ref() {
+        let mut transaction = pool
+            .begin()
+            .await
+            .map_err(|_| HandlerFailure::retry("quote delivery fence transaction failed"))?;
+        let current = quote_delivery_is_current_and_locked(
+            &mut transaction,
+            identity,
+            body_value,
+            source_account_id,
+            &source_actor_uri,
+            inbox_url.as_str(),
+            configured_remote_domain.as_deref(),
+            config.origin.as_str(),
+        )
+        .await
+        .map_err(|_| HandlerFailure::retry("quote delivery fence lookup failed"))?;
+        if !current {
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| HandlerFailure::retry("quote delivery fence rollback failed"))?;
+            return Ok(());
+        }
+        if !WriteRepository::remote_domain_allowed_in_transaction(
+            &mut transaction,
+            policy_domain,
+            config.limited_federation,
+        )
+        .await
+        .map_err(|_| HandlerFailure::retry("quote delivery policy fence failed"))?
+        {
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| HandlerFailure::retry("quote delivery fence rollback failed"))?;
+            return Ok(());
+        }
+        let lease_fenced = sqlx::query(
+            "UPDATE rustodon.durable_jobs \
+                SET lease_expires_at = GREATEST(lease_expires_at, \
+                    clock_timestamp() + interval '60 seconds'), \
+                    updated_at = clock_timestamp() \
+              WHERE id = $1 AND lease_owner = $2 AND lease_generation = $3 \
+                AND dead_at IS NULL AND lease_expires_at > clock_timestamp()",
+        )
+        .bind(job.id)
+        .bind(&job.lease_owner)
+        .bind(job.generation)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| HandlerFailure::retry("quote delivery lease fence failed"))?
+        .rows_affected()
+            == 1;
+        if !lease_fenced {
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| HandlerFailure::retry("quote delivery fence rollback failed"))?;
+            return Ok(());
+        }
+        #[cfg(feature = "test-support")]
+        let delivery = if let Some(endpoint) = config.remote_delivery_endpoint {
+            fetcher
+                .post_signed_json_for_test_endpoint(inbox_url.clone(), &body, &signer, endpoint)
+                .await
+        } else {
+            fetcher
+                .post_signed_json(inbox_url.clone(), &body, &signer)
+                .await
+        };
+        #[cfg(not(feature = "test-support"))]
+        let delivery = fetcher
+            .post_signed_json(inbox_url.clone(), &body, &signer)
+            .await;
+        if delivery.is_ok() {
+            transaction
+                .commit()
+                .await
+                .map_err(|_| HandlerFailure::retry("quote delivery fence commit failed"))?;
+        } else {
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| HandlerFailure::retry("quote delivery fence rollback failed"))?;
+        }
+        delivery
+    } else if is_delete && status_id.is_none() {
         let writer = WriteRepository::from_pool(pool.clone());
         let delivery = writer
             .with_account_lock(source_account_id, || async {
@@ -3025,6 +3808,89 @@ fn remote_note_fetch_failure(error: &RemoteFetchError) -> HandlerFailure {
     }
 }
 
+fn remote_quote_request_fetch_failure(error: &RemoteFetchError) -> HandlerFailure {
+    match error {
+        RemoteFetchError::UnexpectedStatus(status)
+            if *status == StatusCode::NOT_FOUND
+                || *status == StatusCode::REQUEST_TIMEOUT
+                || *status == StatusCode::TOO_MANY_REQUESTS
+                || status.is_server_error() =>
+        {
+            HandlerFailure::retry(format!(
+                "QuoteRequest instrument is temporarily unavailable: {error}"
+            ))
+        }
+        RemoteFetchError::UnexpectedStatus(_) => HandlerFailure::permanent(format!(
+            "QuoteRequest instrument fetch was rejected: {error}"
+        )),
+        RemoteFetchError::NoAddresses
+        | RemoteFetchError::Dns
+        | RemoteFetchError::Client
+        | RemoteFetchError::Request
+        | RemoteFetchError::BodyRead
+        | RemoteFetchError::DomainBudgetExceeded => {
+            HandlerFailure::retry(format!("QuoteRequest instrument fetch failed: {error}"))
+        }
+        RemoteFetchError::InvalidUrl
+        | RemoteFetchError::BlockedAddress(_)
+        | RemoteFetchError::Redirect
+        | RemoteFetchError::TooManyRedirects
+        | RemoteFetchError::MissingContentType
+        | RemoteFetchError::UnsupportedContentType
+        | RemoteFetchError::UnsupportedEncoding
+        | RemoteFetchError::BodyTooLarge
+        | RemoteFetchError::InvalidRepresentation
+        | RemoteFetchError::IdentityMismatch
+        | RemoteFetchError::OriginMismatch
+        | RemoteFetchError::PolicyDenied
+        | RemoteFetchError::Signing => {
+            HandlerFailure::permanent(format!("QuoteRequest instrument fetch is invalid: {error}"))
+        }
+    }
+}
+
+async fn fetch_quote_request_instrument(
+    repository: &Repository,
+    config: &ActivityPubDeliveryConfig,
+    fetcher: &RemoteFetcher,
+    target_account_id: i64,
+    instrument_uri: &str,
+) -> Result<Value, HandlerFailure> {
+    let parsed_instrument = Url::parse(instrument_uri)
+        .map_err(|_| HandlerFailure::permanent("QuoteRequest instrument URL is invalid"))?;
+    let signer_account = repository
+        .account(target_account_id)
+        .await
+        .map_err(|_| HandlerFailure::retry("QuoteRequest fetch signer lookup failed"))?
+        .filter(|account| account.domain.is_none())
+        .ok_or_else(|| HandlerFailure::permanent("QuoteRequest fetch signer is unavailable"))?;
+    let private_key = signer_account
+        .private_key
+        .as_ref()
+        .filter(|key| key.is_present())
+        .ok_or_else(|| HandlerFailure::permanent("QuoteRequest fetch signer has no private key"))?;
+    let signer_key_id = format!(
+        "{}#main-key",
+        activitypub::actor_url(&config.origin, &signer_account)
+    );
+    let signer = HttpSignatureSigner {
+        key_id: &signer_key_id,
+        private_key_pem: private_key.as_str(),
+    };
+    #[cfg(feature = "test-support")]
+    let fetcher = fetcher
+        .clone()
+        .with_test_endpoint(config.remote_fetch_endpoint);
+    #[cfg(not(feature = "test-support"))]
+    let fetcher = fetcher.clone();
+    let response = fetcher
+        .get_signed(parsed_instrument, THREAD_ACTIVITYPUB_CONTENT_TYPES, &signer)
+        .await
+        .map_err(|error| remote_quote_request_fetch_failure(&error))?;
+    serde_json::from_slice(&response.body)
+        .map_err(|_| HandlerFailure::permanent("QuoteRequest instrument JSON is invalid"))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn process_activitypub_note_resolution(
     pool: PgPool,
@@ -3078,6 +3944,7 @@ async fn process_activitypub_note_resolution(
     }
     validate_create_binding(activity_uri, actor_uri, object_uri)?;
     let delivery_target_account_id = parse_delivery_target_account_id(arguments)?;
+    let repository = Repository::from_pool(pool.clone());
     let writer = WriteRepository::from_pool(pool.clone());
     let resolved = writer
         .remote_note_reference_is_resolved(source_account_id, actor_uri, object_uri)
@@ -3085,32 +3952,18 @@ async fn process_activitypub_note_resolution(
         .map_err(|error| {
             remote_note_write_failure(&error, "remote Note resolution state lookup failed")
         })?;
-    if resolved {
-        if let Some(delivery_target_account_id) = delivery_target_account_id {
-            writer
-                .ensure_remote_note_reference_delivery(
-                    source_account_id,
-                    actor_uri,
-                    object_uri,
-                    delivery_target_account_id,
-                )
-                .await
-                .map_err(|error| {
-                    remote_note_write_failure(&error, "remote Note delivery target repair failed")
-                })?;
-        }
-        if activity
-            .get("signature")
-            .is_some_and(|signature| !signature.is_null())
-        {
-            writer
-                .record_remote_note_reference_forwarding(actor_uri, object_uri, activity)
-                .await
-                .map_err(|error| {
-                    remote_note_write_failure(&error, "resolved remote Note forwarding failed")
-                })?;
-        }
-        return Ok(());
+    if resolved && let Some(delivery_target_account_id) = delivery_target_account_id {
+        writer
+            .ensure_remote_note_reference_delivery(
+                source_account_id,
+                actor_uri,
+                object_uri,
+                delivery_target_account_id,
+            )
+            .await
+            .map_err(|error| {
+                remote_note_write_failure(&error, "remote Note delivery target repair failed")
+            })?;
     }
     let target = Url::parse(object_uri)
         .map_err(|_| HandlerFailure::permanent("remote Create object URI is invalid"))?;
@@ -3121,7 +3974,7 @@ async fn process_activitypub_note_resolution(
     }
     let object_domain = inbox_actor_domain(object_uri)
         .ok_or_else(|| HandlerFailure::permanent("remote Create object has no valid domain"))?;
-    if !Repository::from_pool(pool.clone())
+    if !repository
         .remote_domain_allowed(&object_domain, config.limited_federation)
         .await
         .map_err(|_| HandlerFailure::retry("remote Create object policy lookup failed"))?
@@ -3190,16 +4043,62 @@ async fn process_activitypub_note_resolution(
     {
         return Ok(());
     }
-    writer
-        .apply_remote_note_create(
-            source_account_id,
-            actor_uri,
-            &object,
-            delivery_target_account_id,
-            config.origin.as_str(),
-        )
-        .await
-        .map_err(|error| remote_note_write_failure(&error, "resolved remote Note write failed"))?;
+    let quote_authorization = fetch_and_import_quote_authorization(
+        &pool,
+        &repository,
+        &writer,
+        config,
+        fetcher,
+        source_account_id,
+        delivery_target_account_id,
+        &object,
+    )
+    .await?;
+    if resolved {
+        writer
+            .apply_remote_note_update(
+                source_account_id,
+                actor_uri,
+                &object,
+                delivery_target_account_id,
+                config.origin.as_str(),
+            )
+            .await
+            .map_err(|error| {
+                remote_note_write_failure(&error, "resolved remote Note replay write failed")
+            })?;
+    } else {
+        writer
+            .apply_remote_note_create(
+                source_account_id,
+                actor_uri,
+                &object,
+                delivery_target_account_id,
+                config.origin.as_str(),
+            )
+            .await
+            .map_err(|error| {
+                remote_note_write_failure(&error, "resolved remote Note write failed")
+            })?;
+    }
+    if let Some((references, Some(document))) = quote_authorization {
+        let approval_uri = references
+            .approval_uri
+            .as_deref()
+            .expect("fetched authorization has a canonical URI");
+        writer
+            .apply_remote_quote_authorization(
+                source_account_id,
+                object_uri,
+                approval_uri,
+                &document,
+                config.origin.as_str(),
+            )
+            .await
+            .map_err(|error| {
+                remote_note_write_failure(&error, "resolved remote QuoteAuthorization write failed")
+            })?;
+    }
     if activity
         .get("signature")
         .is_some_and(|signature| !signature.is_null())
@@ -5241,15 +6140,204 @@ fn remote_poll_vote_allows_note_fallback(outcome: RemotePollVoteOutcome) -> bool
     outcome == RemotePollVoteOutcome::NotPollVote
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn fetch_and_import_quote_authorization(
+    pool: &PgPool,
+    repository: &Repository,
+    writer: &WriteRepository,
+    config: &ActivityPubDeliveryConfig,
+    fetcher: &RemoteFetcher,
+    source_account_id: i64,
+    delivery_target_account_id: Option<i64>,
+    object: &Value,
+) -> Result<Option<(RemoteQuoteFetchReferences, Option<Value>)>, HandlerFailure> {
+    let Some(references) = remote_note_quote_fetch_references(object) else {
+        return Ok(None);
+    };
+    let existing_target_local = writer
+        .remote_quote_target_is_local(&references.target_uri, config.origin.as_str())
+        .await
+        .map_err(|error| remote_note_write_failure(&error, "quoted status lookup failed"))?;
+    if existing_target_local == Some(true) {
+        return Ok(Some((references, None)));
+    }
+    let target_url = Url::parse(&references.target_uri)
+        .map_err(|_| HandlerFailure::permanent("quoted status URL is invalid"))?;
+    let target_domain = canonical_remote_domain_from_url(&target_url)
+        .map_err(|_| HandlerFailure::permanent("quoted status domain is invalid"))?;
+    if !repository
+        .remote_domain_allowed(&target_domain, config.limited_federation)
+        .await
+        .map_err(|_| HandlerFailure::retry("quoted status domain policy lookup failed"))?
+    {
+        return Err(HandlerFailure::permanent(
+            "quoted status domain is not allowed",
+        ));
+    }
+    let quote_to = remote_announce_audience(object, "to")?;
+    let quote_cc = remote_announce_audience(object, "cc")?;
+    let signer_account = resolve_note_fetch_signer(
+        pool,
+        source_account_id,
+        delivery_target_account_id,
+        &quote_to,
+        &quote_cc,
+        &config.origin,
+    )
+    .await?;
+    let private_key = signer_account
+        .private_key
+        .as_ref()
+        .filter(|key| key.is_present())
+        .ok_or_else(|| HandlerFailure::permanent("quote fetch signer has no private key"))?;
+    let signer_key_id = format!(
+        "{}#main-key",
+        activitypub::actor_url(&config.origin, &signer_account)
+    );
+    let signer = HttpSignatureSigner {
+        key_id: &signer_key_id,
+        private_key_pem: private_key.as_str(),
+    };
+    let authorization_document = if let Some(approval_uri) = references.approval_uri.as_deref() {
+        let approval_url = Url::parse(approval_uri)
+            .map_err(|_| HandlerFailure::permanent("quote authorization URL is invalid"))?;
+        let approval_domain = canonical_remote_domain_from_url(&approval_url)
+            .map_err(|_| HandlerFailure::permanent("quote authorization domain is invalid"))?;
+        if !repository
+            .remote_domain_allowed(&approval_domain, config.limited_federation)
+            .await
+            .map_err(|_| HandlerFailure::retry("quote authorization domain policy lookup failed"))?
+        {
+            return Err(HandlerFailure::permanent(
+                "quote authorization domain is not allowed",
+            ));
+        }
+        if !same_url_origin(&approval_url, &target_url) {
+            return Err(HandlerFailure::permanent(
+                "quoted status does not match the authorization origin",
+            ));
+        }
+        let response = {
+            #[cfg(feature = "test-support")]
+            if let Some(endpoint) = config.remote_fetch_endpoint {
+                fetcher
+                    .get_for_test_endpoint(
+                        approval_url.clone(),
+                        THREAD_ACTIVITYPUB_CONTENT_TYPES,
+                        endpoint,
+                    )
+                    .await
+            } else {
+                fetcher
+                    .get_signed(
+                        approval_url.clone(),
+                        THREAD_ACTIVITYPUB_CONTENT_TYPES,
+                        &signer,
+                    )
+                    .await
+            }
+            #[cfg(not(feature = "test-support"))]
+            fetcher
+                .get_signed(
+                    approval_url.clone(),
+                    THREAD_ACTIVITYPUB_CONTENT_TYPES,
+                    &signer,
+                )
+                .await
+        }
+        .map_err(|error| remote_note_fetch_failure(&error))?;
+        if !same_url_origin(&response.url, &approval_url) {
+            return Err(HandlerFailure::permanent(
+                "quote authorization redirected to another origin",
+            ));
+        }
+        Some(
+            serde_json::from_slice::<Value>(&response.body)
+                .map_err(|_| HandlerFailure::permanent("quote authorization JSON is invalid"))?,
+        )
+    } else {
+        None
+    };
+    let target_exists = existing_target_local.is_some();
+    if !target_exists {
+        let embedded_authorization_target = authorization_document
+            .as_ref()
+            .and_then(|document| document.get("interactionTarget"))
+            .filter(|target| target.is_object())
+            .cloned();
+        let target_document = if let Some(target) = embedded_authorization_target {
+            target
+        } else {
+            let response = {
+                #[cfg(feature = "test-support")]
+                if let Some(endpoint) = config.remote_fetch_endpoint {
+                    fetcher
+                        .get_for_test_endpoint(
+                            target_url.clone(),
+                            THREAD_ACTIVITYPUB_CONTENT_TYPES,
+                            endpoint,
+                        )
+                        .await
+                } else {
+                    fetcher
+                        .get_signed(
+                            target_url.clone(),
+                            THREAD_ACTIVITYPUB_CONTENT_TYPES,
+                            &signer,
+                        )
+                        .await
+                }
+                #[cfg(not(feature = "test-support"))]
+                fetcher
+                    .get_signed(
+                        target_url.clone(),
+                        THREAD_ACTIVITYPUB_CONTENT_TYPES,
+                        &signer,
+                    )
+                    .await
+            }
+            .map_err(|error| remote_note_fetch_failure(&error))?;
+            if !same_url_origin(&response.url, &target_url) {
+                return Err(HandlerFailure::permanent(
+                    "quoted status redirected to another origin",
+                ));
+            }
+            serde_json::from_slice::<Value>(&response.body)
+                .map_err(|_| HandlerFailure::permanent("quoted status JSON is invalid"))?
+        };
+        let (target, actor_uri, canonical_target_uri) =
+            remote_note_document(&target_document, &references.target_uri)?;
+        if canonical_target_uri != references.target_uri {
+            return Err(HandlerFailure::permanent(
+                "quoted status identity is invalid",
+            ));
+        }
+        validate_fetched_activity_actor(&references.target_uri, &actor_uri)?;
+        let account_id =
+            resolve_remote_note_author(pool, config, writer, fetcher, &actor_uri, &signer).await?;
+        writer
+            .apply_remote_note_create(
+                account_id,
+                &actor_uri,
+                &target,
+                delivery_target_account_id,
+                config.origin.as_str(),
+            )
+            .await
+            .map_err(|error| remote_note_write_failure(&error, "quoted status import failed"))?;
+    }
+    Ok(Some((references, authorization_document)))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn process_activitypub_inbox(
     pool: PgPool,
     config: &ActivityPubDeliveryConfig,
     fetcher: &RemoteFetcher,
-    arguments: &Value,
+    claimed_job: &ClaimedJob,
     report_mail_enabled: bool,
 ) -> Result<(), HandlerFailure> {
-    let job = parse_job_arguments(arguments)
+    let job = parse_job_arguments(&claimed_job.arguments)
         .map_err(|error| HandlerFailure::permanent(error.to_string()))?;
     let activity =
         parse_activity(&job.body).map_err(|error| HandlerFailure::permanent(error.to_string()))?;
@@ -5262,6 +6350,9 @@ async fn process_activitypub_inbox(
         | InboxActivity::CreateNoteReference { actor_uri, .. }
         | InboxActivity::UpdateNote { actor_uri, .. }
         | InboxActivity::DeleteNote { actor_uri, .. }
+        | InboxActivity::DeleteQuoteAuthorization { actor_uri, .. }
+        | InboxActivity::QuoteRequest { actor_uri, .. }
+        | InboxActivity::QuoteDecision { actor_uri, .. }
         | InboxActivity::Like { actor_uri, .. }
         | InboxActivity::Announce { actor_uri, .. }
         | InboxActivity::UndoLike { actor_uri, .. }
@@ -5458,6 +6549,182 @@ async fn process_activitypub_inbox(
                     remote_note_write_failure(&error, "remote Undo Announce write failed")
                 })?;
         }
+        InboxActivity::QuoteRequest {
+            request_uri,
+            actor_uri,
+            object_uri,
+            instrument,
+        } => {
+            let instrument_uri = remote_uri_value(Some(&instrument))
+                .ok_or_else(|| HandlerFailure::permanent("QuoteRequest instrument has no ID"))?
+                .to_owned();
+            let import_target = writer
+                .remote_quote_request_may_import(
+                    source_account_id,
+                    &request_uri,
+                    &actor_uri,
+                    &object_uri,
+                    &instrument_uri,
+                    config.origin.as_str(),
+                    job.delivery_target_account_id,
+                )
+                .await
+                .map_err(|error| {
+                    remote_note_write_failure(&error, "QuoteRequest import authorization failed")
+                })?;
+            if let Some((target_status_id, target_account_id)) = import_target {
+                let materialized_instrument = if instrument.is_object() {
+                    instrument
+                } else {
+                    match fetch_quote_request_instrument(
+                        &repository,
+                        config,
+                        fetcher,
+                        target_account_id,
+                        &instrument_uri,
+                    )
+                    .await
+                    {
+                        Ok(instrument) => instrument,
+                        Err(failure)
+                            if failure.disposition == FailureDisposition::Retry
+                                && claimed_job.attempt >= claimed_job.max_attempts =>
+                        {
+                            writer
+                                .apply_remote_quote_request(
+                                    source_account_id,
+                                    &request_uri,
+                                    &actor_uri,
+                                    &object_uri,
+                                    &instrument_uri,
+                                    config.origin.as_str(),
+                                    job.delivery_target_account_id,
+                                )
+                                .await
+                                .map_err(|error| {
+                                    remote_note_write_failure(
+                                        &error,
+                                        "terminal QuoteRequest rejection failed",
+                                    )
+                                })?;
+                            return Ok(());
+                        }
+                        Err(failure) => return Err(failure),
+                    }
+                };
+                validate_quote_request_instrument(
+                    &writer,
+                    &materialized_instrument,
+                    &actor_uri,
+                    &instrument_uri,
+                    target_status_id,
+                    config.origin.as_str(),
+                )
+                .await?;
+                writer
+                    .apply_remote_quote_request_instrument(
+                        source_account_id,
+                        &actor_uri,
+                        &materialized_instrument,
+                        job.delivery_target_account_id,
+                        config.origin.as_str(),
+                        &request_uri,
+                        &object_uri,
+                        &instrument_uri,
+                        target_status_id,
+                        target_account_id,
+                    )
+                    .await
+                    .map_err(|error| {
+                        remote_note_write_failure(&error, "QuoteRequest instrument write failed")
+                    })?;
+            }
+            writer
+                .apply_remote_quote_request(
+                    source_account_id,
+                    &request_uri,
+                    &actor_uri,
+                    &object_uri,
+                    &instrument_uri,
+                    config.origin.as_str(),
+                    job.delivery_target_account_id,
+                )
+                .await
+                .map_err(|error| {
+                    remote_note_write_failure(&error, "remote QuoteRequest write failed")
+                })?;
+        }
+        InboxActivity::QuoteDecision {
+            accepted,
+            actor_uri,
+            request_uri,
+            request_actor_uri,
+            object_uri,
+            instrument_uri,
+            result_uri,
+        } => {
+            let follow_fallback = quote_decision_allows_follow_fallback(
+                accepted,
+                request_actor_uri.as_deref(),
+                object_uri.as_deref(),
+                instrument_uri.as_deref(),
+            );
+            let quote_matched = writer
+                .apply_remote_quote_decision(
+                    source_account_id,
+                    &actor_uri,
+                    &request_uri,
+                    request_actor_uri.as_deref(),
+                    object_uri.as_deref(),
+                    instrument_uri.as_deref(),
+                    result_uri.as_deref(),
+                    accepted,
+                    config.origin.as_str(),
+                    job.delivery_target_account_id,
+                )
+                .await
+                .map_err(|error| {
+                    remote_note_write_failure(&error, "remote quote decision write failed")
+                })?;
+            if follow_fallback && !quote_matched {
+                writer
+                    .apply_remote_follow_decision(
+                        source_account_id,
+                        &request_uri,
+                        None,
+                        None,
+                        true,
+                        config.origin.as_str(),
+                        job.delivery_target_account_id,
+                    )
+                    .await
+                    .map_err(|_| HandlerFailure::retry("remote Accept write failed"))?;
+            }
+        }
+        InboxActivity::DeleteQuoteAuthorization {
+            actor_uri,
+            authorization_uri,
+            activity,
+        } => {
+            let forwarding_activity = activity
+                .get("signature")
+                .is_some_and(|signature| !signature.is_null())
+                .then_some(&activity);
+            writer
+                .apply_remote_quote_authorization_delete(
+                    source_account_id,
+                    &actor_uri,
+                    &authorization_uri,
+                    forwarding_activity,
+                )
+                .await
+                .map_err(|error| {
+                    remote_note_write_failure(
+                        &error,
+                        "remote QuoteAuthorization Delete write failed",
+                    )
+                })?;
+        }
         InboxActivity::CreateNote {
             actor_uri,
             object,
@@ -5479,6 +6746,21 @@ async fn process_activitypub_inbox(
             {
                 return Ok(());
             }
+            let quoting_uri = object
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| HandlerFailure::permanent("remote Note has no object URI"))?;
+            let quote_authorization = fetch_and_import_quote_authorization(
+                &pool,
+                &repository,
+                &writer,
+                config,
+                fetcher,
+                source_account_id,
+                job.delivery_target_account_id,
+                &object,
+            )
+            .await?;
             writer
                 .apply_remote_note_create(
                     source_account_id,
@@ -5491,6 +6773,24 @@ async fn process_activitypub_inbox(
                 .map_err(|error| {
                     remote_note_write_failure(&error, "remote Note Create write failed")
                 })?;
+            if let Some((references, Some(document))) = quote_authorization {
+                let approval_uri = references
+                    .approval_uri
+                    .as_deref()
+                    .expect("fetched authorization has a canonical URI");
+                writer
+                    .apply_remote_quote_authorization(
+                        source_account_id,
+                        quoting_uri,
+                        approval_uri,
+                        &document,
+                        config.origin.as_str(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        remote_note_write_failure(&error, "remote QuoteAuthorization write failed")
+                    })?;
+            }
             if original_activity
                 .get("signature")
                 .is_some_and(|signature| !signature.is_null())
@@ -5554,6 +6854,21 @@ async fn process_activitypub_inbox(
             {
                 return Ok(());
             }
+            let quoting_uri = object
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| HandlerFailure::permanent("remote Note has no object URI"))?;
+            let quote_authorization = fetch_and_import_quote_authorization(
+                &pool,
+                &repository,
+                &writer,
+                config,
+                fetcher,
+                source_account_id,
+                job.delivery_target_account_id,
+                &object,
+            )
+            .await?;
             let updated = writer
                 .apply_remote_note_update(
                     source_account_id,
@@ -5566,6 +6881,24 @@ async fn process_activitypub_inbox(
                 .map_err(|error| {
                     remote_note_write_failure(&error, "remote Note Update write failed")
                 })?;
+            if let Some((references, Some(document))) = quote_authorization {
+                let approval_uri = references
+                    .approval_uri
+                    .as_deref()
+                    .expect("fetched authorization has a canonical URI");
+                writer
+                    .apply_remote_quote_authorization(
+                        source_account_id,
+                        quoting_uri,
+                        approval_uri,
+                        &document,
+                        config.origin.as_str(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        remote_note_write_failure(&error, "remote QuoteAuthorization write failed")
+                    })?;
+            }
             if note_exists
                 && updated.is_some()
                 && activity
@@ -5589,6 +6922,30 @@ async fn process_activitypub_inbox(
             atom_uri,
             activity,
         } => {
+            // Mastodon accepts both an embedded QuoteAuthorization and its bare URI in Delete.
+            // Try the tightly actor-bound authorization lookup before interpreting a scalar URI
+            // as a Note; a miss is side-effect free and falls through to ordinary deletion.
+            let forwarding_activity = activity
+                .get("signature")
+                .is_some_and(|signature| !signature.is_null())
+                .then_some(&activity);
+            if writer
+                .apply_remote_quote_authorization_delete(
+                    source_account_id,
+                    &actor_uri,
+                    &object_uri,
+                    forwarding_activity,
+                )
+                .await
+                .map_err(|error| {
+                    remote_note_write_failure(
+                        &error,
+                        "remote QuoteAuthorization Delete write failed",
+                    )
+                })?
+            {
+                return Ok(());
+            }
             if activity
                 .get("signature")
                 .is_some_and(|signature| !signature.is_null())
@@ -5628,6 +6985,7 @@ async fn process_activitypub_inbox(
                     &actor_uri,
                     &object_uri,
                     atom_uri.as_deref(),
+                    config.origin.as_str(),
                 )
                 .await
                 .map_err(|error| {
@@ -5803,23 +7161,42 @@ async fn process_activitypub_inbox(
                 .map_err(|_| HandlerFailure::retry("remote Accept write failed"))?;
         }
         InboxActivity::Reject {
+            actor_uri,
             follow_uri,
             target_uri,
             nested_actor_uri,
-            ..
         } => {
-            writer
-                .apply_remote_follow_decision(
+            let quote_matched = writer
+                .apply_remote_quote_decision(
                     source_account_id,
+                    &actor_uri,
                     &follow_uri,
-                    target_uri.as_deref(),
                     nested_actor_uri.as_deref(),
+                    target_uri.as_deref(),
+                    None,
+                    None,
                     false,
                     config.origin.as_str(),
                     job.delivery_target_account_id,
                 )
                 .await
-                .map_err(|_| HandlerFailure::retry("remote Reject write failed"))?;
+                .map_err(|error| {
+                    remote_note_write_failure(&error, "remote quote Reject write failed")
+                })?;
+            if !quote_matched {
+                writer
+                    .apply_remote_follow_decision(
+                        source_account_id,
+                        &follow_uri,
+                        target_uri.as_deref(),
+                        nested_actor_uri.as_deref(),
+                        false,
+                        config.origin.as_str(),
+                        job.delivery_target_account_id,
+                    )
+                    .await
+                    .map_err(|_| HandlerFailure::retry("remote Reject write failed"))?;
+            }
         }
         InboxActivity::UndoReference {
             actor_uri,
@@ -7421,7 +8798,7 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
                             pool,
                             &config,
                             &fetcher,
-                            &job.arguments,
+                            &job,
                             report_mail_enabled,
                         )
                         .await
@@ -7523,6 +8900,10 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
                             .arguments
                             .get("poll_updated_at_micros")
                             .and_then(Value::as_i64);
+                        let quote_updated_at_micros = job
+                            .arguments
+                            .get("quote_updated_at_micros")
+                            .and_then(Value::as_i64);
                         let update_kind = job.arguments.get("update_kind").and_then(Value::as_str);
                         let update_version_micros = job
                             .arguments
@@ -7547,6 +8928,72 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
                                     ));
                                 }
                             };
+                        let quote_request = if activity_type == "QuoteRequest" {
+                            Some(QuoteRequestDistribution {
+                                quote_id: job
+                                    .arguments
+                                    .get("quote_id")
+                                    .and_then(Value::as_i64)
+                                    .ok_or_else(|| {
+                                        HandlerFailure::permanent(
+                                            "quote-request distribution is missing its quote ID",
+                                        )
+                                    })?,
+                                request_uri: job
+                                    .arguments
+                                    .get("quote_request_uri")
+                                    .and_then(Value::as_str)
+                                    .filter(|value| !value.is_empty())
+                                    .ok_or_else(|| {
+                                        HandlerFailure::permanent(
+                                            "quote-request distribution is missing its request URI",
+                                        )
+                                    })?
+                                    .to_owned(),
+                                quoted_status_id: job
+                                    .arguments
+                                    .get("quoted_status_id")
+                                    .and_then(Value::as_i64)
+                                    .ok_or_else(|| {
+                                        HandlerFailure::permanent(
+                                            "quote-request distribution is missing its target status",
+                                        )
+                                    })?,
+                                quoted_status_uri: job
+                                    .arguments
+                                    .get("quoted_status_uri")
+                                    .and_then(Value::as_str)
+                                    .filter(|value| !value.is_empty())
+                                    .ok_or_else(|| {
+                                        HandlerFailure::permanent(
+                                            "quote-request distribution is missing its target URI",
+                                        )
+                                    })?
+                                    .to_owned(),
+                                quoted_status_url: job
+                                    .arguments
+                                    .get("quoted_status_url")
+                                    .and_then(Value::as_str)
+                                    .filter(|value| !value.is_empty())
+                                    .ok_or_else(|| {
+                                        HandlerFailure::permanent(
+                                            "quote-request distribution is missing its target URL",
+                                        )
+                                    })?
+                                    .to_owned(),
+                                quoted_account_id: job
+                                    .arguments
+                                    .get("quoted_account_id")
+                                    .and_then(Value::as_i64)
+                                    .ok_or_else(|| {
+                                        HandlerFailure::permanent(
+                                            "quote-request distribution is missing its target account",
+                                        )
+                                    })?,
+                            })
+                        } else {
+                            None
+                        };
                         distribute_status(
                             pool,
                             &config,
@@ -7554,9 +9001,11 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
                             activity_type,
                             edited_at_micros,
                             poll_updated_at_micros,
+                            quote_updated_at_micros,
                             update_kind,
                             update_version_micros,
                             &explicit_recipient_ids,
+                            quote_request.as_ref(),
                         )
                         .await
                     }
@@ -7575,8 +9024,7 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
                     let config = federation.clone();
                     let fetcher = delivery_fetcher.clone();
                     async move {
-                        deliver_activity(pool, operational_pool, &config, &fetcher, &job.arguments)
-                            .await
+                        deliver_activity(pool, operational_pool, &config, &fetcher, &job).await
                     }
                 },
             )?;
@@ -8027,16 +9475,20 @@ mod tests {
 
     use super::{
         FailureDisposition, HandlerRegistry, PollExpirationScanMode, PollExpirationScanStep,
-        RemoteAnnounceTarget, ResourceClass, StatusUpdateKind, StatusUpdateVersionDecision,
-        account_purge_cleanup_paths, account_update_delivery_logical_key,
-        complete_status_update_delivery_kind, delivery_failure, delivery_logical_key,
-        inbox_actor_domain, inferred_current_repair_delivery_kind, note_fetch_audience,
-        note_resolution_logical_key, parse_poll_expiration_scan_mode,
-        poll_expiration_execution_mode, poll_expiration_raw_reconciliation_job,
-        poll_expiration_reconciliation_continuation, poll_expiration_reconciliation_job,
-        poll_expiration_reconciliation_key_from_arguments, poll_expiration_scan_step,
-        preferred_note_fetch_signer_id, remote_announce_document, remote_media_fetch_failure,
-        remote_note_document, remote_note_fetch_failure, remote_poll_vote_allows_note_fallback,
+        QuoteDeliveryKind, RemoteAnnounceTarget, ResourceClass, StatusUpdateKind,
+        StatusUpdateVersionDecision, account_purge_cleanup_paths,
+        account_update_delivery_logical_key, complete_status_update_delivery_kind,
+        delivery_failure, delivery_logical_key, inbox_actor_domain,
+        inferred_current_repair_delivery_kind, note_fetch_audience, note_resolution_logical_key,
+        parse_poll_expiration_scan_mode, poll_expiration_execution_mode,
+        poll_expiration_raw_reconciliation_job, poll_expiration_reconciliation_continuation,
+        poll_expiration_reconciliation_job, poll_expiration_reconciliation_key_from_arguments,
+        poll_expiration_scan_step, preferred_note_fetch_signer_id,
+        quote_decision_allows_follow_fallback, quote_delivery_identity, quote_reference,
+        quote_request_instrument_target_uri, quote_revision_is_current, quote_update_versions,
+        remote_announce_document, remote_media_fetch_failure, remote_note_document,
+        remote_note_fetch_failure, remote_note_quote_fetch_references,
+        remote_poll_vote_allows_note_fallback, remote_quote_request_fetch_failure,
         resolved_create_note, retry_delay, safe_cleanup_path, status_snapshot_repair_activity_id,
         status_update_delivery_is_current, status_update_version_decision, status_update_versions,
         update_delivery_is_current, update_delivery_logical_key, validate_create_binding,
@@ -8045,6 +9497,247 @@ mod tests {
     use crate::jobs::Lane;
     use crate::mastodon::{RemotePollVoteOutcome, activitypub};
     use crate::remote::RemoteFetchError;
+
+    #[test]
+    fn quote_fetch_references_do_not_require_authorization() {
+        let references = remote_note_quote_fetch_references(&json!({
+            "id": "https://remote.example/statuses/9",
+            "quote": "https://target.example/statuses/7"
+        }))
+        .expect("the quote target should be retained");
+
+        assert_eq!(references.target_uri, "https://target.example/statuses/7");
+        assert!(references.approval_uri.is_none());
+        for tombstone in [
+            json!({ "quote": { "type": "Tombstone" } }),
+            json!({
+                "quote": {
+                    "id": "https://target.example/statuses/deleted",
+                    "type": "Tombstone"
+                }
+            }),
+        ] {
+            assert!(
+                remote_note_quote_fetch_references(&tombstone).is_none(),
+                "quoted Tombstones must reconcile as removal without dereference"
+            );
+        }
+    }
+
+    #[test]
+    fn quote_delivery_metadata_binds_the_original_request() {
+        let request_uri = "https://remote.example/quote_requests/1";
+        let request = json!({
+            "id": request_uri,
+            "type": "QuoteRequest",
+            "actor": "https://local.example/users/alice",
+            "object": "https://remote.example/statuses/2",
+            "instrument": { "id": "https://local.example/statuses/3" }
+        });
+        let request_arguments = json!({
+            "quote_delivery_kind": "request",
+            "quote_request_uri": request_uri,
+            "quote_id": 4,
+            "quoting_status_id": 3,
+            "quoted_status_id": 2
+        });
+        let identity = quote_delivery_identity(&request_arguments, &request)
+            .expect("metadata should parse")
+            .expect("QuoteRequest is a quote delivery");
+        assert_eq!(identity.kind, QuoteDeliveryKind::Request);
+        assert_eq!(identity.quote_id, Some(4));
+
+        for (kind, activity_type, result) in [
+            (
+                "accept",
+                "Accept",
+                Some("https://local.example/authorizations/4"),
+            ),
+            ("reject", "Reject", None),
+        ] {
+            let mut body = json!({
+                "type": activity_type,
+                "actor": "https://local.example/users/bob",
+                "object": request
+            });
+            if let Some(result) = result {
+                body["result"] = json!(result);
+            }
+            let arguments = json!({
+                "quote_delivery_kind": kind,
+                "quote_request_uri": request_uri,
+                "quote_id": 4,
+                "quoting_status_id": 3,
+                "quoted_status_id": 2
+            });
+            let identity = quote_delivery_identity(&arguments, &body)
+                .expect("metadata should parse")
+                .expect("decision is a quote delivery");
+            assert_eq!(
+                identity.kind,
+                if kind == "accept" {
+                    QuoteDeliveryKind::Accept
+                } else {
+                    QuoteDeliveryKind::Reject
+                }
+            );
+        }
+
+        assert!(quote_delivery_identity(&json!({}), &request).is_err());
+        let mut contradictory = request_arguments;
+        contradictory["quote_request_uri"] = json!("https://remote.example/quote_requests/other");
+        assert!(quote_delivery_identity(&contradictory, &request).is_err());
+    }
+
+    #[test]
+    fn quote_request_instrument_requires_exact_bindings() {
+        let actor_uri = "https://remote.example/users/alice";
+        let instrument_uri = "https://remote.example/statuses/9";
+        let target_uri = "https://local.example/users/bob/statuses/7";
+        let valid = json!({
+            "id": instrument_uri,
+            "type": "Note",
+            "attributedTo": actor_uri,
+            "content": "a quote",
+            "quote": target_uri
+        });
+        assert_eq!(
+            quote_request_instrument_target_uri(&valid, actor_uri, instrument_uri)
+                .expect("the exact Note should be accepted"),
+            target_uri
+        );
+        let mut question = valid.clone();
+        question["type"] = json!("Question");
+        question
+            .as_object_mut()
+            .expect("Question is an object")
+            .remove("quote");
+        question["quoteUri"] = json!({ "id": target_uri });
+        assert_eq!(
+            quote_request_instrument_target_uri(&question, actor_uri, instrument_uri)
+                .expect("Question and quote aliases should be accepted"),
+            target_uri
+        );
+
+        for invalid in [
+            json!(instrument_uri),
+            json!({
+                "id": instrument_uri,
+                "type": "Article",
+                "attributedTo": actor_uri,
+                "content": "a quote",
+                "quote": target_uri
+            }),
+            json!({
+                "id": "https://remote.example/statuses/other",
+                "type": "Note",
+                "attributedTo": actor_uri,
+                "content": "a quote",
+                "quote": target_uri
+            }),
+            json!({
+                "id": instrument_uri,
+                "type": "Note",
+                "attributedTo": "https://remote.example/users/mallory",
+                "content": "a quote",
+                "quote": target_uri
+            }),
+            json!({
+                "id": instrument_uri,
+                "type": "Note",
+                "attributedTo": actor_uri,
+                "content": "not a quote"
+            }),
+            json!({
+                "id": instrument_uri,
+                "type": "Note",
+                "attributedTo": actor_uri,
+                "content": "a quote",
+                "quote": { "type": "Tombstone" }
+            }),
+            json!({
+                "id": instrument_uri,
+                "type": "Note",
+                "attributedTo": actor_uri,
+                "content": "a quote",
+                "quote": "file:///tmp/status"
+            }),
+        ] {
+            assert_eq!(
+                quote_request_instrument_target_uri(&invalid, actor_uri, instrument_uri)
+                    .expect_err("invalid QuoteRequest instruments must fail permanently")
+                    .disposition,
+                FailureDisposition::Permanent
+            );
+        }
+    }
+
+    #[test]
+    fn quote_request_fetch_failures_distinguish_retryable_and_permanent_errors() {
+        for error in [
+            RemoteFetchError::UnexpectedStatus(StatusCode::NOT_FOUND),
+            RemoteFetchError::UnexpectedStatus(StatusCode::REQUEST_TIMEOUT),
+            RemoteFetchError::UnexpectedStatus(StatusCode::TOO_MANY_REQUESTS),
+            RemoteFetchError::UnexpectedStatus(StatusCode::SERVICE_UNAVAILABLE),
+            RemoteFetchError::NoAddresses,
+            RemoteFetchError::Dns,
+            RemoteFetchError::Client,
+            RemoteFetchError::Request,
+            RemoteFetchError::BodyRead,
+            RemoteFetchError::DomainBudgetExceeded,
+        ] {
+            assert_eq!(
+                remote_quote_request_fetch_failure(&error).disposition,
+                FailureDisposition::Retry,
+                "{error:?} should be retried"
+            );
+        }
+        for error in [
+            RemoteFetchError::UnexpectedStatus(StatusCode::BAD_REQUEST),
+            RemoteFetchError::UnexpectedStatus(StatusCode::UNAUTHORIZED),
+            RemoteFetchError::UnexpectedStatus(StatusCode::FORBIDDEN),
+            RemoteFetchError::UnexpectedStatus(StatusCode::GONE),
+            RemoteFetchError::UnexpectedStatus(StatusCode::NOT_ACCEPTABLE),
+            RemoteFetchError::BlockedAddress("127.0.0.1".parse().expect("loopback address")),
+            RemoteFetchError::InvalidUrl,
+            RemoteFetchError::Redirect,
+            RemoteFetchError::TooManyRedirects,
+            RemoteFetchError::MissingContentType,
+            RemoteFetchError::UnsupportedContentType,
+            RemoteFetchError::UnsupportedEncoding,
+            RemoteFetchError::BodyTooLarge,
+            RemoteFetchError::InvalidRepresentation,
+            RemoteFetchError::IdentityMismatch,
+            RemoteFetchError::OriginMismatch,
+            RemoteFetchError::PolicyDenied,
+            RemoteFetchError::Signing,
+        ] {
+            assert_eq!(
+                remote_quote_request_fetch_failure(&error).disposition,
+                FailureDisposition::Permanent,
+                "{error:?} should fail permanently"
+            );
+        }
+    }
+
+    #[test]
+    fn quote_reference_uses_uri_when_remote_status_has_no_web_url() {
+        assert_eq!(
+            quote_reference(None, Some("https://remote.example/objects/quote")),
+            Some("https://remote.example/objects/quote".to_owned())
+        );
+        assert_eq!(
+            quote_reference(Some("  "), Some("https://remote.example/objects/quote")),
+            Some("https://remote.example/objects/quote".to_owned())
+        );
+        assert_eq!(
+            quote_reference(
+                Some("https://remote.example/@alice/1"),
+                Some("https://remote.example/objects/quote")
+            ),
+            Some("https://remote.example/@alice/1".to_owned())
+        );
+    }
 
     #[tokio::test]
     async fn poll_reconciliation_wall_time_cancels_the_whole_operation() {
@@ -8511,6 +10204,156 @@ mod tests {
             "a superseded repair schedules one repair for the new pair"
         );
         assert!(StatusUpdateKind::PollRepair.has_poll_reach());
+    }
+
+    #[test]
+    fn only_uri_only_quote_accepts_may_fall_back_to_follow_decisions() {
+        assert!(quote_decision_allows_follow_fallback(
+            true, None, None, None
+        ));
+        assert!(!quote_decision_allows_follow_fallback(
+            false, None, None, None
+        ));
+        assert!(!quote_decision_allows_follow_fallback(
+            true,
+            Some("https://remote.example/users/alice"),
+            None,
+            None,
+        ));
+        assert!(!quote_decision_allows_follow_fallback(
+            true,
+            None,
+            Some("https://local.example/statuses/1"),
+            None,
+        ));
+    }
+
+    #[test]
+    fn interaction_policy_updates_use_the_status_row_update_version() {
+        let policy_version = DateTime::<Utc>::from_timestamp(1_700_000_100, 123_000_000)
+            .expect("valid timestamp")
+            .naive_utc();
+        let micros = policy_version.and_utc().timestamp_micros();
+        assert_eq!(
+            StatusUpdateKind::parse("interaction_policy"),
+            Some(StatusUpdateKind::InteractionPolicy)
+        );
+        assert_eq!(
+            status_update_versions(
+                policy_version,
+                None,
+                Some(policy_version),
+                None,
+                StatusUpdateKind::InteractionPolicy,
+                true,
+            ),
+            Some((policy_version, None, policy_version))
+        );
+        let object_uri = "https://local.example/users/alice/statuses/7";
+        let activity_id = activitypub::update_activity_id(object_uri, policy_version);
+        assert!(status_update_delivery_is_current(
+            StatusUpdateKind::InteractionPolicy,
+            Some(&activity_id),
+            object_uri,
+            policy_version,
+            None,
+            Some(micros),
+            None,
+            Some(micros),
+        ));
+    }
+
+    #[test]
+    fn quote_updates_preserve_edit_and_poll_snapshots_with_an_independent_version() {
+        let status_version = DateTime::<Utc>::from_timestamp(1_700_000_000, 123_000_000)
+            .expect("valid timestamp")
+            .naive_utc();
+        let poll_version = status_version + Duration::microseconds(1);
+        let quote_version = poll_version + Duration::microseconds(1);
+        let object_uri = "https://local.example/users/alice/statuses/7";
+        let activity_id = activitypub::update_activity_id(object_uri, quote_version);
+        let status_micros = status_version.and_utc().timestamp_micros();
+        let poll_micros = poll_version.and_utc().timestamp_micros();
+        let quote_micros = quote_version.and_utc().timestamp_micros();
+        let revoked_quote_version = quote_version + Duration::microseconds(1);
+        let revoked_quote_micros = revoked_quote_version.and_utc().timestamp_micros();
+
+        assert!(quote_revision_is_current(
+            Some(quote_version),
+            Some(quote_micros),
+        ));
+        assert!(!quote_revision_is_current(
+            Some(revoked_quote_version),
+            Some(quote_micros),
+        ));
+        assert!(quote_revision_is_current(
+            Some(revoked_quote_version),
+            Some(revoked_quote_micros),
+        ));
+
+        assert_eq!(
+            StatusUpdateKind::parse("quote"),
+            Some(StatusUpdateKind::Quote)
+        );
+        assert_eq!(StatusUpdateKind::Quote.as_str(), "quote");
+        assert!(!StatusUpdateKind::Quote.is_repair());
+        assert!(!StatusUpdateKind::Quote.has_poll_reach());
+        assert_eq!(
+            quote_update_versions(
+                status_version,
+                Some(poll_version),
+                Some(quote_version),
+                Some(status_version),
+                Some(poll_version),
+                Some(quote_micros),
+                Some(quote_version),
+            ),
+            Some((status_version, Some(poll_version), quote_version)),
+        );
+        assert_eq!(
+            quote_update_versions(
+                status_version,
+                Some(poll_version),
+                Some(quote_version),
+                Some(status_version + Duration::microseconds(1)),
+                Some(poll_version),
+                Some(quote_micros),
+                Some(quote_version),
+            ),
+            None,
+            "a quote transition must not serialize across a status edit",
+        );
+        assert_eq!(
+            complete_status_update_delivery_kind(
+                Some("quote"),
+                true,
+                Some(status_micros),
+                Some(poll_micros),
+                Some(quote_micros),
+                Some(quote_micros),
+            ),
+            Some(StatusUpdateKind::Quote),
+        );
+        assert!(status_update_delivery_is_current(
+            StatusUpdateKind::Quote,
+            Some(&activity_id),
+            object_uri,
+            status_version,
+            Some(poll_version),
+            Some(status_micros),
+            Some(poll_micros),
+            Some(quote_micros),
+        ));
+        assert!(!status_update_delivery_is_current(
+            StatusUpdateKind::Quote,
+            Some(&activity_id),
+            object_uri,
+            status_version + Duration::microseconds(1),
+            Some(poll_version),
+            Some(status_micros),
+            Some(poll_micros),
+            Some(quote_micros),
+        ));
     }
 
     #[test]

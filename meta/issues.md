@@ -26,7 +26,6 @@
 - [ ] [Self-heal missing account statistics](issues/self-heal-missing-account-statistics.md)
 - [ ] [Stream public, hashtag, and list timelines](issues/stream-public-hashtag-list-timelines.md)
 - [ ] [Support polls in the bundled frontend](issues/support-poll-voting-and-refresh.md)
-- [ ] [Support quote posts from the bundled frontend](issues/support-frontend-quote-posts.md)
 - [ ] [Support advertised media attachments in the bundled frontend](issues/support-frontend-video-attachments.md)
 - [ ] [Restore status search in the bundled frontend](issues/restore-frontend-status-search.md)
 - [ ] [Compute real instance activity metrics](issues/compute-real-instance-activity-metrics.md)

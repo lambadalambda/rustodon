@@ -19,12 +19,12 @@ or a cutover rehearsal. An open row must not be described as complete.
 | --- | --- | --- |
 | REST inventory | `API_ROUTE_INVENTORY` contains every advertised method/path, rejects duplicate method/path pairs, and `V1_REQUIRED_API_ROUTES` checks every required v1 route. `mise run pinned-source-contracts` independently derives ordinary startup probes from the pinned frontend and checks router/support declarations, including announcements and hashtag search. | A |
 | CLI inventory | `tests/cli_help.rs` checks all four process modes and all 14 administrative command/help contracts exposed by `rustodon --help` and `rustodon admin --help`. | A |
-| Differential compatibility | `mise run differential` defines 26 guarded differential cases and performs 27 executions: a 23-case broad batch plus isolated notification, authorization, absolute actor-media-root, and optimized mixed-profile-media cases. `mise run differential-ci` runs nine distinct high-value cases in ten fresh-fixture invocations, including both actor-media-root modes; all ten retained required-lane invocations passed. The full differential lane and hosted-CI execution remain unclaimed. | A locally for the required lane; full differential and hosted-CI execution remain open |
+| Differential compatibility | `mise run differential` defines 28 guarded differential cases and performs 29 executions: a 25-case broad batch plus isolated notification, authorization, absolute actor-media-root, and optimized mixed-profile-media cases. `mise run differential-ci` runs 11 distinct high-value cases in 12 fresh-fixture invocations, including `quote_lifecycle` and both actor-media-root modes. Retained passes predate the current quote-expanded lane. | M; current final-tree required/full differential and hosted-CI execution remain open |
 | Authorized-fetch reads | `mise run differential -- authorized_fetch_read_routes_require_signatures` starts Rustodon with limited federation enabled and checks protected actor, Note, activity, outbox, followers, and following routes reject unsigned reads while `/actor` remains public. | A locally |
-| Fixture and schema | `mise run fixture-verify`, `mise run mastodon-schema-integration`, and `mise run operational-schema-integration`. | A |
+| Fixture and schema | `mise run fixture-verify`, `mise run mastodon-schema-integration`, and `mise run operational-schema-integration` are present, including the quote privilege/default selector. Retained schema evidence predates the current quote-expanded aggregate. | M; final-tree restored-schema quote evidence remains open |
 | Fixture cutover and rollback | `mise run cutover-integration` migrates the isolated operational schema, starts Rustodon, runs the operator smoke, reopens the pinned Mastodon web process, and compares stable public state and media. | A locally; live production rehearsal remains open |
-| Browser web-client smoke | `mise run browser-integration` starts the HTTPS cutover fixture and drives Chromium through `agent-browser`. It renders and fills the sign-in form, authenticates through the local form endpoint, loads the authenticated shell, exercises leading and trailing Home-settings PUTs with reload persistence, renders profile settings, proves logout, audits API responses, checks the SPA deep link and page errors, and completes the enclosing cutover/rollback comparison. | A locally for the named smoke; untested browser forms, WebSocket/EventSource behavior, and mobile-client recording remain open |
-| Workers | `mise run worker-integration` is the restored-fixture gate for queue/runtime ACLs, enqueue and leases, all-lane recovery, cancellation, ordering and deduplication, retries and dead letters, resource limits, ActivityPub and account lifecycles, URI and parent fetches, media/profile reconciliation, SMTP acknowledgement ambiguity, readiness, shutdown, crash recovery, and poll-expiration repair. A prior combined-tree run passed its then-current 100 tests plus the CLI readiness/shutdown gate, but the subsequently expanded poll worker tests were not run on this final tree. | M; final-tree restored worker evidence, production load/power-loss, and final-tree peer acceptance remain open |
+| Browser web-client smoke | A retained pre-final browser run proves the earlier sign-in, shell, settings, and logout smoke. The current `mise run browser-integration` gate additionally scripts quote creation, nested rendering, reload, deletion, and rollback, but that quote-expanded gate has not run on the final tree. | M; final-tree quote browser run, broader forms, streaming behavior, and mobile-client recording remain open |
+| Workers | `mise run worker-integration` is the restored-fixture gate for queue/runtime ACLs, enqueue and leases, all-lane recovery, cancellation, ordering and deduplication, retries and dead letters, resource limits, ActivityPub and account lifecycles, URI and parent fetches, media/profile reconciliation, SMTP acknowledgement ambiguity, readiness, shutdown, crash recovery, poll-expiration repair, and quote federation. A prior combined-tree run passed its then-current 100 tests plus the CLI readiness/shutdown gate, but the subsequently expanded poll and quote worker tests were not run on this final tree. | M; final-tree restored worker evidence, production load/power-loss, and final-tree peer acceptance remain open |
 | Startup and preflight | `mise run startup-integration` and `mise run preflight-integration`. | A |
 | Operator smoke | `tools/rustodon-smoke` checks health, readiness, authentication, reads, a no-op write, media, WebFinger, and actor discovery against a running instance. | A locally; live operator run remains open |
 
@@ -58,7 +58,7 @@ The standalone operator smoke tool is listed separately.
 
 ## Supported API Routes
 
-`src/web.rs::API_ROUTE_INVENTORY` is the complete advertised API surface: 119
+`src/web.rs::API_ROUTE_INVENTORY` is the complete advertised API surface: 123
 canonical method/path contracts, with trailing-slash aliases registered by the
 router but not duplicated in the inventory. The inventory and route-contract
 tests check unique method/path pairs, representative authentication and
@@ -120,7 +120,7 @@ owning issue, code surface, or acceptance command.
 | --- | --- | --- | --- |
 | REST-01 | Decimal IDs, timestamps, HTML, nullable keys, pagination, CORS, scopes, and error conventions. | `src/mastodon/rest`, `src/web.rs`; differential `rest_protocol_contracts` and serializer tests. | A |
 | REST-02 | Instance and identity endpoints. | Required-route contract plus account/instance serializers and differential cases. | A |
-| REST-03 | Status lifecycle, visibility, replies, mentions, media, interactions, history, context, and idempotent creation. | `WriteRepository`, REST handlers, differential write cases, schema and worker integration. | A locally; complete client/peer proof remains open |
+| REST-03 | Status lifecycle, visibility, replies, mentions, media, interactions, history, context, idempotent creation, quote creation, interaction-policy updates, quote listing, and revocation. | `WriteRepository`, REST handlers, ordinary tests, pinned frontend/backend source contracts, and executable restored-schema/differential/worker/browser selectors. The final-tree heavy quote selectors have not been run. | M; quote restored-schema/differential/worker/browser evidence and complete client/peer proof remain open |
 | REST-04 | Timelines, collections, filters, markers, conversations, and relationship lists. | Repository projections, route inventory, schema/differential tests. | A locally; complete client proof remains open |
 | REST-05 | All required notification persistence, serialization, v1/v2 reads, dismissal, clear, and unread counts. | Notification repository/writer, serializer tests, worker/schema/differential coverage. | A locally; complete client proof remains open |
 | REST-06 | Existing and new local Paperclip media, v1/v2 media CRUD, metadata, and descriptions. | `src/paperclip.rs`, staged media handlers, and durable cleanup workers; fault tests cover publication/deletion ambiguity and fsynced removal; differential media cases and cutover reopen remain green. | A locally; production rollback proof remains open |
@@ -131,7 +131,7 @@ owning issue, code surface, or acceptance command.
 | --- | --- | --- | --- |
 | FED-01 | WebFinger, host-meta, NodeInfo, actors, Notes, emoji resources, and collection representations. | Federation routes in `src/web.rs`; differential `federation_discovery` plus relative/absolute actor-media-root cases; HTTP signature and emoji serializer tests. | A locally |
 | FED-02 | Signed transport, digest/skew checks, inbox enqueue, remote fetch, SSRF checks, shared-inbox deduplication, retries, and domain health. | `src/mastodon/signatures.rs`, `src/remote.rs`, `src/worker.rs`; bounded DNS answer sets, lifecycle-aware 401 classification, bounded per-client-IP signature-key refresh, signed POST DNS/redirect/timeout/response-limit fixtures, and signature, remote, and worker tests. All five bounded Mastodon peer scenarios passed, including signed bidirectional transport, but on a pre-final tree. | A locally; pre-final Mastodon peer evidence exists, while a final-tree rerun and Pleroma interoperability remain open |
-| FED-03 | Follow, Accept, Reject, Undo, embedded and URI-only Note, Like, Announce, Block, actor Update/Delete, audiences, replies, mentions, media, custom emoji, and tombstones. | ActivityPub inbox/outbox workers are covered by retained restored-fixture worker evidence, including URI fetch/retry/deduplication, recipient and parent repair, forwarding replay, provenance checks, emoji fetch/replacement, and relationship/order convergence. Expanded poll worker coverage is executable but its final-tree restored-fixture run is deferred. Pinned-source contracts establish Mastodon's URI dereference behavior. Five bounded Mastodon peer scenarios passed on a pre-final tree; they do not establish the complete final-tree peer/order profile or Pleroma parity. | A locally for retained evidence; expanded poll worker and complete final-tree peer/order acceptance remain open |
+| FED-03 | Follow, Accept, Reject, Undo, embedded and URI-only Note, Like, Announce, Block, actor Update/Delete, audiences, replies, mentions, media, custom emoji, tombstones, and quote federation. | ActivityPub inbox/outbox workers cover QuoteRequest embedded and target-owner-signed scalar imports, bound Accept/Reject, QuoteAuthorization verification/revocation and Delete-before-attachment markers, ID-less Tombstone reconciliation, counters, streams, forwarding, retry/idempotency, exact lease/lifecycle send fences, and safe terminal cancellation. Pinned-source contracts establish Mastodon's URI dereference and quote lifecycle behavior. The five retained Mastodon peer scenarios cover ordinary federation only; they predate the final tree and do not exercise the quote lifecycle. | M; ordinary/source evidence exists, but final-tree quote worker and quote-specific peer/order acceptance remain open |
 
 ### Durable Work
 
@@ -167,7 +167,7 @@ owning issue, code surface, or acceptance command.
 | PRESERVE-04 | Preserve scheduled statuses when none are pending. | Preflight scheduled-status check. | A |
 | PRESERVE-05 | Preserve preview cards and custom emoji. | Repository serializers and filesystem serving. | A locally |
 | PRESERVE-06 | Preserve announcements, reports, warnings, appeals, severance, migrations, imports, backups, and Web Push rows. | The deterministic fixture seeds representative rows, `verify.sql` and `verify.rb` assert their values and foreign-key links, and schema/differential/cutover snapshots prove they survive Rustodon startup and Mastodon reopen. | A locally |
-| PRESERVE-07 | Read and serialize quote, collection, collection-item, and keypair rows without creating those workflows. | REST projections and serializers; route inventory. | A locally |
+| PRESERVE-07 | Create, read, federate, update policy for, revoke, delete, and preserve quotes; read collection, collection-item, and keypair rows without creating those workflows. | Quote REST handlers, transactional writer, ActivityPub lifecycle, REST projections/serializers, pinned source contracts, and executable differential/worker/browser selectors. Heavy final-tree quote evidence is explicitly deferred. | M; restored fixture/differential/worker/browser/cutover/peer acceptance is deferred |
 | PRESERVE-08 | Preserve unknown notification types and future enum values. | Open enum wrappers and notification serializer tests. | A |
 | PRESERVE-09 | Leave unsupported Mastodon-owned tables untouched. | Differential database snapshots and operational-schema integration. | A locally |
 
@@ -207,11 +207,12 @@ owning issue, code surface, or acceptance command.
 The local implementation and fixture gates are substantial, but v1 is not yet
 complete. The matrix cannot be closed until the `O` rows are either implemented
 and proven or explicitly removed from the authoritative v1 scope. The retained
-evidence includes the required differential lane, authenticated browser and
-fixture cutover/rollback, earlier restored-worker coverage, startup, preflight,
+evidence includes pre-expansion differential, authenticated browser and fixture
+cutover/rollback runs, earlier restored-worker coverage, startup, preflight,
 schema, ordinary checks, and a bounded five-scenario Mastodon peer run. The
-expanded poll worker suite remains executable but unrun on the final tree.
-Remaining acceptance includes a recorded mobile client, unexercised
-browser/TOTP and streaming flows, a final-tree Mastodon peer run completing the
-reply profile, and a live production cutover/rollback rehearsal. The earlier
-peer run is not final-tree or Pleroma acceptance.
+expanded poll and quote restored-schema, worker, differential, and browser suites
+remain executable but unrun on the final tree; retained heavy-fixture results are
+not final-tree quote acceptance. Remaining acceptance includes a recorded mobile
+client, unexercised browser/TOTP and streaming flows, a final-tree Mastodon peer
+run completing the reply profile, and a live production cutover/rollback
+rehearsal. The earlier peer run is not final-tree or Pleroma acceptance.

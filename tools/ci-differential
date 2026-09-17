@@ -16,7 +16,7 @@ if [ "$lane" = full ]; then
 else
   for case_name in \
     oauth_bearer_authentication core_rest_serializers rest_protocol_contracts \
-    federation_discovery status_authorization_matrix poll_lifecycle \
+    federation_discovery status_authorization_matrix poll_lifecycle quote_lifecycle \
     authorized_fetch_read_routes_require_signatures \
     browser_recovery_fences browser_reauthentication_limits actor_media_root_url
   do

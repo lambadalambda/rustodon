@@ -983,6 +983,7 @@ schema_read_rust_test() {
     web_settings) set -- --features test-support --lib web::web_settings_tests ;;
     media_proxy) set -- --features test-support --lib web::cached_media_response_tests::cached_private_media_http_requires_status_access_even_when_files_exist ;;
     account_stats_repair) set -- --features test-support --test account_stats_repair ;;
+    quote_lifecycle) set -- --features test-support --test quote_lifecycle ;;
     mastodon_schema) set -- --features test-support --test mastodon_schema ;;
     saved_status_authorization|qualified_local_mentions|followed_hashtag_streams|public_oauth_revocation|oauth_response_modes|media_state)
       set -- --test "$1" ;;
@@ -1303,7 +1304,27 @@ EOF
   printf 'operational schema integration passed for Mastodon %s\n' "$RELEASE"
 }
 
+worker_rust_test() {
+  case "$1" in
+    quote_federation_lifecycle)
+      test_name="quote_lifecycle::$1"
+      ;;
+    *) die "unknown worker test: $1" ;;
+  esac
+  require_ignored_tests exact --features test-support --test workers "$test_name" || return $?
+  cargo test --locked --features test-support --test workers "$test_name" \
+    -- --ignored --exact --nocapture --test-threads=1
+}
+
 worker_test() {
+  case_name=${1:-}
+  if [ -n "$case_name" ]; then
+    case "$case_name" in
+      ''|*[!a-z0-9_]*) die 'worker case must use lowercase letters, digits, or underscores' ;;
+      quote_federation_lifecycle) ;;
+      *) die "unknown worker case: $case_name" ;;
+    esac
+  fi
   "$ROOT/tools/verify-worker-media"
   fixture=$FIXTURE_DIR
   verify_static "$fixture"
@@ -1371,13 +1392,23 @@ CREATE DATABASE $receiver_database TEMPLATE $DATABASE_NAME;
 REVOKE ALL ON DATABASE $receiver_database FROM PUBLIC;
 GRANT CONNECT ON DATABASE $receiver_database TO $WORKER_RUNTIME;
 EOF
-  RUSTODON_WORKER_RECEIVER_DATABASE_URL="postgresql://$WORKER_RUNTIME:$WORKER_RUNTIME_PASSWORD@127.0.0.1:$published_port/$receiver_database" \
-  RUSTODON_WORKER_RECEIVER_OWNER_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$receiver_database" \
-  RUSTODON_WORKER_DATABASE_URL="$runtime_url" \
-  RUSTODON_WORKER_ADMIN_DATABASE_URL="$migrator_url" \
-  RUSTODON_WORKER_WRITE_DATABASE_URL="$writer_url" \
-  RUSTODON_WORKER_OWNER_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
-    cargo test --locked --features test-support --test workers -- --ignored --nocapture --test-threads=1
+  if [ -n "$case_name" ]; then
+    RUSTODON_WORKER_RECEIVER_DATABASE_URL="postgresql://$WORKER_RUNTIME:$WORKER_RUNTIME_PASSWORD@127.0.0.1:$published_port/$receiver_database" \
+    RUSTODON_WORKER_RECEIVER_OWNER_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$receiver_database" \
+    RUSTODON_WORKER_DATABASE_URL="$runtime_url" \
+    RUSTODON_WORKER_ADMIN_DATABASE_URL="$migrator_url" \
+    RUSTODON_WORKER_WRITE_DATABASE_URL="$writer_url" \
+    RUSTODON_WORKER_OWNER_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+      worker_rust_test "$case_name"
+  else
+    RUSTODON_WORKER_RECEIVER_DATABASE_URL="postgresql://$WORKER_RUNTIME:$WORKER_RUNTIME_PASSWORD@127.0.0.1:$published_port/$receiver_database" \
+    RUSTODON_WORKER_RECEIVER_OWNER_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$receiver_database" \
+    RUSTODON_WORKER_DATABASE_URL="$runtime_url" \
+    RUSTODON_WORKER_ADMIN_DATABASE_URL="$migrator_url" \
+    RUSTODON_WORKER_WRITE_DATABASE_URL="$writer_url" \
+    RUSTODON_WORKER_OWNER_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+      cargo test --locked --features test-support --test workers -- --ignored --nocapture --test-threads=1
+  fi
 
   start_worker_cli "$runtime_url" "$worker_log" "$writer_url" &
   worker_pid=$!
@@ -1899,6 +1930,9 @@ cutover_abort() {
   if [ -n "${cutover_browser_poll_status_file:-}" ]; then
     rm -f "$cutover_browser_poll_status_file"
   fi
+  if [ -n "${cutover_browser_quote_status_file:-}" ]; then
+    rm -f "$cutover_browser_quote_status_file"
+  fi
   if [ "${CUTOVER_KEEP_ARTIFACTS:-false}" = true ]; then
     printf 'cutover artifacts retained under %s and %s\n' \
       "${cutover_worker_log:-}" "${cutover_web_log:-}" >&2
@@ -2005,6 +2039,9 @@ cutover_test() {
   cutover_browser_token_max=''
   cutover_browser_poll_status_file=''
   cutover_browser_poll_status_id=''
+  cutover_browser_quote_status_file=''
+  cutover_browser_quote_target_id=''
+  cutover_browser_quote_status_id=''
   cutover_media_root="$ROOT/target/cutover-media-$$"
   trap cutover_abort EXIT HUP INT TERM
 
@@ -2117,7 +2154,8 @@ EOF
     true)
       cutover_browser_user_restore="$ROOT/target/cutover-browser-user-$$.sql"
       cutover_browser_poll_status_file="$ROOT/target/cutover-browser-poll-status-$$"
-      rm -f "$cutover_browser_poll_status_file"
+      cutover_browser_quote_status_file="$ROOT/target/cutover-browser-quote-statuses-$$"
+      rm -f "$cutover_browser_poll_status_file" "$cutover_browser_quote_status_file"
       cutover_browser_login_activity_max=$(run_podman exec "$PG_CONTAINER" psql \
         --set ON_ERROR_STOP=1 --tuples-only --no-align \
         --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
@@ -2183,6 +2221,10 @@ EOF
   SELECT 7, format('SELECT setval(''public.polls_id_seq'', %s, %L);', last_value, is_called) FROM public.polls_id_seq
   UNION ALL
   SELECT 8, format('SELECT setval(''public.poll_votes_id_seq'', %s, %L);', last_value, is_called) FROM public.poll_votes_id_seq
+  UNION ALL
+  SELECT 9, format('SELECT setval(''public.quotes_id_seq'', %s, %L);', last_value, is_called) FROM public.quotes_id_seq
+  UNION ALL
+  SELECT 10, format('SELECT setval(''public.mentions_id_seq'', %s, %L);', last_value, is_called) FROM public.mentions_id_seq
 ) AS restore_statements ORDER BY step;" \
         >> "$cutover_browser_user_restore"
       ;;
@@ -2204,6 +2246,7 @@ EOF
         RUSTODON_BROWSER_VOTER_PASSWORD="${RUSTODON_BROWSER_VOTER_PASSWORD:-}" \
         RUSTODON_BROWSER_VOTER_OTP="${RUSTODON_BROWSER_VOTER_OTP:-}" \
         RUSTODON_BROWSER_POLL_STATUS_FILE="$cutover_browser_poll_status_file" \
+        RUSTODON_BROWSER_QUOTE_STATUS_FILE="$cutover_browser_quote_status_file" \
         "$ROOT/tools/rustodon-browser-smoke" \
         "https://$LOCAL_DOMAIN:$cutover_tls_port" "$LOCAL_DOMAIN"
       cutover_stop_browser_tls
@@ -2217,11 +2260,67 @@ EOF
         rm -f "$cutover_browser_poll_status_file"
         cutover_browser_poll_status_file=''
       fi
+      if [ -n "$cutover_browser_quote_status_file" ]; then
+        [ -s "$cutover_browser_quote_status_file" ] ||
+          die 'browser quote smoke did not record its generated status IDs'
+        [ "$(wc -l < "$cutover_browser_quote_status_file" | tr -d ' ')" = 2 ] ||
+          die 'browser quote smoke recorded an invalid status ID inventory'
+        cutover_browser_quote_target_id=$(sed -n '1p' "$cutover_browser_quote_status_file" | tr -d '[:space:]')
+        cutover_browser_quote_status_id=$(sed -n '2p' "$cutover_browser_quote_status_file" | tr -d '[:space:]')
+        case "$cutover_browser_quote_target_id:$cutover_browser_quote_status_id" in
+          *[!0-9:]*) die 'browser quote smoke recorded invalid status IDs' ;;
+          "$cutover_browser_quote_target_id:$cutover_browser_quote_target_id") die 'browser quote smoke reused its target status ID' ;;
+        esac
+        rm -f "$cutover_browser_quote_status_file"
+        cutover_browser_quote_status_file=''
+      fi
       ;;
     false) ;;
     *) die 'RUSTODON_BROWSER_SMOKE must be true or false' ;;
   esac
   if [ -n "$cutover_browser_user_restore" ]; then
+    if [ -n "$cutover_browser_quote_status_id" ]; then
+      run_podman exec "$PG_CONTAINER" psql \
+      --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
+      --command "BEGIN;
+CREATE TEMP TABLE rustodon_browser_quote_statuses ON COMMIT DROP AS
+  SELECT id, conversation_id FROM public.statuses
+   WHERE id IN ($cutover_browser_quote_target_id, $cutover_browser_quote_status_id)
+     AND account_id = 116844606259201001;
+DO \$\$ BEGIN
+  IF (SELECT count(*) FROM rustodon_browser_quote_statuses) <> 2 THEN
+    RAISE EXCEPTION 'expected exactly two browser quote statuses';
+  END IF;
+END \$\$;
+DELETE FROM public.notifications WHERE activity_type = 'Mention'
+  AND activity_id IN (
+    SELECT id FROM public.mentions
+     WHERE status_id IN (SELECT id FROM rustodon_browser_quote_statuses)
+  );
+DELETE FROM public.notifications WHERE activity_type = 'Quote'
+  AND activity_id IN (
+    SELECT id FROM public.quotes
+     WHERE status_id = $cutover_browser_quote_status_id
+       AND quoted_status_id = $cutover_browser_quote_target_id
+  );
+DELETE FROM public.mentions
+ WHERE status_id IN (SELECT id FROM rustodon_browser_quote_statuses);
+DELETE FROM public.quotes
+ WHERE status_id = $cutover_browser_quote_status_id
+   AND quoted_status_id = $cutover_browser_quote_target_id;
+DELETE FROM public.status_edits
+ WHERE status_id IN (SELECT id FROM rustodon_browser_quote_statuses);
+DELETE FROM public.status_stats
+ WHERE status_id IN (SELECT id FROM rustodon_browser_quote_statuses);
+UPDATE public.statuses SET conversation_id = NULL
+ WHERE id IN (SELECT id FROM rustodon_browser_quote_statuses);
+DELETE FROM public.statuses
+ WHERE id IN (SELECT id FROM rustodon_browser_quote_statuses);
+DELETE FROM public.conversations WHERE id IN (
+  SELECT conversation_id FROM rustodon_browser_quote_statuses WHERE conversation_id IS NOT NULL
+);
+COMMIT;" >/dev/null
+    fi
     if [ -n "$cutover_browser_poll_status_id" ]; then
       run_podman exec "$PG_CONTAINER" psql \
       --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
@@ -2261,9 +2360,11 @@ COMMIT;" >/dev/null
       --set ON_ERROR_STOP=1 --username "$DATABASE_USER" --dbname "$DATABASE_NAME" \
       --command "DELETE FROM public.session_activations WHERE (user_id = 101 AND id > $cutover_browser_session_activation_max) OR (user_id = 102 AND id > $cutover_browser_voter_session_activation_max); DELETE FROM public.oauth_access_tokens WHERE (resource_owner_id = 101 AND id > $cutover_browser_token_max) OR (resource_owner_id = 102 AND id > $cutover_browser_voter_token_max); DELETE FROM public.login_activities WHERE (user_id = 101 AND id > $cutover_browser_login_activity_max) OR (user_id = 102 AND id > $cutover_browser_voter_login_activity_max);" \
       >/dev/null
-    rm -f "$cutover_browser_user_restore" "$cutover_browser_poll_status_file"
+    rm -f "$cutover_browser_user_restore" "$cutover_browser_poll_status_file" \
+      "$cutover_browser_quote_status_file"
     cutover_browser_user_restore=''
     cutover_browser_poll_status_file=''
+    cutover_browser_quote_status_file=''
   fi
   RUSTODON_SMOKE_DOMAIN="$LOCAL_DOMAIN" \
     RUSTODON_SMOKE_HOST="$LOCAL_DOMAIN" \
@@ -2389,7 +2490,7 @@ validate_differential_case() {
       ;;
   esac
   case "$case_name" in
-    account_settings|actor_media_root_url|admin_create_user|authorized_fetch_read_routes_require_signatures|browser_authentication|browser_recovery_fences|browser_reauthentication_limits|browser_two_factor_management|core_rest_serializers|extended_description|extended_description_limited_mode|federation_discovery|instance_v2|local_paperclip_media|local_paperclip_deleted_media|local_web_client_shell|media_writes|mixed_profile_media|notification_writes|oauth_authorization_code|oauth_bearer_authentication|password_recovery|poll_lifecycle|report_writes|rest_protocol_contracts|status_authorization_matrix|write_transactions) ;;
+    account_settings|actor_media_root_url|admin_create_user|authorized_fetch_read_routes_require_signatures|browser_authentication|browser_recovery_fences|browser_reauthentication_limits|browser_two_factor_management|core_rest_serializers|extended_description|extended_description_limited_mode|federation_discovery|instance_v2|local_paperclip_media|local_paperclip_deleted_media|local_web_client_shell|media_writes|mixed_profile_media|notification_writes|oauth_authorization_code|oauth_bearer_authentication|password_recovery|poll_lifecycle|quote_lifecycle|report_writes|rest_protocol_contracts|status_authorization_matrix|write_transactions) ;;
     *) die "unknown differential case: $case_name" ;;
   esac
 }
@@ -2548,6 +2649,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.notification_policies TO $D
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.statuses TO $DIFFERENTIAL_WRITER;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.polls TO $DIFFERENTIAL_WRITER;
 GRANT SELECT, INSERT, DELETE ON TABLE public.poll_votes TO $DIFFERENTIAL_WRITER;
+GRANT SELECT, INSERT, UPDATE ON TABLE public.quotes TO $DIFFERENTIAL_WRITER;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.account_stats TO $DIFFERENTIAL_WRITER;
 GRANT SELECT, DELETE ON TABLE public.generated_annual_reports TO $DIFFERENTIAL_WRITER;
 GRANT SELECT, DELETE ON TABLE public.fasp_follow_recommendations TO $DIFFERENTIAL_WRITER;
@@ -2580,7 +2682,7 @@ GRANT USAGE, SELECT ON SEQUENCE public.reports_id_seq, public.collection_reports
    TO $DIFFERENTIAL_WRITER;
 GRANT USAGE, SELECT ON SEQUENCE public.admin_action_logs_id_seq TO $DIFFERENTIAL_WRITER;
  GRANT USAGE ON SEQUENCE public.web_settings_id_seq, public.polls_id_seq,
-   public.poll_votes_id_seq TO $DIFFERENTIAL_WRITER;
+   public.poll_votes_id_seq, public.quotes_id_seq TO $DIFFERENTIAL_WRITER;
 GRANT USAGE, SELECT ON SEQUENCE
    public.bookmarks_id_seq, public.favourites_id_seq, public.status_stats_id_seq,
    public.status_pins_id_seq, public.statuses_id_seq, public.conversations_id_seq,
@@ -2608,6 +2710,7 @@ EOF
 GRANT USAGE ON SCHEMA rustodon TO $DIFFERENTIAL_WRITER;
 GRANT USAGE, SELECT ON SEQUENCE rustodon.outbox_events_id_seq TO $DIFFERENTIAL_WRITER;
 GRANT SELECT, DELETE ON TABLE rustodon.durable_jobs TO $DIFFERENTIAL_WRITER;
+GRANT UPDATE (lease_expires_at, updated_at) ON TABLE rustodon.durable_jobs TO $DIFFERENTIAL_WRITER;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   rustodon.idempotency_keys, rustodon.outbox_events, rustodon.ordering_markers,
     rustodon.rate_limit_windows
@@ -3082,11 +3185,11 @@ case "$command" in
     [ "$#" -le 1 ] || die 'schema-read-test accepts at most one named case'
     case "${1:-}" in
       '')
-        for selector in mastodon_schema account_stats_repair saved_status_authorization qualified_local_mentions followed_hashtag_streams public_oauth_revocation oauth_response_modes v2_account_search api_empty_reads web_settings media_proxy media_state batch_accounts; do
+        for selector in mastodon_schema quote_lifecycle account_stats_repair saved_status_authorization qualified_local_mentions followed_hashtag_streams public_oauth_revocation oauth_response_modes v2_account_search api_empty_reads web_settings media_proxy media_state batch_accounts; do
           schema_read_test "$FIXTURE_DIR" "$selector"
         done
         ;;
-      mastodon_schema|account_stats_repair|saved_status_authorization|qualified_local_mentions|followed_hashtag_streams|public_oauth_revocation|oauth_response_modes|v2_account_search|api_empty_reads|web_settings|media_proxy|media_state|batch_accounts)
+      mastodon_schema|quote_lifecycle|account_stats_repair|saved_status_authorization|qualified_local_mentions|followed_hashtag_streams|public_oauth_revocation|oauth_response_modes|v2_account_search|api_empty_reads|web_settings|media_proxy|media_state|batch_accounts)
         schema_read_test "$FIXTURE_DIR" "$1"
         ;;
       *) die "unknown schema-read test: $1" ;;
@@ -3097,8 +3200,8 @@ case "$command" in
     operational_schema_test
     ;;
   worker-test)
-    [ "$#" -eq 0 ] || die 'worker-test takes no arguments'
-    worker_test
+    [ "$#" -le 1 ] || die 'worker-test accepts at most one case'
+    worker_test "${1:-}"
     ;;
   startup-test)
     [ "$#" -eq 0 ] || die 'startup-test takes no arguments'

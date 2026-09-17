@@ -125,6 +125,7 @@ pub(crate) struct ActivityPubQuoteTarget {
     pub(crate) uri: Option<String>,
     pub(crate) url: Option<String>,
     pub(crate) approval_uri: Option<String>,
+    pub(crate) accepted: bool,
 }
 
 impl StatusPolicyRow {
@@ -2105,7 +2106,7 @@ impl Repository {
                 )) \
                AND ($3::bigint IS NULL OR quote.id < $3) \
                AND ($4::bigint IS NULL OR quote.id > $4) \
-             ORDER BY status.id DESC, quote.id DESC LIMIT $5",
+             ORDER BY quote.id DESC LIMIT $5",
         )
         .bind(status_id)
         .bind(viewer_account_id)
@@ -2485,12 +2486,34 @@ impl Repository {
         sqlx::query_as::<_, ActivityPubQuoteTarget>(
             "SELECT quote.id AS quote_id, quoted.id, quoted_account.id AS account_id, \
              (quoted.local IS TRUE OR quoted.uri IS NULL) AS local, quoted_account.domain IS NULL AS quoted_account_local, \
-             quoted_account.id_scheme, quoted_account.username, quoted.uri, quoted.url, quote.approval_uri \
+             quoted_account.id_scheme, quoted_account.username, quoted.uri, quoted.url, quote.approval_uri, \
+             TRUE AS accepted \
              FROM quotes quote \
              JOIN statuses status ON status.id = quote.status_id AND status.deleted_at IS NULL \
              JOIN statuses quoted ON quoted.id = quote.quoted_status_id AND quoted.deleted_at IS NULL \
              JOIN accounts quoted_account ON quoted_account.id = quoted.account_id \
              WHERE quote.status_id = $1 AND quote.state = 1 \
+             ORDER BY quote.id LIMIT 1",
+        )
+        .bind(status_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub(crate) async fn activitypub_quote_target_for_delivery(
+        &self,
+        status_id: i64,
+    ) -> sqlx::Result<Option<ActivityPubQuoteTarget>> {
+        sqlx::query_as::<_, ActivityPubQuoteTarget>(
+            "SELECT quote.id AS quote_id, quoted.id, quoted_account.id AS account_id, \
+             (quoted.local IS TRUE OR quoted.uri IS NULL) AS local, quoted_account.domain IS NULL AS quoted_account_local, \
+             quoted_account.id_scheme, quoted_account.username, quoted.uri, quoted.url, quote.approval_uri, \
+             quote.state = 1 AS accepted \
+             FROM quotes quote \
+             JOIN statuses status ON status.id = quote.status_id AND status.deleted_at IS NULL \
+             JOIN statuses quoted ON quoted.id = quote.quoted_status_id AND quoted.deleted_at IS NULL \
+             JOIN accounts quoted_account ON quoted_account.id = quoted.account_id \
+             WHERE quote.status_id = $1 AND quote.state IN (0, 1) \
              ORDER BY quote.id LIMIT 1",
         )
         .bind(status_id)

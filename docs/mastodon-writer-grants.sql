@@ -143,7 +143,11 @@ GRANT SELECT, INSERT ON TABLE public.status_edits TO :"writer_role";
 GRANT SELECT, UPDATE, DELETE ON TABLE public.featured_tags TO :"writer_role";
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.polls TO :"writer_role";
 GRANT INSERT, DELETE ON TABLE public.poll_votes TO :"writer_role";
-GRANT USAGE ON SEQUENCE public.polls_id_seq, public.poll_votes_id_seq TO :"writer_role";
+-- Quote IDs use timestamp_id('quotes'), whose schema-defined default consumes
+-- quotes_id_seq. Quote lifecycle transitions update rows; they never hard-delete them.
+GRANT INSERT, UPDATE ON TABLE public.quotes TO :"writer_role";
+GRANT USAGE ON SEQUENCE public.polls_id_seq, public.poll_votes_id_seq,
+  public.quotes_id_seq TO :"writer_role";
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.account_deletion_requests
   TO :"writer_role";
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.account_stats
@@ -237,6 +241,8 @@ GRANT EXECUTE ON FUNCTION public.rustodon_refresh_instances() TO :"writer_role";
 GRANT USAGE, SELECT ON SEQUENCE rustodon.outbox_events_id_seq
   TO :"writer_role";
 GRANT SELECT, DELETE ON TABLE rustodon.durable_jobs TO :"writer_role";
+GRANT UPDATE (lease_expires_at, updated_at) ON TABLE rustodon.durable_jobs
+  TO :"writer_role";
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   rustodon.idempotency_keys, rustodon.outbox_events,
   rustodon.ordering_markers, rustodon.rate_limit_windows
