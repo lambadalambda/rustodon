@@ -253,7 +253,16 @@ async fn run_admin(command: AdminCommand) -> ExitCode {
     };
     match command {
         AdminCommand::MigrateOperationalSchema => {
-            if let Err(error) = operational_schema::migrate(&mut connection).await {
+            let writer_role = config
+                .write_database
+                .as_ref()
+                .and_then(preflight::postgres_username_for);
+            if let Err(error) = operational_schema::migrate_with_writer_role(
+                &mut connection,
+                writer_role.as_deref(),
+            )
+            .await
+            {
                 eprintln!("operational schema migration failed: {error}");
                 return ExitCode::FAILURE;
             }

@@ -26,7 +26,7 @@ use rustodon::mastodon::{
     WRITE_ACCOUNTS, WRITE_BOOKMARKS, WRITE_CONVERSATIONS, WRITE_FAVOURITES, WRITE_MEDIA,
     WRITE_REPORTS, WRITE_STATUSES, WriteError, WriteRepository,
 };
-use rustodon::operational_schema::migrate;
+use rustodon::operational_schema::migrate_with_writer_role;
 use rustodon::paperclip::PaperclipAttachment;
 use rustodon::streaming::STREAM_EVENT_KIND;
 use serde_json::{Value, json};
@@ -3072,7 +3072,11 @@ async fn write_repository_applies_account_and_domain_moderation_transactionally(
         .expect("the Podman fixture task must provide RUSTODON_MASTODON_WRITER_DATABASE_URL");
     let pool = sqlx::PgPool::connect(&owner_url).await?;
     let mut operational_connection = PgConnection::connect(&owner_url).await?;
-    migrate(&mut operational_connection).await?;
+    migrate_with_writer_role(
+        &mut operational_connection,
+        Some("rustodon_differential_writer"),
+    )
+    .await?;
     for statement in [
         "GRANT USAGE ON SCHEMA rustodon TO rustodon_differential_writer",
         "GRANT SELECT, DELETE ON TABLE rustodon.durable_jobs TO rustodon_differential_writer",
@@ -7404,7 +7408,11 @@ async fn write_repository_runs_local_poll_lifecycle_transactionally() -> Result<
         .expect("the Podman fixture task must provide RUSTODON_MASTODON_WRITER_DATABASE_URL");
     let pool = sqlx::PgPool::connect(&owner_url).await?;
     let mut operational_connection = PgConnection::connect(&owner_url).await?;
-    migrate(&mut operational_connection).await?;
+    migrate_with_writer_role(
+        &mut operational_connection,
+        Some("rustodon_differential_writer"),
+    )
+    .await?;
     for statement in [
         "GRANT USAGE ON SCHEMA rustodon TO rustodon_differential_writer",
         "GRANT SELECT, DELETE ON TABLE rustodon.durable_jobs TO rustodon_differential_writer",
@@ -7959,7 +7967,11 @@ async fn newer_signed_note_refresh_removes_obsolete_remote_poll_state() -> Resul
         .expect("the Podman fixture task must provide RUSTODON_MASTODON_WRITER_DATABASE_URL");
     let pool = sqlx::PgPool::connect(&owner_url).await?;
     let mut operational_connection = PgConnection::connect(&owner_url).await?;
-    migrate(&mut operational_connection).await?;
+    migrate_with_writer_role(
+        &mut operational_connection,
+        Some("rustodon_differential_writer"),
+    )
+    .await?;
     let writer = WriteRepository::connect(&writer_url).await?;
     let actor_uri: String = sqlx::query_scalar("SELECT uri FROM accounts WHERE id = $1")
         .bind(BOB)
@@ -8141,7 +8153,11 @@ async fn write_repository_queues_each_remote_poll_vote_and_final_check()
         .expect("the Podman fixture task must provide RUSTODON_MASTODON_OWNER_DATABASE_URL");
     let pool = sqlx::PgPool::connect(&owner_url).await?;
     let mut operational_connection = PgConnection::connect(&owner_url).await?;
-    migrate(&mut operational_connection).await?;
+    migrate_with_writer_role(
+        &mut operational_connection,
+        Some("rustodon_differential_writer"),
+    )
+    .await?;
     let writer = WriteRepository::connect(&owner_url).await?;
     let authenticator = BearerAuthenticator::new(Repository::connect(&database_url).await?);
     let mut headers = HeaderMap::new();
@@ -8661,7 +8677,11 @@ async fn high_fanout_status_write_takes_stream_order_lock_only_at_terminal_flush
         .expect("the Podman fixture task must provide RUSTODON_MASTODON_OWNER_DATABASE_URL");
     let pool = sqlx::PgPool::connect(&owner_url).await?;
     let mut migration_connection = PgConnection::connect(&owner_url).await?;
-    migrate(&mut migration_connection).await?;
+    migrate_with_writer_role(
+        &mut migration_connection,
+        Some("rustodon_differential_writer"),
+    )
+    .await?;
     let writer = WriteRepository::connect(&owner_url).await?;
     let authenticator = BearerAuthenticator::new(Repository::connect(&database_url).await?);
     let mut headers = HeaderMap::new();
@@ -8952,7 +8972,11 @@ async fn conversation_updates_conflict_concurrently() -> Result<(), Box<dyn Erro
         .expect("the Podman fixture task must provide RUSTODON_MASTODON_OWNER_DATABASE_URL");
     let owner = sqlx::PgPool::connect(&owner_url).await?;
     let mut operational_connection = PgConnection::connect(&owner_url).await?;
-    migrate(&mut operational_connection).await?;
+    migrate_with_writer_role(
+        &mut operational_connection,
+        Some("rustodon_differential_writer"),
+    )
+    .await?;
     let before: Value = sqlx::query_scalar(
         "SELECT to_jsonb(conversation) FROM account_conversations conversation WHERE id = $1",
     )
@@ -9559,7 +9583,7 @@ async fn notification_group_bucket_survives_last_row_deletion()
     let owner_url = std::env::var("RUSTODON_MASTODON_OWNER_DATABASE_URL")
         .expect("the Podman fixture task must provide RUSTODON_MASTODON_OWNER_DATABASE_URL");
     let mut connection = PgConnection::connect(&owner_url).await?;
-    migrate(&mut connection).await?;
+    migrate_with_writer_role(&mut connection, Some("rustodon_differential_writer")).await?;
     sqlx::query("DELETE FROM rustodon.ordering_markers WHERE kind = 'notification_group'")
         .execute(&mut connection)
         .await?;

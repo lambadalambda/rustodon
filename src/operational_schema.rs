@@ -57,8 +57,8 @@ const INDEXES: &[&str] = &[
     "schema_migrations_pkey",
 ];
 const EXPECTED_CATALOG_SHA256: [u8; 32] = [
-    0x9d, 0xf6, 0x0a, 0x97, 0xc0, 0x9a, 0x0d, 0xc1, 0x08, 0xc1, 0x3c, 0x25, 0xec, 0xed, 0xaf, 0xd7,
-    0x40, 0x89, 0x38, 0x1e, 0x3a, 0xe0, 0x1f, 0xb0, 0x39, 0xbe, 0xef, 0x0d, 0x03, 0x0c, 0xc3, 0x1f,
+    0x32, 0x8d, 0x79, 0x3a, 0x7d, 0x32, 0xa3, 0x8b, 0xd0, 0xe3, 0xc8, 0x6e, 0x19, 0x68, 0x77, 0xc9,
+    0x3b, 0x18, 0xe3, 0xa8, 0x47, 0x93, 0xd6, 0x7e, 0xb2, 0x06, 0x9e, 0x22, 0x88, 0xe3, 0x0a, 0xc7,
 ];
 const CATALOG_QUERY: &str = r#"
 WITH schema_info AS (
@@ -726,7 +726,25 @@ pub fn migration_plan(applied: &[MigrationRecord]) -> Result<Vec<i64>, Migration
 ///
 /// Rejects unknown or drifted schemas and propagates `PostgreSQL` migration failures.
 pub async fn migrate(connection: &mut PgConnection) -> Result<(), MigrationError> {
+    migrate_with_writer_role(connection, None).await
+}
+
+/// Creates or upgrades the operational schema while normalizing grants for a known writer role.
+///
+/// # Errors
+///
+/// Rejects unknown or drifted schemas and propagates `PostgreSQL` migration failures.
+pub async fn migrate_with_writer_role(
+    connection: &mut PgConnection,
+    writer_role: Option<&str>,
+) -> Result<(), MigrationError> {
     let mut transaction = connection.begin().await?;
+    if let Some(writer_role) = writer_role {
+        sqlx::query("SELECT pg_catalog.set_config('rustodon.writer_role', $1, true)")
+            .bind(writer_role)
+            .execute(&mut *transaction)
+            .await?;
+    }
     let result = migrate_transaction(&mut transaction).await;
     match result {
         Ok(()) => transaction.commit().await.map_err(MigrationError::from),
@@ -1396,7 +1414,7 @@ mod tests {
     fn expected_catalog_hash_is_pinned_postgresql_14_23_v4_catalog() {
         assert_eq!(
             hex(&EXPECTED_CATALOG_SHA256),
-            "9df60a97c09a0dc108c13c25ecedafd74089381e3ae01fb039beef0d030cc31f"
+            "328d793a7d32a38bd0e3c86e196877c93b18e3a84793d67eb2069e2288e30ac7"
         );
     }
 
