@@ -29,40 +29,10 @@ use super::{
     StatusEditProjection, StatusProjection, TagProjection,
 };
 use crate::mastodon::AccountIdScheme;
+use crate::media::ALL_MEDIA_MIME_TYPES;
 
 const DEFAULT_AVATAR: &str = "avatars/original/missing.png";
 const DEFAULT_HEADER: &str = "headers/original/missing.png";
-pub(crate) const SUPPORTED_MIME_TYPES: &[&str] = &[
-    "image/jpeg",
-    "image/png",
-    "image/gif",
-    "image/heic",
-    "image/heif",
-    "image/webp",
-    "image/avif",
-    "video/webm",
-    "video/mp4",
-    "video/quicktime",
-    "video/ogg",
-    "audio/wave",
-    "audio/wav",
-    "audio/x-wav",
-    "audio/x-pn-wave",
-    "audio/vnd.wave",
-    "audio/ogg",
-    "audio/vorbis",
-    "audio/mpeg",
-    "audio/mp3",
-    "audio/webm",
-    "audio/flac",
-    "audio/aac",
-    "audio/m4a",
-    "audio/x-m4a",
-    "audio/mp4",
-    "audio/3gpp",
-    "video/x-ms-asf",
-];
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatusShape {
     Full,
@@ -345,7 +315,7 @@ impl<'a> RestSerializer<'a> {
                     "characters_reserved_per_url": 23,
                 },
                 "media_attachments": {
-                    "supported_mime_types": SUPPORTED_MIME_TYPES,
+                    "supported_mime_types": ALL_MEDIA_MIME_TYPES,
                     "image_size_limit": 16_777_216,
                     "image_matrix_limit": 33_177_600,
                     "video_size_limit": 103_809_024,
@@ -456,7 +426,7 @@ impl<'a> RestSerializer<'a> {
                     "description_limit": 10_000,
                     "image_matrix_limit": 33_177_600,
                     "image_size_limit": 16_777_216,
-                    "supported_mime_types": SUPPORTED_MIME_TYPES,
+                    "supported_mime_types": ALL_MEDIA_MIME_TYPES,
                     "video_frame_rate_limit": 120,
                     "video_matrix_limit": 8_294_400,
                     "video_size_limit": 103_809_024,

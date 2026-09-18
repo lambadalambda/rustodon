@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod jobs;
 pub mod mail;
 pub mod mastodon;
+pub mod media;
 pub mod operational_schema;
 pub mod paperclip;
 pub mod preflight;
