@@ -76,11 +76,12 @@ pub async fn stage_in(
     let media_id = sqlx::query_scalar(
         "INSERT INTO media_attachments (account_id, type, processing, remote_url,
            file_meta, created_at, updated_at)
-         SELECT id, 0, 0, '', '{}'::json, clock_timestamp(), clock_timestamp()
+         SELECT id, $2, 0, '', '{}'::json, clock_timestamp(), clock_timestamp()
          FROM accounts WHERE id = $1 AND domain IS NULL
          RETURNING id",
     )
     .bind(account_id)
+    .bind(format.kind.database_type())
     .fetch_optional(&mut **tx)
     .await?
     .ok_or(WriteError::NotFound)?;
@@ -151,8 +152,7 @@ async fn lock_pending(
 }
 
 /// Mark durable acceptance and record its processing intent in the SAME transaction.
-/// The next integration must supply a registered, generation-keyed processing spec.
-/// There are intentionally no live callers or new job kinds in this slice. Duplicate
+/// The caller supplies a registered, generation-keyed processing spec. Duplicate
 /// acceptance does not reset an already-dispatched event.
 /// # Errors
 /// Rejects missing/stale/deleted ownership or an invalid outbox spec.
@@ -185,6 +185,10 @@ pub async fn accept_in(
             .execute(&mut **tx)
             .await?;
     }
+    sqlx::query("UPDATE media_attachments SET processing = 1 WHERE id = $1")
+        .bind(identity.media_id)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -362,7 +366,7 @@ pub async fn discard_staging_in(
     Ok(())
 }
 
-/// Fence terminal failure/deletion while retaining every file for later cleanup.
+/// Retain an accepted terminal failure for owner polling, fencing later publication.
 /// Cleanup may forget ownership only after unlink + directory durability succeeds.
 /// # Errors
 /// Rejects stale claims or a no-longer-pending media row.
@@ -371,7 +375,7 @@ pub async fn abandon_in(
     token: UploadClaim,
 ) -> Result<(), WriteError> {
     owned_pending(tx, token).await?;
-    sqlx::query("DELETE FROM media_attachments WHERE id = $1 AND account_id = $2")
+    sqlx::query("UPDATE media_attachments SET processing = 3, updated_at = clock_timestamp() WHERE id = $1 AND account_id = $2")
         .bind(token.identity.media_id)
         .bind(token.identity.account_id)
         .execute(&mut **tx)
@@ -379,17 +383,18 @@ pub async fn abandon_in(
     Ok(())
 }
 
-/// Forget an orphan only after the caller has durably removed its exact manifest.
+/// Forget an orphan or retained failed row only after the caller has durably removed its exact manifest.
 /// Never discards ownership of a live pending upload (including interrupted staging).
 /// # Errors
-/// Rejects stale ownership or any surviving public media row.
+/// Rejects stale ownership or a surviving non-failed public media row.
 pub async fn forget_orphan_in(
     tx: &mut Transaction<'_, Postgres>,
     identity: UploadIdentity,
 ) -> Result<(), WriteError> {
     let deleted = sqlx::query(
         "DELETE FROM rustodon.local_uploads WHERE media_id = $1 AND account_id = $2
-           AND generation = $3 AND NOT EXISTS (SELECT 1 FROM media_attachments WHERE id = $1)",
+           AND generation = $3 AND NOT EXISTS (SELECT 1 FROM media_attachments WHERE id = $1
+             AND (account_id = $2 AND processing = 3 AND file_file_name IS NULL AND remote_url = '') IS NOT TRUE)",
     )
     .bind(identity.media_id)
     .bind(identity.account_id)
@@ -457,4 +462,83 @@ pub async fn retire_ready_in(
         .bind(identity.media_id).bind(identity.account_id).bind(identity.generation)
         .execute(&mut **tx).await?;
     Ok(())
+}
+
+impl super::WriteRepository {
+    /// Authenticated web staging; caller holds the canonical account lock.
+    pub(crate) async fn stage_local_upload_locked(
+        &self,
+        authenticated: &super::AuthenticatedBearer,
+        input: &RawInput<'_>,
+        update: &super::MediaAttachmentUpdate,
+    ) -> Result<UploadIdentity, WriteError> {
+        super::validate_media_attachment_update(update)?;
+        let (account_id, mut tx) = self
+            .begin_account_write(authenticated, super::WRITE_MEDIA)
+            .await?;
+        // A new public ID is a new generation. This path never reuses an ID.
+        let id = stage_in(&mut tx, account_id, 1, input).await?;
+        let description = match &update.description {
+            super::AccountProfileValue::Value(value) => Some(value.as_str()),
+            _ => None,
+        };
+        let meta = super::media_meta_with_focus(json!({}), &update.focus)?;
+        sqlx::query(
+            "UPDATE media_attachments SET description = $2, file_meta = $3::json WHERE id = $1",
+        )
+        .bind(id.media_id)
+        .bind(description)
+        .bind(meta)
+        .execute(&mut *tx)
+        .await?;
+        if let Err(error) = tx.commit().await {
+            // The database may have committed before transport failure. Reload
+            // the exact generation; never infer rollback or unlink speculative paths.
+            if !self
+                .local_upload_committed(id, false)
+                .await
+                .unwrap_or(false)
+            {
+                return Err(error.into());
+            }
+        }
+        Ok(id)
+    }
+
+    pub(crate) async fn accept_local_upload_locked(
+        &self,
+        authenticated: &super::AuthenticatedBearer,
+        id: UploadIdentity,
+    ) -> Result<(), WriteError> {
+        let (account, mut tx) = self
+            .begin_account_write(authenticated, super::WRITE_MEDIA)
+            .await?;
+        if account != id.account_id {
+            return Err(WriteError::NotFound);
+        }
+        accept_in(
+            &mut tx,
+            id,
+            &crate::worker::local_uploads::processing_job(id),
+        )
+        .await?;
+        if let Err(error) = tx.commit().await
+            && !self.local_upload_committed(id, true).await.unwrap_or(false)
+        {
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    async fn local_upload_committed(
+        &self,
+        id: UploadIdentity,
+        accepted: bool,
+    ) -> Result<bool, WriteError> {
+        let mut tx = self.pool.begin().await?;
+        lock_pending(&mut tx, id).await?;
+        Ok(load_in(&mut tx, id)
+            .await?
+            .is_some_and(|state| state.accepted == accepted))
+    }
 }

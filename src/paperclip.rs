@@ -742,6 +742,22 @@ pub async fn prepare_rich_media_attachment(
     .await
 }
 
+/// Run image decoding/resizing/hashing off the async executor.
+/// # Errors
+/// Returns validation errors or an unavailable blocking executor.
+pub async fn prepare_media_attachment_async(
+    account_id: i64,
+    file_name: String,
+    content_type: String,
+    bytes: Vec<u8>,
+) -> Result<PreparedMediaAttachment, MediaAttachmentError> {
+    tokio::task::spawn_blocking(move || {
+        prepare_media_attachment(account_id, &file_name, &content_type, &bytes)
+    })
+    .await
+    .map_err(|_| MediaAttachmentError::ProcessingUnavailable)?
+}
+
 /// Test-support entry point with injectable processor executables and deadline.
 ///
 /// # Errors
@@ -770,7 +786,13 @@ async fn prepare_rich_media_attachment_inner(
         return Err(MediaAttachmentError::TooLarge);
     }
     if !format.external_processing {
-        return prepare_media_attachment(account_id, file_name, content_type, bytes);
+        return prepare_media_attachment_async(
+            account_id,
+            file_name.to_owned(),
+            content_type.to_owned(),
+            bytes.to_vec(),
+        )
+        .await;
     }
 
     let deadline = tokio::time::Instant::now() + config.timeout;
@@ -839,12 +861,13 @@ async fn prepare_modern_still(
         format.input_size_limit - 1,
     )
     .await?;
-    prepare_media_attachment(
+    prepare_media_attachment_async(
         account_id,
-        file_name,
-        format.output_content_type,
-        &output.stdout,
+        file_name.to_owned(),
+        format.output_content_type.to_owned(),
+        output.stdout,
     )
+    .await
     .map_err(|_| MediaAttachmentError::InvalidMedia)
 }
 
@@ -932,12 +955,13 @@ async fn prepare_video_attachment(
     let preview_content_type = format
         .preview_content_type
         .ok_or(MediaAttachmentError::InvalidMedia)?;
-    let prepared_preview = prepare_media_attachment(
+    let prepared_preview = prepare_media_attachment_async(
         account_id,
-        "preview.png",
-        preview_content_type,
-        &preview.stdout,
+        "preview.png".to_owned(),
+        preview_content_type.to_owned(),
+        preview.stdout,
     )
+    .await
     .map_err(|_| MediaAttachmentError::InvalidMedia)?;
     let small_bytes = prepared_preview
         .small_bytes

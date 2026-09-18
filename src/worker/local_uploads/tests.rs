@@ -473,7 +473,7 @@ async fn durable_queue_retry_exhaustion_and_raw_retirement_failure() -> TestResu
     }
     scan(&f).await;
     assert!(f.state(id).await.is_none());
-    assert!(public_state(&f.pool, id).await?.is_none());
+    assert_eq!(public_state(&f.pool, id).await?, Some((Some(3), None)));
     let ready = f.stage("image/png", &image(), true).await;
     // Two pending output removals occur before installation, then raw unlink fails.
     // Exercise raw retirement in isolation after an ambiguous acknowledged publication.
@@ -593,5 +593,89 @@ async fn recovery_scheduler_second_tick_reuses_live_root() -> TestResult {
             arguments: first.arguments().clone(),
         }
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable restored PostgreSQL fixture"]
+async fn local_upload_readiness_requires_registered_maintenance_worker() -> TestResult {
+    use crate::jobs::WorkerHeartbeat;
+    let f = Fixture::new().await;
+    let queue = Queue::new(f.pool.clone());
+    let id = "local-upload-readiness-test";
+    let freshness = chrono::Duration::seconds(30);
+    queue
+        .heartbeat(&WorkerHeartbeat::worker(
+            id,
+            [Lane::Maintenance],
+            json!({"concurrency":1}),
+        ))
+        .await?;
+    assert!(
+        !ready(&queue, freshness).await?,
+        "generic Maintenance cannot process uploads"
+    );
+    queue
+        .heartbeat(&WorkerHeartbeat::worker(
+            id,
+            [Lane::Core],
+            json!({"local_uploads":true}),
+        ))
+        .await?;
+    assert!(
+        !ready(&queue, freshness).await?,
+        "handler outside the selected lane is insufficient"
+    );
+    queue
+        .heartbeat(&WorkerHeartbeat::worker(
+            id,
+            [Lane::Maintenance],
+            json!({"local_uploads":true}),
+        ))
+        .await?;
+    assert!(ready(&queue, freshness).await?);
+    sqlx::query("UPDATE rustodon.heartbeats SET started_at = clock_timestamp() - interval '2 minutes', heartbeat_at = clock_timestamp() - interval '1 minute' WHERE process_id = $1").bind(id).execute(&f.pool).await?;
+    assert!(!ready(&queue, freshness).await?);
+    queue.remove_heartbeat(id).await?;
+    f.cleanup().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable restored PostgreSQL fixture"]
+async fn terminal_failure_unlink_retry_retains_pollable_error_and_fences_replay() -> TestResult {
+    use crate::paperclip::{MediaAttachmentError, PaperclipRemoveFault};
+    let mut f = Fixture::new().await;
+    let id = f.stage("image/avif", b"invalid bytes", true).await;
+    let root = f
+        .root
+        .clone()
+        .with_remove_fault(PaperclipRemoveFault::fail_once());
+    assert!(
+        process_with(f.pool.clone(), root, job(id), |_, _, _| async {
+            Err(MediaAttachmentError::InvalidMedia)
+        })
+        .await
+        .is_err()
+    );
+    assert_eq!(public_state(&f.pool, id).await?, Some((Some(3), None)));
+    assert!(
+        f.state(id).await.is_some(),
+        "unlink error must retain cleanup ownership"
+    );
+    process_with(f.pool.clone(), f.root.clone(), job(id), |_, _, _| async {
+        panic!("failed replay must not decode or publish")
+    })
+    .await
+    .unwrap();
+    assert_eq!(public_state(&f.pool, id).await?, Some((Some(3), None)));
+    assert!(f.state(id).await.is_none());
+    assert!(
+        f.root
+            .private_upload_root()?
+            .open_file(Path::new(&raw_path(id)))
+            .is_err()
+    );
+    f.cleanup().await;
     Ok(())
 }

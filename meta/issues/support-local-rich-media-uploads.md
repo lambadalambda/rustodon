@@ -35,8 +35,22 @@ Rustodon's staged metadata, durable cleanup, and asynchronous safety contracts.
   independently. No production migration as part of implementation.
 - [Process and recover durable local uploads](process-and-recover-durable-local-uploads.md):
   worker, private raw filesystem, and cleanup/recovery only; no live HTTP v2.
-- Then wire v2 acceptance and pending/ready/failure polling, preserving account
+- [Integrate local rich-upload HTTP](integrate-local-rich-upload-http.md):
+  wire v2 acceptance and pending/ready/failure polling, preserving account
   lifecycle locking, current focus/description edits, exact artifact ownership,
   retry idempotency, and commit-ambiguity reconciliation.
 - Finally verify real composer upload, preview/playback, posting, and reload.
   Do not close this issue merely because the processor or persistence layer passes.
+
+## HTTP slice status (2026-09-18)
+
+The [bounded local HTTP integration](integrate-local-rich-upload-http.md) is implemented
+and left uncommitted for parent review. Real-codec HTTP coverage passes all 24 advertised
+external formats plus pending/failure/ownership/deletion contracts, with focused database
+and worker regressions. This is **not** browser acceptance; keep this issue open until
+composer preview/playback, posting, and reload are exercised separately.
+
+The subsequent evidence-only follow-up also passes the same HTTP/worker lifecycle
+under actual narrow runtime/writer roles, with owner access limited to setup and
+assertions. Real worker capability/readiness coverage passes with those roles;
+no implementation or grant changes were needed. See the HTTP subissue and DEVLOG.

@@ -1,4 +1,4 @@
-//! Durable local processing. No HTTP acceptance path is enabled by this module.
+//! Durable local upload processing and exact-manifest cleanup.
 use std::io::Read;
 use std::path::Path;
 
@@ -22,6 +22,27 @@ use crate::paperclip::{
 
 pub const PROCESS_KIND: &str = "rustodon.mastodon.process_local_upload";
 pub const RECOVER_KIND: &str = "rustodon.mastodon.recover_local_uploads";
+
+/// Worker-readiness gate for installations that accept local uploads. A generic
+/// Maintenance worker without the local writer/root handlers is not sufficient.
+/// # Errors
+/// Returns database failures or an invalid freshness bound.
+pub async fn ready(
+    queue: &Queue,
+    freshness: chrono::Duration,
+) -> Result<bool, crate::jobs::JobError> {
+    if freshness <= chrono::Duration::zero() {
+        return Err(crate::jobs::JobError::InvalidInput(
+            "heartbeat freshness must be positive",
+        ));
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM rustodon.heartbeats
+         WHERE role = 'worker' AND 'maintenance' = ANY(lanes)
+           AND info @> '{\"local_uploads\":true}'::jsonb
+           AND heartbeat_at >= clock_timestamp() - make_interval(secs => $1::double precision / 1000))",
+    ).bind(freshness.num_milliseconds()).fetch_one(queue.pool()).await?)
+}
 
 pub(super) async fn schedule_recovery(
     queue: &Queue,
@@ -152,7 +173,7 @@ async fn cleanup_locked(
             retire_ready_in(&mut tx, id).await?;
             raw.remove_file(Path::new(&state.raw_path))?;
         }
-        None => {
+        None | Some((Some(3), None)) => {
             if state.raw_path != raw_path(id) {
                 return Err(WriteError::Conflict);
             }
@@ -164,11 +185,13 @@ async fn cleanup_locked(
                     return Err(WriteError::Conflict);
                 }
             }
+            // Validate absence or exact failed ownership BEFORE destructive I/O.
+            // Unlink errors roll this uncommitted retirement back for recovery.
+            forget_orphan_in(&mut tx, id).await?;
             raw.remove_file(Path::new(&state.raw_path))?;
             for path in &state.output_paths {
                 root.remove_file(Path::new(path))?;
             }
-            forget_orphan_in(&mut tx, id).await?;
         }
         _ => return Ok(false),
     }

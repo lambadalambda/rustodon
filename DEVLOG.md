@@ -1,3 +1,178 @@
+## 2026-09-18 — local-upload restricted-role evidence follow-up (uncommitted)
+
+- Evidence/test wiring only while parent independently reviews implementation.
+  All `src/**/*.rs` hashes match the start of this follow-up; no feature, schema,
+  privilege, production, remote/search, openat2, browser, or commit changes.
+- The existing HTTP lifecycle now requires three explicit, distinct URLs. Owner
+  (`RUSTODON_OPERATIONAL_DATABASE_URL`) is used only for fixture setup/assertions;
+  runtime (`RUSTODON_WORKER_DATABASE_URL`) serves HTTP reads/shared limits, dispatches
+  outbox work, and owns the queue; writer (`RUSTODON_WORKER_WRITE_DATABASE_URL`)
+  serves HTTP mutations and the production-registered worker handlers. Web wiring
+  includes the runtime queue just like production. No owner fallback exists.
+- Fresh PostgreSQL roles `upload_runtime` and `upload_writer` use LOGIN/NOINHERIT,
+  NOSUPERUSER/NOCREATEDB/NOCREATEROLE/NOREPLICATION/NOBYPASSRLS, no memberships, and
+  no database/schema/application-object ownership. Applied unmodified
+  `docs/mastodon-refresh-instances.sql` and `docs/mastodon-writer-grants.sql`.
+  Runtime SQL is extracted verbatim from the existing standalone
+  `src/bootstrap.rs::apply_runtime_grants` profile, substituting only task-owned
+  identifiers; extraction script/SQL and grant logs are retained. No extra grants.
+- Added a fail-closed role guard plus actual denied-SQL checks. Runtime cannot
+  UPDATE public media or SELECT private upload ownership; writer cannot SELECT
+  heartbeats, INSERT durable jobs, or UPDATE account private keys. Each returns
+  PostgreSQL **42501**. The deliberate owner-as-runtime negative run fails before
+  HTTP with `runtime must not inherit or own application objects`
+  (`owner-fallback-red.log`). No unexpected denial occurred in application paths;
+  no implementation or grant correction is proposed.
+- Added owner-only schema setup and a focused real-worker readiness test. The latter
+  runs `run_until_shutdown` with actual narrow pools and production handler registry:
+  generic Maintenance, writer without root, and local handlers on Pull do not
+  advertise local capability; configured local Maintenance does. It checks the
+  same predicate used by writable `admin worker-readiness`, periodic emitted
+  heartbeat refresh, generic lane/scheduler readiness, and cleanup on shutdown.
+  This is not a claim that the separate CLI/startup fixture lane ran.
+- Actual final commands (all `--locked --offline --all-features`, serial):
+  - `cargo test --test media_state local_upload_http::local_rich_upload_http_lifecycle -- --ignored --exact --nocapture --test-threads=1`
+    — **1/1**, `restricted-http-final.log`, all 24 advertised external formats with
+    real codecs and the prior full bounded HTTP lifecycle, including success/failure,
+    edits, deletion/replay, scopes/owner separation, attachment eligibility, raw
+    non-exposure/cleanup, validation, and v1/v2 legacy JPEG success.
+  - `cargo test --test media_state local_upload_http::local_rich_upload_restricted_worker_readiness -- --ignored --exact --nocapture --test-threads=1`
+    — **1/1**, `restricted-readiness-final.log`, four real handler/lane cases.
+  - `cargo clippy --test media_state -- -D warnings` — pass, `roles-clippy.log`.
+    Local `cargo fmt --all --check` / `git diff --check` pass.
+- Test-wiring corrections are recorded, not hidden application failures. Initially
+  owner-side `migrate` rejected the documented writer ACLs because no writer context
+  was supplied; changed only setup to `migrate_with_writer_role` using the actual
+  writer login (`setup-writer-context-failure.log`). Initial readiness assertions
+  raced the separate scheduler heartbeat write; bounded observation now waits for
+  both (`readiness-observation-race.log`). Initial PostgreSQL readiness observed its
+  temporary init server before database creation; setup subsequently waited for a
+  successful TCP SQL connection to the task database before restore.
+- Isolated NAS workspace: `/srv/workspaces/rustodon-upload-http-roles-dee7526-alice/`.
+  Image `7203e0222e2bb72e0b83ab623051873604874cc41a688e318b84691bfa77ad8a`
+  (Rust 1.97.1 / FFmpeg 7.1.5); PostgreSQL 14.23 image
+  `1a6c2409ab71f4d054d676ba09d9b74b5d843d805bd5a0cf08314d27ca659d37`.
+  Sequential tools runs use 4 CPUs, 6 GiB memory/swap, 512 PIDs, read-only root/source,
+  dropped capabilities/no-new-privileges, bounded tmpfs, 870s container and 900s outer
+  wall bounds (+15s kill). PostgreSQL uses only `upload-http-roles-pg-alice`, network
+  `upload-http-roles-alice`, database `uploads`, with 1 CPU, 512 MiB memory/swap,
+  128 PIDs, 3600s lifetime and no published ports. Fresh restore/grants before each
+  final gate; existing authorized cargo/target caches reused. `run.sh`,
+  `reset-fixture.sh`, grant provenance, logs and hashes are retained in evidence.
+- Verified final tested source/grant hashes against the NAS copy and all implementation
+  hashes against the start of the follow-up. Removed only this task's PostgreSQL
+  container/anonymous volume and network; no task containers remain. Source, grant
+  provenance, logs, and caches were retained. Final post-run test-header wording
+  changed only documentation; focused strict Clippy also passed on that snapshot.
+- Earlier owner-connected evidence is not relabelled: these are additional actual
+  restricted-role results. Full matrix/browser/release acceptance remains unclaimed;
+  pending independent parent review and separate browser acceptance, issues stay open.
+
+## 2026-09-18 — bounded local rich-upload HTTP slice (uncommitted)
+
+- Started from clean main `dee7526`; created/indexed
+  `integrate-local-rich-upload-http.md` beneath `support-local-rich-media-uploads`
+  before source edits. Prior persistence/worker evidence was read and reused.
+  No migration, grants, remote/search/browser, production, or openat2 changes.
+- Accepted terminal abandonment now retains `processing=3` and filename-null public
+  state. Exact-owner cleanup can retire its raw/output manifest without deleting the
+  pollable failure row; unlink failure retains ownership for retry. Late publication
+  and replay cannot resurrect explicitly deleted or failed media.
+- V2 external MIME acceptance uses authenticated transaction-level staging under the
+  account lock, private durable raw write/fsync, then atomic acceptance/process intent.
+  Staging stays processing=0; accepted processing=1 is immediately owner-visible.
+  Ambiguous staging/accept commits reload the exact generation and never infer rollback
+  for destructive cleanup. Failed/unknown outcomes retain the manifest.
+- POST 202 has a stable ID and null URL/preview. Owner GET/PUT returns 206 pending,
+  GET 200 ready, and failed GET/PUT returns exact 422
+  `Error processing thumbnail for uploaded media`. Other owners see 404. Failure is
+  rechecked under the writer lock; rejected PUT cannot mutate it. Pending metadata
+  survives publication. Ready status eligibility still requires processing=2.
+- Legacy v1/JPEG success remains 200. Image decoding/resizing/preview normalization
+  now runs via `spawn_blocking`; raw acceptance hashing is also off the web executor.
+  Raw filesystem write/fsync remains synchronous under the account lock so cancellation
+  cannot leave a detached writer racing durable cleanup. Processor child limits remain.
+- Modern stills intentionally use the asynchronous composer workflow rather than
+  reproducing pinned synchronous modern-still processing. Cheap declared MIME/size
+  failures return 422 without a row/owner/file; byte/MIME mismatch can instead return
+  202 then terminal 422. Null previews are not invented before real artifacts exist,
+  and audio without a generated preview remains null.
+- Worker heartbeats advertise local-upload capability only when both local handlers
+  register on a selected Maintenance lane. Writable `admin worker-readiness` now
+  requires this fresh capability in addition to normal lane/scheduler readiness.
+  `/ready` remains the existing database-only check, not a codec or browser gate.
+
+### TDD and executed evidence
+
+- `red.log`: `terminal_upload_retains_failed_row_without_filenames` failed against
+  the baseline with missing public row (`None` instead of processing=3).
+- `api-red.log`: the new HTTP lifecycle exercised the unchanged NAS baseline and
+  failed on HEIC POST (422 instead of 202). HTTP fixture source was developed
+  alongside integration; not every branch had a separate preimplementation red run.
+- Final bounded runs (all commands use `--locked --offline --all-features`):
+  - `cargo test --test media_state local_rich_upload_http_lifecycle -- --ignored --nocapture --test-threads=1`
+    — **1/1**, `api-final.log`, including all **24 advertised external MIME types**
+    through actual codecs. Held-worker pending polling, raw HTTP non-exposure,
+    initial metadata/pending edits, cross-owner/scopes, pending attach refusal,
+    ready attach success, actual artifact paths, optional audio preview, stable ID,
+    failure retention/no-mutation, pending/failed deletion, worker replay, no cheap
+    validation orphans, and legacy v1/v2 JPEG success are covered. Final lint-only
+    follow-up changed one module documentation word to Markdown backticks.
+  - `cargo test --test local_uploads -- --ignored --nocapture --test-threads=1`
+    — **5/5**, `repository-final.log`, including narrow restricted-role contracts.
+  - `cargo test --lib worker::local_uploads::tests -- --ignored --nocapture --test-threads=1`
+    — **9/9**, `worker-final.log`: existing real codecs, commit faults, stale claims,
+    cancellation, deletion, retry exhaustion, recovery bounds, plus retained terminal
+    cleanup failure/replay and local-capability readiness/staleness.
+  - `cargo test --test media_state pinned_media_state_http_matrix -- --ignored --exact --nocapture --test-threads=1`
+    — **1/1**, `legacy-http-final.log` (existing fourteen-request contract matrix).
+  - `cargo test --test workers local_media_jobs_reconcile_create_and_delete_crash_boundaries -- --ignored --exact --nocapture --test-threads=1`
+    — **1/1**, `legacy-worker-final.log`.
+  - `cargo test --lib web::tests -- --test-threads=1` — **91 passed, 2 ignored**,
+    `web-unit.log`; `cargo test --test media_formats --test media_processor -- --test-threads=1`
+    — **3 + 7 passed, 3 ignored**, `media-unit-final.log`.
+  - `cargo clippy --lib --bin rustodon --test local_uploads --test media_state -- -D warnings`
+    — pass, `clippy-final.log`. Local formatting and diff checks pass.
+- Setup corrections, not hidden green results: repeated initial HTTP runs exhausted
+  the real shared 30-upload rate limit; final runs use a fresh task-owned restore,
+  with no limiter bypass. The readiness staleness fixture needed both timestamps
+  aged to obey the existing heartbeat constraint. One legacy worker invocation
+  omitted its ADMIN database variable and was rerun correctly. The tools image has
+  no external `kill` executable: initial supervisor cancellation test errored on
+  executable lookup. Its passing rerun used a task-container `/tmp/test-bin/kill`
+  script delegating to `/bin/sh`'s real `kill "$@"` builtin; no fake result or
+  processor change, system installation, or image mutation.
+
+### Environment and limits
+
+- Workspace/evidence: `/srv/workspaces/rustodon-upload-http-dee7526-alice/`.
+  Supplied immutable media-tools image verified as
+  `7203e0222e2bb72e0b83ab623051873604874cc41a688e318b84691bfa77ad8a`;
+  PostgreSQL 14.23 image
+  `1a6c2409ab71f4d054d676ba09d9b74b5d843d805bd5a0cf08314d27ca659d37`.
+- `evidence/run.sh` reuses the prior bounded native tools pattern: sequential runs,
+  4 CPUs, 6 GiB memory/swap, 512 PIDs, 870s Podman / 900s outer wall bound (+15s kill),
+  read-only source/root, dropped capabilities, no-new-privileges, bounded tmpfs.
+  PostgreSQL used only `upload-http-pg-alice`, `upload-http-alice`, and database
+  `uploads`, with 1 CPU, 512 MiB memory/swap, 128 PIDs, 7200s container timeout,
+  bounded readiness/restore, and no published ports. Reused authorized cargo/target
+  caches at `rustodon-null-route-20260918`; did not alter unrelated resources.
+- Only tracked source and explicit new fixture files were synchronized; no instance
+  environments, credentials, `.git`, build output, or reference checkout. Final
+  source hashes/verification and resource cleanup logs accompany the evidence.
+- HTTP and worker integration used the disposable fixture **owner** connection;
+  legacy URL variables were explicitly pointed to that same task-owned database.
+  The separate restricted-role persistence test is not end-to-end least-privilege
+  HTTP/worker proof. No full named media/worker/schema/startup/peer/browser gate,
+  release claim, actual transport-loss/power-loss acceptance simulation, or new
+  pinned-source run. Parent-supplied exact-source verification remains separate
+  evidence; HTTP commit-reload code is not claimed as live transport-fault proof.
+- Verified runtime versions: Rust 1.97.1, FFmpeg/ffprobe 7.1.5, PostgreSQL 14.23.
+  Removed only this task's PostgreSQL container/anonymous volume and network; no
+  task containers remain. Retained source/evidence and the shared authorized caches.
+- Left uncommitted for parent independent review. HTTP subissue and parent remain
+  open pending review and separate composer preview/playback/post/reload acceptance.
+
 ## 2026-09-18 — local upload review round 1
 
 - Addressed reviewer `ea39b9de`'s high scheduler finding only. The maintenance tick

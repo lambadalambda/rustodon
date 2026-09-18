@@ -293,3 +293,57 @@ async fn ready_upload_retirement_preserves_public_owner() -> Result<(), Box<dyn 
     tx.rollback().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable restored PostgreSQL database"]
+async fn terminal_upload_retains_failed_row_without_filenames()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut db = database().await?;
+    rustodon::operational_schema::migrate(&mut db).await?;
+    let account: i64 = sqlx::query_scalar(
+        "SELECT id FROM accounts WHERE domain IS NULL AND id > 0 ORDER BY id LIMIT 1",
+    )
+    .fetch_one(&mut db)
+    .await?;
+    let mut tx = db.begin().await?;
+    let id = stage_in(
+        &mut tx,
+        account,
+        1,
+        &RawInput {
+            mime: "video/webm",
+            size: 123,
+            sha256: &[0; 32],
+        },
+    )
+    .await?;
+    accept_in(&mut tx, id, &job(id)).await?;
+    let claim = claim_in(&mut tx, id).await?;
+    abandon_in(&mut tx, claim).await?;
+    let row: Option<(Option<i32>, Option<String>)> =
+        sqlx::query_as("SELECT processing, file_file_name FROM media_attachments WHERE id = $1")
+            .bind(id.media_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    assert_eq!(
+        row,
+        Some((Some(3), None)),
+        "accepted failure must remain pollable, not 404"
+    );
+    assert!(claim_in(&mut tx, id).await.is_err());
+    assert!(
+        load_in(&mut tx, id).await?.is_some(),
+        "cleanup ownership remains until durable unlink"
+    );
+    // Simulated durable unlink: cleanup may retire ownership but not the error row.
+    forget_orphan_in(&mut tx, id).await?;
+    assert!(load_in(&mut tx, id).await?.is_none());
+    let processing: i32 =
+        sqlx::query_scalar("SELECT processing FROM media_attachments WHERE id=$1")
+            .bind(id.media_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    assert_eq!(processing, 3);
+    tx.rollback().await?;
+    Ok(())
+}

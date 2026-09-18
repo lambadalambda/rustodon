@@ -80,6 +80,58 @@ disk and memory, and workload-side timeouts. The standalone lane additionally
 requires a local Podman engine because its random PostgreSQL port is bound only
 to loopback.
 
+## Focused local-upload HTTP slice
+
+The opt-in test below requires a **disposable restored** PostgreSQL fixture and the
+real media-tool capability set; it holds the worker until pending assertions and
+then drives the production handler registry with a bounded executor. It is not a
+browser test or the complete schema/worker lane:
+
+```console
+cargo test --locked --all-features --test media_state local_upload_http::local_rich_upload_http_lifecycle -- --ignored --exact --nocapture --test-threads=1
+```
+
+Three distinct URLs to the same **task-owned** database are mandatory (no owner
+fallback):
+
+- `RUSTODON_OPERATIONAL_DATABASE_URL`: owner, only for setup and assertions.
+- `RUSTODON_WORKER_DATABASE_URL`: narrow runtime, used by the HTTP repository,
+  shared rate limiter, queue/outbox dispatcher, and worker heartbeat/readiness.
+- `RUSTODON_WORKER_WRITE_DATABASE_URL`: narrow writer, used by HTTP mutations and
+  the actual registered worker handlers.
+
+On a fresh restored fixture, the ignored `local_upload_http::local_rich_upload_schema_setup`
+selector performs owner-only operational migration before grants. Provision dedicated
+non-superuser/non-owner roles with no memberships using the existing install contract:
+unchanged `docs/mastodon-refresh-instances.sql`, `docs/mastodon-writer-grants.sql`, and
+the runtime grant profile in `src/bootstrap.rs::apply_runtime_grants` (also represented
+in the worker fixture runner). Do not add grants to make a failing test pass. The
+lifecycle setup supplies the actual writer name to the existing migration validator.
+It asserts distinct restricted logins and verifies representative forbidden SQL
+operations really return PostgreSQL `42501`.
+
+The separate focused readiness test starts the real worker loop with these same
+restricted pools and checks generic/missing-root/wrong-lane/fully configured handler
+capability, periodic heartbeat refresh, and removal on shutdown:
+
+```console
+cargo test --locked --all-features --test media_state local_upload_http::local_rich_upload_restricted_worker_readiness -- --ignored --exact --nocapture --test-threads=1
+```
+
+Use a fresh restore per invocation: the HTTP test exercises the real shared 30-upload
+rate limit without bypass/reset, and readiness starts the existing maintenance startup
+reconciliation. These tests are not the full CLI/startup fixture lane. The default
+`media_state` schema selector still runs its existing non-codec matrix without
+`test-support`; it does not imply these opt-in tests ran. DEVLOG records exact bounded
+NAS role provisioning, execution, and source hashes.
+
+Local v2 modern stills/video/audio return 202, then owner polling returns 206 until
+ready (200) or retained failure (422). Modern stills are deliberately asynchronous,
+unlike the pinned synchronous modern-still controller path. Browser completion is
+not established by these HTTP results. For writable installations, `admin
+worker-readiness` also requires a fresh local-upload-capable Maintenance heartbeat;
+`/ready` retains its existing database-only meaning.
+
 ## Standalone bootstrap
 
 `mise run standalone-bootstrap-integration` starts from an empty PostgreSQL 14

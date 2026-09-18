@@ -10,7 +10,9 @@
 //! Published JPEG metadata with processing 0/1/2/3 exercises pending/in-progress/
 //! ready/failed reads and updates, NOT asynchronous processing. V2's synchronous
 //! JPEG context is spec/requests/api/v2/media_spec.rb:8-27. Async upload, video,
-//! audio, new formats, happy CRUD, and repository concurrency are out of scope.
+//! audio, new formats, happy CRUD, and repository concurrency are out of scope for
+//! that matrix. The separate test-support `local_upload_http` module adds the bounded
+//! real-codec local v2 lifecycle with distinct disposable setup/runtime/writer logins.
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
@@ -437,3 +439,7 @@ async fn pinned_media_state_http_matrix() -> TestResult {
     );
     Ok(())
 }
+
+#[cfg(feature = "test-support")]
+#[path = "support/local_upload_http.rs"]
+mod local_upload_http;

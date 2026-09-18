@@ -73,8 +73,7 @@ use crate::mastodon::{
 };
 use crate::paperclip::{
     PaperclipAttachment, PaperclipMetadata, PaperclipRoot, PreparedAccountMedia,
-    PreparedMediaAttachment, parse_paperclip_path, prepare_account_media, prepare_media_attachment,
-    write_prepared_media,
+    PreparedMediaAttachment, parse_paperclip_path, prepare_account_media, write_prepared_media,
 };
 use crate::remote::{
     RemoteAccountResolver, RemoteFetchError, canonical_remote_domain,
@@ -7631,15 +7630,18 @@ async fn api_protocol(
         body_limit
     };
     if content_length_exceeds_limit(&headers, body_limit) {
-        return finalize_api_response(
-            &path,
-            &headers,
-            error_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large"),
-        );
+        return finalize_api_response(&path, &headers, upload_body_limit_response(&path));
     }
     let mut request = match bounded_request(request, body_limit).await {
         Ok(request) => request,
-        Err(response) => return finalize_api_response(&path, &headers, response),
+        Err(response) => {
+            let response = if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                upload_body_limit_response(&path)
+            } else {
+                response
+            };
+            return finalize_api_response(&path, &headers, response);
+        }
     };
     if !valid_percent_encoded(&path) {
         return malformed_request_response(&headers);
@@ -7706,6 +7708,14 @@ fn content_length_exceeds_limit(headers: &HeaderMap, limit: usize) -> bool {
         .is_some_and(|length| length > limit as u64)
 }
 
+fn upload_body_limit_response(path: &str) -> Response<Body> {
+    if path.trim_end_matches('/') == "/api/v2/media" {
+        media_upload_error(crate::paperclip::MediaAttachmentError::TooLarge)
+    } else {
+        error_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large")
+    }
+}
+
 fn api_request_body_limit(
     path: &str,
     route: Option<&ApiRouteContract>,
@@ -7720,6 +7730,7 @@ fn api_request_body_limit(
             "/api/v1/accounts/update_credentials"
             | "/api/v1/profile/avatar"
             | "/api/v1/profile/header" => ACCOUNT_PROFILE_BODY_LIMIT_BYTES,
+            "/api/v2/media" => REST_BODY_LIMIT_BYTES + 64 * 1024,
             _ => REST_BODY_LIMIT_BYTES,
         }
     } else {
@@ -13091,7 +13102,7 @@ async fn media_create_v1(
     Extension(rack): Extension<RackParameters>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    media_create(state, rack, headers).await
+    media_create(state, rack, headers, false).await
 }
 
 async fn media_create_v2(
@@ -13099,10 +13110,16 @@ async fn media_create_v2(
     Extension(rack): Extension<RackParameters>,
     headers: HeaderMap,
 ) -> Response<Body> {
-    media_create(state, rack, headers).await
+    media_create(state, rack, headers, true).await
 }
 
-async fn media_create(state: WebState, rack: RackParameters, headers: HeaderMap) -> Response<Body> {
+#[allow(clippy::too_many_lines)]
+async fn media_create(
+    state: WebState,
+    rack: RackParameters,
+    headers: HeaderMap,
+    rich: bool,
+) -> Response<Body> {
     let rate_limit_user_id = match optional_authenticated_user_id(&state, &headers).await {
         Ok(user_id) => user_id,
         Err(response) => return response,
@@ -13129,15 +13146,6 @@ async fn media_create(state: WebState, rack: RackParameters, headers: HeaderMap)
             "File type of uploaded media could not be verified",
         );
     };
-    let prepared = match prepare_media_attachment(
-        owner.account_id(),
-        &upload.file_name,
-        &upload.content_type,
-        &upload.bytes,
-    ) {
-        Ok(prepared) => prepared,
-        Err(error) => return media_upload_error(error),
-    };
     let description = match media_description_parameter(&rack, "description") {
         Ok(AccountProfileValue::Unchanged | AccountProfileValue::Null) => None,
         Ok(AccountProfileValue::Value(value)) => Some(value),
@@ -13146,6 +13154,33 @@ async fn media_create(state: WebState, rack: RackParameters, headers: HeaderMap)
     let focus = match media_focus_parameter(&rack, "focus") {
         Ok(focus) => focus,
         Err(error) => return error_response(StatusCode::UNPROCESSABLE_ENTITY, error),
+    };
+    if rich
+        && crate::media::media_format(&upload.content_type)
+            .is_some_and(|format| format.external_processing)
+    {
+        return media_create_rich(
+            &state,
+            &authenticated,
+            upload,
+            MediaAttachmentUpdate {
+                description: description
+                    .map_or(AccountProfileValue::Null, AccountProfileValue::Value),
+                focus,
+            },
+        )
+        .await;
+    }
+    let prepared = match crate::paperclip::prepare_media_attachment_async(
+        owner.account_id(),
+        upload.file_name.clone(),
+        upload.content_type.clone(),
+        upload.bytes.clone(),
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => return media_upload_error(error),
     };
     let create = MediaAttachmentCreate {
         media_type: prepared.media_kind.database_type(),
@@ -13185,6 +13220,69 @@ async fn media_create(state: WebState, rack: RackParameters, headers: HeaderMap)
                     id,
                 )
                 .await;
+            }
+            Ok(response)
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => media_write_error(&error),
+    }
+}
+
+// Modern stills are intentionally asynchronous too: the bundled composer polls
+// 206 until ready, or terminates on retained 422. No filename exists before publish.
+async fn media_create_rich(
+    state: &WebState,
+    authenticated: &AuthenticatedBearer,
+    upload: &UploadedFile,
+    update: MediaAttachmentUpdate,
+) -> Response<Body> {
+    use crate::mastodon::local_uploads::{RawInput, raw_path};
+    use sha2::{Digest, Sha256};
+    let Some(format) = crate::media::media_format(&upload.content_type) else {
+        return media_upload_error(crate::paperclip::MediaAttachmentError::UnsupportedContentType);
+    };
+    if upload.bytes.is_empty() || upload.bytes.len() >= format.input_size_limit {
+        return media_upload_error(crate::paperclip::MediaAttachmentError::TooLarge);
+    }
+    let Some(writer) = state.write_repository.as_ref() else {
+        return internal_error();
+    };
+    let account = match authenticated.require_user() {
+        Ok(owner) => owner.account_id(),
+        Err(error) => return error.into_http_response().map(Body::from),
+    };
+    let bytes = upload.bytes.clone();
+    let hash: [u8; 32] =
+        match tokio::task::spawn_blocking(move || Sha256::digest(bytes).into()).await {
+            Ok(hash) => hash,
+            Err(_) => return internal_error(),
+        };
+    match writer
+        .with_account_lock(account, || async {
+            let id = writer
+                .stage_local_upload_locked(
+                    authenticated,
+                    &RawInput {
+                        mime: &upload.content_type,
+                        size: i64::try_from(upload.bytes.len()).expect("bounded upload length"),
+                        sha256: &hash,
+                    },
+                    &update,
+                )
+                .await?;
+            // Stage commit precedes all writes. Synchronous confined write/fsync remains
+            // inside the account lock, including cancellation; no detached write may
+            // outlive ownership. Every ambiguous/error outcome retains its manifest.
+            state
+                .media_root
+                .private_upload_root()?
+                .write_file(FsPath::new(&raw_path(id)), &upload.bytes)?;
+            writer.accept_local_upload_locked(authenticated, id).await?;
+            let mut response = media_response_for_id(state, account, id.media_id).await;
+            if response.status() == StatusCode::PARTIAL_CONTENT {
+                *response.status_mut() = StatusCode::ACCEPTED;
             }
             Ok(response)
         })
@@ -13293,7 +13391,15 @@ async fn media_delete(
 
 async fn media_response_for_id(state: &WebState, account_id: i64, id: i64) -> Response<Body> {
     let media = match state.repository.media_attachment(account_id, id).await {
-        Ok(Some(media)) if media.file_file_name.is_some() => media,
+        Ok(Some(media))
+            if media.file_file_name.is_some()
+                || (media.remote_url.is_empty()
+                    && media
+                        .processing
+                        .is_some_and(|state| matches!(state.0, 1 | 3))) =>
+        {
+            media
+        }
         Ok(Some(_) | None) => return record_not_found(),
         Err(_) => return internal_error(),
     };

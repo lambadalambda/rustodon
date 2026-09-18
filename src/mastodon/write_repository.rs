@@ -6293,12 +6293,13 @@ impl WriteRepository {
         let (account_id, mut transaction) =
             self.begin_account_write(authenticated, WRITE_MEDIA).await?;
         validate_media_attachment_update(update)?;
-        // Mastodon 4.6.5 MediaController#update permits pending/in-progress metadata
-        // updates. Keep unpublished Rust staging rows and failed processing excluded.
-        let current_meta = sqlx::query_scalar::<_, Option<Value>>(
-            "SELECT file_meta FROM media_attachments
+        // Accept published legacy rows and durably accepted local uploads, but not
+        // incomplete filename-null staging. Check failure under the account lock.
+        let (current_meta, processing) = sqlx::query_as::<_, (Option<Value>, Option<i32>)>(
+            "SELECT file_meta, processing FROM media_attachments
              WHERE id = $1 AND account_id = $2 AND status_id IS NULL
-               AND processing IN (0, 1, 2) AND file_file_name IS NOT NULL
+               AND processing IN (0, 1, 2, 3)
+               AND (file_file_name IS NOT NULL OR (remote_url = '' AND processing IN (1, 3)))
              FOR UPDATE",
         )
         .bind(id)
@@ -6306,6 +6307,11 @@ impl WriteRepository {
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(WriteError::NotFound)?;
+        if processing == Some(3) {
+            return Err(WriteError::Validation(
+                "Error processing thumbnail for uploaded media",
+            ));
+        }
         let (description_set, description) = match &update.description {
             AccountProfileValue::Unchanged => (false, None),
             AccountProfileValue::Null => (true, None),
@@ -6375,7 +6381,12 @@ impl WriteRepository {
             ));
         }
         let paths = local_media_deletion_paths(&media);
-        if paths.is_empty() {
+        let durable_local = media.remote_url.is_empty()
+            && media.file_file_name.is_none()
+            && media
+                .processing
+                .is_some_and(|state| matches!(state.0, 1 | 3));
+        if paths.is_empty() && !durable_local {
             return Err(WriteError::NotFound);
         }
         #[cfg(feature = "test-support")]
@@ -6388,11 +6399,15 @@ impl WriteRepository {
                 "injected local media cleanup intent failure",
             ));
         }
-        record_outbox_in(
-            &mut transaction,
-            &local_media_cleanup_job(account_id, id, "delete", &paths),
-        )
-        .await?;
+        if !paths.is_empty() {
+            record_outbox_in(
+                &mut transaction,
+                &local_media_cleanup_job(account_id, id, "delete", &paths),
+            )
+            .await?;
+        }
+        // Filename-null uploads retain their durable raw/output manifest. The
+        // existing processor/recovery reconciles it after this deletion commits.
         let deleted = sqlx::query(
             "DELETE FROM media_attachments
               WHERE id = $1 AND account_id = $2 AND status_id IS NULL",

@@ -375,6 +375,14 @@ async fn run_admin(command: AdminCommand) -> ExitCode {
             if !readiness.ready() {
                 return ExitCode::FAILURE;
             }
+            if config.write_database.is_some()
+                && !rustodon::worker::local_uploads::ready(&queue, freshness)
+                    .await
+                    .unwrap_or(false)
+            {
+                eprintln!("worker readiness: local upload processor is not ready");
+                return ExitCode::FAILURE;
+            }
         }
         AdminCommand::DeadJobs { limit } => {
             let Ok(pool) = connect_pool(options, config.database.pool_size).await else {

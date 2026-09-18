@@ -9267,6 +9267,8 @@ where
     let schedules_maintenance = lanes.contains(&Lane::Maintenance);
     let schedules_upload_recovery =
         schedules_maintenance && handlers.get(local_uploads::RECOVER_KIND)?.is_some();
+    let executes_local_uploads =
+        schedules_upload_recovery && handlers.get(local_uploads::PROCESS_KIND)?.is_some();
     let schedules_poll_expiration_repair = schedules_maintenance
         && handlers
             .get(MASTODON_POLL_EXPIRATION_RECONCILE_JOB_KIND)?
@@ -9297,7 +9299,7 @@ where
         .heartbeat(&WorkerHeartbeat::worker(
             &worker_heartbeat_id,
             lanes.iter().copied(),
-            json!({"concurrency": config.concurrency}),
+            json!({"concurrency": config.concurrency, "local_uploads": executes_local_uploads}),
         ))
         .await?;
     if let Err(error) = queue
@@ -9359,7 +9361,7 @@ where
                     scheduler_queue.heartbeat(&WorkerHeartbeat::worker(
                         &scheduler_worker_id,
                         scheduler_lanes.iter().copied(),
-                        json!({"concurrency": concurrency}),
+                        json!({"concurrency": concurrency, "local_uploads": executes_local_uploads}),
                     )).await?;
                     scheduler_queue.heartbeat(&WorkerHeartbeat::scheduler(
                         &scheduler_id,
