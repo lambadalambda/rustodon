@@ -114,5 +114,15 @@ After deploying the parity fixes, the local user reports that following `lain@la
   from two additional domains.
 - Worker ingress coverage and heartbeats are healthy. Generic service readiness
   therefore does not establish successful processing of each actor stream.
-- No jobs were replayed, skipped, deleted, or changed. Root-cause identification
-  and an isolated regression are still required before repair.
+- No jobs were replayed, skipped, deleted, or changed.
+- Source inspection of the exact deployed revision identifies a matching
+  nullable-boolean defect in `status_timeline_snapshots`: a public reply with an
+  unresolved parent evaluates `(NOT status.reply OR
+  status.in_reply_to_account_id = status.account_id)` to SQL NULL, but the
+  result is decoded into Rust `bool`. The decode error rolls back ingestion
+  and its staged thread-resolution job; the worker retains only the generic
+  retry error. PostgreSQL need not log a server error for a client decode failure.
+- All five live jobs satisfy the triggering conditions: public `to` audience,
+  unsuspended/unsilenced author, and nonlocal parent absent by both URI and URL.
+  A read-only SQL expression check confirmed the NULL result. An isolated
+  end-to-end regression is still required before repairing and deploying.
