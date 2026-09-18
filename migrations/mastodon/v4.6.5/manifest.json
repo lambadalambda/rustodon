@@ -1,0 +1,12 @@
+{
+  "format_version": 1,
+  "mastodon_release": "v4.6.5",
+  "mastodon_revision": "1440d55b139e39ec722c2a3db7f60b66cd889048",
+  "postgres_version": "14.23",
+  "postgres_image": "docker.io/library/postgres@sha256:525844ca03edbc43a4c5fb8ca09ddef2a82bd96a9b4f826542833b7183d44c60",
+  "schema_path": "public-schema.sql",
+  "schema_bytes": 232365,
+  "schema_sha256": "692dc2e12339502d296a17cb2e025918498d8c6156583f1aaa85abf0266ad009",
+  "timestamp_id_salt_sentinel": "__RUSTODON_TIMESTAMP_ID_SALT__",
+  "source_schema_rb_sha256": "e7915a2fadcb1a5f4cb1c5d5fe4aeccb97ecdfaed37759d6b66873efffbde54a"
+}

@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Normalize and verify the pinned standalone Mastodon schema artifact."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import pathlib
+import re
+import sys
+from typing import NoReturn
+
+FIXTURE_SALT = "rustodon-mastodon-v4.6.5-fixture-salt"
+SALT_SENTINEL = "__RUSTODON_TIMESTAMP_ID_SALT__"
+MASTODON_RELEASE = "v4.6.5"
+MASTODON_REVISION = "1440d55b139e39ec722c2a3db7f60b66cd889048"
+POSTGRES_VERSION = "14.23"
+POSTGRES_IMAGE = "docker.io/library/postgres@sha256:525844ca03edbc43a4c5fb8ca09ddef2a82bd96a9b4f826542833b7183d44c60"
+SOURCE_SCHEMA_RB_SHA256 = "e7915a2fadcb1a5f4cb1c5d5fe4aeccb97ecdfaed37759d6b66873efffbde54a"
+SCHEMA_NAME = "public-schema.sql"
+EXPECTED_SCHEMA_BYTES = 232_365
+EXPECTED_SCHEMA_SHA256 = "692dc2e12339502d296a17cb2e025918498d8c6156583f1aaa85abf0266ad009"
+PUBLIC_SCHEMA_BLOCK = """--
+-- Name: public; Type: SCHEMA; Schema: -; Owner: -
+--
+
+CREATE SCHEMA public;
+
+
+"""
+DATA_STATEMENT = re.compile(
+    r"^\s*(?:COPY|INSERT\s+INTO|UPDATE|DELETE\s+FROM|SELECT\s+(?:pg_catalog\.)?setval)\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+PSQL_COMMAND = re.compile(r"^\s*\\", re.MULTILINE)
+REQUIRED_SQL = (
+    "CREATE FUNCTION public.timestamp_id(table_name text) RETURNS bigint",
+    "CREATE TABLE public.accounts",
+    "CREATE TABLE public.schema_migrations",
+    "CREATE MATERIALIZED VIEW public.account_summaries",
+    "CREATE MATERIALIZED VIEW public.global_follow_recommendations",
+    "CREATE MATERIALIZED VIEW public.instances",
+)
+FORBIDDEN_MARKERS = (
+    FIXTURE_SALT,
+    "fixture-v4-6-5.rustodon.invalid",
+    "remote.fixture.invalid",
+    "fixture-password",
+    "fixture-bearer-token-v4-6-5",
+)
+
+
+def fail(message: str) -> NoReturn:
+    raise SystemExit(f"standalone schema artifact: {message}")
+
+
+def artifact_digest(schema_bytes: bytes) -> str:
+    return hashlib.sha256(schema_bytes).hexdigest()
+
+
+def expected_manifest() -> dict[str, object]:
+    return {
+        "format_version": 1,
+        "mastodon_release": MASTODON_RELEASE,
+        "mastodon_revision": MASTODON_REVISION,
+        "postgres_version": POSTGRES_VERSION,
+        "postgres_image": POSTGRES_IMAGE,
+        "schema_path": SCHEMA_NAME,
+        "schema_bytes": EXPECTED_SCHEMA_BYTES,
+        "schema_sha256": EXPECTED_SCHEMA_SHA256,
+        "timestamp_id_salt_sentinel": SALT_SENTINEL,
+        "source_schema_rb_sha256": SOURCE_SCHEMA_RB_SHA256,
+    }
+
+
+def validate_schema(schema: str) -> bytes:
+    if not schema.endswith("\n") or schema.endswith("\n\n"):
+        fail("schema must end with exactly one newline")
+    if schema.count(SALT_SENTINEL) != 1:
+        fail("timestamp_id salt sentinel must occur exactly once")
+    if "CREATE SCHEMA public" in schema:
+        fail("artifact must use the fresh database's existing public schema")
+    if PSQL_COMMAND.search(schema):
+        fail("psql meta-command remains")
+    if DATA_STATEMENT.search(schema):
+        fail("data statement is not permitted")
+    for marker in FORBIDDEN_MARKERS:
+        if marker in schema:
+            fail(f"forbidden fixture marker remains: {marker}")
+    for statement in REQUIRED_SQL:
+        if statement not in schema:
+            fail(f"required SQL is missing: {statement}")
+    if f"Dumped from database version {POSTGRES_VERSION}" not in schema:
+        fail(f"schema was not dumped from PostgreSQL {POSTGRES_VERSION}")
+    return schema.encode("utf-8")
+
+
+def validate_pinned_bytes(schema_bytes: bytes) -> None:
+    if len(schema_bytes) != EXPECTED_SCHEMA_BYTES:
+        fail("schema byte length does not match the pinned artifact")
+    if artifact_digest(schema_bytes) != EXPECTED_SCHEMA_SHA256:
+        fail("schema digest does not match the pinned artifact")
+
+
+def normalize(source_path: pathlib.Path, directory: pathlib.Path) -> None:
+    raw = source_path.read_text()
+    commands = re.findall(r"^\\(restrict|unrestrict)\s+(\S+)\s*$", raw, re.MULTILINE)
+    if len(commands) != 2 or commands[0][0] != "restrict" or commands[1][0] != "unrestrict":
+        fail("expected one pg_dump restrict/unrestrict pair")
+    if commands[0][1] != commands[1][1]:
+        fail("pg_dump restrict/unrestrict tokens differ")
+    unknown_commands = [
+        line
+        for line in raw.splitlines()
+        if line.startswith("\\") and not re.fullmatch(r"\\(?:un)?restrict\s+\S+", line)
+    ]
+    if unknown_commands:
+        fail("unexpected psql meta-command")
+    if raw.count(FIXTURE_SALT) != 1:
+        fail("fixture timestamp_id salt must occur exactly once")
+    if raw.count(PUBLIC_SCHEMA_BLOCK) != 1:
+        fail("expected one generated public schema block")
+
+    normalized = re.sub(r"^\\(?:un)?restrict\s+\S+\s*\n?", "", raw, flags=re.MULTILINE)
+    normalized = normalized.replace(PUBLIC_SCHEMA_BLOCK, "")
+    normalized = normalized.replace(FIXTURE_SALT, SALT_SENTINEL).rstrip("\n") + "\n"
+    schema_bytes = validate_schema(normalized)
+    validate_pinned_bytes(schema_bytes)
+
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / SCHEMA_NAME).write_bytes(schema_bytes)
+    (directory / "manifest.json").write_text(
+        json.dumps(expected_manifest(), indent=2) + "\n"
+    )
+
+
+def verify(directory: pathlib.Path) -> None:
+    manifest_path = directory / "manifest.json"
+    schema_path = directory / SCHEMA_NAME
+    try:
+        manifest = json.loads(manifest_path.read_text())
+        schema_bytes = schema_path.read_bytes()
+        schema = schema_bytes.decode("utf-8")
+    except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(str(error))
+    if manifest != expected_manifest():
+        fail("manifest does not exactly match pinned provenance")
+    validate_pinned_bytes(validate_schema(schema))
+
+
+def usage() -> NoReturn:
+    fail("usage: standalone-schema-artifact normalize RAW DIRECTORY | verify DIRECTORY")
+
+
+def main(arguments: list[str]) -> None:
+    if len(arguments) == 3 and arguments[0] == "normalize":
+        normalize(pathlib.Path(arguments[1]), pathlib.Path(arguments[2]))
+    elif len(arguments) == 2 and arguments[0] == "verify":
+        verify(pathlib.Path(arguments[1]))
+    else:
+        usage()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
