@@ -30,7 +30,3 @@
 - [ ] [Restore status search in the bundled frontend](issues/restore-frontend-status-search.md)
 - [ ] [Compute real instance activity metrics](issues/compute-real-instance-activity-metrics.md)
 - [ ] [Support hashtag and featured-tag controls](issues/support-hashtag-and-featured-tag-controls.md)
-- [ ] [Bootstrap standalone Rustodon instances](issues/bootstrap-standalone-rustodon-instances.md)
-- [ ] [Package a standalone Mastodon-compatible schema](issues/package-standalone-mastodon-schema.md)
-- [ ] [Implement the standalone instance bootstrap command](issues/implement-standalone-bootstrap-command.md)
-- [ ] [Test and document standalone Rustodon bootstrap](issues/test-and-document-standalone-bootstrap.md)

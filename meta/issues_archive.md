@@ -100,3 +100,7 @@
 - [x] [Audit everyday Mastodon frontend parity](issues/audit-everyday-frontend-parity.md)
 - [x] [Support quote posts from the bundled frontend](issues/support-frontend-quote-posts.md)
 - [x] [Repair operational schema v3 to v4 deployment upgrade](issues/repair-operational-v3-v4-upgrade-catalog.md)
+- [x] [Bootstrap standalone Rustodon instances](issues/bootstrap-standalone-rustodon-instances.md)
+- [x] [Package a standalone Mastodon-compatible schema](issues/package-standalone-mastodon-schema.md)
+- [x] [Implement the standalone instance bootstrap command](issues/implement-standalone-bootstrap-command.md)
+- [x] [Test and document standalone Rustodon bootstrap](issues/test-and-document-standalone-bootstrap.md)
