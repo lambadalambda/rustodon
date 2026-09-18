@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use clap::{Parser, Subcommand};
+use rustodon::bootstrap::{self, BootstrapOutcome, BootstrapRequest};
 use rustodon::config::Config;
 use rustodon::config::PaperclipRootUrl;
 use rustodon::crypto::ActiveRecordEncryptionConfig;
@@ -22,6 +23,7 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "A mostly-in-place Mastodon replacement")]
@@ -57,6 +59,24 @@ enum AdminCommand {
         /// Writer role whose operational grants should be normalized without exposing credentials
         #[arg(long)]
         writer_role: Option<String>,
+    },
+    /// Initialize or verify a standalone instance in a fresh `PostgreSQL` 14 database
+    BootstrapInstance {
+        #[arg(long)]
+        admin_username: String,
+        #[arg(long)]
+        admin_email: String,
+        #[arg(long, default_value = "Rustodon")]
+        site_title: String,
+        /// Existing least-privilege NOINHERIT login role used by web and worker processes
+        #[arg(long)]
+        runtime_role: String,
+        /// Existing least-privilege login role used for Mastodon-compatible writes
+        #[arg(long)]
+        writer_role: String,
+        /// Read the first Owner password from stdin when omitted to avoid process-list exposure
+        #[arg(long)]
+        password: Option<String>,
     },
     /// Report worker lane coverage, scheduler liveness, queue depth, and dead letters
     WorkerReadiness,
@@ -276,6 +296,48 @@ async fn run_admin(command: AdminCommand) -> ExitCode {
                 "Rustodon operational schema is at version {}",
                 operational_schema::CURRENT_VERSION
             );
+        }
+        AdminCommand::BootstrapInstance {
+            admin_username,
+            admin_email,
+            site_title,
+            runtime_role,
+            writer_role,
+            password,
+        } => {
+            let mut password = match admin_password(password) {
+                Ok(password) => password,
+                Err(message) => {
+                    eprintln!("{message}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let result = bootstrap::bootstrap_instance(
+                &mut connection,
+                &BootstrapRequest {
+                    admin_username: &admin_username,
+                    admin_email: &admin_email,
+                    admin_password: &password,
+                    site_title: &site_title,
+                    runtime_role: &runtime_role,
+                    writer_role: &writer_role,
+                    media_root: &config.paperclip.root_path,
+                },
+            )
+            .await;
+            password.zeroize();
+            match result {
+                Ok(BootstrapOutcome::Installed) => {
+                    eprintln!("standalone Rustodon instance initialized");
+                }
+                Ok(BootstrapOutcome::Verified) => {
+                    eprintln!("standalone Rustodon instance already initialized and verified");
+                }
+                Err(error) => {
+                    eprintln!("standalone instance bootstrap failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
         AdminCommand::WorkerReadiness => {
             let Ok(pool) = connect_pool(options, config.database.pool_size).await else {

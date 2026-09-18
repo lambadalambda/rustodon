@@ -797,7 +797,7 @@ pub async fn validate(connection: &mut PgConnection) -> Result<(), MigrationErro
     }
 }
 
-async fn migrate_transaction(
+pub(crate) async fn migrate_transaction(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<(), MigrationError> {
     sqlx::query(
@@ -851,6 +851,32 @@ async fn migrate_transaction(
     crate::preflight::validate_supported_mastodon_schema_in_transaction(transaction)
         .await
         .map_err(MigrationError::UnsupportedMastodonSchema)
+}
+
+pub(crate) async fn validate_bootstrap_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    expected_runtime_role: &str,
+    writer_role: &str,
+) -> Result<(), MigrationError> {
+    sqlx::query("SELECT pg_catalog.set_config('rustodon.writer_role', $1, true)")
+        .bind(writer_role)
+        .execute(&mut **transaction)
+        .await?;
+    crate::preflight::validate_supported_mastodon_schema_in_transaction(transaction)
+        .await
+        .map_err(MigrationError::UnsupportedMastodonSchema)?;
+    validate_ledger(transaction).await?;
+    let applied = load_records(transaction).await?;
+    if !migration_plan(&applied)?.is_empty() {
+        return Err(MigrationError::MigrationRequired);
+    }
+    validate_runtime_role(transaction, false).await?;
+    if discover_runtime_role(transaction).await?.as_deref() != Some(expected_runtime_role) {
+        return Err(MigrationError::SchemaDrift(
+            "runtime role does not match standalone bootstrap configuration".to_owned(),
+        ));
+    }
+    validate_catalog(transaction).await
 }
 
 fn crc32(bytes: &[u8]) -> u32 {

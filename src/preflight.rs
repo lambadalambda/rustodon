@@ -1352,6 +1352,46 @@ JOIN pg_catalog.pg_database database_record
 WHERE role.rolname = current_user
 "#;
 
+pub(crate) async fn validate_named_writer_role_in_transaction(
+    connection: &mut PgConnection,
+    role_name: &str,
+) -> Result<(), String> {
+    let query = WRITER_PRIVILEGE_QUERY.replace(
+        "WHERE role.rolname = current_user",
+        "WHERE role.rolname = $1",
+    );
+    if query == WRITER_PRIVILEGE_QUERY {
+        return Err("writer privilege contract query is invalid".to_owned());
+    }
+    let valid = sqlx::query_scalar::<_, bool>(&query)
+        .bind(role_name)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| format!("could not validate writer role privileges: {error}"))?;
+    if valid == Some(true) {
+        Ok(())
+    } else {
+        Err("writer role privileges do not match the supported contract".to_owned())
+    }
+}
+
+/// Validates that an open writer connection directly satisfies the exact privilege contract.
+///
+/// # Errors
+///
+/// Returns an error when the connection cannot be inspected or has missing/broadened privileges.
+pub async fn validate_writer_connection(connection: &mut PgConnection) -> Result<(), String> {
+    let valid = sqlx::query_scalar::<_, bool>(WRITER_PRIVILEGE_QUERY)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| format!("could not validate writer connection privileges: {error}"))?;
+    if valid == Some(true) {
+        Ok(())
+    } else {
+        Err("writer connection privileges do not match the supported contract".to_owned())
+    }
+}
+
 const ACTIVE_CONDITIONS_QUERY: &str = r"
 SELECT
   (SELECT count(*) FROM scheduled_statuses) AS scheduled_statuses,
