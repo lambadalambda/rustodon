@@ -186,5 +186,7 @@ After deploying the parity fixes, the local user reports that following `lain@la
 - Health/readiness and worker coverage passed. Remote thread-fetch retries and
   other invalid-content/media dead letters remain outside this repair; they were
   not broadly replayed or bypassed. Operational records are kept outside the repo.
-- Keep open for user-visible confirmation and a fresh post delivered after this
-  repair, distinguishing recovered backlog from new end-to-end delivery.
+- User confirmed the missing-post symptom is resolved: “yes, looks good now.”
+  Archived on that confirmation, the isolated regression, and verified backlog
+  recovery. A separately identified fresh post delivered after this repair was
+  not verified; do not interpret recovery as that additional evidence.
