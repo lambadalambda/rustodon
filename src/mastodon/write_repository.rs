@@ -1,3 +1,5 @@
+pub mod local_uploads;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;

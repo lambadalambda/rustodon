@@ -3,7 +3,7 @@ use std::fmt::{self, Write};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection, Postgres, Row, Transaction};
 
-pub const CURRENT_VERSION: i64 = 4;
+pub const CURRENT_VERSION: i64 = 5;
 
 const BOOTSTRAP_SQL: &str = "CREATE SCHEMA rustodon; \
 CREATE TABLE rustodon.schema_migrations ( \
@@ -19,11 +19,13 @@ const MIGRATION_1_SQL: &str = include_str!("../migrations/rustodon/0001_operatio
 const MIGRATION_2_SQL: &str = include_str!("../migrations/rustodon/0002_rate_limit_windows.sql");
 const MIGRATION_3_SQL: &str = include_str!("../migrations/rustodon/0003_remote_fetch_leases.sql");
 const MIGRATION_4_SQL: &str = include_str!("../migrations/rustodon/0004_stream_outbox_indexes.sql");
+const MIGRATION_5_SQL: &str = include_str!("../migrations/rustodon/0005_local_uploads.sql");
 const TABLES: &[&str] = &[
     "domain_health",
     "durable_jobs",
     "heartbeats",
     "idempotency_keys",
+    "local_uploads",
     "ordering_markers",
     "outbox_events",
     "rate_limit_windows",
@@ -43,6 +45,7 @@ const INDEXES: &[&str] = &[
     "heartbeats_pkey",
     "idempotency_keys_expires_idx",
     "idempotency_keys_pkey",
+    "local_uploads_pkey",
     "ordering_markers_expires_idx",
     "ordering_markers_pkey",
     "outbox_events_logical_key_idx",
@@ -57,8 +60,8 @@ const INDEXES: &[&str] = &[
     "schema_migrations_pkey",
 ];
 const EXPECTED_CATALOG_SHA256: [u8; 32] = [
-    0x32, 0x8d, 0x79, 0x3a, 0x7d, 0x32, 0xa3, 0x8b, 0xd0, 0xe3, 0xc8, 0x6e, 0x19, 0x68, 0x77, 0xc9,
-    0x3b, 0x18, 0xe3, 0xa8, 0x47, 0x93, 0xd6, 0x7e, 0xb2, 0x06, 0x9e, 0x22, 0x88, 0xe3, 0x0a, 0xc7,
+    0x99, 0xb8, 0x37, 0x5f, 0x5c, 0x77, 0x3f, 0xc1, 0x20, 0x0a, 0xcc, 0x78, 0x2a, 0x25, 0xec, 0x9d,
+    0x92, 0xe2, 0x37, 0x69, 0x9b, 0x16, 0x5c, 0x2f, 0x96, 0x1c, 0x04, 0xbd, 0xea, 0x52, 0x1f, 0x99,
 ];
 const CATALOG_QUERY: &str = r#"
 WITH schema_info AS (
@@ -688,6 +691,10 @@ fn migration(version: i64) -> Option<Migration> {
             version,
             sql: MIGRATION_4_SQL,
         }),
+        5 => Some(Migration {
+            version,
+            sql: MIGRATION_5_SQL,
+        }),
         _ => None,
     }
 }
@@ -845,6 +852,21 @@ pub(crate) async fn migrate_transaction(
         .await?;
         grant_runtime_privileges_for_migration(transaction, version, runtime_role.as_deref())
             .await?;
+        if version == 5 {
+            let writer = sqlx::query_scalar::<_, String>(
+                "SELECT pg_catalog.quote_ident(rolname) FROM pg_catalog.pg_roles \
+                 WHERE rolname = pg_catalog.current_setting('rustodon.writer_role', true)",
+            )
+            .fetch_optional(&mut **transaction)
+            .await?;
+            if let Some(writer) = writer {
+                sqlx::query(&format!(
+                    "GRANT SELECT, INSERT, UPDATE, DELETE ON rustodon.local_uploads TO {writer}"
+                ))
+                .execute(&mut **transaction)
+                .await?;
+            }
+        }
     }
     validate_runtime_role(transaction, false).await?;
     validate_catalog(transaction).await?;
@@ -1006,7 +1028,7 @@ async fn validate_catalog(
     let unexpected_columns = sqlx::query_scalar::<_, String>(
         "WITH expected(table_name, column_count) AS (VALUES \
            ('domain_health', 7), ('durable_jobs', 15), ('heartbeats', 6), \
-           ('idempotency_keys', 6), ('ordering_markers', 6), \
+           ('idempotency_keys', 6), ('local_uploads', 11), ('ordering_markers', 6), \
            ('outbox_events', 6), ('rate_limit_windows', 4), \
            ('remote_fetch_leases', 3), \
            ('schema_migrations', 4)) \
@@ -1437,10 +1459,10 @@ mod tests {
     use super::{CATALOG_QUERY, EXPECTED_CATALOG_SHA256, crc32, hex};
 
     #[test]
-    fn expected_catalog_hash_is_pinned_postgresql_14_23_v4_catalog() {
+    fn expected_catalog_hash_is_pinned_postgresql_14_23_v5_catalog() {
         assert_eq!(
             hex(&EXPECTED_CATALOG_SHA256),
-            "328d793a7d32a38bd0e3c86e196877c93b18e3a84793d67eb2069e2288e30ac7"
+            "99b8375f5c773fc1200acc782a25ec9d92e237699b165c2f961c04bdea521f99"
         );
     }
 

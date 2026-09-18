@@ -35,3 +35,42 @@ account lock. Add explicit durable ownership without changing Mastodon tables.
   spared indefinitely, and publication is not retry-idempotent. Implement this
   persistence boundary separately before worker/API integration. A Rust-owned
   table is preferred to hiding internal state in public media metadata.
+
+## Implementation and review (2026-09-18)
+
+- Migration 5 adds writer-only `rustodon.local_uploads`; the exact PostgreSQL 14.23
+  catalog fingerprint, writer grants/preflight, known-writer upgrade grants, and
+  operational fixture downgrade prefix include it. Standalone bootstrap inherits
+  it through the existing migration and writer-grant paths. No public DDL changes.
+- Transaction primitives live in `mastodon::local_uploads`: `stage_in`, `load_in`,
+  `accept_in`, `claim_in`, `register_outputs_in`, `publish_in`,
+  `discard_staging_in`, `abandon_in`, and `forget_orphan_in`. No live callers.
+- Staging registers bounded raw MIME/size/SHA-256 and a derived raw path before
+  write, without a legacy rollback job. Acceptance and a generation-keyed outbox
+  intent commit together. Claims fence stale publication; the exact output
+  manifest is immutable across retries. Ready publication preserves current
+  description/focus and is retry-idempotent. Deletion retains cleanup ownership.
+- Integration MUST hold the existing account lock around filesystem writes and
+  related transaction boundaries: SQL fencing does not fence an open file writer.
+  Caller authorization/account-lifecycle checks remain mandatory. Reconcile an
+  ambiguous commit by loading the exact identity, never by assuming rollback.
+- Follow-up: register the processing job on an existing lane before wiring
+  acceptance; implement private raw storage/hash verification, bounded processor,
+  recovery scan, raw-only cleanup/retirement after readiness (preserving published
+  outputs), orphan cleanup, and HTTP pending/edit/delete behavior. The old
+  synchronous staging/publish/cleanup bodies are unchanged. No worker behavior,
+  new queue lane, media filesystem changes, or production operations here.
+- Evidence: initial missing-table assertion red on the pinned restored Linux PG
+  fixture; focused upload tests 3/3 green; operational fresh/idempotency/drift test
+  green; v4-to-v5 known-writer upgrade and restricted role checks green; existing
+  standalone bootstrap exact test green, including its synchronous HTTP smoke.
+  This does not claim the complete container fixture launcher or codec/browser/
+  peer gates ran. See DEVLOG for commands and lint boundaries.
+- Independent correctness/architecture review found no blocker/high findings for
+  this persistence-only slice. Follow-up worker tests must establish committed
+  replay/ambiguous-commit and competing-attempt filesystem behavior; sequential
+  transaction tests here do not claim those guarantees end to end.
+- Keep this subissue open through integration until successful raw cleanup can
+  retire ownership without treating live published output as orphaned. The
+  persistence foundation is safe to commit separately; local uploads are not
+  enabled by it.

@@ -69,3 +69,5 @@ pub use write_repository::{
 
 #[cfg(feature = "test-support")]
 pub use auth::password_verification_count;
+
+pub use write_repository::local_uploads;

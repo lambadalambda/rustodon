@@ -26,6 +26,7 @@ const TABLES: &[&str] = &[
     "durable_jobs",
     "heartbeats",
     "idempotency_keys",
+    "local_uploads",
     "ordering_markers",
     "outbox_events",
     "rate_limit_windows",
@@ -34,9 +35,9 @@ const TABLES: &[&str] = &[
 
 #[test]
 fn migration_plan_requires_an_exact_known_prefix() {
-    assert_eq!(migration_plan(&[]).unwrap(), vec![1, 2, 3, 4]);
+    assert_eq!(migration_plan(&[]).unwrap(), vec![1, 2, 3, 4, 5]);
     let current = vec![MigrationRecord::known(1).expect("migration 1 exists")];
-    assert_eq!(migration_plan(&current).unwrap(), vec![2, 3, 4]);
+    assert_eq!(migration_plan(&current).unwrap(), vec![2, 3, 4, 5]);
 
     let unknown = vec![MigrationRecord {
         version: CURRENT_VERSION + 1,
@@ -44,7 +45,7 @@ fn migration_plan_requires_an_exact_known_prefix() {
     }];
     assert!(matches!(
         migration_plan(&unknown),
-        Err(MigrationError::UnknownVersion(5))
+        Err(MigrationError::UnknownVersion(6))
     ));
 
     let wrong_checksum = vec![MigrationRecord {

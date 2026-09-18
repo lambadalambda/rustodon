@@ -1144,6 +1144,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
 GRANT SELECT ON TABLE rustodon.schema_migrations TO $WORKER_RUNTIME;
 GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq
   TO $WORKER_RUNTIME;
+DROP TABLE rustodon.local_uploads;
+DELETE FROM rustodon.schema_migrations WHERE version = 5;
 DROP INDEX rustodon.outbox_events_stream_created_at_idx;
 DROP INDEX rustodon.outbox_events_stream_id_idx;
 DROP INDEX rustodon.outbox_events_pending_idx;

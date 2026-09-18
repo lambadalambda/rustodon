@@ -2,6 +2,54 @@
 
 ## 2026-09-18
 
+- Added the first bounded durable-local-upload ownership slice (pending parent
+  review, no live upload/worker integration). Migration 5 owns exact raw/input and
+  output cleanup identities independently of public media deletion; transaction
+  APIs fence staging/acceptance/claims/manifests/publication and preserve edited
+  metadata. No public schema, legacy synchronous-path, queue-lane, production, or
+  Linux filesystem changes. Bootstrap uses existing migration/grant integration.
+- TDD evidence: the initial focused test first encountered a missing-public-schema
+  setup error on an empty DB (not the intended red). After restoring the tracked
+  pinned `fixtures/mastodon/v4.6.5/database.sql`, it failed specifically with
+  `filename-null rollback staging has no durable upload owner`. The expanded
+  lifecycle tests then passed after implementation/fixture fixes; those expanded
+  cases were not individually run before their corresponding primitives existed.
+- Linux verification used task-owned `upload-ownership-pg` / network
+  `upload-ownership-test`, PostgreSQL 14.23 image `1a6c2409ab71`, tools image
+  `localhost/rustodon-browser-tools:remaining` (`dd8b417b66aa`), and task source
+  `/srv/workspaces/rustodon-upload-ownership/source`. Only tracked source and
+  explicit new files were copied; no instance configuration or reference checkout
+  was copied. Reused the supplied cargo-home/target caches. Test containers ran
+  sequentially under `timeout 900`, `--cpus 4 --memory 6g --pids-limit 512`;
+  PostgreSQL had `--cpus 1 --memory 512m --pids-limit 128`. No host ports exposed.
+  Original local Mastodon reference was clean at exact
+  `1440d55b139e39ec722c2a3db7f60b66cd889048`.
+- Exact successful test commands inside the bounded Linux tools container:
+  - `cargo test --locked --test local_uploads -- --ignored --nocapture --test-threads=1`
+    (3/3; restored disposable `uploads` database, admin fixture connection).
+  - `cargo test --locked --test operational_schema migration_plan_requires_an_exact_known_prefix -- --exact`
+  - `cargo test --locked --test operational_schema operational_schema_lifecycle_is_isolated_and_idempotent -- --ignored --exact --nocapture`
+    (fresh migration, rerun, concurrency, catalog drift/rejection; 1/1).
+  - `cargo test --locked --features test-support --test standalone_bootstrap standalone_bootstrap_installs_and_verifies_exact_baseline -- --ignored --exact --nocapture --test-threads=1`
+    (1/1; separate empty `upload_bootstrap` database, dedicated non-superuser
+    installer/runtime/writer roles, task-only media root). This includes exact
+    bootstrap verification, restricted writer/runtime checks, rejection cases,
+    and the existing synchronous HTTP smoke. No `PF_MEDIA_PROCESSOR` tail failure
+    occurred; this is not a real-codec capability gate or the full launcher lane.
+  - `cargo clippy --locked --all-features --lib --test local_uploads --test operational_schema -- -D warnings`
+  - Local `cargo fmt --all --check` and `git diff --check`.
+- Final focused rerun passed (3/3) and focused strict Clippy passed with verified
+  `rustc 1.97.1 (8bab26f4f 2026-07-14)`. Removed only the task PostgreSQL
+  container/its anonymous volume, task network, and task media directory; retained
+  source workspace and shared caches. Changes remain uncommitted for parent review.
+- Broader `cargo clippy --locked --all-targets --all-features -- -D warnings`
+  encountered existing unrelated `paperclip.rs:2901` needless-by-value lints and
+  `tests/mastodon_schema.rs:8971` test-length lint, plus a new lifecycle-test-length
+  lint. Only the new fixture was adjusted, using the existing tests' scoped
+  `too_many_lines` allowance; focused strict Clippy then passed. Unrelated source
+  was not changed. Full ordinary/media/worker/browser/peer gates were not run.
+
+
 - Made public timeline routing null-safe for replies whose parent is not yet
   stored. Previously a nullable SQL predicate failed Rust boolean decoding,
   rolling back inbound posts and blocking later activities from the same actor.
