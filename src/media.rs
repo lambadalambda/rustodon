@@ -137,3 +137,46 @@ pub const fn media_format(content_type: &str) -> Option<MediaFormat> {
         _ => None,
     }
 }
+
+/// Validated MIME agreement for one remote attachment, not a byte-level probe.
+/// Missing advertisement is an explicit compatibility mode: the response must
+/// still name a supported format and is bounded by that format before streaming.
+#[derive(Clone, Copy, Debug)]
+pub struct RemoteMediaPolicy {
+    advertised: Option<&'static str>,
+}
+
+impl RemoteMediaPolicy {
+    /// Returns `None` for an explicitly advertised unsupported MIME type.
+    #[must_use]
+    pub fn new(advertised: Option<&str>) -> Option<Self> {
+        Some(Self {
+            advertised: match advertised {
+                Some(value) => Some(normalized_media_mime(value)?),
+                None => None,
+            },
+        })
+    }
+
+    /// MIME parameters and casing do not affect agreement. Different MIME
+    /// essences do, even within the same family; only probing can validate bytes.
+    #[must_use]
+    pub fn response_format(self, fetched: &str) -> Option<MediaFormat> {
+        let fetched = normalized_media_mime(fetched)?;
+        if self
+            .advertised
+            .is_some_and(|advertised| advertised != fetched)
+        {
+            return None;
+        }
+        media_format(fetched)
+    }
+}
+
+fn normalized_media_mime(value: &str) -> Option<&'static str> {
+    let essence = value.split(';').next()?.trim();
+    ALL_MEDIA_MIME_TYPES
+        .iter()
+        .copied()
+        .find(|supported| supported.eq_ignore_ascii_case(essence))
+}

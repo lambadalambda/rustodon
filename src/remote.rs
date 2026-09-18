@@ -15,6 +15,8 @@ use tokio::net::lookup_host;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::{Host, Url};
 
+use crate::media::RemoteMediaPolicy;
+
 use crate::mastodon::{
     HttpSignatureRequest, HttpSignatureSigner, body_digest_header, random_auth_token,
     sign_http_signature,
@@ -139,9 +141,54 @@ pub struct RemoteFetcher {
     #[cfg(feature = "test-support")]
     test_endpoint: Option<SocketAddr>,
     limits: RemoteFetchLimits,
+    media_policy: Option<RemoteMediaPolicy>,
     domain_budget: RemoteDomainBudget,
     #[cfg(all(debug_assertions, feature = "test-support"))]
     test_peer: Result<Option<Arc<TestPeerTransport>>, ()>,
+}
+
+/// Attachment-only transport capability. Its inner fetcher cannot escape into
+/// generic requests: only this constructor enables format-specific response caps.
+/// Shares the original host budget, timeouts and endpoint/security configuration.
+/// Does not validate media bytes or activate caching/processing.
+#[derive(Clone, Debug)]
+pub struct RemoteMediaFetcher(RemoteFetcher);
+
+impl RemoteMediaFetcher {
+    /// `None` explicitly permits missing advertisement, not missing response MIME.
+    /// Generic `RemoteFetchLimits` never grant this capability or larger caps.
+    ///
+    /// # Errors
+    /// Returns `UnsupportedContentType` for an unsupported advertisement.
+    pub fn new(
+        fetcher: &RemoteFetcher,
+        advertised: Option<&str>,
+    ) -> Result<Self, RemoteFetchError> {
+        let policy =
+            RemoteMediaPolicy::new(advertised).ok_or(RemoteFetchError::UnsupportedContentType)?;
+        Ok(Self(RemoteFetcher {
+            media_policy: Some(policy),
+            ..fetcher.clone()
+        }))
+    }
+
+    /// Fetch an attachment, checking caller policy on every hop and returning
+    /// visited URLs for installation-time fencing. The response MIME determines
+    /// the cap from `media_format`, replacing the ordinary response-byte limit.
+    ///
+    /// # Errors
+    /// Returns the normal transport/policy errors, including MIME disagreement.
+    pub async fn get_with_policy<F, Fut>(
+        &self,
+        url: Url,
+        policy: F,
+    ) -> Result<(RemoteResponse, Vec<Url>), RemoteFetchError>
+    where
+        F: Fn(Url) -> Fut,
+        Fut: Future<Output = Result<(), RemoteFetchError>>,
+    {
+        self.0.get_with_policy(url, policy).await
+    }
 }
 
 // This capability is absent unless BOTH build gates are enabled. Configuration is
@@ -481,6 +528,7 @@ impl RemoteFetcher {
             #[cfg(feature = "test-support")]
             test_endpoint: None,
             limits: limits.bounded(),
+            media_policy: None,
             domain_budget,
             #[cfg(all(debug_assertions, feature = "test-support"))]
             test_peer: TestPeerTransport::from_env(),
@@ -1050,6 +1098,7 @@ impl RemoteFetcher {
                             accepted_content_types,
                             false,
                             true,
+                            self.media_policy,
                         )
                         .await?,
                     ))
@@ -1122,8 +1171,16 @@ impl RemoteFetcher {
                         ));
                     }
                     Ok(RemoteFetchHop::Response(
-                        read_remote_response(response, hop_url, &self.limits, &[], true, false)
-                            .await?,
+                        read_remote_response(
+                            response,
+                            hop_url,
+                            &self.limits,
+                            &[],
+                            true,
+                            false,
+                            None,
+                        )
+                        .await?,
                     ))
                 })
                 .await?;
@@ -1204,6 +1261,7 @@ async fn read_remote_response(
     accepted_content_types: &[&str],
     allow_success_status: bool,
     require_content_type: bool,
+    media_policy: Option<RemoteMediaPolicy>,
 ) -> Result<RemoteResponse, RemoteFetchError> {
     let status = response.status();
     if (allow_success_status && !status.is_success())
@@ -1236,9 +1294,25 @@ async fn read_remote_response(
             RemoteFetchError::MissingContentType
         });
     }
+    // Decide before reading even the first chunk, including compatibility mode
+    // without advertisement. No generic caller can raise its configured ceiling.
+    let max_response_bytes = if let Some(policy) = media_policy {
+        let fetched = content_type
+            .as_deref()
+            .ok_or(RemoteFetchError::MissingContentType)?;
+        policy
+            .response_format(fetched)
+            .ok_or(RemoteFetchError::UnsupportedContentType)?
+            // Processor input limits are exclusive; the reader uses an
+            // inclusive byte budget. Only media opts into this conversion.
+            .input_size_limit
+            - 1
+    } else {
+        limits.max_response_bytes
+    };
     if response
         .content_length()
-        .is_some_and(|length| length > limits.max_response_bytes as u64)
+        .is_some_and(|length| length > max_response_bytes as u64)
     {
         return Err(RemoteFetchError::BodyTooLarge);
     }
@@ -1246,7 +1320,7 @@ async fn read_remote_response(
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| RemoteFetchError::BodyRead)?;
-        if body.len().saturating_add(chunk.len()) > limits.max_response_bytes {
+        if body.len().saturating_add(chunk.len()) > max_response_bytes {
             return Err(RemoteFetchError::BodyTooLarge);
         }
         body.extend_from_slice(&chunk);
@@ -2670,6 +2744,250 @@ mod tests {
     use url::Url;
 
     use super::*;
+
+    #[cfg(all(debug_assertions, feature = "test-support"))]
+    async fn fetch_media_fixture(
+        media: bool,
+        advertised: Option<&str>,
+        mime: &str,
+        length: usize,
+        chunked: bool,
+    ) -> Result<RemoteResponse, RemoteFetchError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let mime = mime.to_owned();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            let framing = if chunked {
+                "Transfer-Encoding: chunked".to_owned()
+            } else {
+                format!("Content-Length: {length}")
+            };
+            let content_type = if mime.is_empty() {
+                String::new()
+            } else {
+                format!("Content-Type: {mime}\r\n")
+            };
+            let header =
+                format!("HTTP/1.1 200 OK\r\n{content_type}{framing}\r\nConnection: close\r\n\r\n");
+            if socket.write_all(header.as_bytes()).await.is_err() {
+                return;
+            }
+            let bytes = vec![b'x'; 64 * 1024];
+            let mut remaining = length;
+            while remaining > 0 {
+                let count = remaining.min(bytes.len());
+                if chunked
+                    && socket
+                        .write_all(format!("{count:x}\r\n").as_bytes())
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
+                if socket.write_all(&bytes[..count]).await.is_err() {
+                    return;
+                }
+                if chunked && socket.write_all(b"\r\n").await.is_err() {
+                    return;
+                }
+                remaining -= count;
+            }
+            if chunked {
+                let _ = socket.write_all(b"0\r\n\r\n").await;
+            }
+        });
+        let fetcher = RemoteFetcher::new(RemoteFetchLimits {
+            max_response_bytes: usize::MAX,
+            request_timeout: Duration::from_secs(5),
+            ..RemoteFetchLimits::default()
+        })
+        .with_test_endpoint(Some(endpoint));
+        let url = Url::parse("http://remote.example/media").unwrap();
+        let result = if media {
+            RemoteMediaFetcher::new(&fetcher, advertised)
+                .unwrap()
+                .get_with_policy(url, |_| std::future::ready(Ok(())))
+                .await
+                .map(|(response, _)| response)
+        } else {
+            fetcher.get(url, &[]).await
+        };
+        server.abort();
+        let _ = server.await;
+        result
+    }
+
+    #[cfg(all(debug_assertions, feature = "test-support"))]
+    #[tokio::test]
+    async fn remote_media_transport_bounds() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            use crate::media::{AUDIO_VIDEO_SIZE_LIMIT, IMAGE_SIZE_LIMIT};
+            for chunked in [false, true] {
+                for (mime, limit) in [
+                    ("image/png", IMAGE_SIZE_LIMIT),
+                    ("video/mp4", AUDIO_VIDEO_SIZE_LIMIT),
+                    ("audio/mpeg", AUDIO_VIDEO_SIZE_LIMIT),
+                ] {
+                    assert_eq!(
+                        fetch_media_fixture(true, Some(mime), mime, limit - 1, chunked)
+                            .await
+                            .unwrap()
+                            .body
+                            .len(),
+                        limit - 1
+                    );
+                    for length in [limit, limit + 1] {
+                        assert!(
+                            matches!(
+                                fetch_media_fixture(true, None, mime, length, chunked).await,
+                                Err(RemoteFetchError::BodyTooLarge)
+                            ),
+                            "{mime} length={length} chunked={chunked}"
+                        );
+                    }
+                }
+                // Ordinary responses retain inclusive limits.
+                assert_eq!(
+                    fetch_media_fixture(false, None, "image/png", IMAGE_SIZE_LIMIT, chunked)
+                        .await
+                        .unwrap()
+                        .body
+                        .len(),
+                    IMAGE_SIZE_LIMIT
+                );
+                assert!(matches!(
+                    fetch_media_fixture(false, None, "image/png", IMAGE_SIZE_LIMIT + 1, chunked)
+                        .await,
+                    Err(RemoteFetchError::BodyTooLarge)
+                ));
+            }
+            assert!(matches!(
+                fetch_media_fixture(true, None, "", 0, false).await,
+                Err(RemoteFetchError::MissingContentType)
+            ));
+            assert!(
+                fetch_media_fixture(
+                    true,
+                    None,
+                    "VIDEO/MP4; charset=binary",
+                    IMAGE_SIZE_LIMIT + 1,
+                    true
+                )
+                .await
+                .is_ok()
+            );
+            assert!(matches!(
+                fetch_media_fixture(
+                    true,
+                    Some("video/mp4"),
+                    "video/webm",
+                    AUDIO_VIDEO_SIZE_LIMIT + 1,
+                    false
+                )
+                .await,
+                Err(RemoteFetchError::UnsupportedContentType)
+            ));
+            assert!(matches!(
+                fetch_media_fixture(true, None, "application/octet-stream", 0, false).await,
+                Err(RemoteFetchError::UnsupportedContentType)
+            ));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(all(debug_assertions, feature = "test-support"))]
+    #[tokio::test]
+    async fn remote_media_transport_redirect_policy_and_encoding() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let redirect = b"HTTP/1.1 302 Found\r\nLocation: /denied\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let (endpoint, server) = local_http_response(Some(redirect.to_vec()), StdDuration::ZERO);
+            let fetcher = RemoteFetcher::default().with_test_endpoint(Some(endpoint));
+            let media = RemoteMediaFetcher::new(&fetcher, Some("video/mp4")).unwrap();
+            let seen = Mutex::new(Vec::new());
+            let result = media.get_with_policy(Url::parse("http://remote.example/media").unwrap(), |url| {
+                seen.lock().unwrap().push(url.path().to_owned());
+                std::future::ready(if url.path() == "/denied" {
+                    Err(RemoteFetchError::PolicyDenied)
+                } else { Ok(()) })
+            }).await;
+            assert!(matches!(result, Err(RemoteFetchError::PolicyDenied)));
+            assert_eq!(*seen.lock().unwrap(), ["/media", "/denied"]);
+            server.join().unwrap();
+
+            let encoded = b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let (endpoint, server) = local_http_response(Some(encoded.to_vec()), StdDuration::ZERO);
+            let fetcher = RemoteFetcher::default().with_test_endpoint(Some(endpoint));
+            let result = RemoteMediaFetcher::new(&fetcher, None).unwrap()
+                .get_with_policy(Url::parse("http://remote.example/media").unwrap(), |_| std::future::ready(Ok(()))).await;
+            assert!(matches!(result, Err(RemoteFetchError::UnsupportedEncoding)));
+            server.join().unwrap();
+        }).await.unwrap();
+    }
+
+    #[cfg(all(debug_assertions, feature = "test-support"))]
+    #[tokio::test]
+    async fn remote_media_transport_timeout_and_cancellation_release_budget() {
+        use tokio::io::AsyncReadExt;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for cancel in [false, true] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = listener.local_addr().unwrap();
+                let (started, received) = tokio::sync::oneshot::channel();
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).await.unwrap();
+                    started.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                });
+                let budget = RemoteDomainBudget::new(1);
+                let fetcher = RemoteFetcher::with_domain_budget(
+                    RemoteFetchLimits {
+                        request_timeout: Duration::from_secs(1),
+                        ..RemoteFetchLimits::default()
+                    },
+                    budget.clone(),
+                )
+                .with_test_endpoint(Some(endpoint));
+                let url = Url::parse("http://remote.example/media").unwrap();
+                let media = RemoteMediaFetcher::new(&fetcher, None).unwrap();
+                let task_url = url.clone();
+                let request = tokio::spawn(async move {
+                    media
+                        .get_with_policy(task_url, |_| std::future::ready(Ok(())))
+                        .await
+                });
+                received.await.unwrap();
+                // The wrapper must share, not recreate, the ordinary host budget.
+                assert!(matches!(
+                    fetcher.get(url.clone(), &[]).await,
+                    Err(RemoteFetchError::DomainBudgetExceeded)
+                ));
+                if cancel {
+                    request.abort();
+                    assert!(request.await.unwrap_err().is_cancelled());
+                } else {
+                    assert!(matches!(
+                        request.await.unwrap(),
+                        Err(RemoteFetchError::Request)
+                    ));
+                }
+                let permit = budget.acquire(&url).await.unwrap();
+                permit.release().await;
+                server.abort();
+                let _ = server.await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn activitypub_context_requires_the_activitystreams_term() {

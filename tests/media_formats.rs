@@ -50,3 +50,42 @@ fn legacy_images_keep_the_existing_outputs() {
     assert_eq!(gif.output_content_type, "image/gif");
     assert_eq!(gif.preview_content_type, Some("image/png"));
 }
+
+#[test]
+fn remote_media_policy_normalizes_and_requires_mime_agreement() {
+    use rustodon::media::RemoteMediaPolicy;
+    for mime in ALL_MEDIA_MIME_TYPES {
+        let policy =
+            RemoteMediaPolicy::new(Some(&format!(" {} ; charset=binary", mime.to_uppercase())))
+                .unwrap();
+        assert_eq!(policy.response_format(mime), media_format(mime));
+        assert_eq!(
+            RemoteMediaPolicy::new(None).unwrap().response_format(mime),
+            media_format(mime)
+        );
+    }
+    let video = RemoteMediaPolicy::new(Some("video/mp4")).unwrap();
+    for mismatch in [
+        "video/webm",
+        "audio/mp4",
+        "image/png",
+        "application/octet-stream",
+        "",
+    ] {
+        assert!(video.response_format(mismatch).is_none());
+    }
+    for unsupported in [
+        "",
+        "application/octet-stream",
+        "image/*",
+        "video/mp4, image/png",
+    ] {
+        assert!(RemoteMediaPolicy::new(Some(unsupported)).is_none());
+        assert!(
+            RemoteMediaPolicy::new(None)
+                .unwrap()
+                .response_format(unsupported)
+                .is_none()
+        );
+    }
+}

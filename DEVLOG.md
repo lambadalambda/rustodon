@@ -1,3 +1,41 @@
+## 2026-09-18 — remote media review 1: strict processor-compatible bounds
+
+- Fixed parent blocker `9f9122`: media-only budget is existing format input limit
+  minus one; generic inclusive response limits unchanged. Corrected subissue's
+  erroneous inclusive-limit claim. No worker activation or scope expansion.
+- TDD boundary matrix red on exact 16 MiB image → green: fixed/chunked image,
+  video and audio accept limit−1, reject exact/+1; ordinary exact still accepts.
+  Direct wrapper tests prove redirect policy denial, encoding rejection, timeout
+  and cancellation release of shared host budget. Transport selector **3/3, 1.77s**.
+- NAS `7203e022…`, same isolated offline workspace/resources: MIME tests **4/4**,
+  ordinary configured limits **1/1**, focused strict Clippy **pass**. Test-source
+  Clippy with previously recorded unrelated lint exceptions **pass**. Local fmt
+  and diff checks **pass**. Exact commands/bounds in the existing subissue.
+- Uncommitted for parent review 2; no broader suite, production, codec or worker
+  execution. Task containers removed; review workspace retained.
+
+## 2026-09-18 — remote media policy/transport slice (uncommitted)
+
+- Created/indexed [subissue](meta/issues/remote-media-policy-and-transport-bounds.md)
+  before implementation on clean `bed710f`. Central MIME agreement uses existing
+  media format/family caps; typed attachment-only fetcher requires <99 MiB audio/video,
+  <16 MiB images, including explicitly missing advertisement. Fetched MIME checked
+  before body streaming. Ordinary/emoji limits and security transport unchanged.
+- No worker activation, serializer, schema, grant, job, lane or cache change;
+  no remote feature-completion claim. Parent review 1 blocker `9f9122` corrected;
+  parent review 2 pending (nested delegation unavailable); all changes intentionally uncommitted, subissue remains open.
+- TDD: pure MIME missing-API red → 4/4 green; Linux transport missing-API red →
+  1/1 initial green (0.45s; inclusive media boundary corrected below), with
+  unchanged generic ceiling. Existing configured limits 1/1; URL/address/DNS/MIME
+  checks 4/4; host-budget checks 2 passed / 1 DB test ignored.
+- NAS `7203e022…`, task-owned workspace, offline/no-network container, 4 CPU/6 GiB/
+  512 PID and 90–300s group bounds, sequential, registry read-only. No production
+  or codec execution. Exact commands and environment failures in subissue.
+- Focused strict lib/media_formats Clippy, fmt and diff checks pass. Broad strict
+  Clippy blocked by existing unrelated lints; new fixture lints fixed; broad run
+  allowing documented existing lint classes passes. Full/release/fixture lanes
+  not run. Containers removed, isolated source/build retained for review.
+
 ## 2026-09-18 — close reviewed local-upload milestones (docs only)
 
 - Parent explicitly approves closure of local rich uploads and its persistence,
