@@ -1,3 +1,42 @@
+## 2026-09-18 — bounded actual-browser local upload acceptance (uncommitted)
+
+- Created/indexed [browser subissue](meta/issues/verify-local-rich-upload-browser.md)
+  before work. Tested clean tracked `c6cf7b3` archive, default-feature binary with
+  no test-support, exact clean Mastodon `1440d55b139e39ec722c2a3db7f60b66cd889048`
+  reference and checksum-verified tracked frontend. No application/harness source
+  edits, grants/schema changes, production access, remote-media work or commits.
+- Real agent-browser 0.31.1 / Chrome 148.0.7778.96: HEIC, AVIF, WebM and Ogg via
+  composer file input, 202 → held-worker 206 → real-worker 200, then Post 200.
+  Public video and audio have actual advancing native playback clocks before and
+  after reload (video also three decoded frames/960×540). Public AVIF decodes in
+  fresh browser + reload and eventually in the original uploading browser + reload.
+- **Not full acceptance:** ready unattached composer image/video previews and audio
+  Edit → Play return 404. Cookie-authenticated native media also returns 404 for
+  the author's followers-only HEIC post, while owner bearer range gets 206. Source
+  diagnosis: media access requires attached status; optional viewer is bearer-only.
+  Public AVIF initially reused a failed image across reload, despite successful
+  same-URL fetch; later normal reload decoded. Exact cache mechanism not proven.
+  Reported blockers before expansion; no authorization weakening or fix attempted.
+- Malformed HEIC via input reaches terminal 422 with visible error toast, clears
+  composer attachment, retains processing=3/null filename, and cleans ownership/raw
+  files. Browser-origin auth/range diagnostics: public files 206 with correct 16-byte
+  range in anonymous/cookie/bearer modes; private HEIC 404/404/206 respectively.
+- Task-owned NAS PostgreSQL 14.23, narrow runtime/writer, unchanged grants; bounded
+  codec image `7203e022…`. Existing CLI image had no browser: task-only offline image
+  `d6337b96…` combines cached immutable CLI/Playwright images. Existing TLS helper
+  uses exact SPKI trust plus bounded loopback-only canonical-port forwarding.
+  Full identities, limits, setup corrections, results and exclusions are in subissue.
+- Evidence: NAS `/srv/workspaces/rustodon-upload-browser-c6cf7b3-alice/evidence/`;
+  selected local files `target/local-upload-browser-c6cf7b3-alice/evidence/`.
+  Visually inspected video/audio reload, fresh AVIF reload and malformed-error PNGs;
+  JSON clock/decode results prove behavior beyond screenshots. Task containers,
+  PostgreSQL anonymous volume, network and media root removed; evidence/source/task
+  browser image retained. Some containers required bounded SIGKILL during teardown.
+- TDD not applicable to this observation-only slice; no reusable repository harness
+  added pending source fixes. Independent parent review pending (nested delegation
+  unavailable). No full browser/cutover/source-contract/HTTP/peer matrix claim;
+  browser subissue and both upload parents remain open. Changes left uncommitted.
+
 ## 2026-09-18 — local-upload restricted-role evidence follow-up (uncommitted)
 
 - Evidence/test wiring only while parent independently reviews implementation.

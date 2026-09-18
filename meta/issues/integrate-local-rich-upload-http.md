@@ -100,3 +100,12 @@ Bounded HTTP slice of [Support local rich-media uploads](support-local-rich-medi
 - Earlier owner-connected results remain historical evidence; this follow-up adds
   narrow-role end-to-end proof without widening privileges. Still uncommitted and
   open for parent review and the separate browser slice.
+
+### Actual-browser follow-up on committed c6cf7b3
+
+The [bounded browser slice](verify-local-rich-upload-browser.md) now exercises
+HEIC/AVIF/video/audio through the real pinned composer and real worker, including
+public video/audio playback and reload. It found ready-unattached preview and
+cookie-authenticated native media authorization blockers; no source fix was made.
+Browser acceptance and this issue remain open. See the subissue for precise passes,
+failures, request evidence, screenshots and cleanup.

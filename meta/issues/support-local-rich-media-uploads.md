@@ -39,8 +39,11 @@ Rustodon's staged metadata, durable cleanup, and asynchronous safety contracts.
   wire v2 acceptance and pending/ready/failure polling, preserving account
   lifecycle locking, current focus/description edits, exact artifact ownership,
   retry idempotency, and commit-ambiguity reconciliation.
-- Finally verify real composer upload, preview/playback, posting, and reload.
-  Do not close this issue merely because the processor or persistence layer passes.
+- [Verify local rich uploads in the pinned browser](verify-local-rich-upload-browser.md):
+  actual composer upload, preview/playback, posting, and reload. The bounded slice
+  passes asynchronous upload/post and public video/audio playback, but finds
+  unattached-preview and browser-cookie media authorization blockers. Keep open;
+  do not close this issue merely because processor/persistence or public playback passes.
 
 ## HTTP slice status (2026-09-18)
 
