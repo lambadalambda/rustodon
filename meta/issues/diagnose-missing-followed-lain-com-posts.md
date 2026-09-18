@@ -99,3 +99,20 @@ After deploying the parity fixes, the local user reports that following `lain@la
   remain unexplained; do not claim historical backfill or recovery of all five.
   Keep open for user confirmation of the original missing-post symptom; no
   broader replay or ingestion-policy bypass was performed.
+
+## Reopened symptom — 2026-09-18 UTC
+
+- Read-only diagnosis confirms new deliveries are accepted but held in the ingress
+  queue, not merely missing historical backfill. The accepted follow remains.
+- At 11:25–11:31 UTC, 324 ingress jobs were pending: five retrying Create Notes
+  and 319 successors waiting on live predecessors. All five failing Notes reply
+  to parent URIs absent from the local status table; none of the child statuses
+  has been persisted. The reported failure is `remote Note Create write failed`.
+- The affected actor has 36 pending activities (16 Creates and 20 Likes), behind
+  a Create first accepted at 05:22 UTC that has failed six times. Its latest
+  stored status is timestamped 05:13 UTC. Other affected actor streams come
+  from two additional domains.
+- Worker ingress coverage and heartbeats are healthy. Generic service readiness
+  therefore does not establish successful processing of each actor stream.
+- No jobs were replayed, skipped, deleted, or changed. Root-cause identification
+  and an isolated regression are still required before repair.
