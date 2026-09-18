@@ -6,8 +6,11 @@ concurrent Mastodon/Rustodon writers.
 
 ## Before The Window
 
-1. Confirm the Rustodon binary, Mise toolchain, configuration, and local media
-   root are the intended versions. Keep `LOCAL_DOMAIN`, `WEB_DOMAIN`,
+1. Confirm the Rustodon binary, Mise toolchain, configuration, local media
+   root, and compatible `ffmpeg`/`ffprobe` runtime are the intended versions.
+   Media preflight requires AVIF/HEIC and the advertised audio/video demuxers
+   plus H.264 (`libx264`), AAC, PNG, JPEG, and MP3 (`libmp3lame`) encoders. Keep
+   `LOCAL_DOMAIN`, `WEB_DOMAIN`,
    `ALTERNATE_DOMAINS`, PostgreSQL URLs, Paperclip paths, and encryption/signing
    secrets unchanged.
 2. Take a PostgreSQL snapshot and a filesystem snapshot or verified copy of the

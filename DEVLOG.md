@@ -2,6 +2,16 @@
 
 ## 2026-09-16
 
+- Added the bounded rich-media processor foundation for every format advertised
+  by the frontend. Untrusted bytes now reach forced FFmpeg/ffprobe demuxers only
+  through anonymous pipes; child I/O, decoded dimensions, duration, frame count,
+  frame rate, threads, aggregate deadlines, and generated output sizes are
+  bounded, with cancellation killing and reaping child work. AVIF/HEIC normalize
+  to JPEG, video to validated H.264/AAC MP4 plus a real PNG poster, and audio to
+  validated MP3. Startup/preflight exercises pinned tiny fixtures and fails
+  closed if the required runtime codecs are missing. Local durable upload and
+  remote-cache integration remain tracked separately and intentionally open.
+
 - Added standalone instance bootstrap from an empty PostgreSQL 14 database,
   without a Mastodon/Rails runtime dependency. A deterministic schema-only
   Mastodon 4.6.5 artifact and exact migration inventory feed a transactional,

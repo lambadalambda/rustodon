@@ -12,6 +12,10 @@ a migration or repair command.
 ## Prerequisites
 
 - the Rustodon binary built from the intended release;
+- `ffmpeg` and `ffprobe` on `PATH`, built with the AVIF/HEIC decoders and
+  H.264 (`libx264`), AAC, PNG, JPEG, and MP3 (`libmp3lame`) encoders used by
+  Rustodon's bounded media pipeline; startup and `rustodon preflight` exercise
+  these exact paths and fail closed when any capability is unavailable;
 - PostgreSQL 14, with an administrator able to create one database and three
   login roles;
 - an existing, absolute, empty, non-symlink local-media directory writable by

@@ -2231,11 +2231,28 @@ pub async fn run(config: &Config) -> PreflightReport {
 pub async fn runtime_diagnostics(config: &Config) -> Vec<Diagnostic> {
     let mut diagnostics = configuration_diagnostics(config);
     diagnostics.extend(media_root_diagnostics(config));
+    diagnostics.extend(media_processor_diagnostics().await);
     match database_diagnostics(config).await {
         Ok(database) => diagnostics.extend(database),
         Err(diagnostic) => diagnostics.push(diagnostic),
     }
     diagnostics
+}
+
+/// Validates the advertised rich-media processing runtime without persistent side effects.
+pub async fn media_processor_diagnostics() -> Vec<Diagnostic> {
+    if crate::paperclip::validate_media_processor_capabilities()
+        .await
+        .is_ok()
+    {
+        Vec::new()
+    } else {
+        vec![Diagnostic::fatal(
+            "PF_MEDIA_PROCESSOR",
+            "the installed ffmpeg/ffprobe runtime cannot process every advertised media format",
+            "install compatible ffmpeg and ffprobe builds with AVIF, HEIC, H.264, AAC, PNG, JPEG, and MP3 support",
+        )]
+    }
 }
 
 /// Validates the optional Mastodon writer connection without mutating either database.
