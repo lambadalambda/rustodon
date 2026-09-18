@@ -1,3 +1,4 @@
+pub mod local_uploads;
 mod profile_media;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -2097,6 +2098,7 @@ fn safe_cleanup_path(path: &str) -> bool {
     has_component
 }
 
+#[allow(clippy::too_many_lines)]
 async fn process_local_media_cleanup_job(
     pool: PgPool,
     root: PaperclipRoot,
@@ -2149,6 +2151,15 @@ async fn process_local_media_cleanup_job(
     writer
         .with_account_lock(account_id, || async {
             let mut transaction = pool.begin().await?;
+            let owned: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM rustodon.local_uploads WHERE media_id = $1)",
+            )
+            .bind(media_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if owned && action == "rollback_create" {
+                return Ok(());
+            }
             let row = sqlx::query_as::<_, (Option<i64>, Option<String>)>(
                 "SELECT status_id, file_file_name FROM media_attachments
                    WHERE id = $1 AND account_id = $2 FOR UPDATE",
@@ -8404,6 +8415,12 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
         .and_then(|config| config.media_root.clone());
     if let Some(mastodon_writer) = mastodon_writer {
         if let Some(media_root) = domain_block_media_root.clone() {
+            local_uploads::register(
+                &handlers,
+                mastodon_writer.clone(),
+                queue.clone(),
+                media_root.clone(),
+            )?;
             let cleanup_pool = mastodon_writer.clone();
             handlers.register(
                 LOCAL_MEDIA_CLEANUP_JOB_KIND,
@@ -9248,6 +9265,8 @@ where
     }
     let lanes = config.lanes.iter().copied().collect::<Vec<_>>();
     let schedules_maintenance = lanes.contains(&Lane::Maintenance);
+    let schedules_upload_recovery =
+        schedules_maintenance && handlers.get(local_uploads::RECOVER_KIND)?.is_some();
     let schedules_poll_expiration_repair = schedules_maintenance
         && handlers
             .get(MASTODON_POLL_EXPIRATION_RECONCILE_JOB_KIND)?
@@ -9360,6 +9379,9 @@ where
                             json!({"minute": minute}),
                         ).logical_key(format!("maintenance:{minute}")),
                     ).await?;
+                    if schedules_upload_recovery {
+                        local_uploads::schedule_recovery(&scheduler_queue).await?;
+                    }
                     if schedules_poll_expiration_repair {
                         scheduler_queue
                             .enqueue_if_kind_idle(

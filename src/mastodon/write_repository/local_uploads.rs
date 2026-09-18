@@ -416,3 +416,45 @@ fn preserve_focus(mut processed: Value, current: &Value) -> Value {
     }
     processed
 }
+
+/// Retire raw-input ownership after durable raw unlink. Published files remain owned by
+/// the public row. Caller must hold the account lock through unlink and this transaction.
+/// # Errors
+/// Rejects missing, stale, pending, deleted, or mismatched public ownership.
+pub async fn retire_ready_in(
+    tx: &mut Transaction<'_, Postgres>,
+    identity: UploadIdentity,
+) -> Result<(), WriteError> {
+    let state = load_in(tx, identity).await?.ok_or(WriteError::Conflict)?;
+    let row = sqlx::query_as::<_, (String, String)>(
+        "SELECT file_file_name, file_content_type FROM media_attachments
+         WHERE id = $1 AND account_id = $2 AND remote_url = '' AND processing = 2
+           AND file_file_name IS NOT NULL AND file_storage_schema_version = 1 FOR UPDATE",
+    )
+    .bind(identity.media_id)
+    .bind(identity.account_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(WriteError::Conflict)?;
+    let metadata = PaperclipMetadata {
+        attachment: PaperclipAttachment::MediaFile,
+        id: identity.media_id,
+        remote: false,
+        storage_schema_version: Some(1),
+        file_name: row.0,
+        content_type: Some(row.1),
+        variant: None,
+    };
+    let mut paths = ["original", "small"]
+        .into_iter()
+        .filter_map(|style| metadata.relative_path(style))
+        .collect::<Vec<_>>();
+    paths.sort();
+    if !state.accepted || state.claim <= 0 || paths.is_empty() || paths != state.output_paths {
+        return Err(WriteError::Conflict);
+    }
+    sqlx::query("DELETE FROM rustodon.local_uploads WHERE media_id = $1 AND account_id = $2 AND generation = $3")
+        .bind(identity.media_id).bind(identity.account_id).bind(identity.generation)
+        .execute(&mut **tx).await?;
+    Ok(())
+}

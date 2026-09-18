@@ -33,8 +33,10 @@ Rustodon's staged metadata, durable cleanup, and asynchronous safety contracts.
 - [Persist durable local upload ownership](persist-durable-local-upload-ownership.md)
   first: an additive Rust-owned state/migration/privilege boundary, tested
   independently. No production migration as part of implementation.
-- Then wire worker processing and v2 pending/ready/failure polling, preserving
-  account lifecycle locking, current focus/description edits, exact artifact
-  ownership, retry idempotency, and commit-ambiguity reconciliation.
+- [Process and recover durable local uploads](process-and-recover-durable-local-uploads.md):
+  worker, private raw filesystem, and cleanup/recovery only; no live HTTP v2.
+- Then wire v2 acceptance and pending/ready/failure polling, preserving account
+  lifecycle locking, current focus/description edits, exact artifact ownership,
+  retry idempotency, and commit-ambiguity reconciliation.
 - Finally verify real composer upload, preview/playback, posting, and reload.
   Do not close this issue merely because the processor or persistence layer passes.

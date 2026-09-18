@@ -2325,6 +2325,18 @@ impl PaperclipRoot {
         })
     }
 
+    /// Open the private raw-upload namespace, never interpreted by the public route.
+    /// # Errors
+    /// Rejects symlinks and propagates filesystem/durability failures.
+    pub fn private_upload_root(&self) -> io::Result<Self> {
+        let directory = self.open_directory(Path::new(".local-upload-input"), true)?;
+        fchmod(&directory, Mode::from_bits_retain(0o700))?;
+        self.sync_directory(&directory)?;
+        let mut root = self.clone();
+        root.directory = Arc::new(directory);
+        Ok(root)
+    }
+
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn with_write_fault(mut self, fault: PaperclipWriteFault) -> Self {

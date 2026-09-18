@@ -244,3 +244,52 @@ async fn durable_upload_restricted_roles() -> Result<(), Box<dyn std::error::Err
     tx.rollback().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable restored PostgreSQL database"]
+async fn ready_upload_retirement_preserves_public_owner() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut db = database().await?;
+    rustodon::operational_schema::migrate(&mut db).await?;
+    let mut tx = db.begin().await?;
+    let account = sqlx::query_scalar(
+        "SELECT id FROM accounts WHERE domain IS NULL AND id > 0 ORDER BY id LIMIT 1",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let id = stage_in(
+        &mut tx,
+        account,
+        81,
+        &RawInput {
+            mime: "image/png",
+            size: 123,
+            sha256: &[8; 32],
+        },
+    )
+    .await?;
+    assert!(retire_ready_in(&mut tx, id).await.is_err());
+    accept_in(&mut tx, id, &job(id)).await?;
+    let claim = claim_in(&mut tx, id).await?;
+    register_outputs_in(&mut tx, claim, &output()).await?;
+    assert!(retire_ready_in(&mut tx, id).await.is_err());
+    publish_in(&mut tx, claim, &output()).await?;
+    assert!(
+        retire_ready_in(
+            &mut tx,
+            UploadIdentity {
+                generation: 82,
+                ..id
+            }
+        )
+        .await
+        .is_err()
+    );
+    retire_ready_in(&mut tx, id).await?;
+    assert!(load_in(&mut tx, id).await?.is_none());
+    let ready: bool = sqlx::query_scalar("SELECT processing = 2 AND file_file_name = 'output.png' FROM media_attachments WHERE id = $1")
+        .bind(id.media_id).fetch_one(&mut *tx).await?;
+    assert!(ready);
+    tx.rollback().await?;
+    Ok(())
+}

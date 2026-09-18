@@ -1,3 +1,89 @@
+## 2026-09-18 — local upload review round 1
+
+- Addressed reviewer `ea39b9de`'s high scheduler finding only. The maintenance tick
+  now calls shared `schedule_recovery`, whose root singleton has the stable
+  `local-upload-recovery:root` key; cursor continuation keys remain unchanged.
+- TDD: `recovery_scheduler_second_tick_reuses_live_root` reproduced
+  `InvalidData("singleton jobs require a logical key")` before the key fix. It
+  invokes the actual scheduling path twice while root is live, checks `Existing`
+  ownership of the same job, and checks exactly one live root.
+- Reused the bounded NAS image/runner and a newly created task-owned restored
+  PostgreSQL fixture (this run also sets a 3600s database-container timeout).
+  `--lib worker::local_uploads::tests` passed 7/7; existing worker regression
+  `local_media_jobs_reconcile_create_and_delete_crash_boundaries` passed 1/1;
+  focused strict Clippy passed. Exact flags match the prior entry. Evidence:
+  `review1-red.log`, `review1-green.log`, `review1-legacy.log`, `review1-clippy.log`
+  in `/srv/workspaces/rustodon-upload-worker-949d503-alice/evidence/`.
+- Local `cargo fmt --all --check` and `git diff --check` pass. Terminal failure
+  retention and HTTP v2 remain untouched. Left uncommitted for parent review.
+
+## 2026-09-18 — local upload worker and recovery slice (uncommitted)
+
+- Created/indexed `process-and-recover-durable-local-uploads.md` before code,
+  beneath the rich-upload parent and reviewed persistence boundary at `949d503`.
+  No HTTP v2 wiring, migration, public DDL, grants, new queue lane, production
+  operation, or macOS weakening. Independent parent review remains outstanding.
+- Added Maintenance/Media processing and bounded recovery, a private mode-0700
+  raw namespace using existing confined filesystem primitives, exact length/hash
+  reads, bounded processor integration outside account locks, manifest-before-I/O
+  installation, stale/account fences, committed replay, and raw-only ready-owner
+  retirement. Recovery retains live/undispatched work, scans 100 identities per
+  keyset page, and continues past failed owners. Legacy rollback cleanup now
+  spares durable staging. Existing table state sufficed for this slice.
+- TDD: the ready-retirement test failed with missing `retire_ready_in`, then
+  passed. Deterministic worker fault tests were added alongside the integration;
+  not every worker branch had a separate preimplementation red run. Reusing the
+  supplied target cache initially selected an older library (missing the already
+  committed `mastodon::local_uploads` export); touching the isolated source's
+  `src/lib.rs` forced recompilation before the intended red and final gates.
+- NAS workspace/evidence:
+  `/srv/workspaces/rustodon-upload-worker-949d503-alice/{source,evidence}`.
+  Immutable tools image verified as
+  `7203e0222e2bb72e0b83ab623051873604874cc41a688e318b84691bfa77ad8a`.
+  PostgreSQL 14.23 image `1a6c2409ab71f4d054d676ba09d9b74b5d843d805bd5a0cf08314d27ca659d37`;
+  only task `upload-worker-pg-alice`, network `upload-worker-alice`, and database
+  `uploads` were used. Tracked source plus explicit new files only were copied;
+  no instance environments, credentials, build output, `.git`, or reference tree.
+  Reused authorized `rustodon-null-route-20260918` cargo/target caches.
+- `evidence/run.sh` records sequential tools runs with 4 CPUs, 6 GiB memory/swap,
+  512 PIDs, read-only root/source, dropped capabilities, no-new-privileges, bounded
+  tmpfs, Podman timeout 870s and outer timeout 900s (+15s kill). PostgreSQL used
+  1 CPU, 512 MiB memory/swap and 128 PIDs; readiness/restore were bounded at
+  30s/120s. No host ports or production resources were used.
+- Exact successful final commands inside that runner:
+  - `cargo test --locked --offline --all-features --lib worker::local_uploads::tests -- --ignored --nocapture --test-threads=1`
+    — 6/6, `worker-final.log`. Real PNG/WebM/Ogg succeeded through the registered
+    `WorkerExecutor`, with public artifacts retained after raw retirement/replay.
+    Fault coverage: partial writes, before/after publication commit faults,
+    raw unlink failure, size/hash mismatch, symlinks, stale generation/claims,
+    deletion/account disable/edit during unlocked processing, cancellation,
+    real queue retry exhaustion, legacy staging guard, and paginated recovery
+    progressing despite a failed unlink.
+  - `cargo test --locked --offline --all-features --test local_uploads -- --ignored --nocapture --test-threads=1`
+    — 4/4, `repository-final.log`, including ready retirement, migration/restricted
+    role contracts and the previous ownership regressions.
+  - `cargo test --locked --offline --all-features --test workers local_media_jobs_reconcile_create_and_delete_crash_boundaries -- --ignored --exact --nocapture --test-threads=1`
+    — 1/1, `legacy-worker-final.log`. Its three worker database URL variables were
+    explicitly set to this disposable owner fixture, not production or claimed
+    restricted runtime identities.
+  - `cargo clippy --locked --offline --all-features --lib --test local_uploads -- -D warnings`
+    — pass, `clippy-final.log`. Local `cargo fmt --all --check` and
+    `git diff --check` pass. This is focused lint, not the all-targets gate.
+- Verified SHA-256 equality for all six changed/new Rust files against the tested
+  NAS source (`code-sha256.txt`, `source-verification.log`). Removed only the task
+  PostgreSQL container/anonymous volume and task network; retained source/evidence
+  and shared caches. No task test containers remain.
+- Evidence boundary: no full worker/media/browser/peer matrix, HTTP v2, release
+  claim, real transport-loss/power-loss simulation, or end-to-end least-privilege
+  worker gate. Existing fail-before/fail-after commit hooks exercise durable
+  replay states. The processor foundation gate supplied by the user is separate
+  evidence, not rerun or substituted for these worker cases.
+- Follow-up API contract is recorded in the new subissue. In particular, current
+  terminal abandonment deletes pending media, not a retained failure reason;
+  agree on compatible polling/error semantics before enabling v2. Stage-before-
+  raw-write and accepted-intent-before-response, authenticated pending edits and
+  delete, raw non-exposure, and HTTP/composer attach/play/reload remain next work.
+
 # Development Log
 
 ## 2026-09-18
