@@ -27,6 +27,7 @@
 - [ ] [Support polls in the bundled frontend](issues/support-poll-voting-and-refresh.md)
 - [ ] [Support advertised media attachments in the bundled frontend](issues/support-frontend-video-attachments.md)
 - [ ] [Support local rich-media uploads](issues/support-local-rich-media-uploads.md)
+- [ ] [Persist durable local upload ownership](issues/persist-durable-local-upload-ownership.md)
 - [ ] [Cache remote rich media with previews](issues/cache-remote-rich-media-previews.md)
 - [ ] [Restore status search in the bundled frontend](issues/restore-frontend-status-search.md)
 - [ ] [Compute real instance activity metrics](issues/compute-real-instance-activity-metrics.md)

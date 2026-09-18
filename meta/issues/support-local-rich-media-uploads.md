@@ -27,3 +27,14 @@ Rustodon's staged metadata, durable cleanup, and asynchronous safety contracts.
   cases leave no untracked files or publishable invalid rows.
 - Focused HTTP/database/browser regressions cover pending, success, validation,
   playback/preview, reload, and cleanup behavior.
+
+## Implementation sequence
+
+- [Persist durable local upload ownership](persist-durable-local-upload-ownership.md)
+  first: an additive Rust-owned state/migration/privilege boundary, tested
+  independently. No production migration as part of implementation.
+- Then wire worker processing and v2 pending/ready/failure polling, preserving
+  account lifecycle locking, current focus/description edits, exact artifact
+  ownership, retry idempotency, and commit-ambiguity reconciliation.
+- Finally verify real composer upload, preview/playback, posting, and reload.
+  Do not close this issue merely because the processor or persistence layer passes.
