@@ -94,7 +94,8 @@ async fn check_recovery(label: &str, child_visibility: i32, parent_visibility: i
         "http://remote.fixture.invalid/users/timeline_author/statuses/parent-fetch-recovery-{label}"
     );
     let child_uri = format!("{ACTOR}/statuses/parent-fetch-recovery-{label}");
-    let uris = vec![child_uri.clone(), parent_uri.clone()];
+    let successor_uri = format!("{child_uri}/successor");
+    let uris = vec![child_uri.clone(), parent_uri.clone(), successor_uri.clone()];
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM statuses WHERE uri = ANY($1)")
             .bind(&uris)
@@ -189,13 +190,21 @@ async fn check_recovery(label: &str, child_visibility: i32, parent_visibility: i
         let (child_id, conversation): (i64, i64) = sqlx::query_as(
             "SELECT id, conversation_id FROM statuses WHERE uri = $1",
         ).bind(&child_uri).fetch_one(&runtime).await?;
+        let successor_id: i64 = sqlx::query_scalar("SELECT id FROM statuses WHERE uri = $1")
+            .bind(&successor_uri).fetch_one(&runtime).await?;
+        let successor = status_row(&runtime, successor_id).await?;
+        assert_eq!((successor.0, successor.3, successor.4, successor.5),
+            (BOB, true, Some(child_id), Some(BOB)), "ordered successor is a resolved self reply");
         let initial = status_row(&runtime, child_id).await?;
         assert_eq!(initial, (BOB, child_visibility, false, true, None, None, conversation));
         let options = TimelineOptions { since_id: Some(child_id - 1), ..TimelineOptions::default() };
-        assert!(loader.home_timeline(ALICE, &options).await?.is_empty(),
-            "unresolved replies must not enter the follower's home feed");
+        assert_eq!(loader.home_timeline(ALICE, &options).await?.into_iter()
+            .map(|status| status.id).collect::<Vec<_>>(), vec![successor_id],
+            "unresolved reply is excluded, but its ordered resolved self reply proceeds");
+        assert_public_route(&runtime, child_id, false).await?;
+        assert_public_route(&runtime, successor_id, child_visibility == 0).await?;
         drain_notifications(&queue, &executor).await?;
-        assert_notifications(&runtime, &[(child_id, BOB)]).await?;
+        assert_notifications(&runtime, &[(child_id, BOB), (successor_id, BOB)]).await?;
         let (job_id, arguments): (i64, Value) = sqlx::query_as(
             "SELECT id, arguments FROM rustodon.durable_jobs WHERE kind = $1 AND logical_key = $2",
         ).bind(ACTIVITYPUB_THREAD_RESOLVE_JOB_KIND)
@@ -245,17 +254,18 @@ async fn check_recovery(label: &str, child_visibility: i32, parent_visibility: i
         assert_eq!(sqlx::query_scalar::<_, i64>("SELECT replies_count FROM status_stats WHERE status_id = $1")
             .bind(parent_id).fetch_one(&runtime).await?, i64::from(child_visibility < 2));
         drain_notifications(&queue, &executor).await?;
-        // Two legitimate mentions, one per status, NOT a duplicate notification.
-        assert_notifications(&runtime, &[(child_id, BOB), (parent_id, PARENT_AUTHOR)]).await?;
+        // One legitimate mention per status, NOT duplicate notifications.
+        assert_notifications(&runtime, &[(child_id, BOB), (parent_id, PARENT_AUTHOR), (successor_id, BOB)]).await?;
         let mut feed_ids = loader.home_timeline(ALICE, &options).await?.into_iter()
             .map(|status| status.id).collect::<Vec<_>>();
         feed_ids.sort_unstable();
-        let mut expected_ids = vec![child_id, parent_id];
+        let mut expected_ids = vec![child_id, parent_id, successor_id];
         expected_ids.sort_unstable();
         assert_eq!(feed_ids, expected_ids, "recovered reply and parent are each distributed once in the home feed");
         let context = loader.status_context(child_id).await?.ok_or("child context missing")?;
         assert_eq!(context.ancestors.iter().map(|status| status.id).collect::<Vec<_>>(), vec![parent_id]);
-        assert!(context.descendants.is_empty());
+        assert_eq!(context.descendants.iter().map(|status| status.id).collect::<Vec<_>>(), vec![successor_id]);
+        assert_public_route(&runtime, parent_id, parent_visibility == 0).await?;
         for viewer in [None, Some(OUTSIDER)] {
             let outsider = RestProjectionLoader::new(repository.clone(), viewer, DOMAIN);
             assert_eq!(outsider.authorized_status(child_id).await?.is_some(), child_visibility < 2,
@@ -289,13 +299,13 @@ async fn check_recovery(label: &str, child_visibility: i32, parent_visibility: i
         let notifications: Vec<(i64, Value)> = sqlx::query_as(
             "SELECT id, payload -> 'arguments' FROM rustodon.outbox_events WHERE kind = $1 ORDER BY id",
         ).bind(NOTIFICATION_CREATE_JOB_KIND).fetch_all(&runtime).await?;
-        assert_eq!(notifications.len(), 2);
+        assert_eq!(notifications.len(), 3);
         for (id, arguments) in notifications {
             queue.enqueue(&JobSpec::new(Lane::Core, NOTIFICATION_CREATE_JOB_KIND, arguments)
                 .logical_key(format!("parent-fetch:duplicate-notification:{id}"))).await?;
         }
         drain_notifications(&queue, &executor).await?;
-        assert_notifications(&runtime, &[(child_id, BOB), (parent_id, PARENT_AUTHOR)]).await?;
+        assert_notifications(&runtime, &[(child_id, BOB), (parent_id, PARENT_AUTHOR), (successor_id, BOB)]).await?;
         assert_eq!(snapshot(&runtime, &uris).await?, stable,
             "duplicate Create/resolution/notification work preserves rows, reply counts, and distribution intents");
         assert_eq!(sqlx::query_scalar::<_, i64>(
@@ -372,27 +382,59 @@ async fn ingest_child(
     body: &Value,
     key: &str,
 ) -> TestResult {
-    let id = queue
-        .enqueue(
-            &JobSpec::new(
-                Lane::Ingress,
-                ACTIVITYPUB_INBOX_JOB_KIND,
-                json!({"body": body.to_string(), "signature_key_id": format!("{ACTOR}#secondary-key"),
-                    "remote_domain": "remote.fixture.invalid", "delivery_target_account_id": ALICE}),
-            )
-            .logical_key(format!("parent-fetch:{key}")),
+    let child_uri = body["object"]["id"].as_str().ok_or("child URI missing")?;
+    let mut successor_body = body.clone();
+    successor_body["id"] = json!(format!("{child_uri}/successor/activity"));
+    successor_body["object"]["id"] = json!(format!("{child_uri}/successor"));
+    successor_body["object"]["inReplyTo"] = json!(child_uri);
+    let spec = |body: &Value, key: String| {
+        JobSpec::new(
+            Lane::Ingress,
+            ACTIVITYPUB_INBOX_JOB_KIND,
+            json!({"body": body.to_string(), "signature_key_id": format!("{ACTOR}#secondary-key"),
+            "remote_domain": "remote.fixture.invalid", "delivery_target_account_id": ALICE}),
         )
-        .await?;
+        .logical_key(key)
+    };
+    // Queue both before processing: the unresolved reply must not strand the
+    // next activity from this actor, even while its parent remains unavailable.
+    let ordering_key = [33_u8; 32];
     assert!(
-        executor
-            .process_one(
-                "parent-fetch-ingress",
-                &[Lane::Ingress],
-                Duration::seconds(30)
+        queue
+            .enqueue_ordered_once(
+                &spec(body, format!("parent-fetch:{key}")),
+                &ordering_key,
+                &[1_u8; 32]
             )
             .await?
     );
-    assert_completed(queue.pool(), id).await
+    let successor = spec(&successor_body, format!("parent-fetch:{key}:successor"));
+    assert!(
+        queue
+            .enqueue_ordered_once(&successor, &ordering_key, &[2_u8; 32])
+            .await?
+    );
+    for logical_key in [
+        format!("parent-fetch:{key}"),
+        format!("parent-fetch:{key}:successor"),
+    ] {
+        let id: i64 =
+            sqlx::query_scalar("SELECT id FROM rustodon.durable_jobs WHERE logical_key = $1")
+                .bind(logical_key)
+                .fetch_one(queue.pool())
+                .await?;
+        assert!(
+            executor
+                .process_one(
+                    "parent-fetch-ingress",
+                    &[Lane::Ingress],
+                    Duration::seconds(30),
+                )
+                .await?
+        );
+        assert_completed(queue.pool(), id).await?;
+    }
+    Ok(())
 }
 
 async fn drain_notifications(queue: &Queue, executor: &WorkerExecutor) -> TestResult {
@@ -459,4 +501,22 @@ async fn snapshot(pool: &sqlx::PgPool, uris: &[String]) -> TestResult<Value> {
            'account_stats', (SELECT jsonb_agg(to_jsonb(a) ORDER BY a.account_id) FROM account_stats a WHERE a.account_id IN ($2, $3)),
            'outbox', (SELECT jsonb_agg(jsonb_build_array(id, kind, logical_key, payload) ORDER BY id) FROM rustodon.outbox_events))",
     ).bind(uris).bind(BOB).bind(PARENT_AUTHOR).fetch_one(pool).await?)
+}
+
+async fn assert_public_route(pool: &sqlx::PgPool, status_id: i64, expected: bool) -> TestResult {
+    let routes: Vec<Value> = sqlx::query_scalar(
+        "SELECT payload -> 'after' -> 'public' FROM rustodon.outbox_events
+         WHERE kind = $1 AND payload ->> 'event' = 'update'
+           AND payload ->> 'account_id' = '0' AND payload ->> 'object_id' = $2",
+    )
+    .bind(STREAM_EVENT_KIND)
+    .bind(status_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    assert_eq!(
+        routes,
+        vec![json!(expected)],
+        "public routing for {status_id}"
+    );
+    Ok(())
 }

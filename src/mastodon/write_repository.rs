@@ -19791,7 +19791,7 @@ async fn status_timeline_snapshots(
                     status.language, \
                     status.visibility = 0 AND author.suspended_at IS NULL \
                       AND author.silenced_at IS NULL AND status.reblog_of_id IS NULL \
-                      AND (NOT status.reply OR status.in_reply_to_account_id = status.account_id), \
+                      AND (NOT status.reply OR status.in_reply_to_account_id = status.account_id) IS TRUE, \
                     status.visibility = 0 AND author.suspended_at IS NULL \
                       AND author.silenced_at IS NULL, \
                     status.local OR status.uri IS NULL \

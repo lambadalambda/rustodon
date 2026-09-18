@@ -1,5 +1,14 @@
 # Development Log
 
+## 2026-09-18
+
+- Made public timeline routing null-safe for replies whose parent is not yet
+  stored. Previously a nullable SQL predicate failed Rust boolean decoding,
+  rolling back inbound posts and blocking later activities from the same actor.
+  A bounded Linux/PostgreSQL regression reproduced the failure before the fix
+  and verified reply persistence, queued thread recovery, and successor progress
+  afterward.
+
 ## 2026-09-16
 
 - Added the bounded rich-media processor foundation for every format advertised

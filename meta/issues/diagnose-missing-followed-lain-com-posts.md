@@ -126,3 +126,45 @@ After deploying the parity fixes, the local user reports that following `lain@la
   unsuspended/unsilenced author, and nonlocal parent absent by both URI and URL.
   A read-only SQL expression check confirmed the NULL result. An isolated
   end-to-end regression is still required before repairing and deploying.
+
+## Null-safe routing repair — 2026-09-18 UTC
+
+- Minimal repair: apply `IS TRUE` to the public timeline reply predicate in
+  `status_timeline_snapshots`. SQL NULL now routes false, while resolved self
+  replies and ordinary true/false results retain their existing meaning. No
+  ingestion retry policy, privileges, schema, or production configuration changed.
+- Extended the existing parent-fetch worker fixture to queue a distinct same-actor
+  self-reply successor before processing either Create. It requires each ingress
+  job to acknowledge in order, the unresolved child to persist, and its original
+  `resolve_thread` arguments to survive. It checks the unresolved reply's public
+  route is false and the resolved self-reply's is true for public visibility, plus
+  existing parent recovery, notifications, home visibility, and replay invariants.
+- Final-test red: with only the SQL fix removed in isolation, the public recovery
+  test failed at the first ingress acknowledgement: `remote Note Create write
+  failed`. Final-test green: restoring the SQL fix passed
+  `parent_fetch_recovery::public_reply_recovers_after_parent_fetch_503` against a
+  fresh restored PostgreSQL fixture with the restricted writer role.
+- Execution used a task-owned NAS Linux workspace with tracked source only, a
+  disposable database/container/volume/network, serial fixtures, and explicit
+  bounds (test runner: 3 CPUs/8 GiB/512 processes/1200 seconds; database:
+  2 CPUs/1 GiB/128 processes). No macOS compatibility changes or production access.
+  The isolated harness selected the existing test and stopped after database tests;
+  those harness-only changes are not source changes in this repair.
+- Also passed: `cargo fmt --all --check`,
+  `cargo clippy --locked --test workers --all-features -- -D warnings`, and
+  `cargo test --locked --all-features --lib mastodon::write_repository::tests`
+  (44 tests). External logs are under the task workspace
+  `/srv/workspaces/rustodon-null-route-20260918/logs/` (`red-final.log`,
+  `final-checks.log`); these are not repository artifacts.
+- Evidence boundaries: the full worker lane did **not** pass. After the focused
+  test passed, its startup tail refused the tools image's missing media-processor
+  capabilities (`PF_MEDIA_PROCESSOR`). A three-recovery-test attempt also exposed
+  an existing direct-privacy assertion counting the global routing event as a
+  nonrecipient delivery; the same failure was reproduced with the original test
+  source. Subsequent tests in that combined attempt failed its existing
+  parent-author-statistics baseline assertion. These unrelated failures were not
+  repaired. Strict all-target Clippy also remains blocked by existing
+  `needless_pass_by_value` findings in `src/paperclip.rs:2901`.
+- No full ordinary aggregate, browser, differential, peer, or release gate is
+  claimed. Keep this issue open for the parent's separate deployment and fresh
+  external delivery verification; nothing was deployed or replayed here.
