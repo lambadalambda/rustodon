@@ -24,3 +24,7 @@ Rustodon advertises Mastodon-compatible image, video, and audio MIME types, and 
 - Rustodon advertises HEIC/HEIF/AVIF, video, and audio MIME types in its instance response, while media creation, `remote_media_is_fetchable`, and worker content types accept only JPEG/PNG/GIF/WebP. The same v2 upload the bundled composer uses returns 422 for the advertised formats.
 - A live remote MP4 on `rustodon.social` serialized local proxy URLs, but both `original` and `small` returned the same `video/mp4` bytes. The bundled frontend therefore rendered a black poster until Play; playback itself then succeeded at 640×480.
 - This is separate from the repaired GIF-as-`gifv` representation bug: the attachment is a real MP4 and needs a generated still preview.
+- Tracked subissues:
+  - [Add a bounded rich-media processor](add-bounded-rich-media-processor.md)
+  - [Support local rich-media uploads](support-local-rich-media-uploads.md)
+  - [Cache remote rich media with previews](cache-remote-rich-media-previews.md)
