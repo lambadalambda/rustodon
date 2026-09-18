@@ -168,3 +168,23 @@ After deploying the parity fixes, the local user reports that following `lain@la
 - No full ordinary aggregate, browser, differential, peer, or release gate is
   claimed. Keep this issue open for the parent's separate deployment and fresh
   external delivery verification; nothing was deployed or replayed here.
+
+## Recovery verification — 2026-09-18 UTC
+
+- Independent review found no blockers/high-severity defects. The focused public
+  regression also reproduced red and passed green on the exact deployed baseline
+  plus only the reviewed fix; unrelated rich-media work was excluded.
+- After application activation, only the five diagnosed retry heads were made
+  due under guarded row locks. Payloads, ordering, attempt counts, lease generations,
+  and all fields other than scheduling time were preserved.
+- Of 375 captured queued activities, 374 acknowledged and one became an
+  invalid-activity dead letter. None remained live, and no captured job retained
+  `remote Note Create write failed`.
+- All 22 captured Creates from the reported actor materialized. The exact home
+  timeline selector included 10 under normal reply/audience policy. Its 27 Like
+  jobs acknowledged; favourite materialization was not separately established.
+- Health/readiness and worker coverage passed. Remote thread-fetch retries and
+  other invalid-content/media dead letters remain outside this repair; they were
+  not broadly replayed or bypassed. Operational records are kept outside the repo.
+- Keep open for user-visible confirmation and a fresh post delivered after this
+  repair, distinguishing recovered backlog from new end-to-end delivery.
