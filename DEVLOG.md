@@ -1,3 +1,26 @@
+## 2026-09-18 — bounded remote browser acceptance, review 1 corrections
+
+- Exact application `8b2f49e` ran in fresh disposable PG14 with restricted roles,
+  pinned frontend/source and debug/test-support-only task TLS. Real signed ingress,
+  importer enqueue, held/released Pull worker and native WebSocket convergence
+  passed for MP4, audio and AVIF. No application edits or production work.
+- Reload checks now use actual frontend XHR attachment responses (audio preview
+  remains null with no small metadata). Per-stage network resets cannot borrow
+  prior live positives; sanitized aggregate zero-origin evidence is retained and
+  each dedicated reload separately checks DOM hotlinks. Eight offline regressions
+  pass. Executable bounded launch/readiness/cleanup recipe replaces prose-only setup.
+- Initial launcher navigation failed before the controller. The one permitted
+  harness correction added verified end-to-end TLS readiness. The subsequent
+  fresh controller passed uninterrupted: PNG poster before MP4 playback (0->2
+  decoded frames), audio avatar fallback/playback, JPEG still decode and all reloads.
+  Aggregate 1,208 requests; zero origin-media-host requests. Reload intervals:
+  video 148, audio 148, still 147 requests, each with its own local-media positive.
+- Evidence: `target/remote-browser-8b2f49e-r2-evidence/` and NAS workspace
+  `rustodon-remote-browser-8b2f49e-r2-alice/evidence/`. All task containers, PG volume,
+  network, media, certs/keys/env/session and build artifacts cleaned. Prior failed
+  startup evidence kept separately. Harness/evidence uncommitted for review 2;
+  not a full matrix or new private-browser/HTTP proof.
+
 ## 2026-09-18 — remote representations review 1 (uncommitted)
 
 - M1 pinned source confirms explicit thumbnails use attachment-model locality,

@@ -28,3 +28,9 @@ previews.
 - Mismatch, oversize, malformed, retry, lease loss, partial write, commit
   ambiguity, policy change, deletion, and cleanup regressions pass.
 - Focused browser coverage proves preview-before-playback and reload behavior.
+
+## Browser subissue
+
+[Accept remote rich media in the pinned browser](accept-remote-rich-media-browser.md)
+records the bounded exact-`8b2f49e` browser slice, observed evidence and remaining
+review/gate boundaries. Parent remains open; this is not a combined completion claim.
