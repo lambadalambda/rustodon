@@ -1,8 +1,118 @@
 # Verify local rich uploads in the pinned browser
 
+## Current status — complete (2026-09-18)
+
+Parent accepts the exact-`6f44264` pinned-browser evidence: before-attach
+HEIC/AVIF native decoding and video/audio playback, followers-only post/reload
+in uploading and fresh owner contexts, owner reads/ranges, anonymous denial,
+and malformed retained-422/raw cleanup. Earlier `c6cf7b3` blockers are resolved.
+Local parent closure also uses separate persistence/worker/restricted HTTP evidence,
+not this browser slice alone.
+
+Parent explicitly approves closure and archival. This status supersedes earlier
+“open”, “uncommitted”, “review pending” and closure-proposal instructions below;
+those record historical handoff stages, not outstanding work. No gates were rerun
+for this docs-only reconciliation. Actual transport-loss/power-loss simulation,
+full fixture/release matrices and remote-media implementation remain unclaimed.
+The [frontend rich-media parent](support-frontend-video-attachments.md) remains
+**OPEN** for unimplemented remote caching/previews.
+
 ## Summary
 
-Bounded browser acceptance for [Support local rich-media uploads](support-local-rich-media-uploads.md) and [HTTP integration](integrate-local-rich-upload-http.md), based on c6cf7b3. Neither parent is completed by this slice alone.
+Bounded browser acceptance for [Support local rich-media uploads](support-local-rich-media-uploads.md) and [HTTP integration](integrate-local-rich-upload-http.md). Initial run: c6cf7b3; reviewed-fix rerun: 6f44264. Neither parent is completed by this slice alone.
+
+## Historical browser handoff result — 6f44264 (2026-09-18)
+
+**Focused local-browser acceptance passed. Propose closure after parent evidence
+verification; leave open and these documentation updates uncommitted.** The older
+partial result below is historical, not the current outcome. Parent reports the
+narrow authorization fix committed after independent Review2 approval.
+
+### Actual workflows
+
+- Clean tracked archive of `6f44264d20803f90cc66f11dfc696fa6b44ab736`; exact clean
+  reference `1440d55b139e39ec722c2a3db7f60b66cd889048` verified again. All served
+  frontend checksums passed. Default-feature binary, no `test-support`; fresh
+  PostgreSQL 14.23 restore with operational migrations **1–5**.
+- Agent-browser **0.31.1**, Chrome **148.0.7778.96**, actual Alice login and pinned
+  composer file input/Post/Edit/Play controls. No mocked responses, Redux injection,
+  media URL rewriting, cache-busting or disabled cache. Each HEIC, AVIF, WebM and
+  Ogg upload observed **202 → held-worker 206 → real-worker 200**, stable identity,
+  then **Post 200** with the same media ID. All four posts were **followers-only**
+  (`visibility=2`, independently checked in the task DB).
+- **Before attachment:** HEIC and AVIF composer thumbnails decode at **588×392**;
+  the actual editor image decodes at **600×400**. Video poster decodes at **640×360**;
+  the rendered editor video plays at **960×540**, `readyState=4`, no error, clock
+  **0 → 0.087241s** with decoded-frame evidence. Rendered editor audio plays with
+  `readyState=4`, no error, clock **0 → 0.041135s**. Native Play was clicked;
+  subsequent measurements mute/reset/play the same rendered element, not a
+  substitute player. Tiny fixture durations are ~0.133s / ~0.261s; audible output
+  is not asserted.
+- **Post and immediate uploading-session reload:** both images decode with responsive
+  natural dimensions **566×377**. Video clocks **0 → 0.087094 / 0.087121s**;
+  audio **0 → 0.040151 / 0.041139s**. No previous failed-image reuse was observed.
+- **Fresh owner browser context and reload:** all four same status/media URLs pass
+  native decode/playback again. Video **0 → 0.087181 / 0.087095s**; audio
+  **0 → 0.040537 / 0.040187s**. A temporary owner-state export supplied the real
+  existing session cookie to the isolated fresh context (not a second login or
+  invented session); it was deleted and excluded from copied evidence.
+- **Authorization/ranges:** before posting, every original and available preview
+  returns owner-cookie **206 / exactly 16 bytes / correct Content-Range** and
+  credential-omitted **404**. After posting, all originals/previews return owner
+  cookie **200 / 206** for full/range reads and fresh-anonymous **404** for both.
+  Every recorded success/denial is `private, no-store` with
+  `Vary: Authorization, Cookie, Signature`. Native anonymous HEIC decoding fails
+  (`naturalWidth=0`), while owner native decoding succeeds, including fresh reload.
+  No explicit Authorization header was added to native or diagnostic media requests.
+  Other-user/revoked-session/explicit-bearer cases remain the prior reviewed HTTP
+  matrix evidence, not claims of extra browser cases here.
+- **Malformed HEIC:** file input **202 → 206 → 422**, visible exact error toast,
+  zero composer attachments. DB confirms retained `processing=3`, null filename
+  and status, zero ownership rows. Private raw root has no files. Published ready
+  media remain `processing=2` and attached. This confirms terminal raw cleanup;
+  deletion/cancellation fault injection was not rerun in this browser slice.
+
+### Evidence, safety and closure boundary
+
+- NAS: `/srv/workspaces/rustodon-upload-browser-6f44264-alice/evidence/`.
+  Local copied evidence: `target/local-upload-browser-6f44264-alice/evidence/`.
+  `*-pending/ready/post.json`, `*-composer-play.json`, `*-editor-decode.json`,
+  `*-post/reload-native.json`, `*-fresh-*-native.json`, `*-auth-ranges.json`,
+  `*-attached-*-requests.json`, SQL assertions and `network-media.txt` distinguish
+  browser behavior from diagnostics. Screenshot/JSON/script hashes are recorded.
+- Visually inspected `heic-editor.png`, `video-editor.png`, `audio-editor.png`,
+  `heic-fresh-reload.png`, `avif-reload.png`, `malformed-terminal.png`. Other
+  per-format composer/editor/post/reload screenshots are retained as well.
+- Reused immutable codec `7203e022…`, PG14 `1a6c2409…`, browser `d6337b96…` images
+  from the prior run; complete identities retained. Source archive SHA-256:
+  `13eb4496df2da2718fb6c716b15b6fce620acca800945c275d4ee4e8be79491e`.
+  Runtime/writer have no elevated attributes, inheritance, memberships or owned
+  relations. Grant source/docs match the prior runner; owner used for setup/assertions.
+- Only uniquely prefixed `upload-browser-6f44264-*` resources; no published host
+  ports, production, instance environments or credentials. Same strict fixture TLS
+  helper/SPKI and loopback forwarder. Build 4 CPU/6 GiB/512 PIDs/870s (+900s outer);
+  DB 1 CPU/512 MiB/128 PIDs/10800s; web 2 CPU/1 GiB/256 PIDs/10000s;
+  worker 2 CPU/2 GiB/256 PIDs/8000s; browser 2 CPU/2 GiB/512 PIDs/9000s;
+  forwarder 0.5 CPU/128 MiB/32 PIDs/8500s. CLI 30s +5s kill, phase outer bounds
+  60–600s. Heavy builds/phases sequential, task sidecars only.
+- Observation-driver corrections, **not application regressions**: accept CLI refs
+  with `[required, ref=…]`; close the fresh owner context before opening the anonymous
+  context after a third-context CDP handshake failure; run anonymous fetch diagnostics
+  from the SPA rather than the restrictive login-page CSP. No limits/security policy
+  were weakened. Final `fresh-final.log` and `auth-final.log` pass; prior diagnostics
+  retained. Python/CLI scripts live only in ignored/task evidence, not a new repository
+  harness. TDD inapplicable to observation-only testing of already reviewed code.
+- All task containers, DB anonymous volume, network, media root, TLS material and
+  temporary owner state removed. Browser/forwarder required SIGKILL after the bounded
+  10s stop grace; no graceful-shutdown claim. Evidence/source and existing tools/cache
+  retained. Cleanup assertions passed.
+- This satisfies this focused browser issue and the browser dependency of the HTTP/
+  media-authorization subissues. Propose their closure after parent verifies evidence;
+  evaluate the upload parent's broader fault criteria against the already recorded
+  persistence/worker/restricted HTTP results. No aggregate source-contract, full
+  browser/cutover, remote-media/cache/search, peer or release-matrix claim. No code
+  changes or commits; no issue was automatically archived.
+
 
 ## Requirements
 

@@ -1,5 +1,12 @@
 # Completed Issues
 
+- [x] [Support local rich-media uploads](issues/support-local-rich-media-uploads.md)
+- [x] [Persist durable local upload ownership](issues/persist-durable-local-upload-ownership.md)
+- [x] [Process and recover durable local uploads](issues/process-and-recover-durable-local-uploads.md)
+- [x] [Integrate local rich-upload HTTP](issues/integrate-local-rich-upload-http.md)
+- [x] [Verify local rich uploads in the pinned browser](issues/verify-local-rich-upload-browser.md)
+- [x] [Fix local-upload browser media authorization](issues/fix-local-upload-browser-media-authorization.md)
+
 - [x] [Add a bounded rich-media processor](issues/add-bounded-rich-media-processor.md)
 
 - [x] [Diagnose missing posts from followed lain.com account](issues/diagnose-missing-followed-lain-com-posts.md)

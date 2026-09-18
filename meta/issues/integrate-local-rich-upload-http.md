@@ -1,8 +1,38 @@
 # Integrate local rich-upload HTTP
 
+## Current status — complete (2026-09-18)
+
+Independent HTTP review `242746` approved after actual restricted runtime/writer
+evidence. Committed in `c6cf7b3`; all 24 external MIME types pass the HTTP lifecycle.
+Exact-`6f44264` browser acceptance now completes the separate composer
+preview/playback, posting and reload dependency, including malformed retained
+422 failure and raw cleanup.
+
+Parent explicitly approves closure and archival. This status supersedes earlier
+“open”, “uncommitted”, “review pending” and closure-proposal instructions below;
+those record historical handoff stages, not outstanding work. No gates were rerun
+for this docs-only reconciliation. Actual transport-loss/power-loss simulation,
+full fixture/release matrices and remote-media implementation remain unclaimed.
+The [frontend rich-media parent](support-frontend-video-attachments.md) remains
+**OPEN** for unimplemented remote caching/previews.
+
 ## Summary
 
 Bounded HTTP slice of [Support local rich-media uploads](support-local-rich-media-uploads.md), on reviewed persistence/worker main `dee7526`.
+
+## Historical closure proposal — 2026-09-18
+
+The [browser rerun on reviewed 6f44264](verify-local-rich-upload-browser.md) passes
+the separate browser dependency: HEIC/AVIF/video/audio **202 → 206 → 200**, real
+composer preview/playback before attachment, status submission, same-URL native
+reload in uploading and fresh owner contexts, owner-cookie media access, anonymous
+denial/ranges, and malformed **202 → 206 → 422** with retained row/raw cleanup.
+
+Together with the earlier restricted-role 24-format HTTP/worker lifecycle and
+reviewed media-authorization matrix, this is grounds to **propose closure after
+parent evidence verification**. No issue is archived here. No new HTTP fault-matrix,
+full fixture lane or remote-media/cache/search completion is claimed; earlier
+implementation evidence remains separately identified below.
 
 ## Requirements
 

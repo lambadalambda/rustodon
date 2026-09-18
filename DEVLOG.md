@@ -1,4 +1,70 @@
-## 2026-09-18 — bounded actual-browser local upload acceptance (uncommitted)
+## 2026-09-18 — close reviewed local-upload milestones (docs only)
+
+- Parent explicitly approves closure of local rich uploads and its persistence,
+  worker, HTTP, browser and media-authorization subissues; moved exactly those six
+  links to the archive, preserving detail files and historical evidence.
+- Reviews: persistence `688362` approved; worker `2ea39` singleton high resolved;
+  HTTP `242746` approved after actual restricted runtime/writer evidence;
+  authorization `22156` approved M1/M2. Implementations are committed through
+  `6f44264`. This completion overrides earlier local-upload open/uncommitted/
+  review-pending handoff notes below, including the browser closure proposal.
+- Combined acceptance: all 24 external MIME types in HTTP; recorded worker faults,
+  committed replay retention and successful retirement; exact-`6f44264` native
+  HEIC/AVIF/video/audio before-attach and followers-only post/reload in uploading
+  and fresh owner contexts, anonymous denial, malformed retained 422/raw cleanup.
+- No new execution or actual transport-loss/power-loss proof, full fixture/release
+  matrix, or remote implementation claim. Frontend rich-media parent stays OPEN:
+  remote caching/previews and its remote acceptance criteria remain unmet.
+- Preserved pending browser documentation. TDD is inapplicable to docs-only
+  reconciliation; checked diff and exact index movement. No code, production or push.
+
+## 2026-09-18 — historical browser handoff: reviewed 6f44264 rerun passed
+
+- Exact clean tracked archive `6f44264d20803f90cc66f11dfc696fa6b44ab736`, default
+  binary/no test-support, verified clean Mastodon `1440d55b139e39ec722c2a3db7f60b66cd889048`
+  reference and checksum-verified frontend. Fresh task-owned PostgreSQL 14.23 with
+  operational migrations 1–5; unchanged narrow runtime/writer grants. No source,
+  schema, privilege, production, remote-media/cache/search edits or commits.
+- Actual agent-browser 0.31.1 / Chrome 148.0.7778.96: **HEIC, AVIF, WebM and Ogg**
+  file input → 202 → worker-held 206 → real-worker 200 → Post 200. All four posts
+  followers-only (DB visibility=2); attachment identity preserved.
+- Both previous blockers now pass **before attachment**: HEIC/AVIF composer
+  thumbnails decode 588×392 and native editor originals 600×400; video poster
+  640×360 and editor playback 960×540, clock 0→0.087241s; audio editor Play and
+  clock 0→0.041135s. Native playback has readyState=4, no error; tiny video has
+  decoded-frame evidence. Muted measurements, not an assertion of audible output.
+- Uploading-session post/immediate reload: both images decode; video clocks
+  0→0.087094/0.087121s, audio 0→0.040151/0.041139s. Fresh owner browser context
+  post/reload also passes all four exact URLs: video 0→0.087181/0.087095s, audio
+  0→0.040537/0.040187s. Real owner session state imported only into that fresh
+  context, then deleted; no forged credentials, URL changes or cache disabling.
+- Browser-origin full/range checks: owner cookie originals/previews 200/206,
+  exact 16-byte ranges; anonymous unattached and followers-only media 404 with
+  private/no-store + media Vary. Fresh anonymous native HEIC cannot decode.
+  Other-owner/expired/revoked/bearer-precedence coverage remains the earlier
+  reviewed restricted HTTP matrix, not extra browser cases claimed here.
+- Malformed HEIC file input again 202→206→422 with visible exact toast and cleared
+  attachment. Retained processing=3, null filename/status, zero ownership rows;
+  raw root empty. Four successful media remain processing=2/attached.
+- NAS evidence `/srv/workspaces/rustodon-upload-browser-6f44264-alice/evidence/`;
+  selected local evidence `target/local-upload-browser-6f44264-alice/evidence/`.
+  Includes CLI observation scripts, request projections, native clock/decode JSON,
+  SQL assertions, screenshots and hashes. Visually inspected composer/editor,
+  immediate/fresh reload and error screenshots. Full limits, immutable image IDs,
+  commands/scripts and stage distinctions are in the browser subissue/evidence.
+- Driver corrections only: CLI `[required, ref=…]` parsing; third-context CDP
+  handshake failure avoided by closing fresh-owner context before anonymous;
+  anonymous diagnostic fetches moved from restrictive login CSP to the real SPA.
+  No application failure or security-policy relaxation. Final fresh/auth phases pass.
+  TDD not applicable to observation-only rerun; no repository harness was added.
+- All task containers, PG anonymous volume, network, media root, TLS material and
+  temporary owner state removed. Browser/forwarder required bounded SIGKILL at
+  teardown; worker/web/DB stopped. Existing tools/cache and evidence retained.
+- Updated local browser/auth/HTTP/parent issues with **closure proposals**, not
+  automatic archives. Parent supplied Review2 approval of committed fix; parent
+  should verify combined recorded fault/review criteria before closure. No full
+  matrix, peer, remote-media/cache/search or release-completion claim. Docs remain
+  uncommitted for parent verification.
 
 ## 2026-09-18 — media authorization Review1 compact follow-up (uncommitted)
 

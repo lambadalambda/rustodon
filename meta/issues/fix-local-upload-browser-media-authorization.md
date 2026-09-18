@@ -1,8 +1,40 @@
 # Fix local-upload browser media authorization
 
+## Current status — complete (2026-09-18)
+
+Independent media-authorization review `22156` approved M1/M2; committed in
+`6f44264`. Restricted HTTP evidence and the exact-commit browser rerun complete
+the pending review/browser conditions: native owner previews before attachment,
+followers-only post/reload access and private/no-store anonymous denial pass.
+
+Parent explicitly approves closure and archival. This status supersedes earlier
+“open”, “uncommitted”, “review pending” and closure-proposal instructions below;
+those record historical handoff stages, not outstanding work. No gates were rerun
+for this docs-only reconciliation. Actual transport-loss/power-loss simulation,
+full fixture/release matrices and remote-media implementation remain unclaimed.
+The [frontend rich-media parent](support-frontend-video-attachments.md) remains
+**OPEN** for unimplemented remote caching/previews.
+
 ## Summary
 
 Direct blocker subissue of [Verify local rich uploads in the pinned browser](verify-local-rich-upload-browser.md) and [Support local rich-media uploads](support-local-rich-media-uploads.md), on `373da56`. Implements the narrow plan approved by independent design review `2156dc`.
+
+## Historical closure proposal — 2026-09-18
+
+Parent reports independent Review2 approved the narrow fix, now committed as
+`6f44264`. The [actual pinned-browser rerun](verify-local-rich-upload-browser.md)
+on that exact commit **passes** both prior blockers: owner-native HEIC/AVIF
+composer/editor decoding, video/audio editor playback before attachment, and
+followers-only native cookie access after posting and immediate reload. A fresh
+owner browser context also passes same-URL reload; fresh anonymous full/range
+requests and native HEIC decoding are denied, privately and without shared caching.
+
+This supplies the previously missing browser evidence alongside the recorded
+restricted HTTP red/green and review results below. **Propose closure after parent
+verifies the evidence**, not automatic archival. This documentation-only rerun did
+not repeat every revoked/expired/other-owner/bearer-precedence HTTP case, change code,
+or run remote/cache/search integration. Historical “uncommitted/review pending”
+notes below describe the earlier implementation phase, not current commit status.
 
 ## Requirements
 

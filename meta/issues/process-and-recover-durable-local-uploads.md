@@ -1,5 +1,22 @@
 # Process and recover durable local uploads
 
+## Current status — complete (2026-09-18)
+
+Independent worker review `2ea39` resolved the singleton-key high finding;
+committed in `dee7526`. Recorded fault tests, committed replay retention and
+successful retirement cover the lifecycle contract. Subsequent actual restricted
+runtime/writer HTTP-worker evidence adds least-privilege integration. The HTTP
+slice now retains terminal processing=3 rows; the deleted-row description below
+is historical, not current behavior.
+
+Parent explicitly approves closure and archival. This status supersedes earlier
+“open”, “uncommitted”, “review pending” and closure-proposal instructions below;
+those record historical handoff stages, not outstanding work. No gates were rerun
+for this docs-only reconciliation. Actual transport-loss/power-loss simulation,
+full fixture/release matrices and remote-media implementation remain unclaimed.
+The [frontend rich-media parent](support-frontend-video-attachments.md) remains
+**OPEN** for unimplemented remote caching/previews.
+
 ## Summary
 
 Worker/filesystem/lifecycle-only slice of [local rich-media uploads](support-local-rich-media-uploads.md), following reviewed persistence at `949d503`. HTTP v2 remains non-live.

@@ -1,5 +1,13 @@
 # Support advertised media attachments in the bundled frontend
 
+## Current status — OPEN (2026-09-18)
+
+Local upload milestones are complete and archived on combined reviewed
+persistence/worker/restricted HTTP and exact-`6f44264` browser evidence. Remote
+rich-media caching and generated previews remain unimplemented; the remote MP4
+acceptance criterion and combined remote regression coverage remain unmet. The
+original diagnosis below is historical for local uploads, not current local status.
+
 ## Summary
 
 Rustodon advertises Mastodon-compatible image, video, and audio MIME types, and the bundled composer lets users select them, but creation and remote caching are limited to JPEG/PNG/GIF/WebP. Ordinary phone photos, video, and audio uploads therefore begin and fail with HTTP 422; remote video also lacks a still preview.

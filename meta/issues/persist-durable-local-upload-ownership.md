@@ -1,5 +1,20 @@
 # Persist durable local upload ownership
 
+## Current status — complete (2026-09-18)
+
+Independent persistence review `688362` approved; committed in `949d503`.
+Subsequent worker/HTTP integration supplies committed replay retention and
+successful raw-only retirement coverage while preserving published outputs.
+Fresh/upgrade/privilege evidence below and the integration dependencies are complete.
+
+Parent explicitly approves closure and archival. This status supersedes earlier
+“open”, “uncommitted”, “review pending” and closure-proposal instructions below;
+those record historical handoff stages, not outstanding work. No gates were rerun
+for this docs-only reconciliation. Actual transport-loss/power-loss simulation,
+full fixture/release matrices and remote-media implementation remain unclaimed.
+The [frontend rich-media parent](support-frontend-video-attachments.md) remains
+**OPEN** for unimplemented remote caching/previews.
+
 ## Summary
 
 First bounded part of [local rich-media uploads](support-local-rich-media-uploads.md).
