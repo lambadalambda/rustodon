@@ -16817,8 +16817,15 @@ async fn insert_remote_note_media(
     let mut media_ids = Vec::new();
     for attachment in attachments.iter().take(4) {
         let media = sqlx::query_as::<_, (i64, Option<i32>, Option<String>)>(
-            "UPDATE media_attachments SET type = $3, description = $4,
-                file_content_type = $6, file_meta = $7::json, blurhash = $8,
+            "UPDATE media_attachments SET
+                type = CASE WHEN file_file_name IS NULL THEN $3 ELSE type END,
+                description = $4,
+                file_content_type = CASE WHEN file_file_name IS NULL THEN $6 ELSE file_content_type END,
+                file_meta = CASE WHEN file_file_name IS NULL THEN $7::json
+                    ELSE ((COALESCE(file_meta::jsonb, '{}'::jsonb) - 'focus') ||
+                        CASE WHEN $7::jsonb ? 'focus' THEN jsonb_build_object('focus', $7::jsonb -> 'focus')
+                             ELSE '{}'::jsonb END)::json END,
+                blurhash = CASE WHEN file_file_name IS NULL THEN $8 ELSE blurhash END,
                 thumbnail_remote_url = $9,
                 processing = CASE WHEN file_file_name IS NULL THEN $10 ELSE processing END,
                 updated_at = clock_timestamp()
@@ -16899,12 +16906,8 @@ fn remote_media_processing(content_type: Option<&str>) -> i32 {
 }
 
 fn remote_media_is_fetchable(content_type: Option<&str>) -> bool {
-    content_type.is_none_or(|content_type| {
-        matches!(
-            content_type.to_ascii_lowercase().as_str(),
-            "image/jpeg" | "image/png" | "image/gif" | "image/webp"
-        )
-    })
+    // Missing advertisement is allowed only through the bounded response-MIME policy.
+    crate::media::RemoteMediaPolicy::new(content_type).is_some()
 }
 
 fn remote_media_job_logical_key(media_id: i64, remote_url: &str) -> String {
@@ -24602,5 +24605,98 @@ mod tests {
         assert_eq!(report_category_value(Some("other"), true).unwrap(), 2_000);
         assert!(report_category_value(Some("violation"), false).is_err());
         assert!(report_category_value(Some("unknown"), false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod remote_media_worker_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires disposable restored PG14 with narrow writer"]
+    async fn remote_media_import_and_same_url_normalization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let owner = PgPool::connect(&std::env::var("RUSTODON_WORKER_OWNER_DATABASE_URL")?).await?;
+        let writer = PgPool::connect(&std::env::var("RUSTODON_WORKER_WRITE_DATABASE_URL")?).await?;
+        let account = 116_844_606_259_202_001_i64;
+        let status = 116_845_105_643_525_105_i64;
+        let installed = json!({"original":{"width":600,"height":400,"size":"600x400","aspect":1.5},"small":{"width":480,"height":320},"focus":{"x":0.0,"y":0.0}});
+        let id: i64 = sqlx::query_scalar("INSERT INTO media_attachments (account_id,status_id,remote_url,type,processing,file_file_name,file_content_type,file_file_size,file_meta,created_at,updated_at) VALUES ($1,$2,'https://media.fixture.invalid/normalized.heic',0,2,'normalized.jpg','image/jpeg',123,$3::json,clock_timestamp(),clock_timestamp()) RETURNING id")
+            .bind(account).bind(status).bind(&installed).fetch_one(&owner).await?;
+        let mut transaction = writer.begin().await?;
+        let mut attachment = RemoteNoteAttachment {
+            remote_url: "https://media.fixture.invalid/normalized.heic".into(),
+            thumbnail_remote_url: None,
+            content_type: Some("image/heic".into()),
+            description: Some("updated description".into()),
+            blurhash: None,
+            file_meta: json!({"original":{"width":9999,"height":1},"focus":{"x":0.2,"y":-0.3}}),
+        };
+        assert_eq!(
+            insert_remote_note_media(
+                &mut transaction,
+                status,
+                account,
+                std::slice::from_ref(&attachment)
+            )
+            .await?,
+            vec![id]
+        );
+        let (kind,mime,name,size,meta,description): (i32,String,String,i32,Value,String) = sqlx::query_as("SELECT type,file_content_type,file_file_name,file_file_size,file_meta,description FROM media_attachments WHERE id=$1")
+            .bind(id).fetch_one(&mut *transaction).await?;
+        assert_eq!(
+            (kind, mime.as_str(), name.as_str(), size),
+            (0, "image/jpeg", "normalized.jpg", 123)
+        );
+        assert_eq!(meta["original"], installed["original"]);
+        assert_eq!(meta["small"], installed["small"]);
+        assert_eq!(meta["focus"], json!({"x":0.2,"y":-0.3}));
+        assert_eq!(description, "updated description");
+        attachment.content_type = Some("video/quicktime".into());
+        attachment.file_meta = json!({});
+        insert_remote_note_media(&mut transaction, status, account, &[attachment]).await?;
+        let (kind, meta): (i32, Value) =
+            sqlx::query_as("SELECT type, file_meta FROM media_attachments WHERE id=$1")
+                .bind(id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        assert_eq!(kind, 0, "same URL advertisement cannot replace probed kind");
+        assert_eq!(meta["original"], installed["original"]);
+        assert!(meta.get("focus").is_none(), "focus can be cleared");
+        for (i, mime) in [
+            Some("video/mp4"),
+            Some("audio/mpeg"),
+            Some("image/heic"),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let attachment = RemoteNoteAttachment {
+                remote_url: format!("https://media.fixture.invalid/new-{i}"),
+                thumbnail_remote_url: None,
+                content_type: mime.map(str::to_owned),
+                description: None,
+                blurhash: None,
+                file_meta: json!({}),
+            };
+            let ids =
+                insert_remote_note_media(&mut transaction, status, account, &[attachment]).await?;
+            let processing: i32 =
+                sqlx::query_scalar("SELECT processing FROM media_attachments WHERE id=$1")
+                    .bind(ids[0])
+                    .fetch_one(&mut *transaction)
+                    .await?;
+            assert_eq!(processing, 0);
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM rustodon.outbox_events WHERE kind=$1 AND payload->'arguments'->>'media_id'=$2")
+                .bind(ACTIVITYPUB_MEDIA_FETCH_JOB_KIND).bind(ids[0].to_string()).fetch_one(&mut *transaction).await?;
+            assert_eq!(count, 1);
+        }
+        transaction.rollback().await?;
+        sqlx::query("DELETE FROM media_attachments WHERE id=$1")
+            .bind(id)
+            .execute(&owner)
+            .await?;
+        Ok(())
     }
 }

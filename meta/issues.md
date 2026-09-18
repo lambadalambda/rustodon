@@ -27,6 +27,7 @@
 - [ ] [Support polls in the bundled frontend](issues/support-poll-voting-and-refresh.md)
 - [ ] [Support advertised media attachments in the bundled frontend](issues/support-frontend-video-attachments.md)
 - [ ] [Cache remote rich media with previews](issues/cache-remote-rich-media-previews.md)
+- [ ] [Cache remote rich media in the fenced worker](issues/cache-remote-rich-media-worker.md)
 - [ ] [Restore status search in the bundled frontend](issues/restore-frontend-status-search.md)
 - [ ] [Compute real instance activity metrics](issues/compute-real-instance-activity-metrics.md)
 - [ ] [Support hashtag and featured-tag controls](issues/support-hashtag-and-featured-tag-controls.md)

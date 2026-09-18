@@ -50,11 +50,11 @@ use crate::mastodon::{
 };
 use crate::paperclip::{
     PaperclipAttachment, PaperclipMetadata, PaperclipRoot, parse_paperclip_path,
-    prepare_custom_emoji, prepare_media_attachment, write_prepared_custom_emoji,
+    prepare_custom_emoji, prepare_rich_media_attachment, write_prepared_custom_emoji,
     write_prepared_media,
 };
 use crate::remote::{
-    RemoteAccountResolver, RemoteFetchError, RemoteFetchLimits, RemoteFetcher,
+    RemoteAccountResolver, RemoteFetchError, RemoteFetchLimits, RemoteFetcher, RemoteMediaFetcher,
     canonical_remote_domain, canonical_remote_domain_from_url,
 };
 use crate::streaming::event_logical_key;
@@ -66,7 +66,6 @@ const THREAD_ACTIVITYPUB_CONTENT_TYPES: &[&str] = &[
     "application/ld+json; profile=\"https://www.w3.org/ns/activitystreams\"",
 ];
 const REMOTE_MEDIA_CONTENT_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
-const REMOTE_MEDIA_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const NOTIFICATION_CLEANUP_BATCH_SIZE: i64 = 1_000;
 
 fn quote_reference(primary: Option<&str>, fallback: Option<&str>) -> Option<String> {
@@ -5374,13 +5373,12 @@ async fn process_activitypub_media(
             String,
             Option<String>,
             Option<String>,
-            Option<Value>,
             Option<String>,
             Option<String>,
         ),
     >(
         "SELECT media.account_id, media.remote_url, media.file_file_name,
-                media.file_content_type, media.file_meta, media.blurhash, account.domain
+                media.file_content_type, media.blurhash, account.domain
            FROM media_attachments media
            JOIN accounts account ON account.id = media.account_id
            JOIN statuses status ON status.id = media.status_id
@@ -5395,7 +5393,6 @@ async fn process_activitypub_media(
         remote_url,
         existing_file_name,
         existing_content_type,
-        remote_meta,
         blurhash,
         account_domain,
     )) = media
@@ -5431,34 +5428,33 @@ async fn process_activitypub_media(
         .and_then(|mut segments| segments.next_back())
         .filter(|value| !value.is_empty())
         .unwrap_or("remote-media");
-    let limits = RemoteFetchLimits {
-        max_response_bytes: REMOTE_MEDIA_MAX_RESPONSE_BYTES,
-        ..RemoteFetchLimits::default()
-    };
-    let accepted_content_types: &[&str] = if existing_content_type.is_some() {
-        REMOTE_MEDIA_CONTENT_TYPES
-    } else {
-        &[]
-    };
-    let fetcher = fetcher.with_limits(limits);
     #[cfg(feature = "test-support")]
-    let media_response = match config.remote_media_endpoint {
-        Some(endpoint) => {
+    let fetcher = &fetcher
+        .clone()
+        .with_test_endpoint(config.remote_media_endpoint);
+    let media_response = match RemoteMediaFetcher::new(fetcher, existing_content_type.as_deref()) {
+        Ok(fetcher) => {
             fetcher
-                .get_for_test_endpoint(remote_url.clone(), accepted_content_types, endpoint)
+                .get_with_policy(remote_url.clone(), |url| {
+                    let repository = Repository::from_pool(pool.clone());
+                    async move {
+                        let domain = canonical_remote_domain_from_url(&url)?;
+                        if repository
+                            .remote_media_allowed(&domain, config.limited_federation)
+                            .await
+                            .map_err(|_| RemoteFetchError::Request)?
+                        {
+                            Ok(())
+                        } else {
+                            Err(RemoteFetchError::PolicyDenied)
+                        }
+                    }
+                })
                 .await
         }
-        None => {
-            fetcher
-                .get(remote_url.clone(), accepted_content_types)
-                .await
-        }
+        Err(error) => Err(error),
     };
-    #[cfg(not(feature = "test-support"))]
-    let media_response = fetcher
-        .get(remote_url.clone(), accepted_content_types)
-        .await;
-    let response = match media_response {
+    let (response, visited) = match media_response {
         Ok(response) => response,
         Err(error) => {
             let failure = remote_media_fetch_failure(&error);
@@ -5489,7 +5485,9 @@ async fn process_activitypub_media(
         ));
     };
     let prepared =
-        match prepare_media_attachment(account_id, file_name, &content_type, &response.body) {
+        match prepare_rich_media_attachment(account_id, file_name, &content_type, &response.body)
+            .await
+        {
             Ok(prepared) => prepared,
             Err(error) => {
                 if matches!(
@@ -5505,6 +5503,11 @@ async fn process_activitypub_media(
                 )));
             }
         };
+    let visited_domains = visited
+        .iter()
+        .map(canonical_remote_domain_from_url)
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|_| HandlerFailure::permanent("remote media hop has no valid domain"))?;
     let install_marker = RemoteMediaInstallMarker {
         file_name: prepared.file_name.clone(),
         content_type: prepared.content_type.clone(),
@@ -5520,23 +5523,24 @@ async fn process_activitypub_media(
         content_type: Some(prepared.content_type.clone()),
         variant: None,
     };
-    let mut file_meta = prepared.file_meta.clone();
-    let source_meta = remote_meta;
-    if let (Value::Object(target), Some(Value::Object(source))) = (&mut file_meta, source_meta) {
-        for (key, value) in source {
-            if !matches!(key.as_str(), "original" | "small") {
-                target.insert(key, value);
-            }
-        }
-    }
     let writer = WriteRepository::from_pool(pool.clone());
     let persisted = writer
         .with_remote_domain_locks(&account_domain, || async {
             let mut transaction = pool.begin().await?;
             let mut pending_stream_events = Vec::new();
-            let current = sqlx::query_as::<_, (String, Option<String>, Option<String>, bool)>(
+            let current = sqlx::query_as::<
+                _,
+                (
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    bool,
+                    Option<i64>,
+                    Option<Value>,
+                ),
+            >(
                 "SELECT media.remote_url, media.file_file_name, account.domain,
-                        status.deleted_at IS NULL
+                        status.deleted_at IS NULL, media.account_id, media.file_meta
                    FROM media_attachments media
                    JOIN accounts account ON account.id = media.account_id
                    JOIN statuses status ON status.id = media.status_id
@@ -5546,12 +5550,20 @@ async fn process_activitypub_media(
             .bind(media_id)
             .fetch_optional(&mut *transaction)
             .await?;
-            let Some((current_remote_url, current_file_name, current_domain, active)) = current
+            let Some((
+                current_remote_url,
+                current_file_name,
+                current_domain,
+                active,
+                current_account_id,
+                current_meta,
+            )) = current
             else {
                 transaction.rollback().await?;
                 return Ok(false);
             };
             if !active
+                || current_account_id != Some(account_id)
                 || current_remote_url != remote_url.as_str()
                 || current_domain.as_deref() != Some(account_domain.as_str())
                 || current_file_name.is_some()
@@ -5559,13 +5571,22 @@ async fn process_activitypub_media(
                 transaction.rollback().await?;
                 return Ok(false);
             }
-            let allowed = writer
+            let mut allowed = writer
                 .remote_media_allowed_in_transaction(
                     &mut transaction,
                     &remote_domain,
                     config.limited_federation,
                 )
                 .await?;
+            for domain in &visited_domains {
+                allowed &= writer
+                    .remote_media_allowed_in_transaction(
+                        &mut transaction,
+                        domain,
+                        config.limited_federation,
+                    )
+                    .await?;
+            }
             if !allowed {
                 sqlx::query(
                     "UPDATE media_attachments SET processing = 3, updated_at = clock_timestamp()
@@ -5578,13 +5599,25 @@ async fn process_activitypub_media(
                 transaction.commit().await?;
                 return Err(WriteError::Validation("remote media domain is not allowed"));
             }
+            // Focus can be edited or cleared while fetching. Merge the current
+            // locked row, never the prefetch snapshot, without replacing measured geometry.
+            let mut file_meta = prepared.file_meta.clone();
+            if let (Value::Object(target), Some(Value::Object(source))) =
+                (&mut file_meta, current_meta)
+            {
+                for (key, value) in source {
+                    if !matches!(key.as_str(), "original" | "small") {
+                        target.insert(key, value);
+                    }
+                }
+            }
             let written_paths = write_prepared_media(&media_root, &metadata, &prepared)?;
             let mut written_files = WrittenMediaFiles::new(&media_root, written_paths);
             let status_id = match sqlx::query_scalar::<_, i64>(
                 "UPDATE media_attachments SET processing = 2, file_content_type = $3,
                     file_file_name = $4, file_file_size = $5, file_meta = $6::json,
                     file_storage_schema_version = 1, file_updated_at = clock_timestamp(),
-                    blurhash = COALESCE($7, blurhash), updated_at = clock_timestamp()
+                    blurhash = COALESCE($7, blurhash), type = $8, updated_at = clock_timestamp()
                   WHERE id = $1 AND status_id IS NOT NULL AND remote_url = $2
                     AND EXISTS (
                         SELECT 1 FROM statuses
@@ -5600,6 +5633,7 @@ async fn process_activitypub_media(
             .bind(prepared.file_size)
             .bind(file_meta)
             .bind(blurhash.or(prepared.blurhash))
+            .bind(prepared.media_kind.database_type())
             .fetch_optional(&mut *transaction)
             .await
             {
@@ -5622,36 +5656,34 @@ async fn process_activitypub_media(
                 media_id,
             )
             .await?;
+            // Until COMMIT is issued, cancellation must still remove the files.
+            if let Err(error) =
+                flush_stream_events_in(&mut transaction, &mut pending_stream_events).await
+            {
+                written_files.cleanup();
+                let _ = transaction.rollback().await;
+                return Err(error.into());
+            }
             // A cancelled or failed COMMIT is ambiguous: PostgreSQL may still commit after this
-            // future is dropped. Keep paths out of the drop guard until the synchronized probe
-            // below proves that the installation rolled back.
-            let written_paths = written_files.preserve();
+            // future is dropped. Disarm only immediately before COMMIT; retain paths until the
+            // synchronized probe below proves that the installation rolled back.
             #[cfg(feature = "test-support")]
-            let commit_result = if media_root.take_commit_before_fault() {
+            let (written_paths, commit_result) = if media_root.take_commit_before_fault() {
                 transaction.rollback().await?;
-                Err(sqlx::Error::Protocol(
-                    "injected ambiguous metadata commit failure".to_owned(),
-                ))
+                (
+                    written_files.preserve(),
+                    Err(sqlx::Error::Protocol(
+                        "injected ambiguous metadata commit failure".to_owned(),
+                    )),
+                )
             } else {
-                if let Err(error) =
-                    flush_stream_events_in(&mut transaction, &mut pending_stream_events).await
-                {
-                    WrittenMediaFiles::new(&media_root, written_paths.clone()).cleanup();
-                    let _ = transaction.rollback().await;
-                    return Err(error.into());
-                }
-                transaction.commit().await
+                let written_paths = written_files.preserve();
+                (written_paths, transaction.commit().await)
             };
             #[cfg(not(feature = "test-support"))]
-            let commit_result = {
-                if let Err(error) =
-                    flush_stream_events_in(&mut transaction, &mut pending_stream_events).await
-                {
-                    WrittenMediaFiles::new(&media_root, written_paths.clone()).cleanup();
-                    let _ = transaction.rollback().await;
-                    return Err(error.into());
-                }
-                transaction.commit().await
+            let (written_paths, commit_result) = {
+                let written_paths = written_files.preserve();
+                (written_paths, transaction.commit().await)
             };
             #[cfg(feature = "test-support")]
             let commit_result = if commit_result.is_ok() && media_root.take_commit_after_fault() {

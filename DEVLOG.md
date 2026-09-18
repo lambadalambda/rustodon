@@ -1,3 +1,19 @@
+## 2026-09-18 — remote rich-media worker
+
+- Reused bounded rich processing in the existing remote fetch/install lifecycle;
+  normalized type/MIME and measured metadata now survive same-URL updates.
+  Per-hop policy and install-time rechecks retain transport safeguards.
+- Focused Linux/PostgreSQL tests under restricted runtime/writer credentials:
+  8 remote-worker cases plus 1 import/same-URL regression passed, including real
+  rich outputs, ambiguity/reclamation, policy/deletion, and stream convergence.
+- Review-driven red/green barriers cover focus edits/clearing during fetch and
+  cancellation during stream flush. The output guard stays armed until COMMIT;
+  actual uncertain-commit handling remains intact. Independent review2 approved.
+- Formatting/diff and all-feature focused Clippy passed; production-cfg lint
+  retains the existing unrelated unused-self allowance. Detailed commands and
+  evidence are in `meta/issues/cache-remote-rich-media-worker.md`. No browser,
+  representation/proxy, full-matrix, or deployment completion is claimed here.
+
 ## 2026-09-18 — remote media review 1: strict processor-compatible bounds
 
 - Fixed parent blocker `9f9122`: media-only budget is existing format input limit

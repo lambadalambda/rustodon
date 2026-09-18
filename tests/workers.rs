@@ -1,4 +1,8 @@
 #[cfg(feature = "test-support")]
+#[path = "workers/remote_rich_media.rs"]
+mod remote_rich_media;
+
+#[cfg(feature = "test-support")]
 #[path = "workers/quote_lifecycle.rs"]
 mod quote_lifecycle;
 
@@ -7590,9 +7594,13 @@ async fn activitypub_media_fetch_reclaims_after_lease_fence()
         .max_connections(8)
         .connect(&runtime_url)
         .await?;
-    let writer_pool = PgPoolOptions::new()
+    let owner_pool = PgPoolOptions::new()
         .max_connections(8)
         .connect(&owner_url)
+        .await?;
+    let writer_pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&std::env::var("RUSTODON_WORKER_WRITE_DATABASE_URL")?)
         .await?;
     reset().await?;
     let root_path = std::env::temp_dir().join(format!(
@@ -7606,29 +7614,32 @@ async fn activitypub_media_fetch_reclaims_after_lease_fence()
         "SELECT id FROM statuses WHERE account_id = $1 AND deleted_at IS NULL ORDER BY id LIMIT 1",
     )
     .bind(BOB)
-    .fetch_one(&writer_pool)
+    .fetch_one(&owner_pool)
     .await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = listener.local_addr()?;
-    let body = fs::read("fixtures/worker-media/mastodon-v4.6.5/attachment.gif")?;
+    let body = fs::read("tests/fixtures/media/capability.mp4")?;
+    let prepared =
+        rustodon::paperclip::prepare_rich_media_attachment(BOB, "remote.mp4", "video/mp4", &body)
+            .await?;
     let request_started = Arc::new(Notify::new());
     let release_request = Arc::new(Notify::new());
     let remote_url = format!(
-        "http://media.fixture.invalid:{}/lease-fence.gif",
+        "http://media.fixture.invalid:{}/lease-fence.mp4",
         endpoint.port()
     );
     let media_id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO media_attachments (
              account_id, status_id, type, processing, remote_url, file_content_type, file_meta,
              created_at, updated_at)
-         VALUES ($1, $2, 0, 0, $3, 'image/gif', '{}'::json,
+         VALUES ($1, $2, 0, 0, $3, 'video/mp4', '{}'::json,
                  clock_timestamp(), clock_timestamp())
          RETURNING id",
     )
     .bind(BOB)
     .bind(status_id)
     .bind(&remote_url)
-    .fetch_one(&writer_pool)
+    .fetch_one(&owner_pool)
     .await?;
     let config = ActivityPubDeliveryConfig {
         origin: Url::parse(ORIGIN)?,
@@ -7748,7 +7759,7 @@ async fn activitypub_media_fetch_reclaims_after_lease_fence()
                 "SELECT processing, file_file_name FROM media_attachments WHERE id = $1",
             )
             .bind(media_id)
-            .fetch_one(&writer_pool)
+            .fetch_one(&owner_pool)
             .await?,
             (Some(1), None),
             "a fenced handler must not acknowledge or reset the claimed attachment"
@@ -7778,7 +7789,7 @@ async fn activitypub_media_fetch_reclaims_after_lease_fence()
                FROM media_attachments WHERE id = $1",
         )
         .bind(media_id)
-        .fetch_one(&writer_pool)
+        .fetch_one(&owner_pool)
         .await?;
         assert_eq!(media_state.0, Some(2));
         assert!(media_state.2.is_some_and(|size| size > 0));
@@ -7790,7 +7801,7 @@ async fn activitypub_media_fetch_reclaims_after_lease_fence()
             remote: true,
             storage_schema_version: Some(1),
             file_name: media_state.1,
-            content_type: Some("image/gif".to_owned()),
+            content_type: Some("video/mp4".to_owned()),
             variant: None,
         };
         let original_path = metadata.relative_path("original").expect("original path");
@@ -7798,7 +7809,7 @@ async fn activitypub_media_fetch_reclaims_after_lease_fence()
         let mut original = media_root.open_file(Path::new(&original_path))?;
         let mut original_bytes = Vec::new();
         std::io::Read::read_to_end(&mut original, &mut original_bytes)?;
-        assert_eq!(original_bytes, body);
+        assert_eq!(original_bytes, prepared.original_bytes);
         assert!(media_root.open_file(Path::new(&small_path)).is_ok());
         assert!(queue.dead_letters(10).await?.is_empty());
         assert_eq!(queue.queued_count().await?, 0);
@@ -7831,7 +7842,7 @@ async fn activitypub_media_fetch_reclaims_after_lease_fence()
     let cleanup_result = async {
         sqlx::query("DELETE FROM media_attachments WHERE id = $1")
             .bind(media_id)
-            .execute(&writer_pool)
+            .execute(&owner_pool)
             .await?;
         drop(executor);
         drop(media_root);
@@ -7851,6 +7862,39 @@ async fn activitypub_media_fetch_reclaims_after_lease_fence()
 #[allow(clippy::too_many_lines)]
 async fn activitypub_media_fetch_caches_original_and_gif_thumbnail_and_streams_status_update()
 -> Result<(), Box<dyn std::error::Error>> {
+    remote_media_install_case(
+        "fixtures/worker-media/mastodon-v4.6.5/attachment.gif",
+        "image/gif",
+        1,
+        true,
+    )
+    .await
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "requires disposable PG14 and native ffmpeg/ffprobe"]
+async fn activitypub_media_fetch_rich_outputs_and_streams() -> Result<(), Box<dyn std::error::Error>>
+{
+    for (file, mime, kind, small) in [
+        ("capability.mp4", "video/mp4", 2, true),
+        ("capability.mp3", "audio/mpeg", 4, false),
+        ("600x400.heic", "image/heic", 0, true),
+    ] {
+        remote_media_install_case(&format!("tests/fixtures/media/{file}"), mime, kind, small)
+            .await?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[allow(clippy::too_many_lines)]
+async fn remote_media_install_case(
+    fixture: &str,
+    mime: &str,
+    kind: i32,
+    small: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     const BOB: i64 = 116_844_606_259_202_001;
     const BOOSTER: i64 = 116_844_606_259_201_004;
     const BOOST_RECIPIENT: i64 = 116_844_606_259_201_002;
@@ -7864,9 +7908,13 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail_and_streams_s
         .max_connections(8)
         .connect(&runtime_url)
         .await?;
-    let writer_pool = PgPoolOptions::new()
+    let owner_pool = PgPoolOptions::new()
         .max_connections(8)
         .connect(&owner_url)
+        .await?;
+    let writer_pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&std::env::var("RUSTODON_WORKER_WRITE_DATABASE_URL")?)
         .await?;
     reset().await?;
     let root_path = std::env::temp_dir().join(format!(
@@ -7875,15 +7923,19 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail_and_streams_s
     ));
     let _ = fs::remove_dir_all(&root_path);
     fs::create_dir(&root_path)?;
-    let media_root = PaperclipRoot::open(&root_path)?
-        .with_write_fault(PaperclipWriteFault::storage_full_after(1));
+    let media_root = PaperclipRoot::open(&root_path)?;
+    let media_root = if small {
+        media_root.with_write_fault(PaperclipWriteFault::storage_full_after(1))
+    } else {
+        media_root
+    };
     let status_id = sqlx::query_scalar::<_, i64>(
         "SELECT id FROM statuses
           WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL",
     )
     .bind(STATUS_ID)
     .bind(BOB)
-    .fetch_one(&writer_pool)
+    .fetch_one(&owner_pool)
     .await?;
     let follow_id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO follows
@@ -7893,7 +7945,7 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail_and_streams_s
     )
     .bind(BOOSTER)
     .bind(BOB)
-    .fetch_one(&writer_pool)
+    .fetch_one(&owner_pool)
     .await?;
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -7901,7 +7953,7 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail_and_streams_s
         )
         .bind(BOOST_RECIPIENT)
         .bind(BOB)
-        .fetch_one(&writer_pool)
+        .fetch_one(&owner_pool)
         .await?,
         0,
         "boost recipient must not follow the original author",
@@ -7914,7 +7966,7 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail_and_streams_s
     )
     .bind(BOOST_RECIPIENT)
     .bind(BOOSTER)
-    .fetch_one(&writer_pool)
+    .fetch_one(&owner_pool)
     .await?;
     let boost_id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO statuses (
@@ -7926,12 +7978,13 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail_and_streams_s
     )
     .bind(BOOSTER)
     .bind(status_id)
-    .fetch_one(&writer_pool)
+    .fetch_one(&owner_pool)
     .await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = listener.local_addr()?;
-    let body = fs::read("fixtures/worker-media/mastodon-v4.6.5/attachment.gif")?;
-    let prepared = prepare_media_attachment(BOB, "remote.gif", "image/gif", &body)?;
+    let body = fs::read(fixture)?;
+    let prepared =
+        rustodon::paperclip::prepare_rich_media_attachment(BOB, "remote", mime, &body).await?;
     let remote_url = format!(
         "http://media.fixture.invalid:{}/remote.gif",
         endpoint.port()
@@ -7940,14 +7993,15 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail_and_streams_s
         "INSERT INTO media_attachments (
              account_id, status_id, type, processing, remote_url, file_content_type, file_meta,
              created_at, updated_at)
-         VALUES ($1, $2, 0, 0, $3, 'image/gif', '{}'::json,
+         VALUES ($1, $2, 0, 0, $3, $4, '{}'::json,
                  clock_timestamp(), clock_timestamp())
          RETURNING id",
     )
     .bind(BOB)
     .bind(status_id)
     .bind(&remote_url)
-    .fetch_one(&writer_pool)
+    .bind(mime)
+    .fetch_one(&owner_pool)
     .await?;
     let media_metadata = PaperclipMetadata {
         attachment: PaperclipAttachment::MediaFile,
@@ -7958,7 +8012,12 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail_and_streams_s
         content_type: Some(prepared.content_type.clone()),
         variant: None,
     };
-    let server = tokio::spawn(fixture_media_server_for_retries(listener, body.clone(), 2));
+    let server = tokio::spawn(fixture_media_server_typed(
+        listener,
+        body.clone(),
+        mime.to_owned(),
+        if small { 2 } else { 1 },
+    ));
     let config = ActivityPubDeliveryConfig {
         origin: Url::parse(ORIGIN)?,
         local_domain: "fixture-v4-6-5.rustodon.invalid".to_owned(),
@@ -7992,43 +8051,45 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail_and_streams_s
             .process_one("media-worker", &[Lane::Pull], Duration::seconds(30))
             .await?
     );
-    let failed_media_state = sqlx::query_as::<_, (Option<i32>, Option<String>)>(
-        "SELECT processing, file_file_name FROM media_attachments WHERE id = $1",
-    )
-    .bind(media_id)
-    .fetch_one(&writer_pool)
-    .await?;
-    assert_eq!(failed_media_state, (Some(0), None));
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM rustodon.outbox_events
+    if small {
+        let failed_media_state = sqlx::query_as::<_, (Option<i32>, Option<String>)>(
+            "SELECT processing, file_file_name FROM media_attachments WHERE id = $1",
+        )
+        .bind(media_id)
+        .fetch_one(&owner_pool)
+        .await?;
+        assert_eq!(failed_media_state, (Some(0), None));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM rustodon.outbox_events
               WHERE kind = $1 AND payload ->> 'event' = 'status.update'
                 AND payload ->> 'object_id' = $2",
+            )
+            .bind(STREAM_EVENT_KIND)
+            .bind(status_id.to_string())
+            .fetch_one(&owner_pool)
+            .await?,
+            0,
+            "failed media installation must not stream a status update",
+        );
+        let original_path = media_metadata
+            .relative_path("original")
+            .expect("original path");
+        let small_path = media_metadata.relative_path("small").expect("small path");
+        assert!(media_root.open_file(Path::new(&original_path)).is_err());
+        assert!(media_root.open_file(Path::new(&small_path)).is_err());
+        sqlx::query(
+            "UPDATE rustodon.durable_jobs SET run_at = clock_timestamp() WHERE logical_key = $1",
         )
-        .bind(STREAM_EVENT_KIND)
-        .bind(status_id.to_string())
-        .fetch_one(&writer_pool)
-        .await?,
-        0,
-        "failed media installation must not stream a status update",
-    );
-    let original_path = media_metadata
-        .relative_path("original")
-        .expect("original path");
-    let small_path = media_metadata.relative_path("small").expect("small path");
-    assert!(media_root.open_file(Path::new(&original_path)).is_err());
-    assert!(media_root.open_file(Path::new(&small_path)).is_err());
-    sqlx::query(
-        "UPDATE rustodon.durable_jobs SET run_at = clock_timestamp() WHERE logical_key = $1",
-    )
-    .bind(LOGICAL_KEY)
-    .execute(&runtime_pool)
-    .await?;
-    assert!(
-        executor
-            .process_one("media-worker-retry", &[Lane::Pull], Duration::seconds(30))
-            .await?
-    );
+        .bind(LOGICAL_KEY)
+        .execute(&runtime_pool)
+        .await?;
+        assert!(
+            executor
+                .process_one("media-worker-retry", &[Lane::Pull], Duration::seconds(30))
+                .await?
+        );
+    }
     server.await??;
 
     let media_state = sqlx::query_as::<
@@ -8045,20 +8106,27 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail_and_streams_s
            FROM media_attachments WHERE id = $1",
     )
     .bind(media_id)
-    .fetch_one(&writer_pool)
+    .fetch_one(&owner_pool)
     .await?;
     assert_eq!(media_state.0, Some(2));
     let file_name = media_state.1.clone().expect("processed media has a name");
-    assert!(
-        Path::new(&file_name)
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"))
-    );
-    assert!(media_state.2.is_some_and(|size| size > 0));
-    assert!(media_state.3["original"]["size"].is_string());
-    assert!(media_state.3["original"]["aspect"].is_number());
-    assert!(media_state.3["small"]["size"].is_string());
-    assert!(media_state.4.is_some());
+    assert_eq!(file_name, prepared.file_name);
+    assert_eq!(media_state.2, Some(prepared.file_size));
+    assert_eq!(media_state.3, prepared.file_meta);
+    let (installed_kind, installed_mime): (i32, String) =
+        sqlx::query_as("SELECT type, file_content_type FROM media_attachments WHERE id = $1")
+            .bind(media_id)
+            .fetch_one(&owner_pool)
+            .await?;
+    assert_eq!(installed_kind, kind);
+    assert_eq!(installed_mime, prepared.content_type);
+    if matches!(kind, 2 | 4) {
+        assert!(
+            media_state.3["original"]["duration"]
+                .as_f64()
+                .is_some_and(|duration| duration > 0.0)
+        );
+    }
 
     let metadata = PaperclipMetadata {
         id: media_id,
@@ -8066,22 +8134,27 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail_and_streams_s
         ..media_metadata
     };
     let original_path = metadata.relative_path("original").expect("original path");
-    let small_path = metadata.relative_path("small").expect("small path");
+    let small_path = metadata.relative_path("small");
     assert!(original_path.starts_with("cache/"));
-    assert!(small_path.starts_with("cache/"));
-    assert!(
-        Path::new(&small_path)
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
-    );
     let mut original = media_root.open_file(Path::new(&original_path))?;
     let mut original_bytes = Vec::new();
     std::io::Read::read_to_end(&mut original, &mut original_bytes)?;
-    assert_eq!(original_bytes, body);
-    let mut small = media_root.open_file(Path::new(&small_path))?;
-    let mut small_bytes = Vec::new();
-    std::io::Read::read_to_end(&mut small, &mut small_bytes)?;
-    assert!(!small_bytes.is_empty());
+    assert_eq!(original_bytes, prepared.original_bytes);
+    if small {
+        let small_path = small_path.expect("small path");
+        assert!(small_path.starts_with("cache/"));
+        let mut preview = media_root.open_file(Path::new(&small_path))?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut preview, &mut bytes)?;
+        assert_eq!(Some(&bytes), prepared.small_bytes.as_ref());
+        assert!(image::load_from_memory(&bytes).is_ok());
+        if kind == 2 {
+            assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        }
+    } else {
+        assert!(small_path.is_none());
+        assert!(prepared.small_bytes.is_none());
+    }
     let streamed_updates = sqlx::query_as::<_, (i64, String)>(
         "SELECT (payload ->> 'account_id')::bigint, payload ->> 'event'
            FROM rustodon.outbox_events
@@ -8090,7 +8163,7 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail_and_streams_s
     )
     .bind(STREAM_EVENT_KIND)
     .bind(status_id.to_string())
-    .fetch_all(&writer_pool)
+    .fetch_all(&owner_pool)
     .await?;
     assert_eq!(
         streamed_updates,
@@ -8111,7 +8184,7 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail_and_streams_s
     .bind(BOOST_RECIPIENT.to_string())
     .bind(status_id.to_string())
     .bind(boost_id.to_string())
-    .fetch_all(&writer_pool)
+    .fetch_all(&owner_pool)
     .await?;
     assert_eq!(
         boost_recipient_updates,
@@ -8121,15 +8194,15 @@ async fn activitypub_media_fetch_caches_original_and_gif_thumbnail_and_streams_s
 
     sqlx::query("DELETE FROM media_attachments WHERE id = $1")
         .bind(media_id)
-        .execute(&writer_pool)
+        .execute(&owner_pool)
         .await?;
     sqlx::query("DELETE FROM statuses WHERE id = $1")
         .bind(boost_id)
-        .execute(&writer_pool)
+        .execute(&owner_pool)
         .await?;
     sqlx::query("DELETE FROM follows WHERE id = ANY($1)")
         .bind(vec![follow_id, boost_follow_id])
-        .execute(&writer_pool)
+        .execute(&owner_pool)
         .await?;
     drop(executor);
     let _ = fs::remove_dir_all(root_path);
@@ -8155,9 +8228,13 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
         .max_connections(8)
         .connect(&runtime_url)
         .await?;
-    let writer_pool = PgPoolOptions::new()
+    let owner_pool = PgPoolOptions::new()
         .max_connections(8)
         .connect(&owner_url)
+        .await?;
+    let writer_pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&std::env::var("RUSTODON_WORKER_WRITE_DATABASE_URL")?)
         .await?;
     reset().await?;
     let root_path = std::env::temp_dir().join(format!(
@@ -8174,7 +8251,7 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
     )
     .bind(STATUS_ID)
     .bind(BOB)
-    .fetch_one(&writer_pool)
+    .fetch_one(&owner_pool)
     .await?;
     let follow_id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO follows
@@ -8184,18 +8261,20 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
     )
     .bind(RECIPIENT)
     .bind(BOB)
-    .fetch_one(&writer_pool)
+    .fetch_one(&owner_pool)
     .await?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = listener.local_addr()?;
-    let body = fs::read("fixtures/worker-media/mastodon-v4.6.5/attachment.gif")?;
-    let prepared = prepare_media_attachment(BOB, "remote.gif", "image/gif", &body)?;
+    let body = fs::read("tests/fixtures/media/capability.mp4")?;
+    let prepared =
+        rustodon::paperclip::prepare_rich_media_attachment(BOB, "remote.mp4", "video/mp4", &body)
+            .await?;
     let before_url = format!(
-        "http://media.fixture.invalid:{}/ambiguous-before.gif",
+        "http://media.fixture.invalid:{}/ambiguous-before.mp4",
         endpoint.port()
     );
     let after_url = format!(
-        "http://media.fixture.invalid:{}/ambiguous-after.gif",
+        "http://media.fixture.invalid:{}/ambiguous-after.mp4",
         endpoint.port()
     );
     let mut media_ids = Vec::new();
@@ -8205,18 +8284,23 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
                 "INSERT INTO media_attachments (
                      account_id, status_id, type, processing, remote_url, file_content_type, file_meta,
                      created_at, updated_at)
-                 VALUES ($1, $2, 0, 0, $3, 'image/gif', '{}'::json,
+                 VALUES ($1, $2, 0, 0, $3, 'video/mp4', '{}'::json,
                          clock_timestamp(), clock_timestamp())
                  RETURNING id",
             )
             .bind(BOB)
             .bind(status_id)
             .bind(remote_url)
-            .fetch_one(&writer_pool)
+            .fetch_one(&owner_pool)
             .await?,
         );
     }
-    let mut server = tokio::spawn(fixture_media_server_for_retries(listener, body.clone(), 2));
+    let mut server = tokio::spawn(fixture_media_server_typed(
+        listener,
+        body.clone(),
+        "video/mp4".to_owned(),
+        2,
+    ));
     let config = ActivityPubDeliveryConfig {
         origin: Url::parse(ORIGIN)?,
         local_domain: "fixture-v4-6-5.rustodon.invalid".to_owned(),
@@ -8260,7 +8344,7 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
             "SELECT processing, file_file_name FROM media_attachments WHERE id = $1",
         )
         .bind(media_ids[0])
-        .fetch_one(&writer_pool)
+        .fetch_one(&owner_pool)
         .await?;
         assert_eq!(before_state, (Some(3), None));
         let before_metadata = PaperclipMetadata {
@@ -8293,7 +8377,7 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
                 status_id,
                 media_ids[0],
             ))
-            .fetch_one(&writer_pool)
+            .fetch_one(&owner_pool)
             .await?,
             0,
             "rolled-back metadata must not leave a stream event",
@@ -8350,7 +8434,7 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
                FROM media_attachments WHERE id = $1",
         )
         .bind(media_ids[1])
-        .fetch_one(&writer_pool)
+        .fetch_one(&owner_pool)
         .await?;
         assert_eq!(after_state.0, Some(2));
         assert_eq!(after_state.1.as_deref(), Some(prepared.file_name.as_str()));
@@ -8372,7 +8456,7 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
         let mut original = media_root.open_file(Path::new(&original_path))?;
         let mut original_bytes = Vec::new();
         std::io::Read::read_to_end(&mut original, &mut original_bytes)?;
-        assert_eq!(original_bytes, body);
+        assert_eq!(original_bytes, prepared.original_bytes);
         let small_path = after_metadata
             .relative_path("small")
             .expect("ambiguous post-commit small path");
@@ -8389,7 +8473,7 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
                 status_id,
                 media_ids[1],
             ))
-            .fetch_one(&writer_pool)
+            .fetch_one(&owner_pool)
             .await?,
             1,
             "committed metadata and stream event must remain atomic",
@@ -8444,15 +8528,15 @@ async fn activitypub_media_fetch_reconciles_after_ambiguous_metadata_commit()
         )
         .bind(STREAM_EVENT_KIND)
         .bind(status_id.to_string())
-        .execute(&writer_pool)
+        .execute(&owner_pool)
         .await?;
         sqlx::query("DELETE FROM media_attachments WHERE id = ANY($1)")
             .bind(&media_ids)
-            .execute(&writer_pool)
+            .execute(&owner_pool)
             .await?;
         sqlx::query("DELETE FROM follows WHERE id = $1")
             .bind(follow_id)
-            .execute(&writer_pool)
+            .execute(&owner_pool)
             .await?;
         sqlx::query("DELETE FROM rustodon.durable_jobs WHERE logical_key = ANY($1)")
             .bind(vec![
@@ -18125,12 +18209,22 @@ async fn fixture_media_server_for_retries(
     body: Vec<u8>,
     responses: usize,
 ) -> Result<(), std::io::Error> {
+    fixture_media_server_typed(listener, body, "image/gif".to_owned(), responses).await
+}
+
+#[cfg(feature = "test-support")]
+async fn fixture_media_server_typed(
+    listener: TcpListener,
+    body: Vec<u8>,
+    mime: String,
+    responses: usize,
+) -> Result<(), std::io::Error> {
     for _ in 0..responses {
         let (mut socket, _) = listener.accept().await?;
         let mut request = vec![0; 4096];
         let _ = socket.read(&mut request).await?;
         let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: image/gif\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         socket.write_all(headers.as_bytes()).await?;
@@ -18151,7 +18245,7 @@ async fn fixture_media_server_with_lease_barrier(
     request_started.notify_one();
     release_request.notified().await;
     let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: image/gif\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = socket.write_all(headers.as_bytes()).await;
