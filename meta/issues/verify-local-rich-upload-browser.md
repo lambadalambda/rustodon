@@ -126,3 +126,10 @@ expansion, or full fixture matrix is required by this proposal.
   HTTP, schema, cutover, peer and aggregate browser gates were **not** rerun or claimed.
   Independent parent review remains pending; nested reviewer delegation was
   unavailable at this task depth. Leave changes uncommitted and both parents open.
+
+## Scoped blocker implementation follow-up
+
+[Fix local-upload browser media authorization](fix-local-upload-browser-media-authorization.md)
+tracks the pre-code indexed follow-up on `373da56`: owner-only ready unattached reads,
+scoped native session reads and private denial caching. HTTP/unit/codec evidence is
+recorded there and in DEVLOG; independent review and this browser rerun remain pending.

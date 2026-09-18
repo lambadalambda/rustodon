@@ -118,6 +118,20 @@ capability, periodic heartbeat refresh, and removal on shutdown:
 cargo test --locked --all-features --test media_state local_upload_http::local_rich_upload_restricted_worker_readiness -- --ignored --exact --nocapture --test-threads=1
 ```
 
+The focused native-media authorization regression uses the same restricted roles and
+setup, with persisted browser sessions/backing OAuth tokens and the existing JPEG
+state fixture (including stale pending/failed bytes):
+
+```console
+cargo test --locked --all-features --test media_state local_upload_http::local_upload_browser_media_access -- --ignored --exact --nocapture --test-threads=1
+```
+
+It checks owner-only unattached reads, attached visibility, bearer precedence,
+session lifecycle, immutable session/token snapshots, conditional/range ordering
+and private success/denial caching. Its dangling-reference setup is owner-only in
+the disposable database; HTTP still uses the runtime/writer pools. This is not a
+browser run. Unsatisfiable ranges retain the existing Rack/Rails final 404.
+
 Use a fresh restore per invocation: the HTTP test exercises the real shared 30-upload
 rate limit without bypass/reset, and readiness starts the existing maintenance startup
 reconciliation. These tests are not the full CLI/startup fixture lane. The default

@@ -1,5 +1,115 @@
 ## 2026-09-18 — bounded actual-browser local upload acceptance (uncommitted)
 
+## 2026-09-18 — media authorization Review1 compact follow-up (uncommitted)
+
+- Review1 found no blocker/high; addressed only M1/M2. Production follow-up is
+  confined to `src/web.rs`; repository/schema/grants and shared auth are unchanged.
+  M1 finalizes all recognized media 4xx/5xx privately, including anonymous requests;
+  anonymous public 200/206/304 keep the existing public cache policy. The HTTP
+  assertion helper now checks cache/Vary for every request, not just credentials.
+- M2 selects the existing optional bearer viewer for attached media outside limited
+  federation. Malformed/unknown/application-only bearer retains anonymous attached
+  access; revoked/expired/scope errors retain their prior errors. Explicit headers
+  never enter the cookie path. Unattached grants and limited-federation bearer
+  requests still require a functional user. Reads of the small attachment auth
+  projection now precede viewer selection, not metadata/file/range authorization.
+- TDD actual restricted-role NAS REDs, same focused selector/flags below:
+  `review1-m1-red.log`: anonymous unattached denial had no Cache-Control, expected
+  private/no-store. After only M1, `review1-m2-red.log`: attached public empty bearer
+  + owner cookie yielded 401, expected historical 200. No setup or assertion
+  failures were relabelled as product REDs.
+- GREEN `review1-final.log`: **1/1**, 25.77s:
+  `cargo test --locked --offline --all-features --test media_state local_upload_http::local_upload_browser_media_access -- --ignored --exact --nocapture --test-threads=1`.
+  Adds public-attached malformed/empty/unknown/application-only/disabled bearer
+  compatibility, revoked/expired/scope errors, private attached no-cookie-fallback,
+  anonymous metadata/range denials, public success cache preservation, and a
+  sequential limited-federation server proving absent/invalid/app-only/revoked
+  credentials deny despite an owner cookie while valid owner bearer/cookie succeed.
+- Fresh-restore real-codec regression `review1-lifecycle.log`: **1/1**, 154.25s:
+  `cargo test --locked --offline --all-features --test media_state local_upload_http::local_rich_upload_http_lifecycle -- --ignored --exact --nocapture --test-threads=1`.
+  Pure web regression `review1-web-unit.log`: **91 passed, 2 ignored**:
+  `cargo test --locked --offline --all-features --lib web::tests:: -- --test-threads=1`.
+  `review1-clippy.log`: passed
+  `cargo clippy --locked --offline --all-features --lib --test media_state -- -D warnings`.
+  Local fmt/diff checks passed; final local/NAS source hashes match
+  `review1-source.sha256` in `target/media-viewer-evidence/`.
+- Reused the prior isolated workspace/run/reset scripts and immutable codec/PG14
+  images, syncing only the two explicitly edited source/test files. Same tools
+  bounds and unchanged runtime/writer grants; new task PG lifetime 3600s with the
+  same 1 CPU/512 MiB/128 PIDs/no host ports. Gates ran sequentially; only this
+  invocation's PG container/anonymous volume and network were removed. No task
+  containers remain. No browser, production, deployment or commits.
+- Paused for parent Review2; no further implementation expansion or edits pending
+  that review. Issue remains open and all changes uncommitted.
+
+
+## 2026-09-18 — scoped local-upload browser media reads (uncommitted)
+
+- Base `373da56`; created/indexed `fix-local-upload-browser-media-authorization`
+  before code, under the existing browser/upload issues. Production changes are
+  only web + repository. No schema/grants/jobs/global auth/CORS/signature/CSRF,
+  production, deployment, or browser execution.
+- Paperclip GET/HEAD authenticates explicit bearers with READ_STATUSES + require_user;
+  only absent Authorization permits session lookup and internal backing-token
+  authentication. Session user/account identities and functional state must agree.
+  No session touch, token mint/exposure, or cookies. Empty Authorization also gets
+  private denial caching and never falls back.
+- Small authorization projection retains media.status_id separately from joined
+  status availability. Only ready (`processing=2`), local, truly unattached owner
+  media is newly readable. Attached historical processing/status visibility and
+  report-manager discarded exception remain. Exact path metadata and openat2 are
+  unchanged. Authenticated recognized-route responses, including all denials, get
+  private/no-store + Vary Authorization, Cookie, Signature.
+- TDD NAS RED `red.log`: pre-fix production, ready unattached owner bearer GET
+  **404 vs expected 200**. Additional baseline replay `red-cookie.log`: final test
+  against exact base web/repository, private attached owner cookie GET **404 vs
+  expected 200**. Both used persisted tokens/sessions and restricted roles.
+- Final GREEN `final.log`: **1/1**, command
+  `cargo test --locked --offline --all-features --test media_state local_upload_http::local_upload_browser_media_access -- --ignored --exact --nocapture --test-threads=1`.
+  Covers original/small GET/HEAD/range/conditional, owner bearer/cookie, other owner,
+  pending/failed stale files, missing/remote/raw, private owner/follower/unrelated,
+  deleted/dangling + report manager, expired/revoked/logout/disabled/2FA/scope/mismatched
+  sessions, malformed/empty/invalid/scoped/application-only bearer precedence,
+  metadata/disk denials, no Set-Cookie and full session/token snapshot invariance.
+- `lifecycle.log`: **1/1**, same command flags selecting
+  `local_upload_http::local_rich_upload_http_lifecycle` (168.63s), fresh restore.
+  Existing real-codec lifecycle extended to owner bearer/cookie GET/HEAD/range for
+  every ready original/preview URL across the 24 advertised external formats.
+  Not a second codec harness. Subsequent test-only edits added the independent
+  attached-cookie assertion and simplified a path-denial assertion; lifecycle
+  code and production source were unchanged after its passing run.
+- `final-web-unit.log`: `cargo test --locked --offline --all-features --lib web::tests:: -- --test-threads=1`
+  **91 passed, 2 ignored**, including existing pure media/cache/range tests.
+  `final-clippy.log`: `cargo clippy --locked --offline --all-features --lib --test media_state -- -D warnings`
+  passed. Local fmt/diff checks passed.
+- Preserve rather than silently change a discovered compatibility convention:
+  Rack's unsatisfiable 416 cascades to this server's existing **404**. Tests now
+  require that denial to be private; no claim that an HTTP 416 was emitted.
+  Initial `green.log` exposed the test's incorrect 416 expectation. `green2.log`
+  exposed fixture ON DELETE SET NULL (not a dangling reference); setup now uses an
+  owner-only transaction to install a genuinely dangling ID in the disposable DB.
+  `green3.log` exposed an invalid/unrecognized style, removed from the recognized-route
+  cache assertion. No schema/grant or range parser change was made to fix tests.
+- Workspace `/srv/workspaces/rustodon-media-viewer-373da56-alice/`; selected logs,
+  run/reset scripts, grant provenance, baseline source and final hashes also under
+  local ignored `target/media-viewer-evidence/`. Source sync used tracked files only,
+  followed by exact edited files; no environments, credentials, .git or build output.
+  Runtime image `7203e0222e2bb72e0b83ab623051873604874cc41a688e318b84691bfa77ad8a`
+  (Rust 1.97.1 / FFmpeg 7.1.5); PG14 image
+  `1a6c2409ab71f4d054d676ba09d9b74b5d843d805bd5a0cf08314d27ca659d37`.
+  Tools sequential: 4 CPU/6 GiB/512 PIDs/870s +900s outer (+15s kill), read-only
+  source/root, no capabilities, bounded tmpfs, existing authorized cargo caches.
+  Task-only PG/network `media-viewer-pg-alice` / `media-viewer-alice`: 1 CPU/512 MiB/
+  128 PIDs/7200s, no host ports, fresh restored database per selector. Existing
+  runtime/writer grant contract and actual SQLSTATE 42501 rejection assertions.
+- Verified local web/repository/test SHA-256 against the final NAS snapshot.
+  Removed only task PostgreSQL container/anonymous volume and network; task media
+  roots were in per-run tmpfs. No task containers remain; logs/source retained.
+- Independent review remains for parent (nested task delegation unavailable at
+  this depth). Keep subissue and parents open and all changes uncommitted. Browser
+  rerun and full matrix/release evidence are explicitly deferred.
+
+
 - Created/indexed [browser subissue](meta/issues/verify-local-rich-upload-browser.md)
   before work. Tested clean tracked `c6cf7b3` archive, default-feature binary with
   no test-support, exact clean Mastodon `1440d55b139e39ec722c2a3db7f60b66cd889048`

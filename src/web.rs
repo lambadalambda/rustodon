@@ -6922,9 +6922,10 @@ fn paperclip_response_policy(
     ) {
         return (PAPERCLIP_CACHE, None);
     }
-    let has_viewer_credentials = [COOKIE.as_str(), AUTHORIZATION.as_str(), "signature"]
-        .into_iter()
-        .any(|name| request_header_is_nonempty(headers, name));
+    let has_viewer_credentials = headers.contains_key(AUTHORIZATION)
+        || [COOKIE.as_str(), "signature"]
+            .into_iter()
+            .any(|name| request_header_is_nonempty(headers, name));
     (
         if has_viewer_credentials {
             PRIVATE_CACHE
@@ -6935,24 +6936,76 @@ fn paperclip_response_policy(
     )
 }
 
+// Native GET/HEAD media has no bearer header. Resolve only this route's cookie
+// through the existing OAuth user/scope checks, without touching the session.
+async fn paperclip_viewer(
+    state: &WebState,
+    headers: &HeaderMap,
+    attached: bool,
+) -> Result<Option<i64>, Response<Body>> {
+    if headers.contains_key(AUTHORIZATION) {
+        // Retain historical attached bearer semantics. Only the new unattached
+        // owner grant (and limited federation) requires a functional user.
+        if attached && !state.instance_runtime.limited_federation {
+            return optional_viewer(state, headers, READ_STATUSES).await;
+        }
+        return required_viewer(state, headers, READ_STATUSES)
+            .await
+            .map(Some);
+    }
+    if let Some(session_id) = request_cookie(headers, BROWSER_SESSION_COOKIE)
+        && let Some(session) = state
+            .repository
+            .browser_session(session_id)
+            .await
+            .map_err(|_| internal_error())?
+    {
+        let mut session_headers = HeaderMap::new();
+        session_headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", session.access_token.as_str()))
+                .map_err(|_| internal_error())?,
+        );
+        let owner = required_viewer_owner(state, &session_headers, READ_STATUSES).await?;
+        if session.functional
+            && owner.user_id() == session.user_id
+            && owner.account_id() == session.account_id
+        {
+            return Ok(Some(owner.account_id()));
+        }
+        return Err(not_found());
+    }
+    if state.instance_runtime.limited_federation {
+        return required_viewer(state, headers, READ_STATUSES)
+            .await
+            .map(Some);
+    }
+    Ok(None)
+}
+
 async fn paperclip_status_media_access(
     state: &WebState,
     headers: &HeaderMap,
     media_id: i64,
 ) -> Result<bool, Response<Body>> {
-    let viewer_account_id = if state.instance_runtime.limited_federation {
-        Some(required_viewer(state, headers, READ_STATUSES).await?)
-    } else {
-        optional_viewer(state, headers, READ_STATUSES).await?
-    };
-    let Some((status_id, discarded)) = state
+    let media = state
         .repository
-        .media_attachment_status(media_id)
+        .media_attachment_access(media_id)
         .await
-        .map_err(|_| internal_error())?
-    else {
+        .map_err(|_| internal_error())?;
+    let attached = media
+        .as_ref()
+        .is_some_and(|media| media.status_id.is_some());
+    let viewer_account_id = paperclip_viewer(state, headers, attached).await?;
+    let Some(media) = media else {
         return Ok(false);
     };
+    let Some(status_id) = media.status_id else {
+        return Ok(media.local
+            && media.processing == Some(2)
+            && viewer_account_id == Some(media.account_id));
+    };
+    let discarded = media.discarded;
     let status_allowed = state
         .repository
         .rest_authorized_status_ids(&[status_id], viewer_account_id)
@@ -6985,19 +7038,6 @@ async fn paperclip_media(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response<Body> {
-    if state
-        .media_route_authority
-        .as_deref()
-        .is_some_and(|expected| {
-            metadata
-                .host
-                .as_deref()
-                .or_else(|| headers.get(HOST).and_then(|value| value.to_str().ok()))
-                .is_none_or(|actual| !actual.eq_ignore_ascii_case(expected))
-        })
-    {
-        return finalize_api_response(uri.path(), &headers, api_not_found());
-    }
     if !matches!(method, Method::GET | Method::HEAD) {
         return not_found();
     }
@@ -7010,47 +7050,76 @@ async fn paperclip_media(
         return not_found();
     };
     let (cache_control, vary) = paperclip_response_policy(path.attachment(), &headers);
-    if matches!(
-        path.attachment(),
-        PaperclipAttachment::MediaFile | PaperclipAttachment::MediaThumbnail
-    ) {
-        match paperclip_status_media_access(&state, &headers, path.id()).await {
-            Ok(true) => {}
-            Ok(false) => return not_found(),
-            Err(response) => return response,
+    let mut response = async {
+        if state
+            .media_route_authority
+            .as_deref()
+            .is_some_and(|expected| {
+                metadata
+                    .host
+                    .as_deref()
+                    .or_else(|| headers.get(HOST).and_then(|value| value.to_str().ok()))
+                    .is_none_or(|actual| !actual.eq_ignore_ascii_case(expected))
+            })
+        {
+            return finalize_api_response(uri.path(), &headers, api_not_found());
         }
+        if matches!(
+            path.attachment(),
+            PaperclipAttachment::MediaFile | PaperclipAttachment::MediaThumbnail
+        ) {
+            match paperclip_status_media_access(&state, &headers, path.id()).await {
+                Ok(true) => {}
+                Ok(false) => return not_found(),
+                Err(response) => return response,
+            }
+        }
+        match state
+            .repository
+            .paperclip_metadata(path.attachment(), path.id())
+            .await
+        {
+            Ok(Some(metadata)) if path.authorizes(&metadata) => {}
+            Ok(_) => return not_found(),
+            Err(_) => return internal_error(),
+        }
+        let root = state.media_root.clone();
+        let relative_path = path.relative_path().to_owned();
+        let opened = tokio::task::spawn_blocking(move || {
+            let file = root.open_file(&relative_path)?;
+            let metadata = file.metadata()?;
+            Ok::<_, std::io::Error>((file, metadata))
+        })
+        .await;
+        let (file, file_metadata) = match opened {
+            Ok(Ok(opened)) => opened,
+            Ok(Err(_)) => return not_found(),
+            Err(_) => return internal_error(),
+        };
+        paperclip_file_response(
+            &method,
+            &headers,
+            path.relative_path(),
+            file,
+            &file_metadata,
+            cache_control,
+            vary,
+        )
     }
-    match state
-        .repository
-        .paperclip_metadata(path.attachment(), path.id())
-        .await
-    {
-        Ok(Some(metadata)) if path.authorizes(&metadata) => {}
-        Ok(_) => return not_found(),
-        Err(_) => return internal_error(),
-    }
-    let root = state.media_root.clone();
-    let relative_path = path.relative_path().to_owned();
-    let opened = tokio::task::spawn_blocking(move || {
-        let file = root.open_file(&relative_path)?;
-        let metadata = file.metadata()?;
-        Ok::<_, std::io::Error>((file, metadata))
-    })
     .await;
-    let (file, file_metadata) = match opened {
-        Ok(Ok(opened)) => opened,
-        Ok(Err(_)) => return not_found(),
-        Err(_) => return internal_error(),
-    };
-    paperclip_file_response(
-        &method,
-        &headers,
-        path.relative_path(),
-        file,
-        &file_metadata,
-        cache_control,
-        vary,
-    )
+    // Apply after every recognized-media outcome, not just opened files. A
+    // denied composer request must not be reused after upload/attachment state changes.
+    let media_error = vary == Some(PAPERCLIP_STATUS_VARY)
+        && (response.status().is_client_error() || response.status().is_server_error());
+    if cache_control == PRIVATE_CACHE || media_error {
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static(PRIVATE_CACHE));
+        response
+            .headers_mut()
+            .insert(VARY, HeaderValue::from_static(PAPERCLIP_STATUS_VARY));
+    }
+    response
 }
 
 fn paperclip_file_response(
@@ -20428,6 +20497,7 @@ mod tests {
 
         for (name, value) in [
             ("authorization", "Bearer fixture"),
+            ("authorization", ""),
             ("cookie", "_mastodon_session=fixture"),
             ("signature", "fixture"),
         ] {

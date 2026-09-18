@@ -113,6 +113,17 @@ fn parse_acct_key_id(key_id: &str) -> Option<(&str, &str)> {
     Some((username, domain))
 }
 
+/// Authorization facts only; retain the attachment's own status ID even when
+/// the joined status is deleted or missing.
+#[derive(sqlx::FromRow)]
+pub(crate) struct MediaAttachmentAccess {
+    pub account_id: i64,
+    pub status_id: Option<i64>,
+    pub processing: Option<i32>,
+    pub local: bool,
+    pub discarded: bool,
+}
+
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct ActivityPubQuoteTarget {
     pub(crate) quote_id: i64,
@@ -2698,15 +2709,17 @@ impl Repository {
         .await
     }
 
-    pub(crate) async fn media_attachment_status(
+    pub(crate) async fn media_attachment_access(
         &self,
         id: i64,
-    ) -> sqlx::Result<Option<(i64, bool)>> {
-        sqlx::query_as::<_, (i64, bool)>(
-            "SELECT media.status_id, status.id IS NULL OR status.deleted_at IS NOT NULL AS discarded \
+    ) -> sqlx::Result<Option<MediaAttachmentAccess>> {
+        sqlx::query_as::<_, MediaAttachmentAccess>(
+            "SELECT media.account_id, media.status_id, media.processing, \
+             media.remote_url = '' AS local, \
+             status.id IS NULL OR status.deleted_at IS NOT NULL AS discarded \
              FROM media_attachments media \
              LEFT JOIN statuses status ON status.id = media.status_id \
-             WHERE media.id = $1 AND media.status_id IS NOT NULL",
+             WHERE media.id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
