@@ -1,5 +1,7 @@
 # Completed Issues
 
+- [x] [Add a bounded rich-media processor](issues/add-bounded-rich-media-processor.md)
+
 - [x] [Diagnose missing posts from followed lain.com account](issues/diagnose-missing-followed-lain-com-posts.md)
 
 - [x] [Deploy parity fixes to the local Podman instance](issues/deploy-parity-fixes-to-local-instance.md)
