@@ -84,6 +84,14 @@ impl Drop for CachedMediaFixture {
     }
 }
 
+fn cached_remote_media_response(
+    state: &WebState,
+    media: &MediaAttachment,
+    small: bool,
+) -> Option<Response<Body>> {
+    super::cached_remote_media_response(state, media, small, &Method::GET, &HeaderMap::new())
+}
+
 fn media(file_name: &str, content_type: &str) -> MediaAttachment {
     let now = Utc::now().naive_utc();
     MediaAttachment {
@@ -315,6 +323,18 @@ async fn cached_private_media_http_requires_status_access_even_when_files_exist(
 
     let owner = PgPool::connect(&std::env::var("RUSTODON_MASTODON_OWNER_DATABASE_URL")?).await?;
     let repository = Repository::connect(&std::env::var("RUSTODON_MASTODON_DATABASE_URL")?).await?;
+    let reader = PgPool::connect(&std::env::var("RUSTODON_MASTODON_DATABASE_URL")?).await?;
+    let runtime_identity: (String, bool, bool) = sqlx::query_as(
+        "SELECT current_user::text, rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls, has_table_privilege(current_user, 'media_attachments', 'UPDATE') FROM pg_roles WHERE rolname=current_user",
+    ).fetch_one(&reader).await?;
+    let owner_identity: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&owner)
+        .await?;
+    assert_ne!(runtime_identity.0, owner_identity);
+    assert!(
+        !runtime_identity.1 && !runtime_identity.2,
+        "HTTP must use the restricted reader"
+    );
     // Only add test-owned rows; don't change visibility or relationships on seed rows.
     let mut setup = owner.begin().await?;
     sqlx::query(
@@ -403,6 +423,135 @@ async fn cached_private_media_http_requires_status_access_even_when_files_exist(
             }
         }
     }
+    // Normalized rows retain source URLs that no longer describe their cached bytes.
+    for (kind, mime, name, source, preview) in [
+        (
+            2,
+            "video/mp4",
+            "normalized.mp4",
+            "source.mov",
+            Some("normalized.png"),
+        ),
+        (
+            0,
+            "image/jpeg",
+            "normalized.jpeg",
+            "source.heic",
+            Some("normalized.jpeg"),
+        ),
+        (4, "audio/mpeg", "normalized.mp3", "source.wav", None),
+    ] {
+        sqlx::query("UPDATE media_attachments SET type=$2, file_content_type=$3, file_file_name=$4, remote_url=$5 WHERE id=$1")
+            .bind(MEDIA_ID).bind(kind).bind(mime).bind(name)
+            .bind(format!("https://remote.fixture.invalid/{source}"))
+            .execute(&owner).await?;
+        let original = if kind == 0 {
+            encoded_image(ImageFormat::Jpeg, 4, 3)
+        } else {
+            b"normalized original bytes".to_vec()
+        };
+        fixture.write("original", name, &original);
+        let preview_bytes = if kind == 0 {
+            encoded_image(ImageFormat::Jpeg, 2, 1)
+        } else {
+            encoded_image(ImageFormat::Png, 2, 1)
+        };
+        if let Some(name) = preview {
+            fixture.write("small", name, &preview_bytes);
+        }
+        let response = client
+            .get(format!("{base}/media_proxy/{MEDIA_ID}/original"))
+            .header("host", "cached-media.invalid")
+            .bearer_auth(FOLLOWER)
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], mime);
+        assert_eq!(response.bytes().await?.as_ref(), original.as_slice());
+        let url = format!("{base}/media_proxy/{MEDIA_ID}/small");
+        let response = client
+            .get(&url)
+            .header("host", "cached-media.invalid")
+            .bearer_auth(FOLLOWER)
+            .send()
+            .await?;
+        if let Some(preview_name) = preview {
+            let preview_mime = if kind == 0 { "image/jpeg" } else { "image/png" };
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[CONTENT_TYPE], preview_mime);
+            let bytes = response.bytes().await?;
+            assert_eq!(bytes.as_ref(), preview_bytes.as_slice());
+            assert_decodes(
+                &bytes,
+                if kind == 0 {
+                    ImageFormat::Jpeg
+                } else {
+                    ImageFormat::Png
+                },
+                (2, 1),
+            );
+            // Exact serialized local URL, not just the proxy alias.
+            let local = format!("{base}/system/{CACHE_DIRECTORY}/small/{preview_name}");
+            for (method, target) in [
+                (Method::GET, &local),
+                (Method::HEAD, &local),
+                (Method::GET, &url),
+                (Method::HEAD, &url),
+            ] {
+                let response = client
+                    .request(method.clone(), target)
+                    .header("host", "cached-media.invalid")
+                    .header("range", "bytes=0-7")
+                    .bearer_auth(FOLLOWER)
+                    .send()
+                    .await?;
+                assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+                assert_eq!(response.headers()[CONTENT_TYPE], preview_mime);
+                assert_eq!(response.headers()[CACHE_CONTROL], PRIVATE_CACHE);
+                assert_eq!(
+                    response.bytes().await?.as_ref(),
+                    if method == Method::HEAD {
+                        &[]
+                    } else {
+                        &preview_bytes[..8]
+                    }
+                );
+            }
+            let denied = client
+                .get(&local)
+                .header("host", "cached-media.invalid")
+                .bearer_auth(OUTSIDER)
+                .header("range", "bytes=0-7")
+                .send()
+                .await?;
+            assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+            assert_eq!(denied.headers()[CACHE_CONTROL], PRIVATE_CACHE);
+        } else {
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        let denied = client
+            .get(&url)
+            .header("host", "cached-media.invalid")
+            .bearer_auth(OUTSIDER)
+            .send()
+            .await?;
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+        assert_eq!(denied.headers()[CACHE_CONTROL], PRIVATE_CACHE);
+    }
+    for processing in [0, 3] {
+        sqlx::query("UPDATE media_attachments SET processing=$2, file_file_name=NULL, type=2, file_content_type='video/mp4', thumbnail_remote_url=NULL WHERE id=$1")
+            .bind(MEDIA_ID).bind(processing).execute(&owner).await?;
+        let response = client
+            .get(format!("{base}/media_proxy/{MEDIA_ID}/small"))
+            .header("host", "cached-media.invalid")
+            .bearer_auth(FOLLOWER)
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()[CACHE_CONTROL], PRIVATE_CACHE);
+    }
+    assert_explicit_thumbnail_storage_identity(&owner, &fixture, &client, &base).await?;
+    assert_direct_remote_processing_states(&owner, &fixture, &client, &base).await?;
     server.abort();
     let _ = server.await;
     sqlx::query("DELETE FROM media_attachments WHERE id = $1")
@@ -414,4 +563,314 @@ async fn cached_private_media_http_requires_status_access_even_when_files_exist(
         .execute(&owner)
         .await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn rich_cached_original_bounds_do_not_widen_image_or_preview_limits() {
+    let fixture = CachedMediaFixture::new();
+    for (name, mime) in [("movie.mp4", "video/mp4"), ("audio.mp3", "audio/mpeg")] {
+        let media = media(name, mime);
+        let path = fixture.write("original", name, b"bounded cached representation");
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_len(crate::media::AUDIO_VIDEO_SIZE_LIMIT as u64)
+            .unwrap();
+        assert!(cached_remote_media_response(&fixture.state, &media, false).is_some());
+        file.set_len(crate::media::AUDIO_VIDEO_SIZE_LIMIT as u64 + 1)
+            .unwrap();
+        assert!(cached_remote_media_response(&fixture.state, &media, false).is_none());
+    }
+}
+
+#[tokio::test]
+async fn pending_failed_cached_rich_bytes_are_not_served() {
+    let fixture = CachedMediaFixture::new();
+    let mut media = media("movie.mp4", "video/mp4");
+    fixture.write("original", "movie.mp4", b"stale video");
+    fixture.write("small", "movie.png", &encoded_image(ImageFormat::Png, 2, 1));
+    for processing in [0, 1, 3] {
+        media.processing = Some(RawI32(processing));
+        for small in [false, true] {
+            assert!(cached_remote_media_response(&fixture.state, &media, small).is_none());
+        }
+    }
+}
+
+#[test]
+fn remote_rich_small_never_selects_original_source() {
+    for mime in ["video/mp4", "audio/mpeg", "image/heic"] {
+        let mut media = media("source", mime);
+        media.file_file_name = None;
+        media.thumbnail_remote_url = None;
+        for state in [0, 1, 3] {
+            media.processing = Some(RawI32(state));
+            assert_eq!(remote_media_proxy_source(&media, true), None);
+        }
+    }
+}
+
+#[tokio::test]
+async fn cached_png_ranges_and_head_share_representation() {
+    let fixture = CachedMediaFixture::new();
+    let media = media("movie.mp4", "video/mp4");
+    let png = encoded_image(ImageFormat::Png, 2, 1);
+    fixture.write("small", "movie.png", &png);
+    let mut headers = HeaderMap::new();
+    headers.insert(RANGE, HeaderValue::from_static("bytes=0-7"));
+    for method in [Method::GET, Method::HEAD] {
+        let response =
+            super::cached_remote_media_response(&fixture.state, &media, true, &method, &headers)
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[CONTENT_TYPE], "image/png");
+        assert_eq!(response.headers()[CONTENT_LENGTH], "8");
+        assert_eq!(response.headers()[CACHE_CONTROL], PRIVATE_CACHE);
+        let bytes = axum::body::to_bytes(response.into_body(), 8).await.unwrap();
+        assert_eq!(
+            bytes.as_ref(),
+            if method == Method::HEAD {
+                &[]
+            } else {
+                &png[..8]
+            }
+        );
+    }
+}
+
+fn authorized_cached_request(
+    client: &reqwest::Client,
+    method: Method,
+    url: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .request(method, url)
+        .header("host", "cached-media.invalid")
+        .bearer_auth("fixture-bearer-read-statuses-v4-6-5")
+}
+
+async fn assert_explicit_thumbnail_storage_identity(
+    owner: &PgPool,
+    fixture: &CachedMediaFixture,
+    client: &reqwest::Client,
+    base: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repository = Repository::connect(&std::env::var("RUSTODON_MASTODON_DATABASE_URL")?).await?;
+    let origin = Url::parse("https://cached-media.invalid/")?;
+    let png = encoded_image(ImageFormat::Png, 2, 1);
+    fixture.write("small", "normalized.png", &png);
+    for remote in [None, Some("https://remote.fixture.invalid/real.png")] {
+        sqlx::query("UPDATE media_attachments SET type=2, processing=2, file_file_name='normalized.mp4', file_content_type='video/mp4', thumbnail_file_name='real.png', thumbnail_content_type='image/png', thumbnail_storage_schema_version=1, thumbnail_remote_url=$2 WHERE id=$1")
+            .bind(MEDIA_ID).bind(remote).execute(owner).await?;
+        let thumbnail =
+            "cache/media_attachments/thumbnails/000/012/001/original/real.png".to_owned();
+        let path = fixture.root.join(&thumbnail);
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(path, &png)?;
+        let record = repository.remote_media_attachment(MEDIA_ID).await?.unwrap();
+        let serialized = RestSerializer::new(
+            &origin,
+            "cached-media.invalid",
+            "/system",
+            Utc::now().naive_utc(),
+        )
+        .media_attachment(&media_projection(&record, None));
+        let preview_path = Url::parse(serialized.preview_url.as_deref().unwrap())?
+            .path()
+            .trim_start_matches("/system/")
+            .to_owned();
+        // Explicit thumbnails and generated MediaFile small keep independent identities.
+        for path in [
+            preview_path,
+            format!("{CACHE_DIRECTORY}/small/normalized.png"),
+        ] {
+            for (method, range) in [
+                (Method::GET, false),
+                (Method::HEAD, false),
+                (Method::GET, true),
+                (Method::HEAD, true),
+            ] {
+                let mut request = authorized_cached_request(
+                    client,
+                    method.clone(),
+                    &format!("{base}/system/{path}"),
+                );
+                if range {
+                    request = request.header("range", "bytes=0-7");
+                }
+                let response = request.send().await?;
+                assert_eq!(
+                    response.status(),
+                    if range {
+                        StatusCode::PARTIAL_CONTENT
+                    } else {
+                        StatusCode::OK
+                    },
+                    "{path} {method}"
+                );
+                assert_eq!(response.headers()[CONTENT_TYPE], "image/png");
+                assert_eq!(response.headers()[CACHE_CONTROL], PRIVATE_CACHE);
+                assert_eq!(
+                    response.bytes().await?.as_ref(),
+                    if method == Method::HEAD {
+                        &[]
+                    } else if range {
+                        &png[..8]
+                    } else {
+                        &png
+                    }
+                );
+            }
+        }
+        // A stale copy in the other namespace must not authorize the wrong URL.
+        let stale = fixture
+            .root
+            .join("media_attachments/thumbnails/000/012/001/original/real.png");
+        fs::create_dir_all(stale.parent().unwrap())?;
+        fs::write(stale, &png)?;
+        let response = authorized_cached_request(
+            client,
+            Method::GET,
+            &format!("{base}/system/media_attachments/thumbnails/000/012/001/original/real.png"),
+        )
+        .send()
+        .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+    sqlx::query("UPDATE media_attachments SET processing=3 WHERE id=$1")
+        .bind(MEDIA_ID)
+        .execute(owner)
+        .await?;
+    let response = authorized_cached_request(
+        client,
+        Method::HEAD,
+        &format!("{base}/system/cache/media_attachments/thumbnails/000/012/001/original/real.png"),
+    )
+    .header("range", "bytes=0-7")
+    .send()
+    .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::PARTIAL_CONTENT,
+        "separate thumbnail readiness is unchanged"
+    );
+
+    Ok(())
+}
+
+async fn assert_direct_remote_processing_states(
+    owner: &PgPool,
+    fixture: &CachedMediaFixture,
+    client: &reqwest::Client,
+    base: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (kind, mime, name, small) in [
+        (2, "video/mp4", "normalized.mp4", Some("normalized.png")),
+        (4, "audio/mpeg", "normalized.mp3", None),
+        (0, "image/jpeg", "normalized.jpeg", Some("normalized.jpeg")),
+    ] {
+        fixture.write("original", name, b"installed original");
+        if let Some(small) = small {
+            fixture.write("small", small, b"installed preview");
+        }
+        for processing in [Some(2), Some(0), Some(1), Some(3), None, Some(2)] {
+            sqlx::query("UPDATE media_attachments SET type=$2, file_content_type=$3, file_file_name=$4, processing=$5 WHERE id=$1")
+                .bind(MEDIA_ID).bind(kind).bind(mime).bind(name).bind(processing).execute(owner).await?;
+            let ready = processing.is_none_or(|state| state == 2);
+            for (style, name) in [("original", Some(name)), ("small", small)] {
+                let Some(name) = name else {
+                    continue;
+                };
+                let path = format!("{base}/system/{CACHE_DIRECTORY}/{style}/{name}");
+                for (method, range) in [
+                    (Method::GET, false),
+                    (Method::HEAD, false),
+                    (Method::GET, true),
+                    (Method::HEAD, true),
+                ] {
+                    let mut request = authorized_cached_request(client, method.clone(), &path);
+                    if range {
+                        request = request.header("range", "bytes=0-7");
+                    }
+                    let response = request.send().await?;
+                    assert_eq!(
+                        response.status(),
+                        if !ready {
+                            StatusCode::NOT_FOUND
+                        } else if range {
+                            StatusCode::PARTIAL_CONTENT
+                        } else {
+                            StatusCode::OK
+                        },
+                        "{mime} {style} {processing:?} {method}"
+                    );
+                    assert_eq!(response.headers()[CACHE_CONTROL], PRIVATE_CACHE);
+                    let bytes = response.bytes().await?;
+                    if ready {
+                        let expected = if style == "original" {
+                            b"installed original".as_slice()
+                        } else {
+                            b"installed preview".as_slice()
+                        };
+                        assert_eq!(
+                            bytes.as_ref(),
+                            if method == Method::HEAD {
+                                &[]
+                            } else if range {
+                                &expected[..8]
+                            } else {
+                                expected
+                            }
+                        );
+                    } else if method != Method::HEAD {
+                        assert_eq!(
+                            serde_json::from_slice::<serde_json::Value>(&bytes)?,
+                            serde_json::json!({"error": "Not Found"})
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // Do not turn the remote-file rule into a new attached-local readiness rule.
+    let local_path = "media_attachments/files/000/012/001/original/normalized.mp4";
+    let local_file = fixture.root.join(local_path);
+    fs::create_dir_all(local_file.parent().unwrap())?;
+    fs::write(local_file, b"historical attached local")?;
+    for processing in [Some(0), Some(1), Some(3), None, Some(2)] {
+        sqlx::query("UPDATE media_attachments SET remote_url='', type=2, file_content_type='video/mp4', file_file_name='normalized.mp4', processing=$2 WHERE id=$1")
+            .bind(MEDIA_ID).bind(processing).execute(owner).await?;
+        let response =
+            authorized_cached_request(client, Method::GET, &format!("{base}/system/{local_path}"))
+                .send()
+                .await?;
+        assert_eq!(response.status(), StatusCode::OK, "local {processing:?}");
+        assert_eq!(
+            response.bytes().await?.as_ref(),
+            b"historical attached local"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn explicit_thumbnail_metadata_uses_attachment_model_identity() {
+    let mut media = media("normalized.mp4", "video/mp4");
+    for remote_url in ["", "https://remote.invalid/source.mov"] {
+        media.remote_url = remote_url.to_owned();
+        for thumbnail_remote_url in [
+            None,
+            Some("https://remote.invalid/separate.webp".to_owned()),
+        ] {
+            media.thumbnail_remote_url = thumbnail_remote_url;
+            let metadata = media_thumbnail_metadata_from_record(&media).unwrap();
+            assert_eq!(metadata.remote, !remote_url.is_empty());
+            let prefix = if remote_url.is_empty() { "" } else { "cache/" };
+            assert_eq!(
+                metadata.relative_path("original"),
+                Some(format!(
+                    "{prefix}media_attachments/thumbnails/000/012/001/original/separate.webp"
+                ))
+            );
+        }
+    }
 }

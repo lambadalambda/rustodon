@@ -1,3 +1,41 @@
+## 2026-09-18 — remote representations review 1 (uncommitted)
+
+- M1 pinned source confirms explicit thumbnails use attachment-model locality,
+  hence original `remote_url`. Kept authorization repository unchanged; aligned
+  REST/AP and three existing thumbnail metadata/cleanup constructors. Generated
+  MediaFile small paths unchanged. The initial thumbnail_remote_url hypothesis
+  was rejected after inspecting the reference prefix interpolator.
+- M2 direct remote MediaFile reads now reject explicit processing 0/1/3 using
+  existing access facts. NULL/ready, explicit thumbnails and local policy remain
+  unchanged; no MIME/source-suffix guessing for normalized JPEGs.
+- Actual HTTP red → green covers serialized thumbnails with no remote thumbnail
+  URL, GET/HEAD/range, wrong-namespace stale copies, remote stale MP4/MP3/JPEG
+  states and historical NULL/local readiness. Restricted PG14 HTTP 1/1; ordinary
+  library 351 passed/18 ignored; REST 18/18; pinned source 8/8. Scoped strict Clippy
+  passes; broad tests use only previously documented lint exceptions. Details
+  and exact logs in the representation subissue; task DB/network removed.
+- One review/fix round complete. Uncommitted for parent review 2; no browser work.
+
+## 2026-09-18 — consistent remote REST/AP/proxy representations (uncommitted)
+
+- Created/indexed [representation subissue](meta/issues/remote-rich-media-representations.md)
+  before code on `41a771e`. REST rich pending/failed previews fail closed; cached
+  MP4/PNG, MP3/no-preview and normalized JPEG URLs stay local. AP original URLs
+  now match installed MIME; generated small icons use the existing style contract.
+- Proxy cached reads reuse streaming range/HEAD responses, existing rich-family
+  caps, authorization/domain fences, cookie/bearer viewer and private caching.
+  Missing rich posters never fall back to original video/audio. No ordinary cap,
+  schema/job/worker, synchronous codec, or browser expansion.
+- TDD red REST/AP and stale/oversize cached regressions → green. Bounded NAS7203
+  evidence: REST 18/18, final library 350 passed/18 ignored, restricted PG14 HTTP
+  1/1 with PNG/JPEG decoding and authorized proxy/local URL ranges/HEAD, pinned
+  source contracts 8/8. Scoped strict Clippy passes; broad tests pass with recorded
+  pre-existing lint allowances. Formatting/diff checks pass. Exact commands,
+  failed environment attempts, hashes and limits are in the subissue.
+- Task DB/network removed. No production or browser work. Nested delegation is
+  unavailable; changes remain uncommitted for independent parent review (no review
+  claimed), and issues remain open. Full cookie/session integration not rerun.
+
 ## 2026-09-18 — remote rich-media worker
 
 - Reused bounded rich processing in the existing remote fetch/install lifecycle;

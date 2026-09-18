@@ -916,10 +916,10 @@ pub fn note(
         if let Some(height) = height {
             value["height"] = json!(height);
         }
-        if let Some(url) = media_thumbnail_url(origin, media_root_url, attachment) {
+        if let Some((url, content_type)) = media_thumbnail_url(origin, media_root_url, attachment) {
             value["icon"] = json!({
                 "type": "Image",
-                "mediaType": attachment.thumbnail_content_type.clone(),
+                "mediaType": content_type,
                 "url": url,
             });
         }
@@ -1603,14 +1603,14 @@ fn relationship_delivery_logical_key_without_id(
 }
 
 fn media_url(origin: &Url, media_root_url: &str, attachment: &MediaAttachment) -> Option<String> {
-    if !attachment.remote_url.is_empty() {
+    if attachment.file_file_name.is_none() && !rails_blank(&attachment.remote_url) {
         return Some(attachment.remote_url.clone());
     }
     let file_name = attachment.file_file_name.clone()?;
     let metadata = PaperclipMetadata {
         attachment: PaperclipAttachment::MediaFile,
         id: attachment.id,
-        remote: false,
+        remote: !rails_blank(&attachment.remote_url),
         storage_schema_version: attachment.file_storage_schema_version,
         file_name,
         content_type: attachment.file_content_type.clone(),
@@ -1623,21 +1623,47 @@ fn media_thumbnail_url(
     origin: &Url,
     media_root_url: &str,
     attachment: &MediaAttachment,
-) -> Option<String> {
+) -> Option<(String, String)> {
+    if attachment.thumbnail_file_name.is_none() {
+        if attachment.processing.is_some_and(|state| state.0 != 2) {
+            return None;
+        }
+        let metadata = PaperclipMetadata {
+            attachment: PaperclipAttachment::MediaFile,
+            id: attachment.id,
+            remote: !rails_blank(&attachment.remote_url),
+            storage_schema_version: attachment.file_storage_schema_version,
+            file_name: attachment.file_file_name.clone()?,
+            content_type: attachment.file_content_type.clone(),
+            variant: None,
+        };
+        let content_type = metadata.media_file_content_type("small")?;
+        return Some((
+            paperclip_url(origin, media_root_url, &metadata, "small")?,
+            content_type.to_owned(),
+        ));
+    }
     let file_name = attachment.thumbnail_file_name.clone()?;
     let metadata = PaperclipMetadata {
         attachment: PaperclipAttachment::MediaThumbnail,
         id: attachment.id,
-        remote: attachment
-            .thumbnail_remote_url
-            .as_deref()
-            .is_some_and(|url| !rails_blank(url)),
+        remote: !rails_blank(&attachment.remote_url),
         storage_schema_version: attachment.thumbnail_storage_schema_version,
         file_name,
         content_type: attachment.thumbnail_content_type.clone(),
         variant: None,
     };
-    paperclip_url(origin, media_root_url, &metadata, "original")
+    let content_type = attachment.thumbnail_content_type.as_deref()?;
+    if !matches!(
+        content_type,
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+    ) {
+        return None;
+    }
+    Some((
+        paperclip_url(origin, media_root_url, &metadata, "original")?,
+        content_type.to_owned(),
+    ))
 }
 
 fn avatar_url(origin: &Url, media_root_url: &str, account: &Account) -> Option<String> {
@@ -2329,12 +2355,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn note_serializes_media_blurhash() {
-        let origin = url::Url::parse("https://example.test/").expect("valid origin");
-        let account = account(Some(AccountIdScheme::Username));
+    fn image_attachment() -> MediaAttachment {
         let status = status();
-        let media = MediaAttachment {
+        MediaAttachment {
             id: 9,
             account_id: Some(42),
             status_id: Some(7),
@@ -2362,7 +2385,57 @@ mod tests {
             blurhash: Some("L00000000000000000000000000000000".to_owned()),
             created_at: status.created_at,
             updated_at: status.updated_at,
-        };
+        }
+    }
+
+    #[test]
+    fn cached_normalized_media_uses_matching_local_urls_and_mime() {
+        let origin = url::Url::parse("https://example.test/").unwrap();
+        let account = account(Some(AccountIdScheme::Username));
+        let status = status();
+        let media = image_attachment();
+        for (mime, name, preview) in [
+            (
+                "video/mp4",
+                "normalized.mp4",
+                Some(("image/png", "normalized.png")),
+            ),
+            ("audio/mpeg", "normalized.mp3", None),
+            (
+                "image/jpeg",
+                "normalized.jpeg",
+                Some(("image/jpeg", "normalized.jpeg")),
+            ),
+        ] {
+            let mut normalized = media.clone();
+            normalized.processing = Some(RawI32(2));
+            normalized.file_content_type = Some(mime.into());
+            normalized.file_file_name = Some(name.into());
+            normalized.file_storage_schema_version = Some(1);
+            normalized.thumbnail_file_name = None;
+            let value = note_with_media(&origin, &account, &status, &[normalized]);
+            let attachment = &value["attachment"][0];
+            let root = "https://example.test/system/cache/media_attachments/files/000/000/009";
+            assert_eq!(attachment["url"], format!("{root}/original/{name}"));
+            assert_eq!(attachment["mediaType"], mime);
+            if let Some((preview_mime, preview_name)) = preview {
+                assert_eq!(
+                    attachment["icon"]["url"],
+                    format!("{root}/small/{preview_name}")
+                );
+                assert_eq!(attachment["icon"]["mediaType"], preview_mime);
+            } else {
+                assert!(attachment.get("icon").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn note_serializes_media_blurhash() {
+        let origin = url::Url::parse("https://example.test/").expect("valid origin");
+        let account = account(Some(AccountIdScheme::Username));
+        let status = status();
+        let media = image_attachment();
         let value = note_with_media(&origin, &account, &status, std::slice::from_ref(&media));
 
         assert_eq!(
@@ -2381,7 +2454,7 @@ mod tests {
             json!({
                 "type": "Image",
                 "mediaType": "image/png",
-                "url": "https://example.test/system/media_attachments/thumbnails/000/000/009/original/thumb.png"
+                "url": "https://example.test/system/cache/media_attachments/thumbnails/000/000/009/original/thumb.png"
             })
         );
 

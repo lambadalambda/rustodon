@@ -32,3 +32,5 @@
 - [ ] [Compute real instance activity metrics](issues/compute-real-instance-activity-metrics.md)
 - [ ] [Support hashtag and featured-tag controls](issues/support-hashtag-and-featured-tag-controls.md)
 - [ ] [Define remote media MIME policy and scoped transport bounds](issues/remote-media-policy-and-transport-bounds.md)
+
+- [ ] [Consistent remote rich-media REST, ActivityPub, and proxy representations](issues/remote-rich-media-representations.md)

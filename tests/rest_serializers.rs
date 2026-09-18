@@ -765,3 +765,62 @@ fn media_root_urls_preserve_absolute_origins_and_derivative_extensions() {
             .ends_with("/small/movie.png")
     );
 }
+
+#[test]
+fn remote_rich_representations_never_use_original_as_preview() {
+    let mut media = MediaAttachmentProjection {
+        id: 9,
+        media_type: 2,
+        processing: Some(0),
+        remote_url: "https://remote.invalid/source.mov".into(),
+        file_content_type: Some("video/quicktime".into()),
+        file_name: None,
+        file_storage_schema_version: Some(1),
+        thumbnail_file_name: None,
+        thumbnail_storage_schema_version: None,
+        thumbnail_remote_url: None,
+        shortcode: None,
+        meta: None,
+        description: None,
+        blurhash: None,
+        discarded: false,
+    };
+    for (kind, mime) in [(2, "video/quicktime"), (4, "audio/wav")] {
+        media.media_type = kind;
+        media.file_content_type = Some(mime.into());
+        for processing in [Some(0), Some(1), Some(3), None] {
+            media.processing = processing;
+            assert!(serializer().media_attachment(&media).preview_url.is_none());
+        }
+    }
+    media.processing = Some(2);
+    for (kind, mime, name, preview) in [
+        (2, "video/mp4", "normalized.mp4", Some("normalized.png")),
+        (4, "audio/mpeg", "normalized.mp3", None),
+        (0, "image/jpeg", "normalized.jpeg", Some("normalized.jpeg")),
+    ] {
+        media.media_type = kind;
+        media.file_content_type = Some(mime.into());
+        media.file_name = Some(name.into());
+        let value = serializer().media_attachment(&media);
+        let root = "https://fixture-v4-6-5.rustodon.invalid/system/cache/media_attachments/files/000/000/009";
+        assert_eq!(value.url, Some(format!("{root}/original/{name}")));
+        assert_eq!(
+            value.preview_url,
+            preview.map(|name| format!("{root}/small/{name}"))
+        );
+    }
+    media.media_type = 4;
+    media.file_content_type = Some("audio/mpeg".into());
+    media.file_name = Some("normalized.mp3".into());
+    media.thumbnail_file_name = Some("real.png".into());
+    media.thumbnail_storage_schema_version = Some(1);
+    assert_eq!(
+        serializer().media_attachment(&media).preview_url.as_deref(),
+        Some(
+            "https://fixture-v4-6-5.rustodon.invalid/system/cache/media_attachments/thumbnails/000/000/009/original/real.png"
+        )
+    );
+    media.thumbnail_file_name = Some("not-an-image.mp4".into());
+    assert!(serializer().media_attachment(&media).preview_url.is_none());
+}

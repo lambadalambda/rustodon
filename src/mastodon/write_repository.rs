@@ -17872,10 +17872,7 @@ fn local_media_deletion_paths(media: &MediaAttachment) -> Vec<String> {
         let metadata = PaperclipMetadata {
             attachment: PaperclipAttachment::MediaThumbnail,
             id: media.id,
-            remote: !media
-                .thumbnail_remote_url
-                .as_deref()
-                .is_none_or(rails_blank),
+            remote: !rails_blank(&media.remote_url),
             storage_schema_version: media.thumbnail_storage_schema_version,
             file_name: file_name.clone(),
             content_type: media.thumbnail_content_type.clone(),
@@ -22479,7 +22476,7 @@ fn append_media_attachment_metadata(
     thumbnail_storage_schema_version: Option<i32>,
     thumbnail_file_name: Option<String>,
     thumbnail_content_type: Option<String>,
-    thumbnail_remote_url: Option<String>,
+    _thumbnail_remote_url: Option<String>,
 ) {
     if let Some(file_name) = file_file_name.filter(|name| !name.is_empty()) {
         metadata.push(PaperclipMetadata {
@@ -22496,7 +22493,7 @@ fn append_media_attachment_metadata(
         metadata.push(PaperclipMetadata {
             attachment: PaperclipAttachment::MediaThumbnail,
             id: media_id,
-            remote: !thumbnail_remote_url.as_deref().is_none_or(rails_blank),
+            remote: !remote_url.as_deref().is_none_or(rails_blank),
             storage_schema_version: thumbnail_storage_schema_version,
             file_name,
             content_type: thumbnail_content_type,

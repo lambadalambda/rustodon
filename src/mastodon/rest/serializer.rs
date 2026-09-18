@@ -1316,9 +1316,20 @@ impl<'a> RestSerializer<'a> {
                 )
             })
         };
-        let preview_url = if needs_proxy {
+        let rich = matches!(media.media_type, 1 | 2 | 4)
+            && media.file_content_type.as_deref() != Some("image/gif");
+        let preview_url = if remote && rich && (needs_proxy || not_processed) {
+            None
+        } else if needs_proxy {
             Some(self.absolute(&format!("media_proxy/{}/small", media.id)))
-        } else if let Some(file_name) = &media.thumbnail_file_name {
+        } else if let Some(file_name) = media.thumbnail_file_name.as_ref().filter(|name| {
+            name.rsplit_once('.').is_some_and(|(_, extension)| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "gif" | "webp"
+                )
+            })
+        }) {
             self.paperclip_media_url(
                 &PaperclipMetadata {
                     attachment: PaperclipAttachment::MediaThumbnail,

@@ -2715,7 +2715,12 @@ fn cached_remote_media_response(
     state: &WebState,
     media: &MediaAttachment,
     small: bool,
+    method: &Method,
+    headers: &HeaderMap,
 ) -> Option<Response<Body>> {
+    if media.processing.is_some_and(|state| state.0 != 2) {
+        return None;
+    }
     let file_name = media.file_file_name.as_deref()?;
     let content_type = media.file_content_type.as_deref()?;
     let metadata = PaperclipMetadata {
@@ -2733,38 +2738,86 @@ fn cached_remote_media_response(
         .media_root
         .open_file(FsPath::new(&relative_path))
         .ok()?;
-    let mut body = Vec::new();
-    let read_limit = u64::try_from(MEDIA_PROXY_MAX_RESPONSE_BYTES)
-        .ok()?
-        .saturating_add(1);
-    file.take(read_limit).read_to_end(&mut body).ok()?;
-    if body.len() > MEDIA_PROXY_MAX_RESPONSE_BYTES {
+    let file_metadata = file.metadata().ok()?;
+    let limit = if small {
+        MEDIA_PROXY_MAX_RESPONSE_BYTES
+    } else {
+        crate::media::media_format(content_type)?.input_size_limit
+    };
+    if file_metadata.len() > u64::try_from(limit).ok()? {
         return None;
     }
     let content_type = metadata.media_file_content_type(style)?;
-    let mut response = Response::new(Body::from(body));
-    *response.status_mut() = StatusCode::OK;
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static(PRIVATE_CACHE));
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_str(content_type)
-            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    let mut response = paperclip_file_response(
+        method,
+        headers,
+        FsPath::new(&relative_path),
+        file,
+        &file_metadata,
+        PRIVATE_CACHE,
+        Some(PAPERCLIP_STATUS_VARY),
     );
-    response.headers_mut().insert(
-        "x-content-type-options",
-        HeaderValue::from_static("nosniff"),
-    );
+    // Multipart has its own envelope MIME; its parts use the known cached suffix.
+    if matches!(
+        response.status(),
+        StatusCode::OK | StatusCode::PARTIAL_CONTENT
+    ) && !response
+        .headers()
+        .get(CONTENT_TYPE)
+        .is_some_and(|value| value.as_bytes().starts_with(b"multipart/"))
+    {
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_str(content_type).ok()?);
+    }
     Some(response)
 }
 
-#[allow(clippy::too_many_lines)]
 async fn media_proxy(
     State(state): State<WebState>,
     Path(path): Path<String>,
     Extension(metadata): Extension<RequestMetadata>,
+    method: Method,
     headers: HeaderMap,
+) -> Response<Body> {
+    let mut response = media_proxy_inner(&state, &path, metadata, &method, &headers).await;
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(PRIVATE_CACHE));
+    response
+        .headers_mut()
+        .insert(VARY, HeaderValue::from_static(PAPERCLIP_STATUS_VARY));
+    response
+}
+
+// A missing rich poster is not permission to fetch its original as an image.
+fn remote_media_proxy_source(media: &MediaAttachment, small: bool) -> Option<&str> {
+    if media.file_file_name.is_some() {
+        return None; // An installed representation must not silently change back to its source.
+    }
+    if !small {
+        return Some(&media.remote_url);
+    }
+    media
+        .thumbnail_remote_url
+        .as_deref()
+        .filter(|url| !crate::paperclip::rails_blank(url))
+        .or_else(|| {
+            matches!(
+                media.file_content_type.as_deref(),
+                Some("image/jpeg" | "image/png" | "image/gif" | "image/webp")
+            )
+            .then_some(media.remote_url.as_str())
+        })
+}
+
+#[allow(clippy::too_many_lines)]
+async fn media_proxy_inner(
+    state: &WebState,
+    path: &str,
+    metadata: RequestMetadata,
+    method: &Method,
+    headers: &HeaderMap,
 ) -> Response<Body> {
     if let Err(limited) = state
         .media_proxy_limiter
@@ -2773,18 +2826,11 @@ async fn media_proxy(
     {
         return rate_limited_response(limited);
     }
-    let viewer_account_id = if state.instance_runtime.limited_federation {
-        match required_viewer(&state, &headers, READ_STATUSES).await {
-            Ok(account_id) => Some(account_id),
-            Err(response) => return response,
-        }
-    } else {
-        match optional_viewer(&state, &headers, READ_STATUSES).await {
-            Ok(account_id) => account_id,
-            Err(response) => return response,
-        }
+    let viewer_account_id = match paperclip_viewer(state, headers, true).await {
+        Ok(viewer) => viewer,
+        Err(response) => return response,
     };
-    let Some((id, small)) = media_proxy_path(&path) else {
+    let Some((id, small)) = media_proxy_path(path) else {
         return not_found();
     };
     let media = match state.repository.remote_media_attachment(id).await {
@@ -2826,17 +2872,11 @@ async fn media_proxy(
     {
         return not_found();
     }
-    if let Some(response) = cached_remote_media_response(&state, &media, small) {
+    if let Some(response) = cached_remote_media_response(state, &media, small, method, headers) {
         return response;
     }
-    let remote_url = if small {
-        media
-            .thumbnail_remote_url
-            .as_deref()
-            .filter(|url| !crate::paperclip::rails_blank(url))
-            .unwrap_or(&media.remote_url)
-    } else {
-        &media.remote_url
+    let Some(remote_url) = remote_media_proxy_source(&media, small) else {
+        return not_found();
     };
     let Ok(remote_url) = Url::parse(remote_url) else {
         return not_found();
@@ -2847,7 +2887,14 @@ async fn media_proxy(
             max_response_bytes: MEDIA_PROXY_MAX_RESPONSE_BYTES,
             ..RemoteFetchLimits::default()
         })
-        .get(remote_url, SUPPORTED_MIME_TYPES)
+        .get(
+            remote_url,
+            if small {
+                &["image/jpeg", "image/png", "image/gif", "image/webp"]
+            } else {
+                SUPPORTED_MIME_TYPES
+            },
+        )
         .await
     {
         Ok(response) => response,
@@ -2880,6 +2927,18 @@ async fn media_proxy(
         .filter(|value| !value.is_empty())
         .or(media.file_content_type.as_deref())
         .unwrap_or("application/octet-stream");
+    if small
+        && (image::guess_format(&response.body)
+            .ok()
+            .is_none_or(|format| format.to_mime_type() != content_type)
+            || (media
+                .thumbnail_remote_url
+                .as_deref()
+                .is_none_or(crate::paperclip::rails_blank)
+                && media.file_content_type.as_deref() != Some(content_type)))
+    {
+        return not_found();
+    }
     let mut output = Response::new(Body::from(response.body));
     *output.status_mut() = StatusCode::OK;
     output.headers_mut().insert(
@@ -6987,6 +7046,7 @@ async fn paperclip_status_media_access(
     state: &WebState,
     headers: &HeaderMap,
     media_id: i64,
+    attachment: PaperclipAttachment,
 ) -> Result<bool, Response<Body>> {
     let media = state
         .repository
@@ -7000,6 +7060,15 @@ async fn paperclip_status_media_access(
     let Some(media) = media else {
         return Ok(false);
     };
+    // Explicit non-ready remote originals and their generated styles must agree
+    // with the proxy. NULL is historical readiness, not an unfinished upload.
+    // Keep separate thumbnails and the local owner/attached policy unchanged.
+    if attachment == PaperclipAttachment::MediaFile
+        && !media.local
+        && matches!(media.processing, Some(0 | 1 | 3))
+    {
+        return Ok(false);
+    }
     let Some(status_id) = media.status_id else {
         return Ok(media.local
             && media.processing == Some(2)
@@ -7068,7 +7137,9 @@ async fn paperclip_media(
             path.attachment(),
             PaperclipAttachment::MediaFile | PaperclipAttachment::MediaThumbnail
         ) {
-            match paperclip_status_media_access(&state, &headers, path.id()).await {
+            match paperclip_status_media_access(&state, &headers, path.id(), path.attachment())
+                .await
+            {
                 Ok(true) => {}
                 Ok(false) => return not_found(),
                 Err(response) => return response,
@@ -13596,10 +13667,7 @@ fn media_thumbnail_metadata_from_record(
     Some(PaperclipMetadata {
         attachment: PaperclipAttachment::MediaThumbnail,
         id: media.id,
-        remote: !media
-            .thumbnail_remote_url
-            .as_deref()
-            .is_none_or(crate::paperclip::rails_blank),
+        remote: !crate::paperclip::rails_blank(&media.remote_url),
         storage_schema_version: media.thumbnail_storage_schema_version,
         file_name: media.thumbnail_file_name.clone()?,
         content_type: media.thumbnail_content_type.clone(),
