@@ -1,5 +1,19 @@
 # Define remote media MIME policy and scoped transport bounds
 
+## Current status — complete (2026-09-18)
+
+Implemented in `be6c7cd`; transport review 2 accepted strict family caps and
+preserved guards. Transport 3/3 covers fixed/chunked limit−1/exact/+1, unchanged
+ordinary caps, redirect policy, encoding, timeout and cancellation; formats 4/4
+and configured limits 1/1 passed. Policy/transport acceptance is complete.
+
+Parent confirms independent review 2 and approves archival after `fe6e461`.
+This current status overrides historical “open”, “uncommitted”, “review pending”
+and leave-uncommitted handoff instructions below. Evidence references and
+slice-specific boundaries are preserved. No gates were rerun for this docs-only
+reconciliation. Actual transport-loss/power-loss simulation, full fixture/release
+matrices and peer gates remain unclaimed.
+
 ## Summary
 
 First topical slice of [remote rich media](cache-remote-rich-media-previews.md),

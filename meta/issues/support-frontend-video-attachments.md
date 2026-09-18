@@ -1,14 +1,28 @@
 # Support advertised media attachments in the bundled frontend
 
-## Current status — OPEN (2026-09-18)
+## Current status — complete (2026-09-18)
 
-Local upload milestones are complete and archived on combined reviewed
-persistence/worker/restricted HTTP and exact-`6f44264` browser evidence. Remote
-rich-media caching and generated previews remain unimplemented; the remote MP4
-acceptance criterion and combined remote regression coverage remain unmet. The
-original diagnosis below is historical for local uploads, not current local status.
+Combined local and remote acceptance is complete; no unmet parent acceptance
+blocker remains. Parent approves archival after reviewed `fe6e461` evidence.
 
-## Summary
+- The archived [local milestone](support-local-rich-media-uploads.md) records
+  all 24 advertised external MIME types through real-codec HTTP, bounded
+  validation/fault/cleanup checks and reviewed exact-`6f44264` HEIC/AVIF/video/audio
+  composer preview, posting, playback and reload. Processor evidence covers HEIF.
+- The completed [remote milestone](cache-remote-rich-media-previews.md) combines
+  strict transport caps, real worker outputs/faults, authorized REST/AP/proxy
+  representations and fresh uninterrupted exact-`8b2f49e` browser acceptance.
+  MP4 has a real PNG poster before local playback; audio and AVIF→JPEG plus all
+  reloads pass, with native updates and zero origin requests across 1,208 captured
+  requests. Private-byte authorization is proven separately by HTTP, not claimed
+  as new remote private-browser coverage.
+
+This status overrides the historical diagnosis below and earlier handoff notes.
+No gates were rerun for this docs-only reconciliation. Actual transport-loss/
+power-loss simulation, full fixture/release matrices and peer gates remain
+unclaimed; combined completion does not imply a single full-matrix run.
+
+## Historical summary
 
 Rustodon advertises Mastodon-compatible image, video, and audio MIME types, and the bundled composer lets users select them, but creation and remote caching are limited to JPEG/PNG/GIF/WebP. Ordinary phone photos, video, and audio uploads therefore begin and fail with HTTP 422; remote video also lacks a still preview.
 
@@ -27,7 +41,7 @@ Rustodon advertises Mastodon-compatible image, video, and audio MIME types, and 
 - `preview_url` returns an image representation rather than the original video bytes.
 - Focused media and browser regressions cover local upload, remote caching, preview generation, playback, failure, and cleanup.
 
-## Evidence
+## Historical diagnosis and subissues
 
 - Rustodon advertises HEIC/HEIF/AVIF, video, and audio MIME types in its instance response, while media creation, `remote_media_is_fetchable`, and worker content types accept only JPEG/PNG/GIF/WebP. The same v2 upload the bundled composer uses returns 422 for the advertised formats.
 - A live remote MP4 on `rustodon.social` serialized local proxy URLs, but both `original` and `small` returned the same `video/mp4` bytes. The bundled frontend therefore rendered a black poster until Play; playback itself then succeeded at 640×480.

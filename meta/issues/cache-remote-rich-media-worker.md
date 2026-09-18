@@ -1,5 +1,21 @@
 # Cache remote rich media in the fenced worker
 
+## Current status — complete (2026-09-18)
+
+Implemented in `41a771e`; worker review 2 accepted focused real-output worker
+8/8 plus import/same-URL 1/1 under restricted credentials. MP4/PNG, audio/no-poster,
+HEIC/JPEG, mismatch/malformed retry, lease cancellation/reclamation, partial
+writes, ambiguity, policy/deletion, current focus edit/clear and transactional
+stream convergence complete this slice. Same-URL evidence is the shared SQL
+helper, not a federated HTTP UPDATE; lease fencing is not a full generation token.
+
+Parent confirms independent review 2 and approves archival after `fe6e461`.
+This current status overrides historical “open”, “uncommitted”, “review pending”
+and leave-uncommitted handoff instructions below. Evidence references and
+slice-specific boundaries are preserved. No gates were rerun for this docs-only
+reconciliation. Actual transport-loss/power-loss simulation, full fixture/release
+matrices and peer gates remain unclaimed.
+
 ## Summary
 
 Bounded worker subissue of [Cache remote rich media with previews](cache-remote-rich-media-previews.md), starting at `be6c7cd`.

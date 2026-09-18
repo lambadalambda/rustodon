@@ -1,5 +1,24 @@
 # Accept remote rich media in the pinned browser
 
+## Current status — complete (2026-09-18)
+
+Harness committed in `fe6e461` after browser review 2; parent offline contracts
+passed 8/8. The fresh uninterrupted final controller on exact application `8b2f49e`
+completes acceptance: signed ingress/import, held/released real worker, native
+WebSocket convergence, actual PNG poster before MP4 playback, audio avatar fallback
+and playback, AVIF→JPEG decode and all reloads. Network capture records 1,208
+requests, zero origin-media requests and per-reload local positives. The earlier
+segmented run is not substituted for this gate. Sanitized evidence remains outside
+Git at the recorded paths. This is not the full browser lane or private-browser
+coverage; restricted private-byte HTTP is the representation slice's evidence.
+
+Parent confirms independent review 2 and approves archival after `fe6e461`.
+This current status overrides historical “open”, “uncommitted”, “review pending”
+and leave-uncommitted handoff instructions below. Evidence references and
+slice-specific boundaries are preserved. No gates were rerun for this docs-only
+reconciliation. Actual transport-loss/power-loss simulation, full fixture/release
+matrices and peer gates remain unclaimed.
+
 ## Summary
 
 Bounded browser acceptance of application revision
@@ -37,7 +56,7 @@ under [Support advertised media attachments](support-frontend-video-attachments.
 - [x] MP4 poster/playback, audio fallback/playback, JPEG decode and reload pass.
 - [x] Captured browser network proves local-only media requests.
 - [x] Named mechanics, accepted evidence, gaps, and task-only cleanup recorded.
-- [ ] Parent independent review of substantial harness before commit/closure.
+- [x] Parent independent review of substantial harness before commit/closure.
 
 ## Notes
 

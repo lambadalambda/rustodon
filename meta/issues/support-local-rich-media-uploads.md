@@ -13,8 +13,8 @@ Parent explicitly approves closure and archival. This status supersedes earlier
 those record historical handoff stages, not outstanding work. No gates were rerun
 for this docs-only reconciliation. Actual transport-loss/power-loss simulation,
 full fixture/release matrices and remote-media implementation remain unclaimed.
-The [frontend rich-media parent](support-frontend-video-attachments.md) remains
-**OPEN** for unimplemented remote caching/previews.
+The [frontend rich-media parent](support-frontend-video-attachments.md) is now
+**complete** on combined reviewed local and remote evidence after `fe6e461`.
 
 ## Summary
 

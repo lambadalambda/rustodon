@@ -1,5 +1,12 @@
 # Completed Issues
 
+- [x] [Support advertised media attachments in the bundled frontend](issues/support-frontend-video-attachments.md)
+- [x] [Cache remote rich media with previews](issues/cache-remote-rich-media-previews.md)
+- [x] [Accept remote rich media in the pinned browser](issues/accept-remote-rich-media-browser.md)
+- [x] [Cache remote rich media in the fenced worker](issues/cache-remote-rich-media-worker.md)
+- [x] [Define remote media MIME policy and scoped transport bounds](issues/remote-media-policy-and-transport-bounds.md)
+- [x] [Consistent remote rich-media REST, ActivityPub, and proxy representations](issues/remote-rich-media-representations.md)
+
 - [x] [Support local rich-media uploads](issues/support-local-rich-media-uploads.md)
 - [x] [Persist durable local upload ownership](issues/persist-durable-local-upload-ownership.md)
 - [x] [Process and recover durable local uploads](issues/process-and-recover-durable-local-uploads.md)

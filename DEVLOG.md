@@ -1,3 +1,17 @@
+## 2026-09-18 — reviewed rich-media closure reconciliation
+
+- Archived remote policy/transport, worker, representations and browser slices,
+  remote caching parent and overall frontend media parent after checking combined
+  acceptance and parent-confirmed review 2. No unmet acceptance blocker remains;
+  local milestones were already archived.
+- Completion overrides supersede historical uncommitted/review-pending notes:
+  implementation `be6c7cd`, `41a771e`, `8b2f49e`; harness `fe6e461`. Final browser
+  evidence is the fresh uninterrupted exact-`8b2f49e` run (1,208 requests, zero
+  origin media); parent offline contracts 8/8. Detailed evidence references remain.
+- Docs-only: no gate reruns, code/production changes or push. Actual transport/
+  power loss, full fixture/release matrices and peer gates remain unclaimed.
+  Earlier handoff statements below are historical, not outstanding review work.
+
 ## 2026-09-18 — bounded remote browser acceptance, review 1 corrections
 
 - Exact application `8b2f49e` ran in fresh disposable PG14 with restricted roles,

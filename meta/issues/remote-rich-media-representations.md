@@ -1,5 +1,21 @@
 # Consistent remote rich-media REST, ActivityPub, and proxy representations
 
+## Current status — complete (2026-09-18)
+
+Implemented in `8b2f49e`; representation review 2 accepted library 351 passed /
+18 ignored, REST 18/18, pinned source 8/8 and restricted private-byte HTTP 1/1.
+Actual PNG/JPEG, thumbnail identity, GET/HEAD/range, readiness denial, private
+authorization/cache behavior and REST/AP URL/MIME agreement complete this slice.
+Opaque rich HTTP fixtures are not playback proof; worker/browser evidence supplies
+that separately. Full cookie/session lifecycle integration was not rerun.
+
+Parent confirms independent review 2 and approves archival after `fe6e461`.
+This current status overrides historical “open”, “uncommitted”, “review pending”
+and leave-uncommitted handoff instructions below. Evidence references and
+slice-specific boundaries are preserved. No gates were rerun for this docs-only
+reconciliation. Actual transport-loss/power-loss simulation, full fixture/release
+matrices and peer gates remain unclaimed.
+
 ## Summary
 
 Subissue of [Cache remote rich media with previews](cache-remote-rich-media-previews.md), based on worker normalization at `41a771e`.
