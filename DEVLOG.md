@@ -2,6 +2,25 @@
 
 ## 2026-09-16
 
+- Added standalone instance bootstrap from an empty PostgreSQL 14 database,
+  without a Mastodon/Rails runtime dependency. A deterministic schema-only
+  Mastodon 4.6.5 artifact and exact migration inventory feed a transactional,
+  fail-closed `rustodon admin bootstrap-instance` command that creates fresh
+  instance/Owner signing identities, baseline settings, Rustodon operational
+  state, and exact runtime/writer grants. Exact reruns verify without rotating
+  credentials; partial, drifted, live, or non-empty-media targets are rejected.
+  The installer now supports a non-superuser that directly owns the database and
+  `public` schema.
+- Added the bounded `standalone-bootstrap-integration` PostgreSQL-only lane and
+  offline lifecycle harness. The live smoke verifies first-Owner browser login,
+  media upload, public status creation, WebFinger, ActivityPub, exact baseline
+  and rerun behavior, least-privilege runtime/writer connections, and rejection
+  paths. Added a standalone operator runbook covering role/secret provisioning,
+  startup/readiness, backups, and the separate existing-Mastodon cutover path.
+  The live PostgreSQL 14.23 test passed against a task-owned NAS container; the
+  Linux-local runner's selector/environment/timeout/ownership cleanup paths pass
+  offline harness coverage. Independent blocker/high review passed.
+
 - Repaired the operational schema v3-to-v4 deployment blocker by registering the
   221-entry PostgreSQL 14.23 catalog hash produced by the exact physical-clone
   rehearsal. The superseded hash came from a newer PostgreSQL catalog whose

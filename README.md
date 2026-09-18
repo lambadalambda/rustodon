@@ -46,6 +46,8 @@ state.
   fetch coordination.
 - Existing local Paperclip media layout and a controlled Mastodon-to-Rustodon
   cutover with rollback compatibility.
+- Fresh standalone instances from an empty PostgreSQL 14 database, without a
+  Mastodon/Rails bootstrap dependency.
 
 Object storage, Elasticsearch, open registration, SSO providers, scheduled posts,
 relays, other advanced federation extensions, and the full Mastodon administration
@@ -59,6 +61,7 @@ rejected by preflight rather than silently discarded.
 
 - [Architecture and capabilities](docs/architecture.md)
 - [Testing and compatibility fixtures](docs/testing.md)
+- [Standalone instance setup](docs/standalone.md)
 - [Cutover and rollback](docs/cutover.md)
 - [Detailed v1 scope](docs/v1-scope.md)
 - [V1 acceptance matrix](docs/v1-acceptance-matrix.md)
@@ -92,9 +95,10 @@ mise exec -- cargo run -- admin --help
 
 ## Operations
 
-The supported deployment model is a small Mastodon 4.6.5 installation using
-PostgreSQL and local media, with no concurrent Mastodon and Rustodon writers.
-Never treat schema migration alone as a cutover.
+Rustodon supports either a fresh PostgreSQL 14/local-media instance or a
+controlled replacement of a small Mastodon 4.6.5 installation. Follow the
+[standalone setup guide](docs/standalone.md) for an empty database. For an
+existing Mastodon database, never treat schema migration alone as a cutover.
 
 ```console
 rustodon preflight

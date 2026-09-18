@@ -46,6 +46,7 @@ mise run harness-tests
 | Pinned source | `mise run pinned-source-contracts` | Independently derives frontend and Rails contracts from the exact source revision. |
 | Mastodon schema/HTTP | `mise run mastodon-schema-integration` | Restores the fixture and runs named read/write/protocol selectors with least-privilege roles. |
 | Operational schema | `mise run operational-schema-integration` | Creates/upgrades Rustodon-owned tables, rejects drift, and verifies Mastodon data remains unchanged. |
+| Standalone bootstrap | `mise run standalone-bootstrap-integration` | Initializes an empty PostgreSQL 14 database and runs bounded login/media/status/discovery smoke without Mastodon. |
 | Startup | `mise run startup-integration` | Proves web and worker processes fail closed on unsafe configuration or privileges. |
 | Preflight | `mise run preflight-integration` | Exercises canonical and rejection configurations against disposable clones. |
 | Workers | `mise run worker-integration` | Exercises durable queue semantics, all lanes, recovery, readiness, and shutdown. |
@@ -68,7 +69,37 @@ or environment passed.
 
 Run container-backed fixtures sequentially. They currently target GNU/Linux
 x86-64 and require Podman, exact cached/pinned images where specified, sufficient
-disk and memory, and workload-side timeouts.
+disk and memory, and workload-side timeouts. The standalone lane additionally
+requires a local Podman engine because its random PostgreSQL port is bound only
+to loopback.
+
+## Standalone bootstrap
+
+`mise run standalone-bootstrap-integration` starts from an empty PostgreSQL 14
+database and an empty local-media root. It uses a pinned PostgreSQL child image
+and task-owned database, roles, volume, network, random loopback port, and marked
+media directory with explicit CPU, memory, process, readiness, and wall-time
+bounds. It executes one exact ignored test serially and removes only resources
+created by that invocation.
+
+The lane does not obtain Mastodon source, restore the populated compatibility
+fixture, or run a Mastodon image, Rails, Sidekiq, or Redis. It covers fresh
+installation, exact verification rerun, schema/role/grant/data/media rejection
+cases, first-Owner browser login, media upload, public status creation,
+WebFinger, and ActivityPub. See the [standalone setup guide](standalone.md) for
+the operator path and its backup boundary.
+
+A cold run may pull the immutable PostgreSQL image after verifying that the
+pinned index contains the expected `linux/amd64` child. Run the heavy lane
+sequentially:
+
+```console
+mise run standalone-bootstrap-integration
+```
+
+`mise run harness-tests` exercises the lane's selector, environment isolation,
+resource naming, and success/failure cleanup with offline stubs. That wiring
+check is not evidence that PostgreSQL bootstrap or the HTTP smoke passed.
 
 ## Compatibility fixture
 
