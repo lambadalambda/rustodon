@@ -37,6 +37,10 @@ run = "tools/check-harnesses"
 description = "Verify vendored pinned worker assets without a source checkout"
 run = "tools/verify-worker-media"
 
+[tasks.media-processor]
+description = "Exercise the real bounded FFmpeg/ffprobe normalization and capability paths"
+run = "cargo test --locked --all-features --test media_processor -- --ignored --nocapture --test-threads=1"
+
 [tasks.deny]
 description = "Check dependency licenses, advisories, bans, and sources"
 run = "cargo deny --locked check"

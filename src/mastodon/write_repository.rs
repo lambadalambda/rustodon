@@ -65,6 +65,7 @@ use crate::jobs::{
     record_stream_event_in, stage_stream_events_if_large_in,
 };
 use crate::mail::report_job;
+use crate::media::media_format;
 use crate::paperclip::{PaperclipAttachment, PaperclipMetadata, rails_blank};
 use crate::remote::{RemoteActor, canonical_remote_domain, canonical_remote_host};
 use crate::streaming::{
@@ -249,6 +250,7 @@ pub struct MediaFocus {
 
 #[derive(Clone, Debug)]
 pub struct MediaAttachmentCreate {
+    pub media_type: i32,
     pub file_name: String,
     pub content_type: String,
     pub file_size: i32,
@@ -6202,11 +6204,12 @@ impl WriteRepository {
                account_id, type, processing, description, remote_url,
                file_content_type, file_file_name, file_file_size, file_meta,
                file_storage_schema_version, file_updated_at, blurhash, created_at, updated_at
-             ) VALUES ($1, 0, 0, $2, '', NULL, NULL, NULL, $3::json, NULL,
-                       NULL, $4, clock_timestamp(), clock_timestamp())
+             ) VALUES ($1, $2, 0, $3, '', NULL, NULL, NULL, $4::json, NULL,
+                       NULL, $5, clock_timestamp(), clock_timestamp())
              RETURNING id",
         )
         .bind(account_id)
+        .bind(create.media_type)
         .bind(create.description.as_deref())
         .bind(file_meta)
         .bind(&create.blurhash)
@@ -17760,19 +17763,25 @@ fn validate_account_profile_update(update: &AccountProfileUpdate) -> Result<(), 
 }
 
 fn validate_media_attachment_create(create: &MediaAttachmentCreate) -> Result<(), WriteError> {
-    if !matches!(
-        create.content_type.as_str(),
-        "image/jpeg" | "image/png" | "image/gif" | "image/webp"
-    ) {
-        return Err(WriteError::Validation("unsupported media image type"));
+    let Some(format) = media_format(&create.content_type) else {
+        return Err(WriteError::Validation("unsupported media type"));
+    };
+    if create.media_type != format.kind.database_type() {
+        return Err(WriteError::Validation(
+            "media type does not match its content type",
+        ));
     }
-    if !(1..(16 * 1024 * 1024)).contains(&create.file_size)
+    let Ok(file_size) = usize::try_from(create.file_size) else {
+        return Err(WriteError::Validation("invalid media metadata"));
+    };
+    if file_size == 0
+        || file_size >= format.input_size_limit
         || create.file_name.is_empty()
         || create.file_name.len() > 255
         || create.file_name.contains(['/', '\\', '\0'])
         || create.file_name.chars().any(char::is_control)
     {
-        return Err(WriteError::Validation("invalid media image metadata"));
+        return Err(WriteError::Validation("invalid media metadata"));
     }
     if create
         .description
@@ -17802,8 +17811,16 @@ fn local_media_create_cleanup_job(
         .into_iter()
         .filter_map(|style| metadata.relative_path(style))
         .collect::<Vec<_>>();
-    if paths.len() != 2 {
-        return Err(WriteError::Validation("invalid media image metadata"));
+    let expected_paths = if media_format(&create.content_type)
+        .and_then(|format| format.preview_content_type)
+        .is_some()
+    {
+        2
+    } else {
+        1
+    };
+    if paths.len() != expected_paths {
+        return Err(WriteError::Validation("invalid media metadata"));
     }
     Ok(local_media_cleanup_job(
         account_id,

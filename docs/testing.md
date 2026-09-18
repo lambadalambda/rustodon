@@ -44,6 +44,7 @@ mise run harness-tests
 | Lane | Command | Contract |
 | --- | --- | --- |
 | Pinned source | `mise run pinned-source-contracts` | Independently derives frontend and Rails contracts from the exact source revision. |
+| Media processor | `mise run media-processor` | Runs pinned tiny media through the real bounded FFmpeg/ffprobe paths and verifies the complete advertised capability set. |
 | Mastodon schema/HTTP | `mise run mastodon-schema-integration` | Restores the fixture and runs named read/write/protocol selectors with least-privilege roles. |
 | Operational schema | `mise run operational-schema-integration` | Creates/upgrades Rustodon-owned tables, rejects drift, and verifies Mastodon data remains unchanged. |
 | Standalone bootstrap | `mise run standalone-bootstrap-integration` | Initializes an empty PostgreSQL 14 database and runs bounded login/media/status/discovery smoke without Mastodon. |
@@ -55,6 +56,12 @@ mise run harness-tests
 | Cutover | `mise run cutover-integration` | Rehearses migration, Rustodon smoke, rollback, Mastodon reopen, and preservation checks. |
 | Browser | `mise run browser-integration` | Drives the pinned frontend in Chromium within the HTTPS cutover fixture. |
 | Real peer | `mise run peer-public`, `peer-privacy`, `peer-notes`, `peer-profile`, `peer-interactions` | Runs explicit manual scenarios against a disposable pinned Mastodon peer. |
+
+The `media-processor` lane requires the production `ffmpeg` and `ffprobe`
+executables on `PATH`; it is the named real-codec gate and runs serially. The
+ordinary suite still covers deterministic MIME, probe-limit, subprocess I/O,
+timeout, cancellation, and child-reaping behavior without requiring host
+codecs.
 
 The poll-expiration portion of worker startup proves an immutable activation
 boundary plus one bounded reconciliation segment, not completion of the full

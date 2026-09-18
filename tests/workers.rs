@@ -7195,6 +7195,7 @@ async fn local_media_jobs_reconcile_create_and_delete_crash_boundaries()
     let bytes = fs::read("fixtures/worker-media/mastodon-v4.6.5/attachment.jpg")?;
     let prepared = prepare_media_attachment(ALICE, "local.jpg", "image/jpeg", &bytes)?;
     let create = MediaAttachmentCreate {
+        media_type: prepared.media_kind.database_type(),
         file_name: prepared.file_name.clone(),
         content_type: prepared.content_type.clone(),
         file_size: prepared.file_size,
@@ -11515,6 +11516,7 @@ async fn stale_authenticated_account_writes_are_rejected_after_deletion_request(
                 .stage_media_attachment(
                     &authenticated,
                     &MediaAttachmentCreate {
+                        media_type: 0,
                         file_name: "stale-upload.png".to_owned(),
                         content_type: "image/png".to_owned(),
                         file_size: 3,

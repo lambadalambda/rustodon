@@ -44,7 +44,7 @@ serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 sha1 = "0.10.7"
 sha2 = { version = "0.10.9", features = ["oid"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "chrono", "json", "ipnetwork", "derive"] }
-tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.47", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tower-http = { version = "0.6.11", features = ["fs"] }
 url = "2.5"
 unicode-normalization = "0.1"

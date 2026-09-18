@@ -13148,6 +13148,7 @@ async fn media_create(state: WebState, rack: RackParameters, headers: HeaderMap)
         Err(error) => return error_response(StatusCode::UNPROCESSABLE_ENTITY, error),
     };
     let create = MediaAttachmentCreate {
+        media_type: prepared.media_kind.database_type(),
         file_name: prepared.file_name.clone(),
         content_type: prepared.content_type.clone(),
         file_size: prepared.file_size,
@@ -13491,17 +13492,28 @@ fn remove_expected_media(root: &PaperclipRoot, metadata: &PaperclipMetadata) {
 }
 
 fn media_upload_error(error: crate::paperclip::MediaAttachmentError) -> Response<Body> {
-    let message = match error {
-        crate::paperclip::MediaAttachmentError::TooLarge => {
-            "File size of uploaded media is too large"
-        }
+    let (status, message) = match error {
+        crate::paperclip::MediaAttachmentError::TooLarge => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "File size of uploaded media is too large",
+        ),
+        crate::paperclip::MediaAttachmentError::ProcessingTimedOut => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Uploaded media took too long to process",
+        ),
+        crate::paperclip::MediaAttachmentError::ProcessingUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Media processing is temporarily unavailable",
+        ),
         crate::paperclip::MediaAttachmentError::UnsupportedContentType
         | crate::paperclip::MediaAttachmentError::InvalidImage
-        | crate::paperclip::MediaAttachmentError::SizeOverflow => {
-            "File type of uploaded media could not be verified"
-        }
+        | crate::paperclip::MediaAttachmentError::InvalidMedia
+        | crate::paperclip::MediaAttachmentError::SizeOverflow => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "File type of uploaded media could not be verified",
+        ),
     };
-    error_response(StatusCode::UNPROCESSABLE_ENTITY, message)
+    error_response(status, message)
 }
 
 fn media_write_error(error: &WriteError) -> Response<Body> {

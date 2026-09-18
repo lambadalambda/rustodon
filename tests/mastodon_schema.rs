@@ -4202,6 +4202,7 @@ async fn write_repository_creates_updates_and_deletes_unattached_image_media()
         .stage_media_attachment(
             &authenticated,
             &MediaAttachmentCreate {
+                media_type: 0,
                 file_name: "fixture-media.jpg".to_owned(),
                 content_type: "image/jpeg".to_owned(),
                 file_size: 123,
@@ -4233,6 +4234,7 @@ async fn write_repository_creates_updates_and_deletes_unattached_image_media()
         None
     );
     let create = MediaAttachmentCreate {
+        media_type: 0,
         file_name: "fixture-media.jpg".to_owned(),
         content_type: "image/jpeg".to_owned(),
         file_size: 123,

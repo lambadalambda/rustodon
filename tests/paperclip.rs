@@ -482,7 +482,10 @@ fn image_media_processing_builds_original_and_small_metadata() {
     assert_ne!(prepared.original_bytes, bytes);
     assert!(extension_is(&prepared.file_name, "jpg"));
     assert_eq!(prepared.file_name.len(), 20);
-    assert_eq!(prepared.small_file_name, prepared.file_name);
+    assert_eq!(
+        prepared.small_file_name.as_deref(),
+        Some(prepared.file_name.as_str())
+    );
     assert_eq!(prepared.content_type, "image/jpeg");
     assert_eq!(
         prepared.file_size,
@@ -531,7 +534,7 @@ fn prepared_remote_media_writes_under_the_cache_prefix() {
     assert!(paths.iter().all(|path| path.starts_with("cache/")));
     for (path, expected) in [
         (&paths[0], &prepared.original_bytes),
-        (&paths[1], &prepared.small_bytes),
+        (&paths[1], prepared.small_bytes.as_ref().unwrap()),
     ] {
         let mut file = root.open_file(Path::new(path)).expect("media is readable");
         let mut bytes = Vec::new();
