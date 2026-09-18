@@ -1,0 +1,254 @@
+#!/bin/sh
+
+set -eu
+
+PLATFORM='linux/amd64'
+POSTGRES_INDEX_IMAGE='docker.io/library/postgres@sha256:2f439458ab6a57a925825ae14f9d06910e4fe4a41c8d4a0ae06397e65b707e1b'
+POSTGRES_MANIFEST_DIGEST='sha256:525844ca03edbc43a4c5fb8ca09ddef2a82bd96a9b4f826542833b7183d44c60'
+POSTGRES_IMAGE="docker.io/library/postgres@$POSTGRES_MANIFEST_DIGEST"
+DATABASE_NAME='rustodon_standalone_bootstrap'
+CLUSTER_USER='rustodon_bootstrap_cluster_admin'
+CLUSTER_PASSWORD='standalone-cluster-test-password'
+DATABASE_USER='rustodon_bootstrap_installer'
+DATABASE_PASSWORD='standalone-installer-test-password'
+RUNTIME_ROLE='rustodon_standalone_runtime'
+RUNTIME_PASSWORD='standalone-runtime-test-password'
+WRITER_ROLE='rustodon_standalone_writer'
+WRITER_PASSWORD='standalone-writer-test-password'
+
+SCRIPT_DIR=$(CDPATH= cd -P -- "$(dirname -- "$0")" && pwd)
+ROOT=$(dirname "$SCRIPT_DIR")
+RUN_NONCE=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+[ "${#RUN_NONCE}" -eq 16 ] || { printf 'standalone-bootstrap-fixture: could not generate run nonce\n' >&2; exit 1; }
+RUN_ID="$$-$RUN_NONCE"
+NETWORK="rustodon-standalone-bootstrap-network-$RUN_ID"
+PG_CONTAINER="rustodon-standalone-bootstrap-postgres-$RUN_ID"
+PG_VOLUME="rustodon-standalone-bootstrap-postgres-$RUN_ID"
+RUN_ROOT="$ROOT/target/standalone-bootstrap-$RUN_ID"
+MEDIA_ROOT="$RUN_ROOT/media"
+MARKER="$RUN_ROOT/.rustodon-standalone-bootstrap-run"
+NETWORK_CLAIMED=false
+PG_CONTAINER_CLAIMED=false
+PG_VOLUME_CLAIMED=false
+
+fail() {
+  printf 'standalone-bootstrap-fixture: %s\n' "$*" >&2
+  exit 1
+}
+
+need_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
+}
+
+run_podman() {
+  timeout --signal=TERM --kill-after=10s 5m env -i \
+    PATH="$PATH" \
+    HOME="${HOME:-/tmp}" \
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+    podman "$@"
+}
+
+run_podman_short() {
+  timeout --signal=TERM --kill-after=5s 15s env -i \
+    PATH="$PATH" \
+    HOME="${HOME:-/tmp}" \
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+    podman "$@"
+}
+
+run_podman_cleanup() {
+  timeout --signal=TERM --kill-after=5s 20s env -i \
+    PATH="$PATH" \
+    HOME="${HOME:-/tmp}" \
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+    podman "$@"
+}
+
+resource_exists() {
+  resource_type=$1
+  resource_name=$2
+  if run_podman_short "$resource_type" exists "$resource_name" >/dev/null 2>&1; then
+    return 0
+  else
+    exists_status=$?
+  fi
+  [ "$exists_status" -eq 1 ] && return 1
+  fail "could not inspect $resource_type resource $resource_name"
+}
+
+remove_owned_resource() {
+  resource_type=$1
+  resource_name=$2
+  if ! resource_exists "$resource_type" "$resource_name"; then
+    return 0
+  fi
+  if ! resource_session=$(run_podman_cleanup "$resource_type" inspect "$resource_name" --format '{{ index .Labels "io.rustodon.fixture.session" }}' 2>/dev/null); then
+    printf 'standalone-bootstrap-fixture: could not inspect owned %s %s during cleanup\n' "$resource_type" "$resource_name" >&2
+    return 1
+  fi
+  if [ "$resource_session" != "$RUN_ID" ]; then
+    printf 'standalone-bootstrap-fixture: refusing to remove unowned %s %s\n' "$resource_type" "$resource_name" >&2
+    return 1
+  fi
+  case "$resource_type" in
+    container)
+      run_podman_cleanup rm -f --volumes "$resource_name" >/dev/null || return 1
+      ;;
+    volume)
+      run_podman_cleanup volume rm -f "$resource_name" >/dev/null || return 1
+      ;;
+    network)
+      run_podman_cleanup network rm "$resource_name" >/dev/null || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  if resource_exists "$resource_type" "$resource_name"; then
+    printf 'standalone-bootstrap-fixture: %s %s still exists after cleanup\n' "$resource_type" "$resource_name" >&2
+    return 1
+  fi
+}
+
+cleanup() {
+  status=$?
+  trap - EXIT HUP INT TERM
+  cleanup_failed=false
+
+  if [ "$PG_CONTAINER_CLAIMED" = true ] && ! remove_owned_resource container "$PG_CONTAINER"; then
+    cleanup_failed=true
+  fi
+  if [ "$PG_VOLUME_CLAIMED" = true ] && ! remove_owned_resource volume "$PG_VOLUME"; then
+    cleanup_failed=true
+  fi
+  if [ "$NETWORK_CLAIMED" = true ] && ! remove_owned_resource network "$NETWORK"; then
+    cleanup_failed=true
+  fi
+  if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "run=$RUN_ID" ]; then
+    rm -rf "$RUN_ROOT" || cleanup_failed=true
+  elif [ -e "$RUN_ROOT" ]; then
+    printf 'standalone-bootstrap-fixture: refusing to remove unmarked run root: %s\n' "$RUN_ROOT" >&2
+    cleanup_failed=true
+  fi
+
+  if [ "$cleanup_failed" = true ] && [ "$status" -eq 0 ]; then
+    status=1
+  fi
+  exit "$status"
+}
+
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+verify_postgres_image() {
+  if inspected=$(run_podman image inspect "$POSTGRES_IMAGE" --format '{{.Os}}/{{.Architecture}}|{{.Digest}}' 2>/dev/null); then
+    [ "$inspected" = "$PLATFORM|$POSTGRES_MANIFEST_DIGEST" ] ||
+      fail "cached PostgreSQL child mismatch: expected $PLATFORM|$POSTGRES_MANIFEST_DIGEST, got $inspected"
+    return
+  fi
+
+  manifest=$(run_podman manifest inspect "$POSTGRES_INDEX_IMAGE")
+  printf '%s\n' "$manifest" | grep -F "\"digest\": \"$POSTGRES_MANIFEST_DIGEST\"" >/dev/null 2>&1 ||
+    fail "PostgreSQL index does not contain pinned $PLATFORM child $POSTGRES_MANIFEST_DIGEST"
+  run_podman pull --quiet --platform "$PLATFORM" "$POSTGRES_IMAGE" >/dev/null
+  inspected=$(run_podman image inspect "$POSTGRES_IMAGE" --format '{{.Os}}/{{.Architecture}}|{{.Digest}}')
+  [ "$inspected" = "$PLATFORM|$POSTGRES_MANIFEST_DIGEST" ] ||
+    fail "pulled PostgreSQL child mismatch: expected $PLATFORM|$POSTGRES_MANIFEST_DIGEST, got $inspected"
+}
+
+need_command cargo
+need_command grep
+need_command od
+need_command podman
+need_command timeout
+need_command tr
+
+cd "$ROOT"
+
+# A stale selector must fail before any container or filesystem resource is created.
+listing=$(timeout --signal=TERM --kill-after=30s 10m env -i PATH="$PATH" HOME="${HOME:-/tmp}" CARGO_HOME="${CARGO_HOME:-${HOME:-/tmp}/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-${HOME:-/tmp}/.rustup}" RUSTUP_TOOLCHAIN='1.97.1' cargo test --locked --features test-support --test standalone_bootstrap standalone_bootstrap_installs_and_verifies_exact_baseline -- --ignored --list --exact) ||
+  fail 'standalone bootstrap test discovery failed'
+printf '%s\n' "$listing" | grep -Eq '^standalone_bootstrap_installs_and_verifies_exact_baseline: test$' ||
+  fail 'selected ignored standalone bootstrap test is missing'
+
+verify_postgres_image
+resource_exists container "$PG_CONTAINER" && fail "task container already exists: $PG_CONTAINER"
+resource_exists volume "$PG_VOLUME" && fail "task volume already exists: $PG_VOLUME"
+resource_exists network "$NETWORK" && fail "task network already exists: $NETWORK"
+[ ! -e "$RUN_ROOT" ] || fail "task run root already exists: $RUN_ROOT"
+mkdir -p "$MEDIA_ROOT"
+printf 'run=%s\n' "$RUN_ID" > "$MARKER"
+
+NETWORK_CLAIMED=true
+run_podman network create \
+  --label 'io.rustodon.fixture=standalone-bootstrap' \
+  --label "io.rustodon.fixture.session=$RUN_ID" \
+  "$NETWORK" >/dev/null
+PG_VOLUME_CLAIMED=true
+run_podman volume create \
+  --label 'io.rustodon.fixture=standalone-bootstrap' \
+  --label "io.rustodon.fixture.session=$RUN_ID" \
+  "$PG_VOLUME" >/dev/null
+PG_CONTAINER_CLAIMED=true
+run_podman run -d \
+  --platform "$PLATFORM" \
+  --name "$PG_CONTAINER" \
+  --label 'io.rustodon.fixture=standalone-bootstrap' \
+  --label "io.rustodon.fixture.session=$RUN_ID" \
+  --network "$NETWORK" \
+  --volume "$PG_VOLUME:/var/lib/postgresql/data" \
+  --publish 127.0.0.1::5432 \
+  --cpus 2 \
+  --memory 2g \
+  --pids-limit 512 \
+  --env "POSTGRES_DB=$DATABASE_NAME" \
+  --env "POSTGRES_USER=$CLUSTER_USER" \
+  --env "POSTGRES_PASSWORD=$CLUSTER_PASSWORD" \
+  "$POSTGRES_IMAGE" >/dev/null
+
+attempts=0
+consecutive_ready_checks=0
+while [ "$consecutive_ready_checks" -lt 2 ]; do
+  if run_podman_short exec "$PG_CONTAINER" psql \
+    --username "$CLUSTER_USER" --dbname "$DATABASE_NAME" \
+    --tuples-only --no-align --command 'SELECT 1' >/dev/null 2>&1
+  then
+    consecutive_ready_checks=$((consecutive_ready_checks + 1))
+  else
+    consecutive_ready_checks=0
+  fi
+  attempts=$((attempts + 1))
+  [ "$attempts" -lt 60 ] || fail 'PostgreSQL 14 container did not become ready'
+  sleep 1
+done
+
+run_podman_short exec -i "$PG_CONTAINER" psql \
+  --set ON_ERROR_STOP=1 --username "$CLUSTER_USER" --dbname "$DATABASE_NAME" >/dev/null <<SQL
+CREATE ROLE $DATABASE_USER LOGIN NOINHERIT PASSWORD '$DATABASE_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE $RUNTIME_ROLE LOGIN NOINHERIT PASSWORD '$RUNTIME_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE $WRITER_ROLE LOGIN NOINHERIT PASSWORD '$WRITER_PASSWORD'
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+ALTER DATABASE $DATABASE_NAME OWNER TO $DATABASE_USER;
+ALTER SCHEMA public OWNER TO $DATABASE_USER;
+SQL
+
+published_endpoint=$(run_podman_short port "$PG_CONTAINER" 5432/tcp)
+published_port=${published_endpoint##*:}
+case "$published_endpoint" in
+  127.0.0.1:*) ;;
+  *) fail "PostgreSQL was not published on loopback: $published_endpoint" ;;
+esac
+case "$published_port" in
+  ''|*[!0-9]*) fail "invalid published PostgreSQL port: $published_endpoint" ;;
+esac
+
+installer_url="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
+cluster_admin_url="postgresql://$CLUSTER_USER:$CLUSTER_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
+runtime_url="postgresql://$RUNTIME_ROLE:$RUNTIME_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
+writer_url="postgresql://$WRITER_ROLE:$WRITER_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
+
+timeout --signal=TERM --kill-after=30s 20m env -i PATH="$PATH" HOME="${HOME:-/tmp}" CARGO_HOME="${CARGO_HOME:-${HOME:-/tmp}/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-${HOME:-/tmp}/.rustup}" RUSTUP_TOOLCHAIN='1.97.1' RUSTODON_BOOTSTRAP_DATABASE_URL="$installer_url" RUSTODON_BOOTSTRAP_CLUSTER_ADMIN_DATABASE_URL="$cluster_admin_url" RUSTODON_BOOTSTRAP_RUNTIME_DATABASE_URL="$runtime_url" RUSTODON_BOOTSTRAP_WRITER_DATABASE_URL="$writer_url" RUSTODON_BOOTSTRAP_RUNTIME_ROLE="$RUNTIME_ROLE" RUSTODON_BOOTSTRAP_WRITER_ROLE="$WRITER_ROLE" RUSTODON_BOOTSTRAP_MEDIA_ROOT="$MEDIA_ROOT" cargo test --locked --features test-support --test standalone_bootstrap standalone_bootstrap_installs_and_verifies_exact_baseline -- --ignored --exact --nocapture --test-threads=1
+
+printf 'standalone PostgreSQL 14 bootstrap and HTTP smoke passed\n'

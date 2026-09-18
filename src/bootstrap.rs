@@ -564,7 +564,7 @@ async fn validate_database_envelope(
            AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_language WHERE oid >= 16384) \
            AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_foreign_data_wrapper WHERE oid >= 16384) \
            AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_foreign_server WHERE oid >= 16384) \
-           AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_user_mapping WHERE oid >= 16384) \
+           AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_user_mappings WHERE umid >= 16384) \
            AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_am WHERE oid >= 16384) \
            AND NOT EXISTS ( \
              SELECT 1 FROM pg_catalog.pg_trigger trigger \

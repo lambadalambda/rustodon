@@ -73,6 +73,10 @@ run = "tools/mastodon-fixture schema-read-test"
 description = "Create and verify the isolated Rustodon operational schema"
 run = "tools/mastodon-fixture operational-schema-test"
 
+[tasks.standalone-bootstrap-integration]
+description = "Bootstrap and smoke-test an empty standalone PostgreSQL 14 instance"
+run = "tools/standalone-bootstrap-fixture"
+
 [tasks.worker-integration]
 description = "Exercise durable jobs, scheduler readiness, and worker shutdown"
 run = "tools/mastodon-fixture worker-test"
