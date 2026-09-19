@@ -9300,6 +9300,57 @@ async fn announcements(State(state): State<WebState>, headers: HeaderMap) -> Res
     }
 }
 
+// SearchService's URL branch is exclusive and independent of text filters.
+fn status_search_url<'a>(
+    query: &'a str,
+    resolve: bool,
+    kind: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Option<&'a str> {
+    let kind = kind.filter(|value| !value.trim().is_empty());
+    let query = query.trim();
+    if !resolve || limit == 0 || kind.is_some_and(|kind| kind != "statuses" || offset > 0) {
+        return None;
+    }
+    let url = Url::parse(query).ok()?;
+    (matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none())
+    .then_some(query)
+}
+
+async fn search_known_status(
+    state: &WebState,
+    viewer: i64,
+    url: &str,
+) -> Result<Vec<crate::mastodon::rest::RestStatus>, ()> {
+    let id = state
+        .repository
+        .known_search_status_id(url, state.origin.as_str(), viewer)
+        .await
+        .map_err(|_| ())?;
+    let Some(id) = id else {
+        return Ok(Vec::new());
+    };
+    let status = state
+        .loader(Some(viewer))
+        .authorized_status(id)
+        .await
+        .map_err(|_| ())?;
+    status
+        .iter()
+        .map(|status| {
+            state
+                .serializer()
+                .status(status, StatusShape::Full)
+                .map_err(|_| ())
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_lines)]
 async fn search_v2(
     State(state): State<WebState>,
     Extension(metadata): Extension<RequestMetadata>,
@@ -9319,10 +9370,12 @@ async fn search_v2(
     let Ok(search_type) = oauth_scalar(&rack, "type") else {
         return error_response(StatusCode::BAD_REQUEST, "type is invalid");
     };
-    if owner.is_none() && rack.get("offset").is_some() {
+    let search_type = search_type.filter(|value| !value.trim().is_empty());
+    let resolve = boolean_parameter(&rack, "resolve");
+    if owner.is_none() && (resolve || rack.get("offset").is_some()) {
         return error_response(
             StatusCode::UNAUTHORIZED,
-            "Search queries pagination is not supported without authentication",
+            "Search resolution and pagination require authentication",
         );
     }
     let Ok(limit) = nonnegative_search_parameter(&rack, "limit", 20, Some(40)) else {
@@ -9336,6 +9389,27 @@ async fn search_v2(
     } else {
         0
     };
+    // No remote status resolution in this slice. A URL search must never fall
+    // through to account/hashtag text results, even when it misses or is hidden.
+    if resolve && (query.trim().starts_with("https://") || query.trim().starts_with("http://")) {
+        let mut statuses = Vec::new();
+        if let (Some(viewer), Some(url)) = (
+            owner,
+            status_search_url(query, resolve, search_type, limit, offset),
+        ) {
+            statuses = match search_known_status(&state, viewer, url).await {
+                Ok(statuses) => statuses,
+                Err(()) => return internal_error(),
+            };
+        }
+        return json_response(
+            StatusCode::OK,
+            serde_json::to_vec(&serde_json::json!({
+                "accounts": [], "statuses": statuses, "hashtags": [], "collections": [],
+            }))
+            .expect("search response is serializable"),
+        );
+    }
     let accounts = if search_type.is_none_or(|value| value == "accounts") && limit > 0 {
         match search_accounts(
             &state,

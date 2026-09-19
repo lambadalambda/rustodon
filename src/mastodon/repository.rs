@@ -1016,6 +1016,54 @@ impl Repository {
         .await
     }
 
+    /// Read-only exact URL lookup. Audience authorization remains in the loader;
+    /// search additionally suppresses viewer blocks, mutes and domain blocks.
+    pub(crate) async fn known_search_status_id(
+        &self,
+        url: &str,
+        origin: &str,
+        viewer: i64,
+    ) -> sqlx::Result<Option<i64>> {
+        let local_id = url
+            .strip_prefix(origin)
+            .and_then(|path| path.rsplit('/').next())
+            .and_then(|id| id.parse::<i64>().ok());
+        // Select identity before authorization. A denied authoritative status is
+        // not permission to fall back to an unrelated row claiming its URL.
+        // Display URLs are not unique: ambiguous best-tier matches fail closed.
+        let id: Option<i64> = sqlx::query_scalar(
+            "WITH candidates AS ( \
+               SELECT status.id, 0 AS priority FROM statuses status \
+               JOIN accounts author ON author.id = status.account_id \
+               WHERE status.id = $2 AND (status.local = true OR status.uri IS NULL) \
+                 AND author.domain IS NULL AND ($1 = $3 || '@' || author.username || '/' || status.id::text \
+                   OR $1 = $3 || 'users/' || author.username || '/statuses/' || status.id::text \
+                   OR $1 = $3 || 'ap/users/' || author.id::text || '/statuses/' || status.id::text) \
+               UNION ALL SELECT id, 1 FROM statuses WHERE uri = $1 \
+               UNION ALL SELECT id, 2 FROM statuses WHERE url = $1 \
+             ) SELECT CASE WHEN count(*) = 1 THEN min(id) END FROM candidates \
+               WHERE priority = (SELECT min(priority) FROM candidates)",
+        )
+        .bind(url)
+        .bind(local_id)
+        .bind(origin)
+        .fetch_one(&self.pool)
+        .await?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        Ok(self
+            .rest_status_policy_rows(&[id], Some(viewer))
+            .await?
+            .into_iter()
+            .find(|row| {
+                !row.viewer_blocks_author
+                    && !row.viewer_mutes_author
+                    && !row.viewer_domain_blocks_author
+            })
+            .map(|row| row.id))
+    }
+
     pub(crate) async fn rest_authorized_status_ids(
         &self,
         ids: &[i64],

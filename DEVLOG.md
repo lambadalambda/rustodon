@@ -1,3 +1,136 @@
+## 2026-09-19 — Exact status URL identity collision review fix
+
+- Resumed after unlock; first NAS access succeeded. Loaded nas-podman and
+  repo-issues skills. Parent independent review `6a18159b` identified a high:
+  OR + lowest-ID selection let foreign display URLs impersonate authoritative
+  local aliases/canonical URIs, or suppress genuine matches when hidden.
+- Bounded fix only in repository lookup: a CTE ranks validated local aliases
+  before exact canonical URI before display URL. It selects only a unique
+  best-tier identity, then performs existing search suppression/normal audience
+  projection. Denied authoritative rows cannot trigger lower-tier fallback.
+  Ambiguous display-only matches fail closed before access filtering. No schema,
+  ingestion, resolver, authentication architecture, or privilege changes.
+- TDD persisted RED before repository edit (`collision-red.log`): exact
+  `web::account_search_tests::v2_known_status_urls_use_authorized_projection`
+  failed with older foreign IDs, hidden colliding rows suppressing genuine
+  targets, denied authoritative targets returning foreign content, local alias
+  versus foreign canonical URI, and ambiguous display URL substitution.
+  Command: `cargo test --locked --offline --features test-support --lib web::account_search_tests::v2_known_status_urls_use_authorized_projection -- --ignored --exact --nocapture --test-threads=1`.
+- Final GREEN (`collision-final.log`), fresh disposable PG14 restore:
+  `cargo test --locked --offline --features test-support --lib web::account_search_tests:: -- --include-ignored --nocapture --test-threads=1`
+  **3 passed**, 0 failed, 368 filtered, 19.42s. Same named pure/account/status
+  tests as prior evidence; status test now includes collision matrix. Existing
+  fixture setup uses owner credentials, HTTP uses actual restricted runtime
+  credentials, and SQLSTATE 42501 status-update denial remains asserted.
+  No claim that a separate restricted writer mutation gate ran.
+- `cargo clippy --locked --offline --features test-support --lib -- -D warnings`
+  passed (`collision-clippy-final.log`).
+  `cargo test --locked --offline --features test-support --lib web::tests:: -- --test-threads=1`
+  passed **91**, ignored **2** (`collision-web-unit.log`); subsequent edit only
+  replaced a redundant closure in the status test, then reran the focused gate.
+  `cargo fmt --all --check` and `git diff --check` passed.
+- Broader `cargo clippy --locked --offline --features test-support --lib --tests -- -D warnings`
+  still fails on existing unrelated warnings in tests/media_processor.rs,
+  tests/mastodon_schema.rs, src/paperclip.rs and src/worker/local_uploads/tests.rs
+  (`collision-clippy-tests-final.log`). Fixed our earlier redundant closure;
+  no diagnostics remain in the changed search files. Did not expand this fix.
+- Verified SHA-256 main checkout vs final NAS source with `shasum -a 256 -c`:
+  src/web.rs: 5a0175cf5b5bbf081bc088d3eb3057ca0dd2281a9b6de82898f202b9b31dd8e1
+  src/mastodon/repository.rs: 2ff01ef497d8dc8d58811977a6488f34cf96a73c53157557d9d7c1e5dc0216c2
+  src/web/account_search_tests.rs: 862d8a774fd38b33282cad83d7dfa12041a5a3916c6ef410c6355f1867e2f638
+  Only explicit changed source files were synchronized. No production data,
+  credentials, .git or build output was copied into the test workspace.
+- Resource lifecycle: inspected timed-out `status-search-pg-alice`, removed it
+  with its verified anonymous volume
+  `9f38bf4b3abedf06b2ee337fdf91b26c477904b407aca837d6493845d85ca0da`.
+  Recreated only this PG container on existing task `status-search-alice`
+  network, database `uploads`, pinned PG14 image and same bounds (1 CPU,
+  512 MiB, 128 PIDs, 5400s, no host ports; disposable fsync/synchronous_commit off).
+  Tools retained 4 CPU/6 GiB/512 PIDs/870s +900s outer/15s kill bounds and image
+  7203e0222e2bb72e0b83ab623051873604874cc41a688e318b84691bfa77ad8a.
+- Cleanup completed after final tests: inspected actual mounts and network
+  membership, stopped/removed `status-search-pg-alice` with new anonymous volume
+  `0f9fa57d804d4c0f730ca91803e3f9f9f66a5c903217572b6b00927ef0ef0150`, then
+  removed `status-search-alice`. Verified both recorded volumes, PG container,
+  auto-removed `status-search-test-alice` runner and network absent. Evidence:
+  `collision-cleanup.txt`, before-cleanup inspect JSONs. No broad pruning.
+- Retained NAS workspace `/srv/workspaces/rustodon-status-search-f93b6ef-alice/`
+  with source/, evidence/, run.sh and reset.sh. Collected all existing/new logs
+  and scripts to ignored local `target/status-search-evidence/nas/`.
+  Shared `/srv/workspaces/rustodon-null-route-20260918/{cargo-home,source/target}`
+  caches were reused but never removed. This supersedes prior SSH/cleanup gaps.
+- Leave all changes uncommitted and both issues open for parent review 2.
+  Uncached resolution/browser/full matrix remain deferred; no push/deployment.
+
+## 2026-09-18 — Known exact status URL search (f93b6ef, uncommitted)
+
+- Created/indexed `meta/issues/search-known-exact-status-urls.md` before source edits.
+  Parent remains open; uncached resolution, browser regression, Elasticsearch,
+  new schema/protocol/jobs/privileges and full fixture matrix are excluded.
+- Verified actual reference checkout root using
+  `git -C target/mastodon-v4.6.5 rev-parse --show-toplevel HEAD`:
+  `/Users/lainsoykaf/repos/rustodon/target/mastodon-v4.6.5`, revision
+  `1440d55b139e39ec722c2a3db7f60b66cd889048`; `status --porcelain` empty.
+  Inspected `app/services/search_service.rb` directly, without modifying it.
+- URL branch requires resolve=true and authenticated read/read:search user,
+  is exclusive, accepts absent/blank/statuses type, returns none at limit=0,
+  suppresses positive offset for specified type but ignores it for blank type.
+  Text account_id/min_id/max_id/following filters do not apply to URL lookup,
+  as in the reference. Anonymous resolve/pagination now returns 401, including
+  account resolution; existing account tests updated for this explicit contract.
+- Read-only repository lookup accepts exact stored uri/url or configured-origin
+  local permalink/username/numeric AP object paths, checks username/account ID,
+  and handles nullable local flags consistently with the normal projection.
+  Existing StatusAccess/authorized_status remains the audience/deleted/suspended
+  authority. Additional viewer block/mute/account-domain-block suppression is an
+  intentional safer search policy, not a claim of bug-for-bug context silencing.
+  No remote request or status creation path was added.
+- TDD: NAS pure contract RED failed for the missing helper; GREEN passed.
+  Persisted baseline-handler replay (new pure helper retained for compilation)
+  failed as expected: empty statuses versus an ordinary visible status projection.
+  Baseline replay log: `baseline-http-red.log`. The persisted test was added
+  after initial implementation, so this behavioral replay is retrospective RED.
+- Final NAS command (log `http-verified.log`):
+  `cargo test --locked --offline --features test-support --lib web::account_search_tests:: -- --include-ignored --nocapture --test-threads=1`
+  **3 passed**, 0 failed, 368 filtered; test execution 19.56s. Named tests:
+  `known_status_url_branch_contract`,
+  `v2_accounts_reuse_search_and_authenticated_resolution`,
+  `v2_known_status_urls_use_authorized_projection`.
+  Covers local permalink/AP aliases, persisted remote uri/url, rich fixture
+  media/poll/quote projections compared with ordinary GET, wrong origin/author,
+  unknown URLs, deleted/suspended, private/direct denial and mention membership,
+  blocks/mutes/domain blocks, type/offset/limit, URL-filter independence,
+  anonymous/application/scope rejection and existing account resolution behavior.
+  HTTP status lookup has no configured writer; runtime UPDATE denial asserts
+  SQLSTATE 42501. Owner connection is used only for disposable fixture setup.
+- `cargo clippy --locked --offline --features test-support --lib -- -D warnings`
+  passed (`clippy-verified.log`). Earlier `--lib --tests` exposed unrelated
+  existing warnings in `paperclip.rs` (needless_pass_by_value) and
+  `worker/local_uploads/tests.rs` (items_after_statements); not fixed here.
+  Local cargo tests blocked by rustc 1.97.0 versus required 1.97.1; NAS used the
+  pinned Linux tool image instead. Local formatting and diff whitespace checked.
+- Disposable NAS workspace `/srv/workspaces/rustodon-status-search-f93b6ef-alice`;
+  source sync was tracked files only plus exact edited source, not environments,
+  credentials, .git or output. Tools image
+  `7203e0222e2bb72e0b83ab623051873604874cc41a688e318b84691bfa77ad8a`,
+  sequential 4 CPU/6 GiB/512 PIDs/870s container +900s outer/15s kill,
+  read-only source/root, dropped caps, task tmpfs and reused dependency/build
+  caches. Task PG14 image
+  `1a6c2409ab71f4d054d676ba09d9b74b5d843d805bd5a0cf08314d27ca659d37`,
+  1 CPU/512 MiB/128 PIDs/5400s; internal network, no host ports, disposable DB
+  with fsync/synchronous_commit disabled. Fresh restores between fixture runs.
+  Runtime grants reuse bootstrap contract and revoke PUBLIC DB/schema/function
+  privileges; an initial harness writer-grant mismatch was corrected, without
+  changing production schema/grants. Logs/scripts remain in remote evidence/;
+  local runner/reset/baseline replay source in ignored target/status-search-evidence/.
+- Gaps: independent task review rejected by nesting limit (1/1), twice including
+  explicit read-only review attempt. No independent review claim. SSH agent
+  locked after final successful focused gates, preventing extra web-unit/test
+  Clippy invocation, log collection and task cleanup. Asked user to unlock; no
+  workaround attempted. Task PG container `status-search-pg-alice` is time-bound
+  but container/volume and network `status-search-alice` still need task-only
+  cleanup after unlock. No production touched, no commits, issues remain open.
+
 ## 2026-09-18 — reviewed rich-media closure reconciliation
 
 - Archived remote policy/transport, worker, representations and browser slices,

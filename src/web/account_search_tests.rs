@@ -304,8 +304,10 @@ async fn v2_accounts_reuse_search_and_authenticated_resolution() -> TestResult {
     assert_eq!(remote_rows(writer.pool()).await?, 0);
     // A configured writer and live counter mock make accidental anonymous resolution observable.
     for token in [None, Some(APP_TOKEN), Some("unknown-search-token")] {
-        let body = results(&client, &base, &remote_query, token).await?;
-        assert_eq!(body["accounts"], json!([]));
+        assert_eq!(
+            search(&client, &base, true, &remote_query, token).await?.0,
+            401
+        );
     }
     for suffix in [
         "&type=hashtags",
@@ -358,7 +360,12 @@ async fn v2_accounts_reuse_search_and_authenticated_resolution() -> TestResult {
         "missing"
     );
     for token in [None, Some(SEARCH_TOKEN)] {
-        let cached = results(&client, &base, &remote_query, token).await?;
+        let cached_query = if token.is_none() {
+            remote_query.replace("&resolve=true", "")
+        } else {
+            remote_query.clone()
+        };
+        let cached = results(&client, &base, &cached_query, token).await?;
         assert_eq!(
             cached["accounts"],
             expected_accounts_for_viewer(&resolved["accounts"], token.is_some())
@@ -371,5 +378,420 @@ async fn v2_accounts_reuse_search_and_authenticated_resolution() -> TestResult {
     );
     server.abort();
     mock_server.abort();
+    Ok(())
+}
+
+#[test]
+fn known_status_url_branch_contract() {
+    for kind in [None, Some(""), Some("statuses")] {
+        assert_eq!(
+            status_search_url(" https://example.test/s/1 ", true, kind, 1, 0),
+            Some("https://example.test/s/1")
+        );
+    }
+    for (resolve, kind, limit, offset) in [
+        (false, None, 1, 0),
+        (true, Some("accounts"), 1, 0),
+        (true, Some("hashtags"), 1, 0),
+        (true, Some("unknown"), 1, 0),
+        (true, None, 0, 0),
+        (true, Some("statuses"), 1, 1),
+    ] {
+        assert_eq!(
+            status_search_url("https://example.test/s/1", resolve, kind, limit, offset),
+            None
+        );
+    }
+    assert!(status_search_url("https://example.test/s/1", true, None, 1, 99).is_some());
+    assert!(status_search_url("https://example.test/s/1", true, Some(""), 1, 99).is_some());
+    for query in [
+        "alice",
+        "ftp://example.test/s/1",
+        "https://",
+        "https://user:pass@example.test/s/1",
+    ] {
+        assert_eq!(status_search_url(query, true, None, 1, 0), None);
+    }
+}
+
+// Separate status assertions: account-only `results` deliberately requires an empty status array.
+async fn status_results(
+    client: &reqwest::Client,
+    base: &str,
+    url: &str,
+    suffix: &str,
+) -> TestResult<Value> {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("q", url)
+        .finish();
+    let (code, body) = search(
+        client,
+        base,
+        true,
+        &format!("{query}&resolve=true{suffix}"),
+        Some(SEARCH_TOKEN),
+    )
+    .await?;
+    assert_eq!(code, 200, "{body}");
+    for field in ["accounts", "hashtags", "collections"] {
+        assert_eq!(body[field], json!([]), "{body}");
+    }
+    Ok(body["statuses"].clone())
+}
+
+#[tokio::test]
+#[ignore = "requires tools/mastodon-fixture schema-read-test v2_account_search"]
+#[allow(clippy::too_many_lines)]
+async fn v2_known_status_urls_use_authorized_projection() -> TestResult {
+    let owner_url = std::env::var("RUSTODON_MASTODON_OWNER_DATABASE_URL")?;
+    let writer = WriteRepository::connect(&owner_url).await?;
+    let repository = Repository::connect(&std::env::var("RUSTODON_MASTODON_DATABASE_URL")?).await?;
+    // The HTTP application's repository must really be the restricted read role.
+    let runtime_pool = PgPool::connect(&std::env::var("RUSTODON_MASTODON_DATABASE_URL")?).await?;
+    let denied = sqlx::query("UPDATE statuses SET text=text WHERE false")
+        .execute(&runtime_pool)
+        .await
+        .expect_err("runtime cannot write statuses");
+    assert_eq!(
+        denied
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("42501")
+    );
+    let viewer: i64 =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE username = 'alice' AND domain IS NULL")
+            .fetch_one(writer.pool())
+            .await?;
+    let remote: i64 = sqlx::query_scalar(
+        "SELECT id FROM accounts WHERE username = 'bob' AND domain = 'remote.fixture.invalid'",
+    )
+    .fetch_one(writer.pool())
+    .await?;
+    for (token, scopes) in [
+        (SEARCH_TOKEN, "read:search"),
+        (ACCOUNTS_TOKEN, "read:accounts"),
+    ] {
+        sqlx::query("INSERT INTO oauth_access_tokens (token, scopes, resource_owner_id, application_id, created_at) SELECT $1, $2, resource_owner_id, application_id, clock_timestamp() FROM oauth_access_tokens WHERE token = $3 ON CONFLICT (token) DO NOTHING")
+            .bind(token).bind(scopes).bind(TOKEN).execute(writer.pool()).await?;
+    }
+    sqlx::query("DELETE FROM mutes WHERE account_id = $1 AND target_account_id = $2")
+        .bind(viewer)
+        .bind(remote)
+        .execute(writer.pool())
+        .await?;
+    for (id, author, local, uri, url) in [
+        (990_001_i64, viewer, true, None, None),
+        (
+            990_002,
+            remote,
+            false,
+            Some("https://remote.fixture.invalid/objects/search-known"),
+            Some("https://remote.fixture.invalid/@bob/search-known"),
+        ),
+    ] {
+        sqlx::query("INSERT INTO statuses (id, account_id, local, uri, url, text, visibility, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,'known URL search fixture',0,clock_timestamp(),clock_timestamp())")
+            .bind(id).bind(author).bind(local).bind(uri).bind(url).execute(writer.pool()).await?;
+    }
+    let state = WebState::new(
+        repository,
+        Url::parse(&format!("https://{DOMAIN}/"))?,
+        DOMAIN,
+        "/system",
+        std::env::temp_dir(),
+        runtime(),
+        Vec::new(),
+        vec![DOMAIN.to_owned()],
+    )?;
+    // Deliberately no writer/resolver configured; lookup is read-only.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move { axum::serve(listener, router(state)).await });
+    let client = reqwest::Client::new();
+    let local = format!("https://{DOMAIN}/@alice/990001");
+    let remote_url = "https://remote.fixture.invalid/objects/search-known";
+    for (url, id) in [
+        // Existing rich media, nullable-local unlisted, poll, and quote fixtures.
+        (
+            format!("https://{DOMAIN}/@alice/116844842188805001"),
+            "116844842188805001",
+        ),
+        (
+            format!("https://{DOMAIN}/@alice/116844846120965002"),
+            "116844846120965002",
+        ),
+        (
+            "https://remote.fixture.invalid/users/bob/statuses/111680579174405102".to_owned(),
+            "111680579174405102",
+        ),
+        (
+            "https://remote.fixture.invalid/users/bob/statuses/116845317980165202".to_owned(),
+            "116845317980165202",
+        ),
+        (local.clone(), "990001"),
+        (
+            format!("https://{DOMAIN}/users/alice/statuses/990001"),
+            "990001",
+        ),
+        (
+            format!("https://{DOMAIN}/ap/users/{viewer}/statuses/990001"),
+            "990001",
+        ),
+        (remote_url.to_owned(), "990002"),
+        (
+            "https://remote.fixture.invalid/@bob/search-known".to_owned(),
+            "990002",
+        ),
+    ] {
+        let ordinary: Value = serde_json::from_str(
+            &client
+                .get(format!("{base}/api/v1/statuses/{id}"))
+                .header("host", DOMAIN)
+                .bearer_auth(TOKEN)
+                .send()
+                .await?
+                .text()
+                .await?,
+        )?;
+        for suffix in [
+            "",
+            "&type=",
+            "&type=statuses",
+            "&offset=99",
+            "&type=&offset=99",
+            "&type=statuses&account_id=1&min_id=999999999&max_id=1&following=true",
+        ] {
+            let statuses = status_results(&client, &base, &url, suffix).await?;
+            assert_eq!(statuses, json!([ordinary]), "{url} {suffix}");
+            assert_eq!(statuses[0]["id"], id);
+        }
+        for suffix in [
+            "&limit=0",
+            "&type=statuses&offset=1",
+            "&type=accounts",
+            "&type=hashtags",
+            "&type=unknown",
+        ] {
+            assert_eq!(
+                status_results(&client, &base, &url, suffix).await?,
+                json!([])
+            );
+        }
+    }
+    for url in [
+        format!("http://{DOMAIN}/@alice/990001"),
+        format!("https://{DOMAIN}/@bob/990001"),
+        "https://evil.invalid/@alice/990001".to_owned(),
+        format!("{local}?extra=1"),
+        "https://remote.fixture.invalid/objects/unknown".to_owned(),
+    ] {
+        assert_eq!(status_results(&client, &base, &url, "").await?, json!([]));
+    }
+    for (query, token, expected) in [
+        (format!("q={local}&resolve=true"), None, 401),
+        (format!("q={local}&resolve=true"), Some(APP_TOKEN), 401),
+        (format!("q={local}&resolve=true"), Some(ACCOUNTS_TOKEN), 403),
+        (format!("q={local}&offset=0"), None, 401),
+        (format!("q={local}&resolve=false"), None, 200),
+        (format!("q={local}&resolve=false"), Some(SEARCH_TOKEN), 200),
+    ] {
+        let (code, body) = search(&client, &base, true, &query, token).await?;
+        assert_eq!(code, expected, "{body}");
+        if code == 200 {
+            assert_eq!(body["statuses"], json!([]));
+        }
+    }
+    assert_status_url_collisions(&client, &base, writer.pool(), viewer, remote).await?;
+    for (table, extra) in [("blocks", ""), ("mutes", ", hide_notifications")] {
+        let values = if extra.is_empty() { "" } else { ", true" };
+        sqlx::query(&format!("INSERT INTO {table} (account_id,target_account_id,created_at,updated_at{extra}) VALUES ($1,$2,clock_timestamp(),clock_timestamp(){values})"))
+            .bind(viewer).bind(remote).execute(writer.pool()).await?;
+        assert_eq!(
+            status_results(&client, &base, remote_url, "").await?,
+            json!([]),
+            "{table}"
+        );
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE account_id=$1 AND target_account_id=$2"
+        ))
+        .bind(viewer)
+        .bind(remote)
+        .execute(writer.pool())
+        .await?;
+    }
+    sqlx::query("INSERT INTO account_domain_blocks (account_id,domain,created_at,updated_at) VALUES ($1,'remote.fixture.invalid',clock_timestamp(),clock_timestamp())").bind(viewer).execute(writer.pool()).await?;
+    assert_eq!(
+        status_results(&client, &base, remote_url, "").await?,
+        json!([])
+    );
+    sqlx::query(
+        "DELETE FROM account_domain_blocks WHERE account_id=$1 AND domain='remote.fixture.invalid'",
+    )
+    .bind(viewer)
+    .execute(writer.pool())
+    .await?;
+    sqlx::query("UPDATE accounts SET suspended_at=clock_timestamp() WHERE id=$1")
+        .bind(remote)
+        .execute(writer.pool())
+        .await?;
+    assert_eq!(
+        status_results(&client, &base, remote_url, "").await?,
+        json!([])
+    );
+    sqlx::query("UPDATE accounts SET suspended_at=NULL WHERE id=$1")
+        .bind(remote)
+        .execute(writer.pool())
+        .await?;
+    sqlx::query("DELETE FROM follows WHERE account_id=$1 AND target_account_id=$2")
+        .bind(viewer)
+        .bind(remote)
+        .execute(writer.pool())
+        .await?;
+    for visibility in [2, 3] {
+        sqlx::query("UPDATE statuses SET visibility=$1 WHERE id=990002")
+            .bind(visibility)
+            .execute(writer.pool())
+            .await?;
+        assert_eq!(
+            status_results(&client, &base, remote_url, "").await?,
+            json!([])
+        );
+        sqlx::query("INSERT INTO mentions (account_id,status_id,created_at,updated_at) VALUES ($1,990002,clock_timestamp(),clock_timestamp())").bind(viewer).execute(writer.pool()).await?;
+        assert_eq!(
+            status_results(&client, &base, remote_url, "").await?[0]["id"],
+            "990002"
+        );
+        sqlx::query("DELETE FROM mentions WHERE status_id=990002")
+            .execute(writer.pool())
+            .await?;
+    }
+    sqlx::query("UPDATE statuses SET visibility=0,deleted_at=clock_timestamp() WHERE id=990002")
+        .execute(writer.pool())
+        .await?;
+    assert_eq!(
+        status_results(&client, &base, remote_url, "").await?,
+        json!([])
+    );
+    server.abort();
+    Ok(())
+}
+
+// Identity selection precedes all access filtering: a hidden authoritative row
+// cannot turn a less authoritative display-URL collision into the search result.
+#[allow(clippy::too_many_lines)]
+async fn assert_status_url_collisions(
+    client: &reqwest::Client,
+    base: &str,
+    pool: &PgPool,
+    viewer: i64,
+    remote: i64,
+) -> TestResult {
+    sqlx::query("INSERT INTO statuses (id,account_id,local,uri,url,text,visibility,created_at,updated_at) VALUES (980001,$1,false,'https://foreign.fixture.invalid/collision/1',NULL,'foreign collision',0,clock_timestamp(),clock_timestamp())")
+        .bind(remote).execute(pool).await?;
+    let mut checks = Vec::new();
+    for (url, target) in [
+        (format!("https://{DOMAIN}/@alice/990001"), 990_001_i64),
+        (
+            format!("https://{DOMAIN}/users/alice/statuses/990001"),
+            990_001,
+        ),
+        (
+            format!("https://{DOMAIN}/ap/users/{viewer}/statuses/990001"),
+            990_001,
+        ),
+        (
+            "https://remote.fixture.invalid/objects/search-known".to_owned(),
+            990_002,
+        ),
+    ] {
+        sqlx::query("UPDATE statuses SET url=$1 WHERE id=980001")
+            .bind(&url)
+            .execute(pool)
+            .await?;
+        let expected = json!([target.to_string()]);
+        let ids = |statuses: Value| -> Value {
+            statuses
+                .as_array()
+                .expect("statuses array")
+                .iter()
+                .map(|status| status["id"].clone())
+                .collect()
+        };
+        checks.push((
+            format!("authoritative target wins: {url}"),
+            ids(status_results(client, base, &url, "").await?),
+            expected.clone(),
+        ));
+        sqlx::query("UPDATE statuses SET deleted_at=clock_timestamp() WHERE id=980001")
+            .execute(pool)
+            .await?;
+        checks.push((
+            format!("denied collision cannot hide target: {url}"),
+            ids(status_results(client, base, &url, "").await?),
+            expected,
+        ));
+        sqlx::query("UPDATE statuses SET deleted_at=NULL WHERE id=980001")
+            .execute(pool)
+            .await?;
+        sqlx::query("UPDATE statuses SET deleted_at=clock_timestamp() WHERE id=$1")
+            .bind(target)
+            .execute(pool)
+            .await?;
+        checks.push((
+            format!("denied authoritative target has no fallback: {url}"),
+            ids(status_results(client, base, &url, "").await?),
+            json!([]),
+        ));
+        sqlx::query("UPDATE statuses SET deleted_at=NULL WHERE id=$1")
+            .bind(target)
+            .execute(pool)
+            .await?;
+    }
+    // The configured-origin alias is more authoritative even than foreign uri.
+    let local = format!("https://{DOMAIN}/@alice/990001");
+    sqlx::query("UPDATE statuses SET uri=$1,url=NULL WHERE id=980001")
+        .bind(&local)
+        .execute(pool)
+        .await?;
+    let statuses = status_results(client, base, &local, "").await?;
+    checks.push((
+        "local alias precedes foreign canonical URI".to_owned(),
+        statuses[0]["id"].clone(),
+        json!("990001"),
+    ));
+    sqlx::query("UPDATE statuses SET uri='https://foreign.fixture.invalid/collision/1',url='https://foreign.fixture.invalid/shared-display' WHERE id=980001").execute(pool).await?;
+    sqlx::query("INSERT INTO statuses (id,account_id,local,uri,url,text,visibility,created_at,updated_at) VALUES (980002,$1,false,'https://foreign.fixture.invalid/collision/2','https://foreign.fixture.invalid/shared-display','second foreign collision',0,clock_timestamp(),clock_timestamp())")
+        .bind(remote).execute(pool).await?;
+    for hidden in [false, true] {
+        if hidden {
+            sqlx::query("UPDATE statuses SET deleted_at=clock_timestamp() WHERE id=980001")
+                .execute(pool)
+                .await?;
+        }
+        checks.push((
+            format!("ambiguous display URL fails closed, hidden={hidden}"),
+            status_results(
+                client,
+                base,
+                "https://foreign.fixture.invalid/shared-display",
+                "",
+            )
+            .await?,
+            json!([]),
+        ));
+    }
+    sqlx::query("DELETE FROM statuses WHERE id IN (980001,980002)")
+        .execute(pool)
+        .await?;
+    // Collect every mismatch so the red run proves each collision case, rather
+    // than aborting at the first substituted ID.
+    let failures: Vec<_> = checks
+        .into_iter()
+        .filter(|(_, actual, expected)| actual != expected)
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "status URL identity collisions: {failures:?}"
+    );
     Ok(())
 }

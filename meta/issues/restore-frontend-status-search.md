@@ -24,3 +24,10 @@ Rustodon's v2 search response always contains an empty `statuses` array. Signed-
 - Rustodon's v2 search handler unconditionally serializes `"statuses": []` in `src/web.rs`.
 - Live search of an ActivityPub object URL on `rustodon.social` returned HTTP 200 with no status result, consistent with the source path.
 - This is separate from the existing v2 account-search issue, which covers the `accounts` branch.
+
+## Bounded slices
+
+- [Known exact persisted status URLs](search-known-exact-status-urls.md): implementation and focused NAS tests complete; independent review pending. No remote fetching or Elasticsearch.
+- URL-branch clarification from pinned `SearchService`: `account_id`, `min_id`, `max_id`, and `following` filter textual searches, not exact URL resolution. The URL branch is exclusive and ignores those filters. This refines the account-filter requirement above rather than imposing contradictory URL semantics.
+- Search intentionally suppresses viewer-blocked, muted, and viewer-domain-blocked authors in addition to normal audience authorization. This is a stricter safety choice, not pinned bug-for-bug context silencing behavior.
+- Uncached URL resolution and bundled-frontend browser regression remain subsequent slices; parent stays open.
