@@ -1,5 +1,26 @@
 # Aggregate and cache instance activity metrics
 
+## Current disposition — accepted after parent review 980993
+
+Accepted and archived on parent approval. Review `980993` found no high-severity
+blocker and supports focused closure from the combined reviewed recording,
+cache, pinned-source, restricted PostgreSQL/worker/main-HTTP evidence and actual
+browser acceptance on exact app `10ddf66caf1fe8714f7c41ac4a1a0b8ceaf7fe34`.
+This disposition supersedes historical open, review-pending, browser-deferred and
+leave-uncommitted statements below; earlier logs remain historical evidence,
+not fresh execution claims. The wider combined acceptance sweep remains pending.
+
+### Accepted aggregation boundary
+
+Criteria were reviewed against exact UTC/distinct/history tests, bounded pruning
+and renewal races, restricted worker integration, cache tests and actual main HTTP
+(including rules/manifest availability follow-up). Exact `COUNT(DISTINCT ...)`,
+not approximate reference HyperLogLog, is intentional safer counting. The linked
+browser slice now proves ordinary/limited publication and reload on exact `10ddf66`.
+Its nonzero history is explicitly a real TODAY helper-recorded bucket moved to
+yesterday in setup, not observed midnight or actual historical backfill. Earlier
+359 passing library tests had **30 ignored**; those ignored tests are not passes.
+
 ## Summary
 
 Bounded aggregation/publication and cleanup slice on 3df2724 after migration 6.

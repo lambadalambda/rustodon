@@ -1,5 +1,25 @@
 # Record transactional daily instance activity
 
+## Current disposition — accepted after parent review 980993
+
+Accepted and archived on parent approval. Review `980993` found no high-severity
+blocker and supports focused closure from the combined reviewed recording,
+cache, pinned-source, restricted PostgreSQL/worker/main-HTTP evidence and actual
+browser acceptance on exact app `10ddf66caf1fe8714f7c41ac4a1a0b8ceaf7fe34`.
+This disposition supersedes historical open, review-pending, browser-deferred and
+leave-uncommitted statements below; earlier logs remain historical evidence,
+not fresh execution claims. The wider combined acceptance sweep remains pending.
+
+### Accepted recording boundary
+
+Criteria were reviewed against the recorded eligibility/transaction/expiry tests,
+fresh and upgrade migration/bootstrap/grant checks, restricted HTTP tracking and
+round-2 fixture follow-up below. Returning tracking covers implemented interactive
+HTML, credentials, settings and session hooks, not all API/lifecycle tracking.
+The reusable activation helper is not a new approval API. Empty historical rollout
+is intentional; no real backfill. Exact unique memberships replace approximate
+reference HLL membership semantics without claiming full tracking parity.
+
 ## Summary
 
 First bounded slice of [Compute real instance activity metrics](compute-real-instance-activity-metrics.md), based on `16c751c`: operational storage and existing authentication hooks only. Cached aggregation and public counts are a separate next slice.

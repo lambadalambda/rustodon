@@ -132,3 +132,7 @@
 - [x] [Implement local hashtag control APIs](issues/implement-local-hashtag-control-apis.md)
 - [x] [Diagnose featured-tag limit metadata and typed-name editor](issues/diagnose-featured-tag-limit-metadata-and-typed-name-editor.md)
 - [x] [Support hashtag and featured-tag controls](issues/support-hashtag-and-featured-tag-controls.md)
+- [x] [Compute real instance activity metrics](issues/compute-real-instance-activity-metrics.md)
+- [x] [Record transactional daily instance activity](issues/record-transactional-daily-instance-activity.md)
+- [x] [Aggregate and cache instance activity metrics](issues/aggregate-and-cache-instance-activity-metrics.md)
+- [x] [Accept instance activity in the bundled browser](issues/accept-instance-activity-browser.md)

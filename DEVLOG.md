@@ -1,3 +1,21 @@
+## 2026-09-19 — Instance activity browser acceptance and focused closure
+
+- Parent review `980993` found no high-severity blocker; archived activity parent,
+  recording, cache and browser issues using combined reviewed source/restricted
+  DB/worker/main-HTTP evidence plus real pinned browser on exact `10ddf66`.
+- Migration 6 empty history and confirmed eligible TODAY login publish 0. Setup
+  moved that real helper-recorded bucket/member to yesterday: sidebar/v2/initial
+  1 and NodeInfo 1/1; limited sidebar/v2/initial 0, NodeInfo 1/1. Reloads passed.
+  This is simulated history, not observed midnight, real backfill or deployment.
+- Exact DISTINCT instead of approximate HLL is intentional; returning tracking
+  covers interactive HTML/credentials/settings/session hooks, not full lifecycle
+  parity. Browser library 3 passed / 7 ignored, focused source 1 passed; closure
+  harness 2 + shared 8 passed. No ignored-test or full-matrix pass claim.
+- Sanitized exact-source/hashes/screenshots/grants and separate final cleanup proof
+  remain under `target/activity-browser-evidence/evidence/`. Deferred medium
+  cleanup-status masking and missing negative observer unit tests are recorded in
+  the browser issue. Wider combined sweep remains pending; no production push.
+
 ## 2026-09-19 — Activity review-2 fixture reliability follow-up (tests only)
 
 - Parent accepted production source with no high-severity findings. Addressed
