@@ -33,4 +33,7 @@ The bundled frontend exposes a hashtag header with Follow/Unfollow and Feature/U
 
 ### Local slice status
 
-Local API/database implementation and focused restricted-role HTTP/stream tests are present, pending parent independent review; see the subissue for exact executed gates. Header history has a bounded current-public-status aggregate, not Mastodon Redis retention parity. Browser controls, Rails HTTP differential coverage, and peer feature projections remain unproved/deferred. Do not close this parent on local evidence alone.
+Local API/database implementation and focused restricted-role HTTP/stream tests are present; parent source review round 2 approved `8e22f52`. See the local subissue for exact executed gates. Header history has a bounded current-public-status aggregate, not Mastodon Redis retention parity. Do not close this parent on local evidence alone.
+
+- [Bounded browser and Rails differential acceptance](accept-local-hashtag-controls-browser-differential.md) is open. Real browser header Follow/Unfollow/Feature/Unfeature, reload/public-profile state and representative home inclusion/removal passed before a **profile UI blocker**: `GET /api/v1/profile` returns 404. A genuine profile suggestion click creates the featured tag (200), but the absent profile model prevents item/Delete controls from rendering, including after reload. No app fix or API-click substitute was made.
+- Full uninterrupted browser completion, profile UI removal, actual Rails differential and independent harness review remain pending. The exact Rails image is cached, but no Rails differential was run before pausing on the blocker. Peer projections remain deferred.
