@@ -204,6 +204,49 @@ impl<'a> RestSerializer<'a> {
         })
     }
 
+    /// Owner-only editor projection: raw inputs alongside their public formatting.
+    pub fn profile(
+        &self,
+        credential: &CredentialAccountProjection,
+        tags: &[FeaturedTagProjection],
+    ) -> Result<serde_json::Value, RestError> {
+        let raw = &credential.account;
+        let credential = self.credential_account(credential)?;
+        let account = &credential.account;
+        let has_avatar = raw
+            .avatar_file_name
+            .as_deref()
+            .is_some_and(|name| !name.is_empty());
+        let has_header = raw
+            .header_file_name
+            .as_deref()
+            .is_some_and(|name| !name.is_empty());
+        Ok(serde_json::json!({
+            "id": account.id,
+            "display_name": raw.display_name,
+            "note": raw.note,
+            "fields": credential.source.fields,
+            "formatted_note": account.note,
+            "formatted_fields": account.fields,
+            "avatar": has_avatar.then_some(&account.avatar),
+            "avatar_static": has_avatar.then_some(&account.avatar_static),
+            "avatar_description": raw.avatar_description,
+            "header": has_header.then_some(&account.header),
+            "header_static": has_header.then_some(&account.header_static),
+            "header_description": raw.header_description,
+            "locked": raw.locked,
+            "bot": account.bot,
+            "hide_collections": raw.hide_collections,
+            "discoverable": raw.discoverable,
+            "indexable": raw.indexable,
+            "show_media": raw.show_media,
+            "show_media_replies": raw.show_media_replies,
+            "show_featured": raw.show_featured,
+            "attribution_domains": credential.source.attribution_domains,
+            "featured_tags": tags.iter().map(|tag| self.featured_tag(tag)).collect::<Vec<_>>(),
+        }))
+    }
+
     pub fn credential_account(
         &self,
         credential: &CredentialAccountProjection,

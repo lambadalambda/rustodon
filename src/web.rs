@@ -1828,6 +1828,13 @@ pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
         Private
     ),
     route!(
+        "/api/v1/profile",
+        Implemented,
+        ApiAuthentication::Required(VERIFY_CREDENTIALS.as_slice()),
+        None,
+        Private
+    ),
+    route!(
         "/api/v1/accounts/verify_credentials",
         Implemented,
         ApiAuthentication::Required(VERIFY_CREDENTIALS.as_slice()),
@@ -3847,6 +3854,8 @@ pub fn router(state: WebState) -> Router {
             get(account_featured_tags),
         )
         .route("/api/v1/accounts/relationships", get(relationships))
+        .route("/api/v1/profile", get(profile))
+        .route("/api/v1/profile/", get(profile))
         .route(
             "/api/v1/accounts/verify_credentials",
             get(verify_credentials),
@@ -17177,6 +17186,34 @@ async fn relationships(
     }
 }
 
+async fn profile(State(state): State<WebState>, headers: HeaderMap) -> Response<Body> {
+    let owner = match required_viewer_owner(&state, &headers, VERIFY_CREDENTIALS).await {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    let loader = state.loader(Some(owner.account_id()));
+    let credential = match loader
+        .credential_account(owner.user_id(), owner.account_id())
+        .await
+    {
+        Ok(Some(credential)) => credential,
+        Ok(None) => return record_not_found(),
+        Err(_) => return internal_error(),
+    };
+    let Ok(tags) = loader.featured_tags(owner.account_id()).await else {
+        return internal_error();
+    };
+    match state
+        .serializer()
+        .profile(&credential, &tags)
+        .ok()
+        .and_then(|value| serde_json::to_vec(&value).ok())
+    {
+        Some(body) => json_response(StatusCode::OK, body),
+        None => internal_error(),
+    }
+}
+
 async fn verify_credentials(State(state): State<WebState>, headers: HeaderMap) -> Response<Body> {
     let owner = match required_viewer_owner(&state, &headers, VERIFY_CREDENTIALS).await {
         Ok(owner) => owner,
@@ -20513,6 +20550,9 @@ mod extended_description_tests;
 mod web_settings;
 
 #[cfg(test)]
+mod profile_tests;
+
+#[cfg(test)]
 mod web_settings_tests;
 
 #[cfg(test)]
@@ -21849,7 +21889,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn api_route_inventory_is_unique_and_declares_protocol_contracts() {
-        assert_eq!(API_ROUTE_INVENTORY.len(), 130);
+        assert_eq!(API_ROUTE_INVENTORY.len(), 131);
         assert_eq!(REST_BODY_LIMIT_BYTES, 103_809_024);
         assert_eq!(
             API_ROUTE_INVENTORY

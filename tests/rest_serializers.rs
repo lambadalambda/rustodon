@@ -824,3 +824,107 @@ fn remote_rich_representations_never_use_original_as_preview() {
     media.thumbnail_file_name = Some("not-an-image.mp4".into());
     assert!(serializer().media_attachment(&media).preview_url.is_none());
 }
+
+#[test]
+fn profile_read_preserves_raw_fields_and_nullable_images() {
+    use rustodon::mastodon::rest::{CredentialAccountProjection, CredentialRoleProjection};
+    let mut account = alice();
+    account.note = "Raw <text> & bio".into();
+    account.fields = vec![AccountFieldProjection {
+        name: "Website".into(),
+        value: "https://example.org".into(),
+        verified_at: None,
+    }];
+    account.avatar_file_name = None;
+    let credential = CredentialAccountProjection {
+        account,
+        privacy: "public".into(),
+        sensitive: false,
+        language: None,
+        follow_requests_count: 0,
+        attribution_domains: Some(vec!["example.org".into()]),
+        quote_policy: "public".into(),
+        role: CredentialRoleProjection {
+            id: 0,
+            name: String::new(),
+            permissions: 0,
+            color: String::new(),
+            highlighted: false,
+            collection_limit: 0,
+        },
+    };
+    let value = serializer().profile(&credential, &[]).unwrap();
+    assert_eq!(value["id"], ALICE.to_string());
+    assert_eq!(value["note"], credential.account.note);
+    assert_ne!(value["formatted_note"], value["note"]);
+    assert_eq!(
+        value["fields"][0]["value"],
+        credential.account.fields[0].value
+    );
+    assert!(value["avatar"].is_null());
+    assert!(value["avatar_static"].is_null());
+    assert!(value["header"].is_null());
+    assert!(value["header_static"].is_null());
+    assert_eq!(value["attribution_domains"], json!(["example.org"]));
+    assert_eq!(value["featured_tags"], json!([]));
+    let mut keys: Vec<_> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    let mut expected = vec![
+        "id",
+        "display_name",
+        "note",
+        "fields",
+        "formatted_note",
+        "formatted_fields",
+        "avatar",
+        "avatar_static",
+        "avatar_description",
+        "header",
+        "header_static",
+        "header_description",
+        "locked",
+        "bot",
+        "hide_collections",
+        "discoverable",
+        "indexable",
+        "show_media",
+        "show_media_replies",
+        "show_featured",
+        "attribution_domains",
+        "featured_tags",
+    ];
+    expected.sort_unstable();
+    assert_eq!(keys, expected);
+    let mut with_media = credential.clone();
+    with_media.account.avatar_file_name = Some("avatar.gif".into());
+    with_media.account.avatar_content_type = Some("image/gif".into());
+    with_media.account.header_file_name = Some("header.png".into());
+    with_media.account.header_content_type = Some("image/png".into());
+    let tag = rustodon::mastodon::rest::FeaturedTagProjection {
+        id: 42,
+        name: "Rust".into(),
+        tag_name: "rust".into(),
+        statuses_count: 3,
+        last_status_at: None,
+        username: "alice".into(),
+        domain: None,
+    };
+    let value = serializer().profile(&with_media, &[tag]).unwrap();
+    assert!(value["avatar"].as_str().unwrap().contains("/original/"));
+    assert!(
+        value["avatar_static"]
+            .as_str()
+            .unwrap()
+            .contains("/static/")
+    );
+    assert!(value["header"].as_str().unwrap().contains("/original/"));
+    assert_eq!(value["header"], value["header_static"]);
+    assert_eq!(value["featured_tags"][0]["id"], "42");
+    assert_eq!(value["featured_tags"][0]["statuses_count"], "3");
+    assert_eq!(value["featured_tags"][0]["name"], "Rust");
+}

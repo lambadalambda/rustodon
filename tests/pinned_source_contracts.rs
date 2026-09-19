@@ -1033,3 +1033,78 @@ fn pinned_local_hashtag_controls_contract() {
     assert!(serializer.contains("attribute :following, if: :current_user?"));
     assert!(serializer.contains("attribute :featuring, if: :current_user?"));
 }
+
+#[test]
+#[ignore = "requires the read-only pinned Mastodon source checkout"]
+fn pinned_profile_read_contract() {
+    let source = mastodon_source();
+    let controller = read(&source.join("app/controllers/api/v1/profiles_controller.rb"));
+    assert!(controller.contains("doorkeeper_authorize! :profile, :read, :'read:accounts'"));
+    assert!(controller.contains("before_action :require_user!"));
+    assert!(controller.contains("@account = current_account"));
+    let serializer = read(&source.join("app/serializers/rest/profile_serializer.rb"));
+    let attributes = serializer
+        .split("attributes ")
+        .nth(1)
+        .unwrap()
+        .split("has_many")
+        .next()
+        .unwrap();
+    let mut fields: Vec<_> = attributes
+        .split(',')
+        .map(str::trim)
+        .map(|s| s.trim_start_matches(':'))
+        .collect();
+    fields.sort_unstable();
+    let mut expected = vec![
+        "id",
+        "display_name",
+        "note",
+        "fields",
+        "formatted_note",
+        "formatted_fields",
+        "avatar",
+        "avatar_static",
+        "avatar_description",
+        "header",
+        "header_static",
+        "header_description",
+        "locked",
+        "bot",
+        "hide_collections",
+        "discoverable",
+        "indexable",
+        "show_media",
+        "show_media_replies",
+        "show_featured",
+        "attribution_domains",
+    ];
+    expected.sort_unstable();
+    assert_eq!(fields, expected);
+    assert!(
+        serializer.contains("has_many :featured_tags, serializer: REST::FeaturedTagSerializer")
+    );
+    assert!(serializer.contains("object.fields.map(&:to_h)"));
+    assert!(serializer.contains(
+        "object.avatar_file_name.present? ? full_asset_url(object.avatar_original_url) : nil"
+    ));
+    assert!(serializer.contains(
+        "object.header_file_name.present? ? full_asset_url(object.header_original_url) : nil"
+    ));
+    let frontend = read(&source.join("app/javascript/mastodon/api/accounts.ts"));
+    assert!(frontend.contains("apiRequestGet<ApiProfileJSON>('v1/profile')"));
+    let reducer = read(&source.join("app/javascript/mastodon/reducers/slices/profile_edit.ts"));
+    assert!(reducer.contains("fetchProfile.fulfilled"));
+    assert!(reducer.contains("state.profile.featuredTags"));
+    let editor = read(&source.join("app/javascript/mastodon/features/account_edit/index.tsx"));
+    assert!(editor.contains("dispatch(fetchProfile())"));
+    assert!(editor.contains("profile.featuredTags"));
+    let tags =
+        read(&source.join("app/javascript/mastodon/features/account_edit/featured_tags.tsx"));
+    assert!(tags.contains("fetchProfile"));
+    let route = API_ROUTE_INVENTORY
+        .iter()
+        .find(|route| route.path == "/api/v1/profile")
+        .unwrap();
+    assert_eq!(route.support, ApiRouteSupport::Implemented);
+}

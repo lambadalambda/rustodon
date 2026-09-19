@@ -1,3 +1,34 @@
+## 2026-09-19 — Hashtag browser acceptance blocked on profile read (8e22f52)
+
+- Created/indexed `accept-local-hashtag-controls-browser-differential` before
+  harness work. Reused fixed remote-browser adapter, exact source archive,
+  verified clean read-only Mastodon 1440d55b, pinned frontend assets, NAS tools
+  7203/browser d633/PG14.23. No app edits, production, deployment, push or commit.
+- Offline adapter missing-helper RED -> 1 passed. Two fresh bounded serial
+  browser attempts: first failed a harness link-vs-button selector; corrected
+  once. Second real-click controller passed header/nonzero history, Follow and
+  Unfollow, reload state, representative home inclusion/exclusion, Feature and
+  Unfeature, reload and public-profile presence/removal. Not a full gate pass.
+- True ordinary UI blocker: profile editor GET /api/v1/profile returns 404.
+  Suggestion click POST /api/v1/featured_tags returns 200, but the missing profile
+  model prevents rendering the item/Delete control even after reload. Pinned
+  apiGetProfile and profile_edit reducer confirm dependency. No API workaround,
+  no app fix; paused for scope decision. Profile removal and subsequent browser
+  suffix are unexecuted and need revalidation after the profile read is supplied.
+- Exact Rails image is cached, but differential was NOT run and no selector or
+  Rails DB/media clone created before pause. Normalization/duplicates/limits/
+  owner IDs/scopes parity remains unproved. Current-DB history versus Redis
+  retention/activity is intentionally excluded from future incidental parity,
+  never normalized to zero. Existing WebSocket test not rerun; peers deferred.
+- Internal task network, no host ports or workers/peer routes; explicit resource
+  and wall bounds, restricted runtime/writer proof. Task containers, PG volume,
+  network, media, TLS keys/env/sessions and build output removed/absence checked.
+  Sanitized actual-call/DOM/screenshot evidence exported to ignored
+  target/hashtag-browser-acceptance-evidence; executed harness hashes match.
+  Credential scan only matched static asset `password-ByJdIm8f.png: OK`.
+- Nested delegation denied; independent parent harness review pending. Both
+  issues remain open; README records exact bounds, partial evidence and gaps.
+
 ## 2026-09-19 — Hashtag review 1 ce0d follow-up
 
 - Addressed the two directly relevant medium findings (review reported no highs):
