@@ -140,7 +140,10 @@ GRANT SELECT, INSERT, DELETE ON TABLE
 GRANT SELECT, INSERT, UPDATE ON TABLE public.markers TO :"writer_role";
 GRANT SELECT, INSERT, UPDATE ON TABLE public.tags TO :"writer_role";
 GRANT SELECT, INSERT ON TABLE public.status_edits TO :"writer_role";
-GRANT SELECT, UPDATE, DELETE ON TABLE public.featured_tags TO :"writer_role";
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.featured_tags TO :"writer_role";
+-- Local hashtag controls use only existing relationship tables and sequences.
+GRANT INSERT ON TABLE public.tag_follows TO :"writer_role";
+GRANT USAGE ON SEQUENCE public.tag_follows_id_seq, public.featured_tags_id_seq TO :"writer_role";
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.polls TO :"writer_role";
 GRANT INSERT, DELETE ON TABLE public.poll_votes TO :"writer_role";
 -- Quote IDs use timestamp_id('quotes'), whose schema-defined default consumes

@@ -25,3 +25,12 @@ The bundled frontend exposes a hashtag header with Follow/Unfollow and Feature/U
 - Mastodon 4.6.5's bundled hashtag page first calls `GET /api/v1/tags/:tag`; only a successful response renders the header and its follow/feature controls. The profile UI separately uses the featured-tag collection create/delete routes.
 - Rustodon has none of the tag lookup, follow/unfollow, or feature/unfeature routes. Featured-tag collection routes are GET-only, so the hashtag controls are absent and profile mutations receive 405 responses.
 - The missing tag lookup was explicitly deferred by the completed empty-read compatibility issue; this issue owns it because it is a prerequisite for the bundled controls.
+
+## Bounded implementation
+
+- [Local API/database slice](implement-local-hashtag-control-apis.md) owns the first implementation; this parent remains open for browser evidence and remaining compatibility work.
+- ActivityPub AddHashtag/RemoveHashtag peer projections require a separate protocol scope and are deferred, not supplied by the local controls. Historical stream cleanup remains separately tracked.
+
+### Local slice status
+
+Local API/database implementation and focused restricted-role HTTP/stream tests are present, pending parent independent review; see the subissue for exact executed gates. Header history has a bounded current-public-status aggregate, not Mastodon Redis retention parity. Browser controls, Rails HTTP differential coverage, and peer feature projections remain unproved/deferred. Do not close this parent on local evidence alone.

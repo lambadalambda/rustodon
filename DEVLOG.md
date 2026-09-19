@@ -1,3 +1,61 @@
+## 2026-09-19 — Hashtag review 1 ce0d follow-up
+
+- Addressed the two directly relevant medium findings (review reported no highs):
+  relationship INSERT/sequence-USAGE grants now stay inside the existing grant
+  transaction; pre-rate-limit follow checks use a lightweight normalized EXISTS
+  query rather than aggregating history before and after mutation.
+- Readback policy is explicit: failed bounded history returns HTTP 500, never
+  fabricated zero history; the committed idempotent relationship remains safe
+  to retry. Actual table-lock timeout regression RED -> GREEN proves this.
+  Grant placement regression also RED -> GREEN.
+- Expanded existing restricted-role HTTP fixture with seven UTC day/boundary,
+  distinct-author, public-only, suspended/silenced, boost/deleted and future
+  exclusion assertions. No storage/cache/job/protocol expansion.
+- Bounded NAS PG14: focused HTTP/grant tests 3/3, reused API-driven home/WebSocket
+  fixture 1/1, verified read-only pinned source contracts 9/9, strict all-feature
+  library Clippy/fmt/diff checks passed. Did not chase stress SIGKILL or unrelated
+  lint. Evidence uses review2-* logs in target/hashtag-controls-evidence/ and NAS
+  task workspace; source hashes verified; task PG/volume/network removed.
+- All changes uncommitted, no production push/access. Ready for parent independent
+  review 2; browser/peer/differential/history-retention boundaries unchanged.
+
+## 2026-09-19 — Bounded local hashtag controls (d9f8ae1)
+
+- Created/indexed `implement-local-hashtag-control-apis.md` before code; parent
+  remains open. Added lookup/follow/unfollow/feature/unfeature and featured
+  collection create/delete without schema, jobs, protocol or browser changes.
+- Reused account locks, transactions, serializers, dynamic home/stream recipients.
+  Pinned normalization/duplicates, owner deletion, concurrent limit 10, narrow
+  writer INSERT/sequence USAGE grants and preflight checks.
+- Header history: seven-UTC-day public/non-boost aggregate with two-second DB
+  timeout; excludes deleted/suspended/silenced data. Not Redis retained counts,
+  registration-time history or trend equivalence; other history projections
+  unchanged. AP AddHashtag/RemoveHashtag and historical stream cleanup deferred.
+- Route RED -> GREEN; HTTP lifecycle found missing local-delete count decrement,
+  now reusing the existing helper. Stream fixture uses real API follows/unfollows
+  and restricted roles; stale silenced delete assertion now matches existing
+  cleanup semantics, without changing the streaming engine.
+- Sequential bounded NAS PG14: default lib 343 passed/7 ignored; all-feature lib
+  354 passed/21 ignored; restricted-role HTTP 1/1 (including privilege revocation,
+  concurrent limits/follows, counts/history); WebSocket/home lifecycle 1/1;
+  pinned source contracts 9/9. Exact clean 1440d55b source verified on host and
+  mounted read-only. Wrapper could not verify inside git-less tool image; host
+  verification and actual source tests recorded separately, not differential.
+- All-target/all-feature cargo check, all-feature lib strict Clippy, fmt/diff
+  checks passed. Full strict Clippy blocked by existing media_processor,
+  paperclip test helper and worker/local_uploads test lints, not changed here.
+  Two-request concurrency passed; six-request stress SIGKILLed within 6-GiB
+  container. No stress-success, Rails HTTP differential, browser, peer or full
+  milestone gate claim. Child nesting limit prevents independent review; parent
+  review required. All changes deliberately uncommitted; issues remain open.
+- NAS task workspace rustodon-hashtag-d9f8ae1-alice, tools 7203e0222e2b,
+  PG14.23 1a6c2409ab71; runner 4 CPUs/6 GiB/512 PIDs/870s (outer 900s+15s),
+  PG 1 CPU/512 MiB/128 PIDs/7200s; internal network, no published ports.
+  Only intended source/explicit new helpers/tests synchronized; final hashes
+  matched. Task PG/anonymous volume/network removed; shared caches and clean
+  source untouched. Evidence in ignored target/hashtag-controls-evidence/ and
+  task NAS workspace. No production access.
+
 ## 2026-09-19 — Status-search reconciliation after 0994711
 
 - Docs-only archive of four status-search issues on parent approval. Accepted

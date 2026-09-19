@@ -1,3 +1,4 @@
+mod hashtag_controls;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::collections::VecDeque;
@@ -1713,6 +1714,55 @@ pub const API_ROUTE_INVENTORY: &[ApiRouteContract] = &[
         ApiAuthentication::Optional(READ_COLLECTIONS.as_slice()),
         AssociationId,
         Anonymous
+    ),
+    route!(
+        "/api/v1/tags/{tag}",
+        Implemented,
+        ApiAuthentication::Optional(NO_SCOPE.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/featured_tags",
+        Implemented,
+        ApiAuthentication::Required(WRITE_ACCOUNTS.as_slice()),
+        None,
+        Private
+    ),
+    delete_route!(
+        "/api/v1/featured_tags/{id}",
+        Implemented,
+        ApiAuthentication::Required(WRITE_ACCOUNTS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/tags/{tag}/follow",
+        Implemented,
+        ApiAuthentication::Required(WRITE_FOLLOWS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/tags/{tag}/unfollow",
+        Implemented,
+        ApiAuthentication::Required(WRITE_FOLLOWS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/tags/{tag}/feature",
+        Implemented,
+        ApiAuthentication::Required(WRITE_ACCOUNTS.as_slice()),
+        None,
+        Private
+    ),
+    post_route!(
+        "/api/v1/tags/{tag}/unfeature",
+        Implemented,
+        ApiAuthentication::Required(WRITE_ACCOUNTS.as_slice()),
+        None,
+        Private
     ),
     route!(
         "/api/v1/featured_tags",
@@ -3758,7 +3808,25 @@ pub fn router(state: WebState) -> Router {
             "/api/v1/accounts/{id}/in_collections",
             get(account_in_collections),
         )
-        .route("/api/v1/featured_tags", get(featured_tags))
+        .route(
+            "/api/v1/featured_tags",
+            get(featured_tags).post(hashtag_controls::create_featured),
+        )
+        .route(
+            "/api/v1/featured_tags/{id}",
+            delete(hashtag_controls::delete_featured),
+        )
+        .route("/api/v1/tags/{tag}", get(hashtag_controls::show))
+        .route("/api/v1/tags/{tag}/follow", post(hashtag_controls::mutate))
+        .route(
+            "/api/v1/tags/{tag}/unfollow",
+            post(hashtag_controls::mutate),
+        )
+        .route("/api/v1/tags/{tag}/feature", post(hashtag_controls::mutate))
+        .route(
+            "/api/v1/tags/{tag}/unfeature",
+            post(hashtag_controls::mutate),
+        )
         .route("/api/v1/followed_tags", get(followed_tags))
         .route("/api/v1/follow_requests", get(follow_requests))
         .route(
@@ -3996,7 +4064,28 @@ pub fn router(state: WebState) -> Router {
             "/api/v1/accounts/{id}/in_collections/",
             get(account_in_collections),
         )
-        .route("/api/v1/featured_tags/", get(featured_tags))
+        .route(
+            "/api/v1/featured_tags/",
+            get(featured_tags).post(hashtag_controls::create_featured),
+        )
+        .route(
+            "/api/v1/featured_tags/{id}/",
+            delete(hashtag_controls::delete_featured),
+        )
+        .route("/api/v1/tags/{tag}/", get(hashtag_controls::show))
+        .route("/api/v1/tags/{tag}/follow/", post(hashtag_controls::mutate))
+        .route(
+            "/api/v1/tags/{tag}/unfollow/",
+            post(hashtag_controls::mutate),
+        )
+        .route(
+            "/api/v1/tags/{tag}/feature/",
+            post(hashtag_controls::mutate),
+        )
+        .route(
+            "/api/v1/tags/{tag}/unfeature/",
+            post(hashtag_controls::mutate),
+        )
         .route("/api/v1/followed_tags/", get(followed_tags))
         .route("/api/v1/follow_requests/", get(follow_requests))
         .route(
@@ -20433,6 +20522,9 @@ mod api_empty_reads_tests;
 mod cached_media_response_tests;
 
 #[cfg(test)]
+mod hashtag_controls_tests;
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
@@ -21757,7 +21849,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn api_route_inventory_is_unique_and_declares_protocol_contracts() {
-        assert_eq!(API_ROUTE_INVENTORY.len(), 123);
+        assert_eq!(API_ROUTE_INVENTORY.len(), 130);
         assert_eq!(REST_BODY_LIMIT_BYTES, 103_809_024);
         assert_eq!(
             API_ROUTE_INVENTORY
@@ -21866,7 +21958,7 @@ mod tests {
                 .iter()
                 .filter(|route| route.method == ApiMethod::Post)
                 .count(),
-            37
+            42
         );
         assert!(api_route("/api/v1/markers").is_some());
     }

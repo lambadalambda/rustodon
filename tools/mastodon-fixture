@@ -2616,7 +2616,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.accounts_tags TO $DIFFERENT
 GRANT SELECT, INSERT, UPDATE ON TABLE public.tags TO $DIFFERENTIAL_WRITER;
 GRANT SELECT, INSERT, DELETE ON TABLE public.statuses_tags TO $DIFFERENTIAL_WRITER;
 GRANT SELECT, INSERT ON TABLE public.status_edits TO $DIFFERENTIAL_WRITER;
- GRANT SELECT, UPDATE, DELETE ON TABLE public.featured_tags TO $DIFFERENTIAL_WRITER;
+ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.featured_tags TO $DIFFERENTIAL_WRITER;
+ GRANT INSERT ON TABLE public.tag_follows TO $DIFFERENTIAL_WRITER;
+ GRANT USAGE ON SEQUENCE public.tag_follows_id_seq, public.featured_tags_id_seq TO $DIFFERENTIAL_WRITER;
  GRANT SELECT, DELETE ON TABLE
     public.account_aliases, public.account_domain_blocks, public.account_migrations,
    public.account_notes, public.account_pins, public.collection_items, public.collections,

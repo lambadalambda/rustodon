@@ -420,6 +420,8 @@ SELECT
       AND pg_catalog.has_table_privilege(role.oid, 'public.custom_filters', 'SELECT')
        AND pg_catalog.has_table_privilege(role.oid, 'public.custom_filters', 'DELETE')
         AND pg_catalog.has_table_privilege(role.oid, 'public.featured_tags', 'SELECT')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.featured_tags', 'INSERT')
+        AND pg_catalog.has_sequence_privilege(role.oid, 'public.featured_tags_id_seq', 'USAGE')
         AND pg_catalog.has_table_privilege(role.oid, 'public.featured_tags', 'UPDATE')
         AND pg_catalog.has_table_privilege(role.oid, 'public.featured_tags', 'DELETE')
        AND pg_catalog.has_table_privilege(role.oid, 'public.invites', 'SELECT')
@@ -446,6 +448,8 @@ SELECT
        AND pg_catalog.has_table_privilege(role.oid, 'public.scheduled_statuses', 'SELECT')
        AND pg_catalog.has_table_privilege(role.oid, 'public.scheduled_statuses', 'DELETE')
         AND pg_catalog.has_table_privilege(role.oid, 'public.tag_follows', 'SELECT')
+        AND pg_catalog.has_table_privilege(role.oid, 'public.tag_follows', 'INSERT')
+        AND pg_catalog.has_sequence_privilege(role.oid, 'public.tag_follows_id_seq', 'USAGE')
         AND pg_catalog.has_table_privilege(role.oid, 'public.tag_follows', 'DELETE')
         AND pg_catalog.has_table_privilege(role.oid, 'public.tombstones', 'SELECT')
         AND pg_catalog.has_table_privilege(role.oid, 'public.tombstones', 'INSERT')
@@ -1160,7 +1164,7 @@ SELECT
                  'users_id_seq'))
                OR (namespace.nspname = 'public' AND relation.relname IN (
                     'custom_emojis_id_seq', 'polls_id_seq', 'poll_votes_id_seq',
-                    'quotes_id_seq', 'web_settings_id_seq')
+                    'quotes_id_seq', 'web_settings_id_seq', 'tag_follows_id_seq', 'featured_tags_id_seq')
                    AND acl.privilege_type = 'USAGE')
                OR (namespace.nspname = 'rustodon' AND relation.relname = 'outbox_events_id_seq')
              )
@@ -1213,7 +1217,7 @@ SELECT
                 'account_warnings', 'accounts_tags', 'admin_action_logs',
                 'blocks', 'bookmarks', 'canonical_email_blocks', 'collection_reports',
                 'conversations', 'conversation_mutes', 'domain_blocks', 'favourites',
-                'follows', 'follow_requests', 'keypairs', 'login_activities', 'markers',
+                'featured_tags', 'tag_follows', 'follows', 'follow_requests', 'keypairs', 'login_activities', 'markers',
                 'media_attachments', 'mentions', 'mutes', 'notification_permissions',
                 'notification_policies', 'notification_requests', 'notifications',
                 'oauth_access_grants', 'oauth_access_tokens', 'oauth_applications',

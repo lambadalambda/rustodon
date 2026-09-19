@@ -3087,6 +3087,44 @@ impl Repository {
         .await
     }
 
+    pub(crate) async fn tag_by_name(&self, name: &str) -> sqlx::Result<Option<Tag>> {
+        sqlx::query_as("SELECT id, name, display_name, usable, trendable, listable, last_status_at FROM tags WHERE lower(name) = lower($1)")
+            .bind(normalize_hashtag(name)).fetch_optional(&self.pool).await
+    }
+
+    /// Seven UTC days of current public, non-boost status usage. This deliberately
+    /// excludes private/unlisted data and is not Redis trend-counter parity.
+    pub(crate) async fn tag_history(&self, tag_id: i64) -> sqlx::Result<Vec<(i64, i64, i64)>> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SET LOCAL statement_timeout = '2s'")
+            .execute(&mut *transaction)
+            .await?;
+        let rows = sqlx::query_as(
+            "SELECT extract(epoch FROM date_trunc('day', status.created_at))::bigint, count(*), count(DISTINCT status.account_id) \
+             FROM statuses_tags st JOIN statuses status ON status.id = st.status_id \
+             JOIN accounts author ON author.id = status.account_id \
+             WHERE st.tag_id = $1 AND status.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') - interval '6 days' \
+               AND status.created_at <= now() AT TIME ZONE 'UTC' AND status.deleted_at IS NULL \
+               AND status.visibility = 0 AND status.reblog_of_id IS NULL \
+               AND author.suspended_at IS NULL AND author.silenced_at IS NULL \
+             GROUP BY date_trunc('day', status.created_at)")
+            .bind(tag_id).fetch_all(&mut *transaction).await?;
+        transaction.commit().await?;
+        Ok(rows)
+    }
+
+    /// Checks follow idempotence without loading tag history or a REST projection.
+    pub(crate) async fn follows_tag(&self, account_id: i64, name: &str) -> sqlx::Result<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM tag_follows follow JOIN tags tag ON tag.id = follow.tag_id \
+             WHERE follow.account_id = $1 AND lower(tag.name) = lower($2))",
+        )
+        .bind(account_id)
+        .bind(normalize_hashtag(name))
+        .fetch_one(&self.pool)
+        .await
+    }
+
     pub(crate) async fn rest_tag_relationships(
         &self,
         account_id: i64,

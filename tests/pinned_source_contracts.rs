@@ -962,3 +962,74 @@ fn pinned_quote_federation_and_output_contract_covers_lifecycle_effects() {
     assert!(rest.contains("has_one :quote, key: :quote, serializer: REST::QuoteSerializer"));
     assert!(rest.contains(":favourites_count, :quotes_count, :edited_at"));
 }
+
+#[test]
+#[ignore = "requires the read-only pinned Mastodon source checkout"]
+fn pinned_local_hashtag_controls_contract() {
+    let source = mastodon_source();
+    let controller = read(&source.join("app/controllers/api/v1/tags_controller.rb"));
+    for evidence in [
+        "doorkeeper_authorize! :follow, :write, :'write:follows'",
+        "doorkeeper_authorize! :write, :'write:accounts'",
+        "before_action :require_user!, except: :show",
+        "override_rate_limit_headers :follow, family: :follows",
+        "TagFollow.create_with(rate_limit: true).find_or_create_by!",
+        "Tag::HASHTAG_NAME_RE.match?(params[:id])",
+        "Tag.find_normalized(params[:id]) || Tag.new(name: params[:id], display_name: params[:id])",
+    ] {
+        assert!(controller.contains(evidence), "{evidence}");
+    }
+    let collection = read(&source.join("app/controllers/api/v1/featured_tags_controller.rb"));
+    assert!(collection.contains("current_account.featured_tags.find(params[:id])"));
+    let model = read(&source.join("app/models/featured_tag.rb"));
+    for evidence in [
+        "LIMIT = 10",
+        "name.strip.delete_prefix('#')",
+        "validates :tag_id, uniqueness: { scope: :account_id }",
+        "account.statuses.distributable_visibility.tagged_with(tag)",
+    ] {
+        assert!(model.contains(evidence), "{evidence}");
+    }
+    let service = read(&source.join("app/services/create_featured_tag_service.rb"));
+    assert!(service.contains("account.featured_tags.find_or_initialize_by(tag: name_or_tag)"));
+    assert!(service.contains("account.featured_tags.find_or_initialize_by(name: name_or_tag)"));
+    let normalizer = read(&source.join("app/lib/hashtag_normalizer.rb"));
+    assert!(
+        normalizer.contains("remove_invalid_characters(ascii_folding(lowercase(cjk_width(str))))")
+    );
+    let folding = read(&source.join("app/lib/ascii_folding.rb"));
+    let rust = read(&repository_root().join("src/mastodon/repository.rs"));
+    for (ruby_name, rust_name) in [
+        ("NON_ASCII_CHARS", "NON_ASCII"),
+        ("EQUIVALENT_ASCII_CHARS", "ASCII"),
+    ] {
+        let ruby_value = folding
+            .lines()
+            .find(|line| line.trim_start().starts_with(ruby_name))
+            .unwrap()
+            .split('\'')
+            .nth(1)
+            .unwrap();
+        let rust_value = rust
+            .lines()
+            .find(|line| {
+                line.trim_start()
+                    .starts_with(&format!("const {rust_name}:"))
+            })
+            .unwrap()
+            .split('"')
+            .nth(1)
+            .unwrap();
+        assert_eq!(ruby_value, rust_value, "pinned folding table {ruby_name}");
+    }
+    let history = read(&source.join("app/models/trends/tags.rb"));
+    assert!(
+        history
+            .contains("!status.reblog? && status.public_visibility? && !status.account.silenced?")
+    );
+    // Local DB history intentionally does not claim Redis retention equivalence.
+    let serializer = read(&source.join("app/serializers/rest/tag_serializer.rb"));
+    assert!(serializer.contains("object.id.to_s"));
+    assert!(serializer.contains("attribute :following, if: :current_user?"));
+    assert!(serializer.contains("attribute :featuring, if: :current_user?"));
+}

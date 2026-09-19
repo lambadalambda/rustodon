@@ -352,7 +352,7 @@ pub struct RestTagHistory {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RestTag {
-    pub id: DecimalId,
+    pub id: String,
     pub name: String,
     pub url: String,
     pub history: Vec<RestTagHistory>,

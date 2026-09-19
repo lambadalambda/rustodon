@@ -146,23 +146,33 @@ async fn policy(pool: &PgPool, name: &str, enabled: bool) -> TestResult {
 async fn hashtag_only_home_membership_matches_stream_lifecycle() -> TestResult {
     let owner_url = std::env::var("RUSTODON_MASTODON_OWNER_DATABASE_URL")?;
     let mut connection = <sqlx::PgConnection as sqlx::Connection>::connect(&owner_url).await?;
-    rustodon::operational_schema::migrate(&mut connection).await?;
-    let writer = WriteRepository::connect(&owner_url).await?;
-    let pool = writer.pool();
+    let writer_url = std::env::var("RUSTODON_WORKER_WRITE_DATABASE_URL")?;
+    rustodon::operational_schema::migrate_with_writer_role(
+        &mut connection,
+        Some(Url::parse(&writer_url)?.username()),
+    )
+    .await?;
+    let writer =
+        WriteRepository::connect(&std::env::var("RUSTODON_WORKER_WRITE_DATABASE_URL")?).await?;
+    let owner = PgPool::connect(&owner_url).await?;
+    let pool = &owner;
+    sqlx::query(
+        "UPDATE oauth_access_tokens SET scopes = scopes || ' write:follows' WHERE token = $1",
+    )
+    .bind(VIEWER_TOKEN)
+    .execute(pool)
+    .await?;
     // Two followed tags must still produce only one event. No accepted author follow.
     sqlx::query("DELETE FROM follows WHERE account_id = $1 AND target_account_id = $2")
         .bind(VIEWER)
         .bind(AUTHOR)
         .execute(pool)
         .await?;
-    sqlx::query("INSERT INTO tags (name, created_at, updated_at) VALUES ('r12one', clock_timestamp(), clock_timestamp()), ('r12two', clock_timestamp(), clock_timestamp())")
-        .execute(pool).await?;
-    sqlx::query("INSERT INTO tag_follows (account_id, tag_id, created_at, updated_at) SELECT $1, id, clock_timestamp(), clock_timestamp() FROM tags WHERE name IN ('r12one', 'r12two')")
-        .bind(VIEWER).execute(pool).await?;
     let repository = Repository::connect(&std::env::var("RUSTODON_MASTODON_DATABASE_URL")?).await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let base = format!("http://{address}");
+    let runtime_pool = PgPool::connect(&std::env::var("RUSTODON_MASTODON_DATABASE_URL")?).await?;
     let state = WebState::new(
         repository,
         Url::parse(&format!("https://{DOMAIN}/"))?,
@@ -174,9 +184,18 @@ async fn hashtag_only_home_membership_matches_stream_lifecycle() -> TestResult {
         vec![DOMAIN.to_owned(), address.to_string()],
     )?
     .with_write_repository(writer.clone())
-    .with_queue(Queue::new(pool.clone()));
+    .with_queue(Queue::new(runtime_pool));
     let server = tokio::spawn(async move { axum::serve(listener, router(state)).await });
     let client = reqwest::Client::new();
+    for name in ["r12one", "r12two"] {
+        let response = client
+            .post(format!("{base}/api/v1/tags/{name}/follow"))
+            .header("host", DOMAIN)
+            .bearer_auth(VIEWER_TOKEN)
+            .send()
+            .await?;
+        assert_eq!(response.status(), 200, "{}", response.text().await?);
+    }
     let mut actual = Vec::new();
     let mut expected = Vec::new();
     for (name, visibility, allowed) in [
@@ -263,6 +282,10 @@ async fn hashtag_only_home_membership_matches_stream_lifecycle() -> TestResult {
                     "status.update".to_owned(),
                     "delete".to_owned(),
                 ]
+            } else if name == "silenced" {
+                // Existing delete fanout intentionally bypasses author silencing:
+                // a client may retain a status from before that policy changed.
+                vec!["delete".to_owned()]
             } else {
                 vec![]
             },
@@ -330,6 +353,30 @@ async fn hashtag_only_home_membership_matches_stream_lifecycle() -> TestResult {
             assert!(home_contains(&client, &base, id).await?);
         }
     }
+    for name in ["r12one", "r12two"] {
+        let response = client
+            .post(format!("{base}/api/v1/tags/{name}/unfollow"))
+            .header("host", DOMAIN)
+            .bearer_auth(VIEWER_TOKEN)
+            .send()
+            .await?;
+        assert_eq!(response.status(), 200);
+    }
+    let after = publish(
+        &client,
+        &base,
+        None,
+        "#r12one #r12two after unfollow",
+        "public",
+    )
+    .await?;
+    assert!(!home_contains(&client, &base, after).await?);
+    assert!(events(pool, after).await?.is_empty());
+    assert!(
+        timeout(Duration::from_millis(500), socket.next())
+            .await
+            .is_err()
+    );
     socket.close(None).await?;
     server.abort();
     Ok(())

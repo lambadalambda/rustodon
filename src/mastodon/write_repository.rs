@@ -1,3 +1,4 @@
+mod hashtag_controls;
 pub mod local_uploads;
 
 use std::collections::HashMap;
@@ -8871,6 +8872,17 @@ impl WriteRepository {
         .bind(deleted_at)
         .execute(&mut *transaction)
         .await?;
+        if matches!(visibility, 0 | 1) {
+            let tag_ids = sqlx::query_scalar::<_, i64>(
+                "SELECT tag_id FROM statuses_tags WHERE status_id = $1",
+            )
+            .bind(status_id)
+            .fetch_all(&mut *transaction)
+            .await?;
+            for tag_id in tag_ids {
+                decrement_featured_tag(&mut transaction, account_id, tag_id).await?;
+            }
+        }
         if delete_media && !reported {
             let cleanup_jobs = removed_attachments
                 .iter()

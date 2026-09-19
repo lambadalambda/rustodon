@@ -1919,6 +1919,36 @@ impl RestProjectionLoader {
             .find(|request| request.id == request_id))
     }
 
+    /// Loads a persisted tag and its public seven-day database history.
+    pub(crate) async fn tag(&self, name: &str) -> sqlx::Result<Option<TagProjection>> {
+        let Some(tag) = self.repository.tag_by_name(name).await? else {
+            return Ok(None);
+        };
+        let relationship = if let Some(owner) = self.viewer_account_id {
+            self.repository
+                .rest_tag_relationships(owner, &[tag.id])
+                .await?
+                .pop()
+        } else {
+            None
+        };
+        let mut history = recent_tag_history();
+        for (day, uses, accounts) in self.repository.tag_history(tag.id).await? {
+            if let Some(row) = history.iter_mut().find(|row| row.day == day.to_string()) {
+                row.uses = uses.to_string();
+                row.accounts = accounts.to_string();
+            }
+        }
+        Ok(Some(TagProjection {
+            id: tag.id,
+            name: tag.name,
+            display_name: tag.display_name,
+            history,
+            following: relationship.map(|(_, following, _)| following),
+            featuring: relationship.map(|(_, _, featuring)| featuring),
+        }))
+    }
+
     /// Loads featured tags owned by one authenticated account.
     ///
     /// # Errors

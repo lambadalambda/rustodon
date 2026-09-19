@@ -1405,7 +1405,7 @@ impl<'a> RestSerializer<'a> {
     #[must_use]
     pub fn tag(&self, tag: &TagProjection) -> RestTag {
         RestTag {
-            id: DecimalId::new(tag.id),
+            id: tag.id.to_string(),
             name: tag.display_name.clone().unwrap_or_else(|| tag.name.clone()),
             url: self.tag_url(&tag.name),
             history: tag

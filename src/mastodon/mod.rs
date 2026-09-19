@@ -1,6 +1,7 @@
 pub mod activitypub;
 pub(crate) mod activitypub_inbox;
 mod auth;
+pub(crate) mod hashtag;
 mod oauth;
 pub mod policy;
 pub(crate) mod profile_media;
