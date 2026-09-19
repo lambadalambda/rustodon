@@ -1,3 +1,24 @@
+## 2026-09-19 — Combined b64e94d verification, partial / paused
+
+- Exact tracked b64e94d archive on native NAS Linux x86-64; all 6485 source
+  hashes matched after execution. Sequential bounded tools runs, disposable PG14,
+  no production/deployment/push or application/harness changes.
+- Passed default-feature all-target ordinary suite, fmt, Linux harnesses, static
+  fixture/media checks, real codec 3/3, full pinned source 12/12. Strict Clippy
+  failed test-helper lint; all-feature debug/release hit missing external `kill`;
+  cargo-deny absent. Initial read-only scratch failure retained, scratch corrected.
+- Focused activity storage 6/7 (one lock-wait timeout), maintenance worker 1/1.
+  Upgrade/lifecycle/upload HTTP/bootstrap blocked by task role setup: initial
+  privileged owner, then missing NOINHERIT. Paused after two setup variants;
+  these are not application-regression proof or full named DB gate results.
+- Named peer-public verified cached prerequisites then blocked on host cargo
+  missing, before peer resource creation. No peer/browser/differential acceptance
+  claim; broader matrix not run. Task PG/container/anonymous volume/network cleanup
+  independently confirmed; source/logs/tools image/caches intentionally retained.
+- Detailed commands, every exit, limitations and cleanup in
+  `target/combined-b64e94d-evidence/evidence/` and the existing open isolated-worker
+  issue. No TDD cycle for verification-only work; nested review unavailable.
+
 ## 2026-09-19 — Instance activity browser acceptance and focused closure
 
 - Parent review `980993` found no high-severity blocker; archived activity parent,
