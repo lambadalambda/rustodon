@@ -32,3 +32,4 @@
 - [ ] [Search known exact status URLs](issues/search-known-exact-status-urls.md)
 
 - [ ] [Resolve uncached exact status URLs in search](issues/search-uncached-exact-status-urls.md)
+- [ ] [Bounded status-search browser acceptance](issues/accept-status-search-browser.md)

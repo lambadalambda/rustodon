@@ -1,3 +1,50 @@
+## 2026-09-19 — Bounded status-search browser acceptance (exact c3497f5)
+
+- Indexed `accept-status-search-browser` before new harness files. Reused the
+  existing NAS remote-browser lifecycle with a fixed task-only adapter and
+  separate TLS Note source/passive XHR observer/controller; no application or
+  existing media-acceptance files changed. No deployment, push or commit.
+- Verified read-only reference clean at 1440d55b139e39ec722c2a3db7f60b66cd889048;
+  exact git archive c3497f5cdf71678c70542689e079ac589de253a1, pinned frontend packs,
+  NAS tools 7203e0222e2b/browser d6337b96fb60/PG14.23 1a6c2409ab71. Migration 5,
+  narrow runtime/writer, owner only for setup/grants/migration/observations.
+- Final fresh uninterrupted controller PASS: signed-in native URL input + Enter,
+  Posts click, visible known-local and canonical uncached public Note results,
+  timestamp click to exact returned status permalink, independent frontend
+  status GET/render after reload. Actual search XHRs: resolve=true, limit=11,
+  omitted type and type=statuses, offset absent. No response injection.
+- Controlled task CA/TLS source cryptographically verifies instance-actor RSA
+  signatures. One public GET; cached repeat and known-hidden search add zero
+  remote source fetches. Source counts all paths except explicit readiness.
+  Known-hidden and unrelated private Note display No results/no status DOM;
+  private count 0, public count 1, task mentions 0, total mentions unchanged (8),
+  known-hidden row hash unchanged. Uncached baseline count 0. Existing Bob actor
+  reused; this does not exercise unknown-actor discovery or a real peer.
+- First attempt passed known URL but failed the source verifier because the
+  harness expected Alice rather than the instance actor key; fixed with a RED
+  regression guard. Second passed; final fresh run additionally checked complete
+  source request counts and before/after privacy state. Attempts retained apart.
+  Helper missing-file RED -> GREEN; final helper/crypto/opt-in pinned query
+  contracts 5 passed; unchanged media harness tests 8 passed; diff check passed.
+- Reused explicit serial bounds: build 4CPU/6GiB/512PID/900s, PG1CPU/512MiB,
+  web2CPU/1GiB, browser2CPU/2GiB, source/TLS1CPU/256MiB, forward1CPU/128MiB;
+  runtime PID/wall limits, controller600s, total1500s. No published ports or
+  production resources. Closed browser and removed owned containers/PG volume,
+  network, fixture state/media, certificates/keys/env and fresh build output.
+- Final sanitized evidence and SHA256SUMS under ignored
+  `target/status-search-browser-evidence/evidence/`, original NAS workspace
+  `/srv/workspaces/rustodon-status-search-browser-c3497f5-alice`. Executed harness
+  and representative application hashes match checkout. No raw session/HAR/token
+  data exported; credential-pattern scan and exported checksums passed.
+- Boundary: singleton has no load-more UI. Pinned source contract checks expand
+  limit/offset and Rails URL typed-offset behavior; nonzero-offset browser gate
+  NOT run. Full-text, HTML alternates, actor URLs, hashtags excluded. Prior HTTP
+  security suite not rerun; full Rust pinned-source/browser/DB/worker/peer/
+  differential/check/Clippy lanes not run. No app bug encountered.
+- Independent parent review remains pending: task delegation rejected at nested
+  depth limit. Leave subissue open and everything uncommitted. Existing DEVLOG
+  trailing NUL bytes were already in HEAD and preserved, not repaired in scope.
+
 ## 2026-09-19 — Uncached search review 1 test-isolation follow-up
 
 - Parent review `a30e` reported no blockers/high findings and one directly
