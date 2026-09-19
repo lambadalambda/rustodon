@@ -3398,6 +3398,71 @@ impl WriteRepository {
         Ok(())
     }
 
+    /// Read-only preflight for user-initiated resolution. This does not confer inbox
+    /// delivery authority: only the document's existing audience can admit a viewer.
+    pub(crate) async fn remote_note_search_allowed(
+        &self,
+        viewer: i64,
+        actor_uri: &str,
+        object: &Value,
+        origin: &str,
+    ) -> Result<bool, WriteError> {
+        let note = RemoteNoteData::parse(object, actor_uri)?;
+        if !same_remote_note_host(actor_uri, &note.uri)? {
+            return Ok(false);
+        }
+        let mut transaction = self.pool.begin().await?;
+        let denied: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM accounts author WHERE author.uri=$1 AND (
+                author.domain IS NULL OR author.suspended_at IS NOT NULL
+                OR EXISTS (SELECT 1 FROM blocks WHERE (account_id=$2 AND target_account_id=author.id)
+                    OR (account_id=author.id AND target_account_id=$2))
+                OR EXISTS (SELECT 1 FROM mutes WHERE account_id=$2 AND target_account_id=author.id)
+                OR EXISTS (SELECT 1 FROM account_domain_blocks WHERE account_id=$2 AND domain=author.domain)))
+             OR EXISTS (SELECT 1 FROM tombstones WHERE uri=$3 OR uri=$4)
+             OR EXISTS (SELECT 1 FROM statuses status JOIN accounts author ON author.id=status.account_id
+                 WHERE (status.uri=$3 OR status.uri=$4) AND author.uri<>$1)",
+        ).bind(actor_uri).bind(viewer).bind(&note.uri).bind(&note.atom_uri)
+            .fetch_one(&mut *transaction).await?;
+        if denied {
+            return Ok(false);
+        }
+        let author: Option<(i64, String)> = sqlx::query_as(
+            "SELECT id, followers_url FROM accounts WHERE uri=$1 AND domain IS NOT NULL",
+        )
+        .bind(actor_uri)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let visibility = remote_note_visibility(
+            &note.audience,
+            author
+                .as_ref()
+                .map_or("", |(_, followers)| followers.as_str()),
+        );
+        if matches!(visibility, 0 | 1) {
+            return Ok(true);
+        }
+        for uri in note
+            .audience
+            .to
+            .iter()
+            .chain(&note.audience.cc)
+            .chain(&note.mentions)
+        {
+            if local_activitypub_account_id(&mut transaction, uri, origin).await? == Some(viewer) {
+                return Ok(true);
+            }
+        }
+        if visibility == 2
+            && let Some((author, _)) = author
+        {
+            return Ok(sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM follows WHERE account_id=$1 AND target_account_id=$2)",
+            ).bind(viewer).bind(author).fetch_one(&mut *transaction).await?);
+        }
+        Ok(false)
+    }
+
     pub(crate) async fn remote_note_is_relevant(
         &self,
         account_id: i64,

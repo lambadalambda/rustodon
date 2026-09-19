@@ -38,7 +38,7 @@ pub use oauth::{
 };
 pub use records::*;
 pub use repository::Repository;
-pub(crate) use repository::normalize_hashtag;
+pub(crate) use repository::{KnownSearchStatus, normalize_hashtag};
 pub use settings::{RawJsonText, RawYamlText};
 pub use signatures::{
     HttpSignatureError, HttpSignatureKey, HttpSignatureRequest, HttpSignatureSigner,

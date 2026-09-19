@@ -2,6 +2,7 @@
 use std::error::Error;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use axum::response::IntoResponse;
 use serde_json::{Value, json};
 
 use super::*;
@@ -106,8 +107,14 @@ async fn remote_rows(pool: &PgPool) -> TestResult<i64> {
 async fn v2_accounts_reuse_search_and_authenticated_resolution() -> TestResult {
     let owner_url = std::env::var("RUSTODON_MASTODON_OWNER_DATABASE_URL")?;
     let mut connection = <sqlx::PgConnection as sqlx::Connection>::connect(&owner_url).await?;
-    crate::operational_schema::migrate(&mut connection).await?;
-    let writer = WriteRepository::connect(&owner_url).await?;
+    let writer =
+        WriteRepository::connect(&std::env::var("RUSTODON_WORKER_WRITE_DATABASE_URL")?).await?;
+    let writer_role: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(writer.pool())
+        .await?;
+    crate::operational_schema::migrate_with_writer_role(&mut connection, Some(&writer_role))
+        .await?;
+    let setup = WriteRepository::connect(&owner_url).await?;
     let repository = Repository::connect(&std::env::var("RUSTODON_MASTODON_DATABASE_URL")?).await?;
     for (token, scopes) in [
         (SEARCH_TOKEN, "read:search"),
@@ -121,25 +128,25 @@ async fn v2_accounts_reuse_search_and_authenticated_resolution() -> TestResult {
         .bind(token)
         .bind(scopes)
         .bind(TOKEN)
-        .execute(writer.pool())
+        .execute(setup.pool())
         .await?;
     }
     sqlx::query("UPDATE oauth_access_tokens SET scopes = 'read:search' WHERE token = $1")
         .bind(APP_TOKEN)
-        .execute(writer.pool())
+        .execute(setup.pool())
         .await?;
     sqlx::query(
         "UPDATE accounts SET display_name = 'searchprobe' \
          WHERE domain IS NULL AND username IN ('alice', 'moderator')",
     )
-    .execute(writer.pool())
+    .execute(setup.pool())
     .await?;
     // Fixture-only signer: never use an instance environment or live credential.
     sqlx::query("UPDATE accounts SET private_key = $1 WHERE id = -99")
         .bind(include_str!(
             "../../tests/fixtures/http-signature-private.pem"
         ))
-        .execute(writer.pool())
+        .execute(setup.pool())
         .await?;
 
     let fetches = Arc::new(AtomicUsize::new(0));
@@ -301,7 +308,7 @@ async fn v2_accounts_reuse_search_and_authenticated_resolution() -> TestResult {
     }
 
     let remote_query = format!("q=discovered%40{REMOTE_DOMAIN}&resolve=true");
-    assert_eq!(remote_rows(writer.pool()).await?, 0);
+    assert_eq!(remote_rows(setup.pool()).await?, 0);
     // A configured writer and live counter mock make accidental anonymous resolution observable.
     for token in [None, Some(APP_TOKEN), Some("unknown-search-token")] {
         assert_eq!(
@@ -325,7 +332,7 @@ async fn v2_accounts_reuse_search_and_authenticated_resolution() -> TestResult {
         assert_eq!(body["accounts"], json!([]));
     }
     assert_eq!(fetches.load(Ordering::SeqCst), 0);
-    assert_eq!(remote_rows(writer.pool()).await?, 0);
+    assert_eq!(remote_rows(setup.pool()).await?, 0);
     let resolved = results(
         &client,
         &base,
@@ -354,7 +361,7 @@ async fn v2_accounts_reuse_search_and_authenticated_resolution() -> TestResult {
         1,
         "actor fetch stays signed"
     );
-    assert_eq!(remote_rows(writer.pool()).await?, 1);
+    assert_eq!(remote_rows(setup.pool()).await?, 1);
     assert_eq!(
         resolved["accounts"][0]["feature_approval"]["current_user"],
         "missing"
@@ -793,5 +800,418 @@ async fn assert_status_url_collisions(
         failures.is_empty(),
         "status URL identity collisions: {failures:?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PG14 restricted runtime/writer fixture"]
+#[allow(clippy::too_many_lines)]
+async fn v2_uncached_status_urls_do_not_create_an_audience() -> TestResult {
+    use rsa::pkcs1::DecodeRsaPrivateKey;
+    use rsa::pkcs8::EncodePublicKey;
+    const REMOTE_DOMAIN: &str = "status-resolution.onion";
+    let setup = PgPool::connect(&std::env::var("RUSTODON_MASTODON_OWNER_DATABASE_URL")?).await?;
+    let writer =
+        WriteRepository::connect(&std::env::var("RUSTODON_WORKER_WRITE_DATABASE_URL")?).await?;
+    let repository = Repository::connect(&std::env::var("RUSTODON_MASTODON_DATABASE_URL")?).await?;
+    let role: (bool, bool) =
+        sqlx::query_as("SELECT rolsuper, rolcreaterole FROM pg_roles WHERE rolname=current_user")
+            .fetch_one(writer.pool())
+            .await?;
+    assert_eq!(role, (false, false));
+    sqlx::query("INSERT INTO oauth_access_tokens (token, scopes, resource_owner_id, application_id, created_at) SELECT $1, 'read:search', resource_owner_id, application_id, clock_timestamp() FROM oauth_access_tokens WHERE token=$2 ON CONFLICT DO NOTHING")
+        .bind(SEARCH_TOKEN).bind(TOKEN).execute(&setup).await?;
+    sqlx::query("UPDATE accounts SET private_key=$1 WHERE id=-99")
+        .bind(include_str!(
+            "../../tests/fixtures/http-signature-private.pem"
+        ))
+        .execute(&setup)
+        .await?;
+    let key = rsa::RsaPrivateKey::from_pkcs1_pem(include_str!(
+        "../../tests/fixtures/http-signature-private.pem"
+    ))?;
+    let public_key = rsa::RsaPublicKey::from(&key).to_public_key_pem(rsa::pkcs8::LineEnding::LF)?;
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let count = fetches.clone();
+    let mock = Router::new().fallback(get(move |uri: Uri, headers: HeaderMap| {
+        let count = count.clone();
+        let public_key = public_key.clone();
+        async move {
+            count.fetch_add(1, Ordering::SeqCst);
+            assert!(uri.path() == "/.well-known/webfinger" || headers.contains_key("signature"), "unsigned resolution: {uri}");
+            if uri.path() != "/.well-known/webfinger" {
+                let request = HttpSignatureRequest::new(&Method::GET, uri.path_and_query().unwrap().as_str(), &headers, &[]);
+                let key_id = signature_key_id(&headers).expect("signature").expect("key id");
+                verify_http_signature(&request, &HttpSignatureKey { key_id: &key_id, public_key_pem: &public_key }, SystemTime::now()).expect("valid signed GET");
+            }
+            if uri.path() == "/html" {
+                return ([(CONTENT_TYPE, "text/html")], "<html>unsupported discovery</html>").into_response();
+            }
+            if uri.path() == "/missing" { return StatusCode::NOT_FOUND.into_response(); }
+            if uri.path() == "/display" {
+                return (StatusCode::FOUND, [(LOCATION, format!("http://{REMOTE_DOMAIN}/public"))]).into_response();
+            }
+            if uri.path() == "/redirect" {
+                return (StatusCode::FOUND, [(LOCATION, "http://elsewhere.onion/public")]).into_response();
+            }
+            let actor = format!("http://{REMOTE_DOMAIN}/users/statusauthor");
+            let public = "https://www.w3.org/ns/activitystreams#Public";
+            let body = if uri.path() == "/.well-known/webfinger" {
+                json!({"subject":format!("acct:statusauthor@{REMOTE_DOMAIN}"), "links":[{"rel":"self", "type":"application/activity+json", "href":actor}]})
+            } else if uri.path() == "/users/statusauthor" {
+                json!({"@context":"https://www.w3.org/ns/activitystreams", "id": actor, "type":"Person", "preferredUsername":"statusauthor", "inbox":"https://8.8.8.8/inbox", "followers":format!("{actor}/followers")})
+            } else {
+                let (to, cc) = match uri.path() {
+                    "/private" | "/private-new" => (json!([format!("{actor}/followers")]), json!([])),
+                    "/unlisted" => (json!([format!("{actor}/followers")]), json!([public])),
+                    _ => (json!([public]), json!([])),
+                };
+                let mut note = json!({"id":format!("http://{REMOTE_DOMAIN}{}", uri.path()), "type":"Note", "attributedTo":actor, "content":"uncached search", "to":to, "cc":cc});
+                match uri.path() {
+                    "/mismatch" => note["id"] = json!(format!("http://{REMOTE_DOMAIN}/different")),
+                    "/attribution" => note["attributedTo"] = json!("http://elsewhere.onion/users/attacker"),
+                    "/invalid" => note["content"] = Value::Null,
+                    "/article" => note["type"] = json!("Article"),
+                    "/reply" => note["inReplyTo"] = json!(format!("http://{REMOTE_DOMAIN}/missing-parent")),
+                    "/question" => { note["type"] = json!("Question"); note["oneOf"] = json!([{"type":"Note", "name":"yes", "replies":{"totalItems":0}}, {"type":"Note", "name":"no", "replies":{"totalItems":0}}]); },
+                    "/direct" => { let recipient = format!("https://{DOMAIN}/users/alice"); note["to"] = json!([recipient]); note["tag"] = json!([{"type":"Mention", "href":recipient, "name":"@alice"}]); },
+                    _ => (),
+                }
+                note
+            };
+            ([(CONTENT_TYPE, if uri.path() == "/.well-known/webfinger" { "application/jrd+json" } else { "application/activity+json" })], body.to_string()).into_response()
+        }
+    }));
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = mock_listener.local_addr()?;
+    let mock_server = tokio::spawn(async move { axum::serve(mock_listener, mock).await });
+    let mut state = WebState::new(
+        repository,
+        Url::parse(&format!("https://{DOMAIN}/"))?,
+        DOMAIN,
+        "/system",
+        std::env::temp_dir(),
+        runtime(),
+        Vec::new(),
+        vec![DOMAIN.to_owned()],
+    )?
+    .with_write_repository(writer);
+    state.remote_fetcher = state
+        .remote_fetcher
+        .clone()
+        .with_test_endpoint(Some(endpoint));
+    state.remote_account_resolver = RemoteAccountResolver::new(state.remote_fetcher.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move { axum::serve(listener, router(state)).await });
+    let client = reqwest::Client::new();
+    let public_url = format!("http://{REMOTE_DOMAIN}/public");
+    for suffix in ["&type=hashtags", "&limit=0", "&type=statuses&offset=1"] {
+        assert_eq!(
+            status_results(&client, &base, &public_url, suffix).await?,
+            json!([])
+        );
+    }
+    assert_eq!(fetches.load(Ordering::SeqCst), 0);
+    for (token, expected) in [(None, 401), (Some(APP_TOKEN), 401)] {
+        let (code, _) = search(
+            &client,
+            &base,
+            true,
+            &format!("q={public_url}&resolve=true&type=statuses"),
+            token,
+        )
+        .await?;
+        assert_eq!(code, expected);
+    }
+    assert_eq!(fetches.load(Ordering::SeqCst), 0);
+    for path in [
+        "private-new",
+        "mismatch",
+        "attribution",
+        "invalid",
+        "article",
+        "html",
+        "missing",
+        "redirect",
+    ] {
+        let before = fetches.load(Ordering::SeqCst);
+        assert_eq!(
+            status_results(
+                &client,
+                &base,
+                &format!("http://{REMOTE_DOMAIN}/{path}"),
+                "&type=statuses"
+            )
+            .await?,
+            json!([]),
+            "{path}"
+        );
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            before + 1,
+            "no actor/redirect discovery for {path}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM accounts WHERE domain=$1")
+                .bind(REMOTE_DOMAIN)
+                .fetch_one(&setup)
+                .await?,
+            0,
+            "no account creation for {path}"
+        );
+    }
+    for input in [
+        format!("http://user:pass@{REMOTE_DOMAIN}/public"),
+        format!("http://{REMOTE_DOMAIN}/public#fragment"),
+        format!("http://{DOMAIN}/unknown"),
+    ] {
+        let before = fetches.load(Ordering::SeqCst);
+        assert_eq!(
+            status_results(&client, &base, &input, "&type=statuses").await?,
+            json!([])
+        );
+        assert_eq!(fetches.load(Ordering::SeqCst), before);
+    }
+    let public = status_results(&client, &base, &public_url, "&type=statuses").await?;
+    assert_eq!(public.as_array().unwrap().len(), 1, "uncached public URL");
+    assert_eq!(public[0]["visibility"], "public");
+    let request_count = fetches.load(Ordering::SeqCst);
+    assert!(request_count >= 2);
+    assert_eq!(
+        status_results(&client, &base, &public_url, "&type=statuses").await?,
+        public
+    );
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        request_count,
+        "cache must not fetch"
+    );
+    assert_eq!(
+        status_results(
+            &client,
+            &base,
+            &format!("http://{REMOTE_DOMAIN}/display"),
+            "&type=statuses"
+        )
+        .await?,
+        public,
+        "same-origin redirect to exact canonical ID"
+    );
+    let unlisted = status_results(
+        &client,
+        &base,
+        &format!("http://{REMOTE_DOMAIN}/unlisted"),
+        "&type=statuses",
+    )
+    .await?;
+    assert_eq!(unlisted[0]["visibility"], "unlisted");
+    assert_eq!(
+        status_results(
+            &client,
+            &base,
+            &format!("http://{REMOTE_DOMAIN}/private"),
+            "&type=statuses"
+        )
+        .await?,
+        json!([])
+    );
+    let private_count: i64 = sqlx::query_scalar("SELECT count(*) FROM statuses WHERE uri=$1")
+        .bind(format!("http://{REMOTE_DOMAIN}/private"))
+        .fetch_one(&setup)
+        .await?;
+    assert_eq!(private_count, 0, "unauthorized search must not materialize");
+    let mentions: i64 = sqlx::query_scalar("SELECT count(*) FROM mentions JOIN statuses ON statuses.id=mentions.status_id WHERE statuses.uri LIKE $1")
+        .bind(format!("http://{REMOTE_DOMAIN}/%" )).fetch_one(&setup).await?;
+    assert_eq!(mentions, 0, "searcher must never become a delivery target");
+    let viewer: i64 =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE username='alice' AND domain IS NULL")
+            .fetch_one(&setup)
+            .await?;
+    let author: i64 = sqlx::query_scalar("SELECT id FROM accounts WHERE domain=$1")
+        .bind(REMOTE_DOMAIN)
+        .fetch_one(&setup)
+        .await?;
+    sqlx::query("INSERT INTO follows (account_id,target_account_id,created_at,updated_at) VALUES ($1,$2,now(),now())")
+        .bind(viewer).bind(author).execute(&setup).await?;
+    let private = status_results(
+        &client,
+        &base,
+        &format!("http://{REMOTE_DOMAIN}/private"),
+        "&type=statuses",
+    )
+    .await?;
+    assert_eq!(
+        private[0]["visibility"], "private",
+        "real follower may import private Note"
+    );
+    let private_mentions: i64 = sqlx::query_scalar("SELECT count(*) FROM mentions JOIN statuses ON statuses.id=mentions.status_id WHERE statuses.uri=$1")
+        .bind(format!("http://{REMOTE_DOMAIN}/private")).fetch_one(&setup).await?;
+    assert_eq!(private_mentions, 0);
+    sqlx::query("DELETE FROM follows WHERE account_id=$1 AND target_account_id=$2")
+        .bind(viewer)
+        .bind(author)
+        .execute(&setup)
+        .await?;
+    sqlx::query(
+        "INSERT INTO tombstones (account_id,uri,created_at,updated_at) VALUES ($1,$2,now(),now())",
+    )
+    .bind(author)
+    .bind(format!("http://{REMOTE_DOMAIN}/tombstoned"))
+    .execute(&setup)
+    .await?;
+    let before = fetches.load(Ordering::SeqCst);
+    for path in ["private", "tombstoned"] {
+        assert_eq!(
+            status_results(
+                &client,
+                &base,
+                &format!("http://{REMOTE_DOMAIN}/{path}"),
+                "&type=statuses"
+            )
+            .await?,
+            json!([])
+        );
+    }
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        before,
+        "known private denial and tombstone cannot fetch"
+    );
+    sqlx::query("UPDATE statuses SET deleted_at=now() WHERE uri=$1")
+        .bind(&public_url)
+        .execute(&setup)
+        .await?;
+    assert_eq!(
+        status_results(&client, &base, &public_url, "&type=statuses").await?,
+        json!([])
+    );
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        before,
+        "deleted authoritative status cannot fetch"
+    );
+    sqlx::query("UPDATE statuses SET deleted_at=NULL WHERE uri=$1")
+        .bind(&public_url)
+        .execute(&setup)
+        .await?;
+
+    for path in ["reply", "question", "direct"] {
+        let result = status_results(
+            &client,
+            &base,
+            &format!("http://{REMOTE_DOMAIN}/{path}"),
+            "&type=statuses",
+        )
+        .await?;
+        assert_eq!(result.as_array().unwrap().len(), 1, "{path}");
+        if path == "direct" {
+            assert_eq!(result[0]["visibility"], "direct");
+        }
+    }
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM rustodon.outbox_events WHERE kind='rustodon.activitypub.resolve_thread' AND payload->'arguments'->>'parent_url'=$1")
+        .bind(format!("http://{REMOTE_DOMAIN}/missing-parent")).fetch_one(&setup).await?;
+    assert_eq!(jobs, 1, "normal durable missing-parent resolver");
+    let policy_baseline = status_results(&client, &base, &public_url, "&type=statuses").await?;
+    assert_eq!(policy_baseline[0]["id"], public[0]["id"]);
+    // Every case owns and removes exactly one policy. In particular, the domain
+    // case must not inherit a viewer block that could mask a missing domain gate.
+    for (policy, install, remove, expected_fetches) in [
+        (
+            "author-blocked",
+            "INSERT INTO blocks (account_id,target_account_id,created_at,updated_at) SELECT viewer,author,now(),now() FROM policy",
+            "DELETE FROM blocks USING policy WHERE account_id=viewer AND target_account_id=author",
+            1,
+        ),
+        (
+            "reverse-blocked",
+            "INSERT INTO blocks (account_id,target_account_id,created_at,updated_at) SELECT author,viewer,now(),now() FROM policy",
+            "DELETE FROM blocks USING policy WHERE account_id=author AND target_account_id=viewer",
+            1,
+        ),
+        (
+            "muted",
+            "INSERT INTO mutes (account_id,target_account_id,created_at,updated_at) SELECT viewer,author,now(),now() FROM policy",
+            "DELETE FROM mutes USING policy WHERE account_id=viewer AND target_account_id=author",
+            1,
+        ),
+        (
+            "suspended",
+            "UPDATE accounts SET suspended_at=now() FROM policy WHERE id=author",
+            "UPDATE accounts SET suspended_at=NULL FROM policy WHERE id=author",
+            1,
+        ),
+        (
+            "domain-blocked",
+            "INSERT INTO account_domain_blocks (account_id,domain,created_at,updated_at) SELECT viewer,accounts.domain,now(),now() FROM policy JOIN accounts ON accounts.id=author",
+            "DELETE FROM account_domain_blocks blocked USING policy, accounts WHERE accounts.id=author AND blocked.account_id=viewer AND blocked.domain=accounts.domain",
+            0,
+        ),
+    ] {
+        let policy_sql = |statement| {
+            format!(
+                "WITH policy AS (SELECT $1::bigint AS viewer, $2::bigint AS author) {statement}"
+            )
+        };
+        assert_eq!(
+            sqlx::query(&policy_sql(install))
+                .bind(viewer)
+                .bind(author)
+                .execute(&setup)
+                .await?
+                .rows_affected(),
+            1,
+            "install {policy}"
+        );
+        let before = fetches.load(Ordering::SeqCst);
+        assert_eq!(
+            status_results(&client, &base, &public_url, "&type=statuses").await?,
+            json!([]),
+            "known {policy}"
+        );
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            before,
+            "known {policy} must not fetch"
+        );
+        let uncached_url = format!("http://{REMOTE_DOMAIN}/{policy}");
+        assert_eq!(
+            status_results(&client, &base, &uncached_url, "&type=statuses").await?,
+            json!([]),
+            "uncached {policy}"
+        );
+        let request_delta = fetches.load(Ordering::SeqCst) - before;
+        let persisted: i64 = sqlx::query_scalar("SELECT count(*) FROM statuses WHERE uri=$1")
+            .bind(&uncached_url)
+            .fetch_one(&setup)
+            .await?;
+        assert_eq!(
+            sqlx::query(&policy_sql(remove))
+                .bind(viewer)
+                .bind(author)
+                .execute(&setup)
+                .await?
+                .rows_affected(),
+            1,
+            "cleanup {policy}"
+        );
+        assert_eq!(
+            request_delta, expected_fetches,
+            "{policy}: only domain denial precedes the object GET"
+        );
+        assert_eq!(persisted, 0, "{policy} must not materialize a status");
+        assert_eq!(
+            status_results(&client, &base, &public_url, "&type=statuses").await?,
+            policy_baseline,
+            "{policy} fully removed"
+        );
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            before + expected_fetches,
+            "cleanup uses cached positive control"
+        );
+    }
+    server.abort();
+    mock_server.abort();
     Ok(())
 }

@@ -9321,17 +9321,40 @@ fn status_search_url<'a>(
     .then_some(query)
 }
 
-async fn search_known_status(
+async fn search_status_url(
     state: &WebState,
     viewer: i64,
     url: &str,
 ) -> Result<Vec<crate::mastodon::rest::RestStatus>, ()> {
-    let id = state
+    use crate::mastodon::KnownSearchStatus;
+    let mut target = state
         .repository
         .known_search_status_id(url, state.origin.as_str(), viewer)
         .await
         .map_err(|_| ())?;
-    let Some(id) = id else {
+    if target == KnownSearchStatus::Unknown
+        && let Some(writer) = state.write_repository.as_ref()
+    {
+        let resolved = crate::status_resolution::RemoteStatusResolver {
+            repository: &state.repository,
+            writer,
+            fetcher: &state.remote_fetcher,
+            origin: &state.origin,
+            limited_federation: state.instance_runtime.limited_federation,
+        }
+        .resolve(viewer, url)
+        .await?;
+        target = state
+            .repository
+            .known_search_status_id(
+                resolved.as_deref().unwrap_or(url),
+                state.origin.as_str(),
+                viewer,
+            )
+            .await
+            .map_err(|_| ())?;
+    }
+    let KnownSearchStatus::Found(id) = target else {
         return Ok(Vec::new());
     };
     let status = state
@@ -9389,15 +9412,14 @@ async fn search_v2(
     } else {
         0
     };
-    // No remote status resolution in this slice. A URL search must never fall
-    // through to account/hashtag text results, even when it misses or is hidden.
+    // A URL search must never fall through to hashtag/text results.
     if resolve && (query.trim().starts_with("https://") || query.trim().starts_with("http://")) {
         let mut statuses = Vec::new();
         if let (Some(viewer), Some(url)) = (
             owner,
             status_search_url(query, resolve, search_type, limit, offset),
         ) {
-            statuses = match search_known_status(&state, viewer, url).await {
+            statuses = match search_status_url(&state, viewer, url).await {
                 Ok(statuses) => statuses,
                 Err(()) => return internal_error(),
             };

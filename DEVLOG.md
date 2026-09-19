@@ -1,3 +1,108 @@
+## 2026-09-19 — Uncached search review 1 test-isolation follow-up
+
+- Parent review `a30e` reported no blockers/high findings and one directly
+  security-relevant medium fixture gap. Closed that gap with tests only:
+  table-driven independent viewer-block, reverse-block, mute, suspended-author
+  and viewer-domain-block cases in the existing uncached fixture.
+- Each case installs exactly one policy, checks cached denial with zero fetches,
+  checks a unique uncached URL returns empty with no persisted status, then
+  removes exactly its policy and verifies the cached positive control again.
+  Author policies require exactly one signed object GET; domain denial requires
+  zero. The prior viewer block no longer masks the domain case.
+- No behavior/source-service changes. Production source SHA-256 values match
+  pre-review evidence. Fixed test-only Clippy naming/import-placement findings.
+  Test-only follow-up: no new production red/green cycle claimed. First expanded
+  run failed because the cleanup positive control compared old account counters
+  captured before later imports; corrected it to capture the current projection
+  before the matrix. The policy matrix then passed against unchanged production.
+- Final restricted runtime/writer Linux PG14 command (`review1-verified.log`):
+  `cargo test --locked --offline --features test-support --lib web::account_search_tests:: -- --include-ignored --nocapture --test-threads=1`
+  **4 passed**, 0 failed, 368 filtered, 28.23s. Fresh disposable restore; owner
+  credentials only for setup/policy fixtures, actual HTTP uses restricted roles.
+- Final library Clippy with `--features test-support --lib -- -D warnings`
+  passed (`review1-clippy-verified.log`). Broader `--lib --tests` still fails on
+  pre-existing unrelated diagnostics in tests/media_processor.rs, src/paperclip.rs
+  and src/worker/local_uploads/tests.rs; no diagnostics remain in changed search
+  code/tests (`review1-test-clippy-verified.log`). Local fmt/diff checks passed.
+- Reused task workspace `/srv/workspaces/rustodon-uncached-search-54dc5c9-alice/`
+  and explicit test-file-only sync. Same NAS7203 tools image and bounded
+  4 CPU/6 GiB/512 PID/870s +900s outer limits. Fresh PG14 resources used
+  1 CPU/512 MiB/128 PIDs/1800s, task internal network, no host ports. Verified
+  final source hashes against NAS (`review1-source-sha256.txt`). Removed both
+  runs' task PG anonymous volumes, PG/runner containers and network; absence
+  verified (`review1-cleanup.txt`). No production access, broad prune or shared
+  cache removal. Logs collected under ignored `target/uncached-search-evidence/`.
+- Leave uncommitted for parent review 2 (maximum two substantive rounds).
+  HTML/actor-URL behavior unchanged; browser work remains next, not run here.
+
+## 2026-09-19 — Uncached exact status URL search (54dc5c9, uncommitted)
+
+- Created/indexed `meta/issues/search-uncached-exact-status-urls.md` before source
+  edits. Changes remain uncommitted; parent and subissue remain open for review.
+- Verified the read-only reference checkout is clean at exactly
+  `1440d55b139e39ec722c2a3db7f60b66cd889048`; inspected SearchService and
+  ResolveURLService. No claim of full URLService compatibility or source-contract
+  gate execution in this slice.
+- Added narrow `status_resolution` service: existing signed RemoteFetcher,
+  actor resolver/WebFinger, normal Note/Question parser and
+  `apply_remote_note_create(..., None, ...)`. No worker internals exported,
+  schema/grants/job types/source identity scheme changed. Missing-parent work
+  uses the existing durable outbox resolver job; its execution was not tested.
+- Lookup now distinguishes Unknown/Denied/Found before any fetch. Authoritative
+  identity tiers and ambiguous-match denial are preserved. Existing audience
+  policy is checked before fetch and again during final authorized projection.
+  Ingestion parser-backed preflight rejects invalid documents, tombstones,
+  blocked/muted/suspended known authors and unauthorized audiences before actor
+  creation. The searching user is NEVER an inbox delivery target; actual to/cc
+  and Mention data, or an existing follow, must supply private access.
+- Exact URL coverage: cached URI/display URL/local aliases remain supported;
+  uncached canonical HTTP(S) Note/Question IDs and same-origin transport redirects
+  to an exact canonical response ID are supported. Arbitrarily advertised IDs,
+  cross-origin redirects and attribution are rejected. Existing URL-aware domain
+  canonicalization preserves non-default ports. There is no trusted HTML Link
+  discovery helper in RemoteFetcher, so HTML and an unredirected display URL
+  returning a different canonical ID are explicitly unsupported. No crawler,
+  Create/Announce wrapper expansion, collections or full-text search was added.
+  Existing account-handle resolution remains covered; actor-URL dispatch is not
+  newly implemented by this status-only resolver.
+- TDD actual RED (`red.log`): newly added restricted-role fixture failed at
+  `uncached public URL`, expected 1 result, actual 0, before production edits.
+  Initial harness attempts failed on startup readiness/missing disposable roles;
+  these were corrected with explicit owner-only setup, not credential fallback.
+  Intermediate fixture corrections included the actor context, PKCS#1 fixture
+  key format and checking the actual durable outbox payload, not undispatched
+  durable_jobs. None are claimed as behavioral red/green evidence.
+- Final GREEN (`canonical.log`), fresh task-owned PG14 restore:
+  `cargo test --locked --offline --features test-support --lib web::account_search_tests:: -- --include-ignored --nocapture --test-threads=1`
+  **4 passed**, 0 failed, 368 filtered, 27.48s. Existing account regression now
+  also uses actual restricted writer credentials for HTTP resolution; owner is
+  setup only. Runtime/writer grants are unchanged documented grants.
+  New fixture verifies RSA-signed object/actor GETs (ordinary WebFinger unsigned),
+  public/unlisted/private/direct access, private import only after a real follow,
+  no fabricated mention, zero-fetch cache reuse/known-private denial/deletion/
+  tombstone, early anonymous/app/limit/type/offset/origin rejection, mismatched
+  IDs/attribution, malformed/unsupported/HTML/404/cross-origin responses, denied
+  author and domain, Question and normal durable missing-parent outbox work.
+  It checks no new actor rows for early rejected remote documents.
+- `cargo clippy --locked --offline --features test-support --lib -- -D warnings`
+  passed on final source (`canonical-clippy.log`). Ordinary remote tests: **39
+  passed, 1 ignored** (`remote-unit.log`); web tests: **91 passed, 2 ignored**
+  (`web-unit.log`), before the final URL-domain canonicalizer substitution and
+  added tombstone/private-deletion assertions. These are not a live HTTPS/peer
+  gate. Local fmt/diff checks passed; no browser, full matrix or release claim.
+- NAS workspace `/srv/workspaces/rustodon-uncached-search-54dc5c9-alice/`;
+  tools image `7203e0222e2bb72e0b83ab623051873604874cc41a688e318b84691bfa77ad8a`,
+  4 CPUs/6 GiB/512 PIDs/870s, outer 900s +15s kill. PG14 image
+  `1a6c2409ab71f4d054d676ba09d9b74b5d843d805bd5a0cf08314d27ca659d37`,
+  1 CPU/512 MiB/128 PIDs/5400s initially, 1800s final rerun; isolated internal
+  task network, no published ports. Only tracked HEAD source and explicit source
+  edits/new helper were synchronized. No production access. Task-specific PG,
+  anonymous volumes, runner and network removed; evidence/scripts retained in
+  ignored `target/uncached-search-evidence/` and NAS workspace. Shared build
+  caches were reused, never removed. Final source hashes verified against NAS.
+- Independent review is pending with the parent. This child could not spawn a
+  reviewer (configured nesting depth limit); no independent review is claimed.
+
 ## 2026-09-19 — Exact status URL identity collision review fix
 
 - Resumed after unlock; first NAS access succeeded. Loaded nas-podman and

@@ -29,6 +29,13 @@ use super::records::{
 };
 use super::types::{PermissionBits, SecretText, StatusVisibility, UserPermission};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KnownSearchStatus {
+    Unknown,
+    Denied,
+    Found(i64),
+}
+
 #[derive(sqlx::FromRow)]
 #[allow(clippy::struct_excessive_bools)]
 struct StatusPolicyRow {
@@ -1023,7 +1030,7 @@ impl Repository {
         url: &str,
         origin: &str,
         viewer: i64,
-    ) -> sqlx::Result<Option<i64>> {
+    ) -> sqlx::Result<KnownSearchStatus> {
         let local_id = url
             .strip_prefix(origin)
             .and_then(|path| path.rsplit('/').next())
@@ -1031,7 +1038,7 @@ impl Repository {
         // Select identity before authorization. A denied authoritative status is
         // not permission to fall back to an unrelated row claiming its URL.
         // Display URLs are not unique: ambiguous best-tier matches fail closed.
-        let id: Option<i64> = sqlx::query_scalar(
+        let (count, id): (i64, Option<i64>) = sqlx::query_as(
             "WITH candidates AS ( \
                SELECT status.id, 0 AS priority FROM statuses status \
                JOIN accounts author ON author.id = status.account_id \
@@ -1041,7 +1048,7 @@ impl Repository {
                    OR $1 = $3 || 'ap/users/' || author.id::text || '/statuses/' || status.id::text) \
                UNION ALL SELECT id, 1 FROM statuses WHERE uri = $1 \
                UNION ALL SELECT id, 2 FROM statuses WHERE url = $1 \
-             ) SELECT CASE WHEN count(*) = 1 THEN min(id) END FROM candidates \
+             ) SELECT count(*), CASE WHEN count(*) = 1 THEN min(id) END FROM candidates \
                WHERE priority = (SELECT min(priority) FROM candidates)",
         )
         .bind(url)
@@ -1050,18 +1057,25 @@ impl Repository {
         .fetch_one(&self.pool)
         .await?;
         let Some(id) = id else {
-            return Ok(None);
+            return Ok(if count == 0 {
+                KnownSearchStatus::Unknown
+            } else {
+                KnownSearchStatus::Denied
+            });
         };
         Ok(self
             .rest_status_policy_rows(&[id], Some(viewer))
             .await?
             .into_iter()
             .find(|row| {
-                !row.viewer_blocks_author
+                status_access(row.access_facts(true)).is_allowed()
+                    && !row.viewer_blocks_author
                     && !row.viewer_mutes_author
                     && !row.viewer_domain_blocks_author
             })
-            .map(|row| row.id))
+            .map_or(KnownSearchStatus::Denied, |row| {
+                KnownSearchStatus::Found(row.id)
+            }))
     }
 
     pub(crate) async fn rest_authorized_status_ids(

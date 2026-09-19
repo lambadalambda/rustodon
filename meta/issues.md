@@ -30,3 +30,5 @@
 - [ ] [Support hashtag and featured-tag controls](issues/support-hashtag-and-featured-tag-controls.md)
 
 - [ ] [Search known exact status URLs](issues/search-known-exact-status-urls.md)
+
+- [ ] [Resolve uncached exact status URLs in search](issues/search-uncached-exact-status-urls.md)

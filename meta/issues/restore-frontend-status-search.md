@@ -31,3 +31,5 @@ Rustodon's v2 search response always contains an empty `statuses` array. Signed-
 - URL-branch clarification from pinned `SearchService`: `account_id`, `min_id`, `max_id`, and `following` filter textual searches, not exact URL resolution. The URL branch is exclusive and ignores those filters. This refines the account-filter requirement above rather than imposing contradictory URL semantics.
 - Search intentionally suppresses viewer-blocked, muted, and viewer-domain-blocked authors in addition to normal audience authorization. This is a stricter safety choice, not pinned bug-for-bug context silencing behavior.
 - Uncached URL resolution and bundled-frontend browser regression remain subsequent slices; parent stays open.
+
+- [Uncached exact status URL resolution](search-uncached-exact-status-urls.md): bounded signed-fetch follow-up implemented with focused NAS red/green evidence; parent review 1 completed without blockers/high findings; test-isolation follow-up verified, review 2 pending. HTML/full-text/browser remain deferred.
