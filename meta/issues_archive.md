@@ -126,3 +126,7 @@
 - [x] [Search known exact status URLs](issues/search-known-exact-status-urls.md)
 - [x] [Resolve uncached exact status URLs in search](issues/search-uncached-exact-status-urls.md)
 - [x] [Bounded status-search browser acceptance](issues/accept-status-search-browser.md)
+
+- [x] [Accept local hashtag controls in browser and Rails differential](issues/accept-local-hashtag-controls-browser-differential.md)
+- [x] [Support authenticated profile read](issues/support-authenticated-profile-read.md)
+- [x] [Implement local hashtag control APIs](issues/implement-local-hashtag-control-apis.md)

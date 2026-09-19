@@ -1,3 +1,66 @@
+## 2026-09-19 — Reviewed bounded hashtag acceptance closure (75f770)
+
+- Parent review 75f770 approves the bounded harness commit without blockers.
+  Preserve strict Rails differential **FAIL 54/59**, all 59 statuses/equivalent
+  rejection semantics. Five text differences accepted as nonblocking ordinary
+  compatibility pending an actual client dependency; no normalization/fake PASS.
+- Archive exactly the bounded browser/differential acceptance child, profile-read
+  prerequisite (c493, bd01aca plus successful browser continuation), and local
+  API child (8e22f52 review 2 plus recorded API/grant/stream/source gates). API
+  closure does not claim browser coverage. Historical evidence remains intact.
+- Keep support-hashtag-and-featured-tag-controls OPEN. Created/indexed focused
+  metadata/typed-name editor follow-up: captured empty editor says maximum tags;
+  suggestion Add/Delete passed, typed entry did not. Verified source has frontend
+  zero fallback and existing Rust max_featured_tags literals; cause/fix not yet
+  established. No implementation, new browser or differential attempt this turn.
+- Peer AddHashtag/RemoveHashtag and Redis-history semantic boundaries unchanged.
+  No production, push or application changes. Raw evidence stays ignored in
+  target; explicitly stage intended harness/docs only, excluding __pycache__.
+- Pre-commit checks passed: focused offline 4 + existing browser regressions 8,
+  cargo fmt --all -- --check, diff whitespace, exact issue-index closure set and
+  unchanged raw-evidence checksums. No extra broad fixture/test gates.
+
+## 2026-09-19 — bd01aca hashtag browser PASS; real Rails differential findings
+
+- Resumed indexed acceptance on exact bd01acae2bc4e1b8a75bd95648e216535c790330,
+  reviewed prerequisite c493. Verified clean read-only Mastodon 1440d55b; exact
+  git archive and pinned assets. No app code, production, deployment, push/commit.
+- Final fresh uninterrupted real-click browser PASS: tag header/history, four
+  header controls, reload state, representative home inclusion/removal, profile
+  featured-tag add/Delete, reload and public-profile presence/removal. No API
+  replacement or profile PATCH. Initial 1-GiB request interruption unproved;
+  2-GiB run reached a DOM-valued wait; boolean correction passed third fresh run.
+- Serial real pinned Rails HTTP differential ran twice. Final 59 cases: 54 strict
+  matches, all statuses match, count "3"/date and final limit 10 match. Covered
+  supported local methods, normalization/duplicates, ownership/auth scopes and
+  limits. Five error strings differ: invalid lookup; missing/empty/invalid name;
+  Rails header-limit message repeated three times vs once. Strict FAIL retained;
+  no application fix or silent error normalization. Parent disposition required.
+- First differential's four additional date differences came from rewriting an
+  older-ID timestamp; corrected only the seed to a new chronological highest-ID
+  current status. Second/final attempt removes these date differences. No third
+  attempt, application timestamp change or upstream incidental-defect emulation.
+- Differential reuses mastodon-fixture pinned constants/start_differential_web,
+  with no host ports and explicit bounds. Separate restored Rust/Rails PG14.23
+  DB/media, restricted runtime/writer and Rails non-superuser DB owner. Internal
+  task networks; no Sidekiq/Rust workers or federation delivery. History actual
+  Rails 0/0 vs Rust 1/1 retained, excluded from equality as DB/Redis semantics;
+  IDs bijectively paired and only equal-count ordering ties normalized.
+- Bounded source builds 4 CPU/6 GiB/512 PIDs/870s; app and Rails each 2 CPU/2 GiB;
+  full invocations 1500s. Other explicit process/memory/time limits in README.
+  Task containers/PG volumes/networks/media/keys/env/sessions/build output removed
+  and absence checked. Final container states running/non-OOM before teardown.
+- New offline guards RED -> GREEN; final 4 focused + 8 existing browser regressions
+  pass, JS/shell syntax and diff checks pass. Full mise harness aggregate stops
+  in existing peer test on macOS BSD stat -c; not a full aggregate pass. No
+  unrelated portability work. Disabled-user probe scope-confounded; no separate
+  suspended-account precedence or anonymous public-profile browser proof.
+- Sanitized evidence/hashes: target/hashtag-acceptance-bd01aca; NAS originals in
+  rustodon-hashtag-{browser,differential}-bd01aca-alice, earlier attempts separate.
+  Executed application/helpers match; final generator reproduces runtime scripts.
+  Parent harness review pending. Issues remain open for five string dispositions;
+  peer AddHashtag/RemoveHashtag and Redis history equivalence remain deferred.
+
 ## 2026-09-19 — Hashtag browser acceptance blocked on profile read (8e22f52)
 
 - Created/indexed `accept-local-hashtag-controls-browser-differential` before

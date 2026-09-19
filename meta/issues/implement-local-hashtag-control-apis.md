@@ -62,3 +62,10 @@ Review-fix verification on the same bounded disposable NAS PG14/tool-image lane:
 - Strict all-feature library Clippy, formatting and diff checks passed. No stress investigation or unrelated lint changes.
 
 Ready for independent parent review 2; no second independent review is claimed by this child. Still uncommitted, no production access/push, no new schema/cache/job/protocol/browser work. Existing history/peer/differential limitations remain. Review-fix task PG/anonymous volume/network removed; source/evidence retained in the existing ignored task evidence directories.
+
+
+## Closure — reviewed local API/database slice
+
+Closed/archived on approved `8e22f52`: parent independent source review round 2 approved the local implementation after the two relevant review-1 fixes. The recorded restricted-role HTTP/grant **3/3**, API-driven home/WebSocket **1/1**, pinned source **9/9**, library Clippy and formatting checks establish this bounded API/database slice. Historical pending/uncommitted statements above are superseded by that commit/review disposition. These gates were not rerun for this documentation closure.
+
+No browser claim is needed to close this API child; subsequent bounded browser/Rails evidence belongs to [the acceptance child](accept-local-hashtag-controls-browser-differential.md). Parent review `75f770` accepts its five error-text differences as nonblocking ordinary compatibility, without converting strict differential FAIL 54/59 to PASS. The hashtag parent stays open for [typed-name/limit-metadata editor work](diagnose-featured-tag-limit-metadata-and-typed-name-editor.md). No new protocol/schema/job, Redis-history equivalence, peer delivery, stress or full matrix completion is claimed.

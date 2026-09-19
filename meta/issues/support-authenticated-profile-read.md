@@ -63,3 +63,10 @@ Implementation and verification pending; keep open. Existing sibling-owned brows
 - Open for parent review and browser continuation. Independent child review was
   unavailable (agent nesting limit); no independent review is claimed. Sibling
   documentation/harness left untouched except the requested new issue index entry.
+
+
+## Closure — verified prerequisite
+
+Closed/archived: implementation committed as `bd01acae2bc4e1b8a75bd95648e216535c790330`, independent parent review `c493` reports no issues. The executed projection/source/restricted-role HTTP gates above establish this read-only prerequisite. Subsequent bounded browser acceptance on that exact commit passed consolidated profile loading/reloading and genuine featured-tag suggestion Add/Delete; parent harness review `75f770` accepted that evidence.
+
+Historical pending/uncommitted statements above are superseded by this disposition. No profile PATCH, deployment or general editor parity is claimed. The separate [typed-name/limit-metadata follow-up](diagnose-featured-tag-limit-metadata-and-typed-name-editor.md) and hashtag parent remain open; their scope does not reopen this completed authenticated read contract.

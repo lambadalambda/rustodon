@@ -28,7 +28,5 @@
 - [ ] [Compute real instance activity metrics](issues/compute-real-instance-activity-metrics.md)
 - [ ] [Support hashtag and featured-tag controls](issues/support-hashtag-and-featured-tag-controls.md)
 
-- [ ] [Implement local hashtag control APIs](issues/implement-local-hashtag-control-apis.md)
-- [ ] [Accept local hashtag controls in browser and Rails differential](issues/accept-local-hashtag-controls-browser-differential.md)
 
-- [ ] [Support authenticated profile read](issues/support-authenticated-profile-read.md)
+- [ ] [Diagnose featured-tag limit metadata and typed-name editor](issues/diagnose-featured-tag-limit-metadata-and-typed-name-editor.md)
