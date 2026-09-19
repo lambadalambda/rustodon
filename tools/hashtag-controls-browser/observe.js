@@ -17,6 +17,8 @@
       const row = {method, path:url.pathname, code:this.status};
       if (/\/tags\/|featured_tags/.test(url.pathname)) row.tags = Array.isArray(body) ? body.map(tag) : body && tag(body);
       if (url.pathname === '/api/v1/timelines/home') row.ids = Array.isArray(body) ? body.map(x=>x.id) : [];
+      if (url.pathname === '/api/v2/instance') row.max_featured_tags = body?.configuration?.accounts?.max_featured_tags;
+      if (url.pathname === '/api/v1/profile') row.featured_tags = body?.featured_tags?.map(tag);
       window.hashtagCalls.push(row);
     });
     return send.apply(this, args);

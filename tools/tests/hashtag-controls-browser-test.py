@@ -28,6 +28,22 @@ class AdapterTests(unittest.TestCase):
             self.assertIn('seed.sql', setup)
             self.assertIn('remaining-task-containers', (Path(directory) / 'cleanup.sh').read_text())
 
+    def test_typed_mode_waits_for_actual_instance_metadata(self):
+        spec = importlib.util.spec_from_file_location('prepare', ROOT / 'tools/hashtag-controls-browser/prepare.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as directory:
+            module.prepare(ROOT, Path(directory), mode='typed')
+            run = (Path(directory) / 'run.sh').read_text()
+            self.assertIn('featured-typed-d17bec9', run)
+            self.assertIn('ui.py typed', run)
+            self.assertIn('d17bec9ceaea8791323e630d5fd5bd10dc2bd67d', run)
+        controller = (ROOT / 'tools/hashtag-controls-browser/ui.py').read_text()
+        self.assertIn('max_featured_tags===10', controller)
+        self.assertIn("'fill', 'input[type=search]'", controller)
+        self.assertIn("'Add #' + name", controller)
+        self.assertIn('range(10)', controller)
+
     def test_differential_reuses_real_rails_and_isolates(self):
         spec = importlib.util.spec_from_file_location('prepare', ROOT / 'tools/hashtag-controls-browser/prepare.py')
         module = importlib.util.module_from_spec(spec)
@@ -56,7 +72,7 @@ class AdapterTests(unittest.TestCase):
                 if node.args and isinstance(node.args[0], ast.Constant):
                     code = node.args[0].value
                     self.assertFalse(code.startswith('document.querySelector(') and '.innerText.includes(' not in code, 'CDP waits must return boolean, not DOM objects')
-        tail = source.split("record('profile-remove')", 1)[1]
+        tail = source.split("record('profile-remove')", 1)[1].split("def editor(", 1)[0]
         self.assertIn('r.path===\"/api/v1/profile\"', tail)
         self.assertNotIn('r.path===\"/api/v1/featured_tags\"', tail)
         self.assertIn("button('Delete FixtureTag')", source)

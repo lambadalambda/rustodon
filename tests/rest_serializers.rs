@@ -928,3 +928,60 @@ fn profile_read_preserves_raw_fields_and_nullable_images() {
     assert_eq!(value["featured_tags"][0]["statuses_count"], "3");
     assert_eq!(value["featured_tags"][0]["name"], "Rust");
 }
+
+#[test]
+fn instance_featured_tag_limit_is_at_the_frontend_selector_path() {
+    use rustodon::mastodon::rest::{InstanceProjection, InstanceRuntimeConfig};
+    let instance = InstanceProjection {
+        runtime: InstanceRuntimeConfig {
+            domain: "fixture-v4-6-5.rustodon.invalid".into(),
+            version: "4.6.5".into(),
+            source_url: "https://example.org/source".into(),
+            streaming_api: "wss://fixture-v4-6-5.rustodon.invalid".into(),
+            vapid_public_key: None,
+            thumbnail_url: String::new(),
+            thumbnail_description: String::new(),
+            thumbnail_blurhash: None,
+            thumbnail_versions: None,
+            icons: vec![],
+            languages: vec!["en".into()],
+            active_month: 0,
+            active_halfyear: 0,
+            translation_enabled: false,
+            limited_federation: false,
+            single_user_mode: false,
+            terms_of_service_url: None,
+            sso_signup_url: None,
+            wrapstodon: None,
+        },
+        title: "Fixture".into(),
+        short_description: String::new(),
+        legacy_description: String::new(),
+        contact_email: String::new(),
+        status_page_url: None,
+        user_count: 1,
+        status_count: 0,
+        domain_count: 0,
+        registrations_mode: "none".into(),
+        require_invite_text: false,
+        closed_registrations_message: None,
+        min_age: None,
+        invites_enabled: false,
+        local_live_feed_access: "public".into(),
+        remote_live_feed_access: "public".into(),
+        local_topic_feed_access: "public".into(),
+        remote_topic_feed_access: "public".into(),
+        contact_account: None,
+        rules: vec![],
+    };
+    let serializer = serializer();
+    for value in [
+        serde_json::to_value(serializer.instance_v1(&instance).unwrap()).unwrap(),
+        serde_json::to_value(serializer.instance_v2(&instance).unwrap()).unwrap(),
+    ] {
+        assert_eq!(
+            value.pointer("/configuration/accounts/max_featured_tags"),
+            Some(&json!(10))
+        );
+    }
+}

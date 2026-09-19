@@ -1108,3 +1108,49 @@ fn pinned_profile_read_contract() {
         .unwrap();
     assert_eq!(route.support, ApiRouteSupport::Implemented);
 }
+
+#[test]
+#[ignore = "requires the read-only pinned Mastodon source checkout"]
+fn pinned_featured_editor_waits_for_delayed_instance_limit() {
+    let source = mastodon_source();
+    for (path, evidence) in [
+        (
+            "features/ui/index.jsx",
+            "setTimeout(() => this.props.dispatch(fetchServer()), 3000)",
+        ),
+        (
+            "api/instance.ts",
+            "apiRequestGet<ApiInstanceJSON>('v2/instance')",
+        ),
+        (
+            "models/server.ts",
+            "createServerFromServerJSON = (obj: ApiInstanceJSON): Server => obj",
+        ),
+        (
+            "reducers/server.ts",
+            "state.server.item = createServerFromServerJSON(action.payload)",
+        ),
+        (
+            "features/account_edit/featured_tags.tsx",
+            "state.server.server.item?.configuration.accounts.max_featured_tags ?? 0",
+        ),
+        (
+            "features/account_edit/featured_tags.tsx",
+            "const canAddMoreTags = tags.length < maxTags",
+        ),
+        (
+            "features/account_edit/featured_tags.tsx",
+            "{canAddMoreTags && <AccountEditTagSearch />}",
+        ),
+        (
+            "features/account_edit/components/tag_search.tsx",
+            "dispatch(addFeaturedTags({ names: [item.name] }))",
+        ),
+        ("hooks/useSearchTags.ts", "defaultMessage: 'Add #{tagName}'"),
+    ] {
+        assert!(
+            read(&source.join("app/javascript/mastodon").join(path)).contains(evidence),
+            "{path}: {evidence}"
+        );
+    }
+}

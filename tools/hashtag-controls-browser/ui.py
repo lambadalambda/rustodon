@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 spec = importlib.util.spec_from_file_location('base_ui', '/harness/tools/remote-browser/ui.py')
 ui = importlib.util.module_from_spec(spec)
@@ -139,9 +140,77 @@ def main():
     ab('close')
 
 
+def editor(count, label):
+    # Pinned UI dispatches fetchServer after 3000 ms; profile loaded != editor ready.
+    wait('window.hashtagCalls.some(r=>r.path==="/api/v2/instance" && r.code===200 && r.max_featured_tags===10)')
+    wait('window.hashtagCalls.some(r=>r.path==="/api/v1/profile" && r.code===200)')
+    wait('Array.from(document.querySelectorAll("button")).filter(b=>(b.getAttribute("aria-label") || "").startsWith("Delete ")).length===' + str(count))
+    if count < 10:
+        wait('Boolean(document.querySelector("input[type=search]"))')
+        assert 'You have reached the maximum number' not in js('document.body.innerText')
+    else:
+        wait('document.body.innerText.includes("You have reached the maximum number of featured hashtags.")')
+        assert not js('Boolean(document.querySelector("input[type=search]"))')
+    record(label)
+
+
+def typed_main():
+    observer = Path('/run-fixture/hashtag-observe.js')
+    observer.write_text(Path('/harness/tools/remote-browser/observe.js').read_text() + '\n' + Path('/harness/tools/hashtag-controls-browser/observe.js').read_text())
+    ab('open', '--init-script', str(observer), BASE + '/auth/sign_in')
+    ui.login()
+    ab('open', BASE + '/profile/featured_tags')
+    editor(0, 'typed-empty')
+    ab('reload')
+    editor(0, 'typed-empty-reload')
+    names = ['TypedLimit' + str(i) for i in range(10)]
+    for i, name in enumerate(names):
+        previous = js('window.hashtagCalls.filter(r=>r.method==="POST" && r.path==="/api/v1/featured_tags" && r.code===200).length')
+        ab('fill', 'input[type=search]', name)
+        ab('find', 'text', 'Add #' + name, 'click', '--exact')
+        wait('window.hashtagCalls.filter(r=>r.method==="POST" && r.path==="/api/v1/featured_tags" && r.code===200).length===' + str(previous + 1))
+        editor(i + 1, 'typed-add-' + str(i + 1))
+        if i == 0:
+            ab('reload')
+            editor(1, 'typed-one-reload')
+            typed_public(names[:1], 'typed-public-one')
+            ab('open', BASE + '/profile/featured_tags')
+            editor(1, 'typed-one-return')
+    ab('reload')
+    editor(10, 'typed-limit-reload')
+    typed_public(names, 'typed-public-ten')
+    ab('open', BASE + '/profile/featured_tags')
+    editor(10, 'typed-limit-return')
+    for i, name in enumerate(names):
+        previous = js('window.hashtagCalls.filter(r=>r.method==="DELETE" && r.path.startsWith("/api/v1/featured_tags/") && r.code===200).length')
+        button('Delete ' + name)
+        wait('window.hashtagCalls.filter(r=>r.method==="DELETE" && r.path.startsWith("/api/v1/featured_tags/") && r.code===200).length===' + str(previous + 1))
+        editor(9 - i, 'typed-delete-' + str(i + 1))
+        if i == 0:
+            ab('reload')
+            editor(9, 'typed-below-limit-reload')
+    ab('reload')
+    editor(0, 'typed-removed-reload')
+    typed_public([], 'typed-public-removed')
+    save('controller-result', {'result': 'PASS', 'mutations': '10 typed Add clicks and 10 Delete clicks', 'limit': 10})
+    ab('close')
+
+
+def typed_public(names, label):
+    ab('open', BASE + '/@alice')
+    wait('window.hashtagCalls.some(r=>r.path.endsWith("/featured_tags") && r.code===200)')
+    tags = js('window.hashtagCalls.filter(r=>r.path.endsWith("/featured_tags") && r.code===200).at(-1).tags')
+    assert sorted(t['name'] for t in tags) == sorted(names), tags
+    for name in names:
+        wait('Array.from(document.querySelectorAll("button")).some(b=>b.textContent===' + json.dumps('#' + name) + ')')
+    if not names:
+        assert 'TypedLimit' not in js('document.body.innerText')
+    record(label)
+
+
 if __name__ == '__main__':
     try:
-        main()
+        typed_main() if sys.argv[1:] == ["typed"] else main()
     except Exception:
         # Sanitized DOM/call evidence, no auth inputs or raw network payloads.
         save('failure', {'calls':js('window.hashtagCalls'), 'snapshot':ab('snapshot', '-i')})

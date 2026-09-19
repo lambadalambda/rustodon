@@ -14,13 +14,16 @@ def once(text, old, new):
 
 
 def prepare(root, out, mode='browser'):
-    if mode not in ('browser', 'differential'):
+    if mode not in ('browser', 'differential', 'typed'):
         raise ValueError('unknown bounded mode')
     name_prefix = NAME if mode == 'browser' else 'hashtag-differential-bd01aca'
+    if mode == 'typed':
+        name_prefix = 'featured-typed-d17bec9'
+    revision = 'd17bec9ceaea8791323e630d5fd5bd10dc2bd67d' if mode == 'typed' else REV
     out.mkdir(parents=True, exist_ok=True)
     for name in ('run.sh', 'setup.sh', 'cleanup.sh', 'browser', 'forward.py', 'ready.py'):
         text = (root / 'tools/remote-browser' / name).read_text()
-        text = text.replace('8b2f49e42a7cddd75b9d2dce4be24cfcd388099c', REV)
+        text = text.replace('8b2f49e42a7cddd75b9d2dce4be24cfcd388099c', revision)
         text = text.replace('remote-browser-8b2f49e-r2', name_prefix)
         text = text.replace('tools/remote-browser/', 'tools/hashtag-runtime/')
         if name == 'run.sh':
@@ -29,6 +32,8 @@ def prepare(root, out, mode='browser'):
             end = text.index('podman image inspect', start)
             text = text[:start] + '''timeout -k 10 600 podman exec "$P-browser-alice" python3 /harness/tools/hashtag-controls-browser/ui.py > evidence/accept.log 2>&1
 ''' + text[end:]
+            if mode == 'typed':
+                text = once(text, 'ui.py >', 'ui.py typed >')
         elif name == 'setup.sh':
             text = '\n'.join(line for line in text.split('\n') if not line.startswith(('RUSTODON_TEST_PEER_ORIGINS=', 'RUSTODON_TEST_PEER_CA=')))
             start = text.index('openssl req -x509')

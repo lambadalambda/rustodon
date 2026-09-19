@@ -3245,3 +3245,21 @@
   manifest updates. Worker integration passes 35/35; hard power-loss and
   production disk-failure behavior remain unproved.
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   
+
+## Featured typed-entry diagnosis on d17bec9
+
+No app bug/fix: v1/v2 instance metadata already advertises ten. Pinned UI delays
+server fetch 3000 ms; old harness asserted too early. Focused `typed` adapter mode
+waits for actual metadata and proves ten typed Add POSTs, reload/public-profile
+persistence, warning at ten, ten UI DELETEs and reload removal. Fresh bounded NAS
+PG14/7203 run passed; cleanup verified. New serializer/source-contract tests pass
+on NAS, plus 5+8 offline harness tests. Local Rust blocked by existing macOS
+rustix assumptions. Detailed provenance, failed test attempt, transfer deviation,
+checks and exclusions are in tools/hashtag-controls-browser/README.md; sanitized
+export target/featured-typed-d17bec9/evidence. No full/differential repeat, app
+change. Independent parent review 293a7 approved code/harness with no blockers;
+typed-limit follow-up and hashtag-controls parent are archived for ordinary local
+acceptance. Closure reran 5+8 offline tests, Rust fmt and diff checks. Ten tags are
+persisted in signed-in public-route response/DOM, not necessarily simultaneously
+visible; warning correctness is after readiness only. Strict Rails FAIL 54/59 and
+peer/Redis exclusions remain unchanged. No production push.

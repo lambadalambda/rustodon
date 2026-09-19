@@ -170,13 +170,95 @@ The acceptance child is archived, as are the reviewed profile-read prerequisite
 (`c493`, `bd01aca`) and reviewed local API child (`8e22f52`, API/stream evidence
 only). Historical pending-review notes are superseded, not evidence of extra runs.
 
-The hashtag parent remains **OPEN** for [featured-tag limit metadata / typed-name
-editor diagnosis](../../meta/issues/diagnose-featured-tag-limit-metadata-and-typed-name-editor.md).
-Captured `profile-remove-reload.json` shows the maximum-tags warning with an empty
-editor. Suggestion Add/Delete passed, but **typed entry is not established**. Source
-has a zero fallback for missing frontend limit metadata; existing Rust limit literals
-do not establish correct nesting/state. No diagnosis implementation is included.
+The original acceptance left typed-name entry unestablished: its snapshots preceded
+instance readiness. The follow-up below resolves that gap; historical evidence and
+the strict differential result above are unchanged. Existing home WebSocket evidence
+is separate, not rerun. No full release/peer/check completion claim.
 
-No full parent/release/peer/check completion claim. Existing home WebSocket test
-is separate, not rerun; representative browser home behavior is established here.
-Peer AddHashtag/RemoveHashtag and Redis-history semantic equivalence remain deferred.
+## Typed-name follow-up on d17bec9
+
+**No application bug found; no application change.** Both v1/v2 serializers
+already emit numeric `configuration.accounts.max_featured_tags: 10`. The pinned
+server model is an identity mapping; `features/ui/index.jsx` deliberately delays
+`fetchServer()` by **3000 ms**. Until it fulfills, the featured editor's selector
+uses `0`. Old empty/one-tag snapshots were taken before `/api/v2/instance` was
+observed. Waiting only for `/api/v1/profile` was an incorrect readiness condition.
+The transient warning is pinned frontend behavior, not missing Rust metadata.
+
+New **`typed`** adapter mode reuses the existing setup/teardown and controller,
+without running header/home/differential scenarios. `editor()` waits for the real
+instance response with limit 10, profile response, rendered item count and the
+appropriate input/warning state. The observer additionally allowlists the numeric
+instance limit and profile featured-tag fields. No response injection, Redux
+writes, API mutation substitutes or profile PATCH.
+
+Fresh uninterrupted run **PASS**, unchanged application
+`d17bec9ceaea8791323e630d5fd5bd10dc2bd67d`, binary SHA256
+`5bc34fe93f18afc9a96d2f4d67df10386ef22fd4b30a7fafb85f041c2b0fc148`:
+
+- Empty normal load and document reload after readiness: real instance GET 200, limit **10**,
+  typed input present, no maximum warning.
+- Native input fill `TypedLimit0` → **Add #TypedLimit0** click → collection POST
+  **200**; persisted editor reload and rendered public-profile tag.
+- Nine more distinct typed Add clicks/POST **200**, not suggestion-button adds;
+  all ten persist in the public-profile response and DOM, not necessarily in the
+  viewport simultaneously. At ten, normal load/reload **after readiness** shows
+  the maximum warning and hides the typed input. The upstream transient warning
+  before readiness remains unchanged.
+- Ten native Delete clicks/DELETE **200**. At nine, typed entry reappears, including
+  after reload. Final reload has zero items, typed entry and no warning; public
+  profile GET and DOM both show removal.
+- Public routes were viewed signed in; no anonymous-profile claim. Backend
+  eleventh-creation rejection is prior accepted API/differential evidence, not an
+  API substitute or an eleventh browser mutation in this run.
+
+Executed on NAS in `/srv/workspaces/rustodon-featured-typed-d17bec9-alice`:
+
+```sh
+python3 harness/tools/hashtag-controls-browser/prepare.py harness harness/tools/hashtag-runtime typed
+timeout -k 20 1500 sh harness/tools/hashtag-runtime/run.sh
+```
+
+Same PG14/tools `7203`/browser images and narrow runtime/writer roles as above;
+role proof, image identities and frontend SHA verification retained. Same resource
+bounds, sequential execution, no workers or external peers. Task PG volume,
+containers, network, media, keys/env/sessions and build output removed; absence
+verified. No production access, deployment or push.
+
+Sanitized export: ignored **`target/featured-typed-d17bec9/evidence/`**, including
+`typed-*.json/png`, controller result, role/container proof, reference/harness
+hashes, focused Rust logs, and `SHA256SUMS`. No raw service logs, login output,
+credentials or session files exported. Application source was `git archive HEAD`;
+explicit changed helpers overlay the harness only. Transfer deviation: the initial
+base-harness directory tar also included local Python cache/AppleDouble artifacts;
+they are listed in the initial hash inventory and were removed from this task's
+workspace. Final inventory contains source only; no instance data was copied.
+Use `git ls-files` rather than a directory tar for future base-harness transfers.
+
+Focused verification:
+
+- TDD adapter regression first failed (`unknown bounded mode`); **5** adapter tests
+  and **8** existing remote-browser tests now pass. JS syntax and diff whitespace
+  checks pass. No fabricated application red/green: serializer already correct.
+- New actual v1/v2 serializer path regression **PASS**; new pinned delayed-fetch /
+  identity-model / selector / typed-Add source contract **PASS**, each one exact
+  Rust test in bounded NAS tools container. Source contract uses a read-only subset
+  archived from the locally verified clean pinned revision, with file hashes.
+- Local plain cargo was blocked by 1.97.0 vs required 1.97.1; mise's correct compiler
+  then hit existing macOS-only `rustix::openat2`/`NOATIME` build failures. No app
+  portability changes. First NAS serializer test passed but source-contract attempt
+  failed on a non-checkout reference candidate; this is preserved as a failed
+  attempt. Final source-contract run used the verified archive, not that candidate.
+- No full-suite or differential rerun. Prior strict **54/59** result and accepted
+  wording differences remain unchanged. Peer AddHashtag/RemoveHashtag and Redis
+  history equivalence remain explicitly excluded.
+
+Independent parent code/harness review **293a7** approved this follow-up with no
+blockers. Together with the prior accepted local API/stream, browser and Rails
+evidence, ordinary local acceptance is complete: the typed-limit follow-up and
+hashtag-controls parent are archived. Closure checks reran 5 adapter + 8 existing
+remote-browser tests, Rust formatting and diff whitespace checks successfully.
+No application source changed. The strict Rails result remains **FAIL 54/59**;
+five wording differences were previously accepted as nonblocking. Separate
+[peer AddHashtag/RemoveHashtag work](../../meta/issues/support-featured-tag-peer-add-remove.md)
+and Redis retention equivalence remain excluded, not claimed complete.
