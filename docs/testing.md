@@ -386,3 +386,36 @@ fail closed rather than using floating tags or credentials. See
   shared with unrelated workloads.
 - Preserve command exit status and treat timeouts or interrupted cleanup as
   failures until task-owned resources are inspected.
+
+## Focused instance activity aggregation slice
+
+After restoring/migrating a disposable PostgreSQL 14 fixture and applying the
+existing restricted runtime and writer grant profiles, run these serially:
+
+```console
+cargo test --locked --all-features --lib activity::aggregation_tests::
+cargo test --locked --all-features --lib activity::tests:: -- --ignored --test-threads=1
+cargo test --locked --all-features --lib worker::activity_tests:: -- --ignored --test-threads=1
+```
+
+These use `RUSTODON_OPERATIONAL_DATABASE_URL` (owner),
+`RUSTODON_WORKER_DATABASE_URL` (restricted runtime), and
+`RUSTODON_WORKER_WRITE_DATABASE_URL` (restricted writer). Activity tests clear only
+fixture activity tables and create synthetic accounts; **restore a clean fixture
+before the main-process test** because these accounts deliberately lack signing
+keys and must fail production startup validation.
+
+```console
+cargo test --locked --all-features --test startup \
+  main_runtime_activity_counts_cache_privacy_and_initial_metadata \
+  -- --ignored --exact --test-threads=1
+```
+
+Main-process testing uses the existing `RUSTODON_STARTUP_DATABASE_URL`,
+`RUSTODON_STARTUP_WRITE_DATABASE_URL`, `RUSTODON_STARTUP_OWNER_DATABASE_URL`, and
+`RUSTODON_STARTUP_MEDIA_ROOT` fixture variables. It launches actual web binaries,
+checks both federation modes, initial HTML metadata, cache sharing with activity
+tables exclusively locked, and fail-closed responses with an empty cache. This
+is not a browser/sidebar rendering gate or the complete startup lane. Worker
+coverage invokes the registered maintenance handler with restricted pools; it is
+not a claim of the complete durable worker lifecycle lane.

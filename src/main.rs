@@ -1051,8 +1051,6 @@ async fn run_web() -> ExitCode {
         thumbnail_versions: None,
         icons: Vec::new(),
         languages: vec!["en".to_owned()],
-        active_month: 0,
-        active_halfyear: 0,
         translation_enabled: false,
         limited_federation: config.limited_federation,
         single_user_mode: false,

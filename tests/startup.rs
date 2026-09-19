@@ -979,3 +979,143 @@ fn output_with_timeout(mut command: Command) -> Result<Output, Box<dyn std::erro
         std::thread::sleep(Duration::from_millis(25));
     }
 }
+
+/// Actual main-created `WebState`, restricted runtime/writer roles, no injected counts.
+#[tokio::test]
+#[ignore = "requires disposable migrated PG14 and distinct restricted roles"]
+#[allow(clippy::too_many_lines)]
+async fn main_runtime_activity_counts_cache_privacy_and_initial_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
+    let runtime_url = std::env::var("RUSTODON_STARTUP_DATABASE_URL")?;
+    let writer_url = std::env::var("RUSTODON_STARTUP_WRITE_DATABASE_URL")?;
+    let owner_url = std::env::var("RUSTODON_STARTUP_OWNER_DATABASE_URL")?;
+    let mut owner = PgConnection::connect(&owner_url).await?;
+    sqlx::raw_sql(
+        "DELETE FROM rustodon.activity_members; DELETE FROM rustodon.activity_buckets; \
+         INSERT INTO rustodon.activity_buckets(day, expires_at) \
+         SELECT (clock_timestamp() AT TIME ZONE 'UTC')::date - d, clock_timestamp() + interval '1 day' \
+         FROM unnest(ARRAY[0,1,28,168]) AS d; \
+         INSERT INTO rustodon.activity_members(day,user_id) \
+         SELECT (clock_timestamp() AT TIME ZONE 'UTC')::date - d, u \
+         FROM (VALUES (0,900), (1,901), (28,901), (28,902), (168,903)) AS v(d,u)",
+    ).execute(&mut owner).await?;
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    for limited in [false, true] {
+        let port = unused_port()?;
+        let child = ChildCleanup::new(
+            command_with_writer("web", &runtime_url, port, Some(&writer_url))
+                .env(
+                    "LIMITED_FEDERATION_MODE",
+                    if limited { "true" } else { "false" },
+                )
+                .spawn()?,
+        );
+        let base = format!("http://127.0.0.1:{port}");
+        if let Err(error) = wait_for_activity_main(&client, &base).await {
+            let mut child = child.into_child();
+            let _ = child.kill();
+            let output = child.wait_with_output()?;
+            return Err(format!(
+                "{error}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        let request = |path: &str| {
+            client
+                .get(format!("{base}{path}"))
+                .header("host", "fixture-v4-6-5.rustodon.invalid")
+                .header("x-forwarded-proto", "https")
+        };
+        let response = request("/api/v2/instance").send().await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            response.text().await?
+        );
+        let api: serde_json::Value = serde_json::from_str(&response.text().await?)?;
+        assert_eq!(
+            api["usage"]["users"]["active_month"],
+            if limited { 0 } else { 2 }
+        );
+        // Activity tables locked after warmup: every subsequent endpoint must
+        // reuse the shared cache rather than run another expensive aggregation.
+        sqlx::raw_sql("BEGIN; LOCK rustodon.activity_buckets IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut owner)
+            .await?;
+        let node = request("/nodeinfo/2.0").send().await?;
+        assert_eq!(node.status(), StatusCode::OK);
+        let node: serde_json::Value = serde_json::from_str(&node.text().await?)?;
+        assert_eq!(node["usage"]["users"]["activeMonth"], 2);
+        assert_eq!(node["usage"]["users"]["activeHalfyear"], 3);
+        let html = request("/").send().await?;
+        assert_eq!(html.status(), StatusCode::OK);
+        let html = html.text().await?;
+        let initial = html
+            .split("<script id=\"initial-state\"")
+            .nth(1)
+            .ok_or("initial state missing")?
+            .split_once('>')
+            .ok_or("script missing")?
+            .1
+            .split("</script>")
+            .next()
+            .ok_or("script end missing")?;
+        let initial: serde_json::Value = serde_json::from_str(initial)?;
+        assert_eq!(initial["instance"]["usage"], api["usage"]);
+        sqlx::query("ROLLBACK").execute(&mut owner).await?;
+        let mut child = child.into_child();
+        let _ = child.kill();
+        child.wait()?;
+    }
+    // A fresh main cache cannot silently return zero on failed aggregation.
+    let port = unused_port()?;
+    let child = ChildCleanup::new(
+        command_with_writer("web", &runtime_url, port, Some(&writer_url)).spawn()?,
+    );
+    let base = format!("http://127.0.0.1:{port}");
+    wait_for_activity_main(&client, &base).await?;
+    sqlx::raw_sql("BEGIN; LOCK rustodon.activity_buckets IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut owner)
+        .await?;
+    for path in ["/api/v1/instance/rules", "/manifest", "/manifest.json"] {
+        let response = client
+            .get(format!("{base}{path}"))
+            .header("host", "fixture-v4-6-5.rustodon.invalid")
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+    }
+    for path in ["/api/v2/instance", "/nodeinfo/2.0", "/"] {
+        let response = client
+            .get(format!("{base}{path}"))
+            .header("host", "fixture-v4-6-5.rustodon.invalid")
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    sqlx::query("ROLLBACK").execute(&mut owner).await?;
+    let mut child = child.into_child();
+    let _ = child.kill();
+    child.wait()?;
+    Ok(())
+}
+
+async fn wait_for_activity_main(
+    client: &reqwest::Client,
+    base: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for _ in 0..6 {
+        if wait_for_status(client, &format!("{base}/health"), StatusCode::OK)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    Err("main did not become healthy within 30s".into())
+}

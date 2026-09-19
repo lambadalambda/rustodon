@@ -506,3 +506,173 @@ async fn stored_members_support_exact_exclusive_day_windows() -> TestResult {
     }
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable migrated PG14 database and distinct restricted roles"]
+async fn aggregation_exact_windows_and_historical_membership() -> TestResult {
+    let (owner, writer, reader) = pools().await?;
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&owner)
+        .await?;
+    let id = user(&owner, "aggregate", true, true).await?;
+    let today = now.date_naive();
+    // The same user on the oldest and last month day counts once; other IDs
+    // deliberately have no live user row. Reporting must not join users.
+    for (ago, ids, expired) in [
+        (0, vec![90], false),
+        (1, vec![id, 91], false),
+        (28, vec![id, 92], false),
+        (29, vec![93], false),
+        (168, vec![94], false),
+        (169, vec![95], false),
+        (2, vec![96], true),
+    ] {
+        let day = today - Duration::days(ago);
+        sqlx::query("INSERT INTO rustodon.activity_buckets(day,expires_at) VALUES($1,$2)")
+            .bind(day)
+            .bind(if expired {
+                now
+            } else {
+                now + Duration::days(1)
+            })
+            .execute(&writer)
+            .await?;
+        for id in ids {
+            sqlx::query("INSERT INTO rustodon.activity_members(day,user_id) VALUES($1,$2)")
+                .bind(day)
+                .bind(id)
+                .execute(&writer)
+                .await?;
+        }
+    }
+    let expected = InstanceActivityCounts {
+        active_month: 3,
+        active_halfyear: 5,
+    };
+    assert_eq!(aggregate(&reader, now).await?, expected);
+    sqlx::query("UPDATE users SET disabled=true, approved=false, confirmed_at=NULL WHERE id=$1")
+        .bind(id)
+        .execute(&owner)
+        .await?;
+    assert_eq!(aggregate(&reader, now).await?, expected);
+    sqlx::query("DELETE FROM users WHERE id=$1")
+        .bind(id)
+        .execute(&owner)
+        .await?;
+    assert_eq!(aggregate(&reader, now).await?, expected);
+    assert!(
+        prune(&reader).await.is_err(),
+        "runtime must remain SELECT-only"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable migrated PG14 database and distinct restricted roles"]
+async fn pruning_is_chunked_and_skips_recording_renewals() -> TestResult {
+    let (owner, writer, reader) = pools().await?;
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&owner)
+        .await?;
+    let day = now.date_naive();
+    sqlx::query("INSERT INTO rustodon.activity_buckets(day,expires_at) VALUES($1,$2)")
+        .bind(day)
+        .bind(now - Duration::seconds(1))
+        .execute(&writer)
+        .await?;
+    sqlx::query("INSERT INTO rustodon.activity_members SELECT $1, generate_series(1,1002)")
+        .bind(day)
+        .execute(&writer)
+        .await?;
+    assert_eq!(prune(&writer).await?, 1000);
+    assert_eq!(count(&reader).await, 2);
+    let mut renewal = writer.begin().await?;
+    sqlx::query("SELECT day FROM rustodon.activity_buckets WHERE day=$1 FOR UPDATE")
+        .bind(day)
+        .execute(&mut *renewal)
+        .await?;
+    assert_eq!(prune(&writer).await?, 0);
+    record_member_in(&mut renewal, 1003, now).await?;
+    renewal.commit().await?;
+    assert_eq!(prune(&writer).await?, 0);
+    assert_eq!(count(&reader).await, 1);
+    sqlx::query("UPDATE rustodon.activity_buckets SET expires_at=$1")
+        .bind(now)
+        .execute(&writer)
+        .await?;
+    assert_eq!(prune(&writer).await?, 1);
+    let buckets: i64 = sqlx::query_scalar("SELECT count(*) FROM rustodon.activity_buckets")
+        .fetch_one(&reader)
+        .await?;
+    assert_eq!(buckets, 0);
+    // Renewal after complete cleanup recreates bucket and membership atomically.
+    let mut renewal = writer.begin().await?;
+    record_member_in(&mut renewal, 1003, now).await?;
+    renewal.commit().await?;
+    assert_eq!(count(&reader).await, 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable migrated PG14 database and distinct restricted roles"]
+async fn recording_waiting_for_cleanup_recreates_no_orphans() -> TestResult {
+    let (owner, writer, reader) = pools().await?;
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&owner)
+        .await?;
+    let day = now.date_naive();
+    sqlx::query("INSERT INTO rustodon.activity_buckets VALUES($1,$2)")
+        .bind(day)
+        .bind(now - Duration::seconds(1))
+        .execute(&writer)
+        .await?;
+    // Hold cleanup's deletion uncommitted while a recorder tries to insert/lock.
+    let mut cleanup = writer.begin().await?;
+    sqlx::query("SELECT day FROM rustodon.activity_buckets WHERE day=$1 FOR UPDATE")
+        .bind(day)
+        .execute(&mut *cleanup)
+        .await?;
+    sqlx::query("DELETE FROM rustodon.activity_buckets WHERE day=$1")
+        .bind(day)
+        .execute(&mut *cleanup)
+        .await?;
+    let task_writer = writer.clone();
+    let recorder = tokio::spawn(async move {
+        let mut tx = task_writer.begin().await?;
+        sqlx::query("SET LOCAL application_name = 'activity-renewal-race'")
+            .execute(&mut *tx)
+            .await?;
+        record_member_in(&mut tx, 9001, now).await?;
+        tx.commit().await
+    });
+    let waiting = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                WHERE application_name='activity-renewal-race' AND wait_event_type='Lock')",
+            )
+            .fetch_one(&owner)
+            .await?;
+            if waiting {
+                return Ok::<_, sqlx::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    // Release before asserting so a failed fixture cannot leave a blocked task.
+    cleanup.commit().await?;
+    waiting??;
+    tokio::time::timeout(std::time::Duration::from_secs(3), recorder).await???;
+    assert_eq!(count(&reader).await, 1);
+    let live: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM rustodon.activity_buckets \
+        WHERE day=$1 AND expires_at > clock_timestamp())",
+    )
+    .bind(day)
+    .fetch_one(&reader)
+    .await?;
+    assert!(live);
+    assert_eq!(prune(&writer).await?, 0);
+    Ok(())
+}

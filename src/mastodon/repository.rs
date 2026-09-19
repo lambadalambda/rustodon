@@ -304,6 +304,11 @@ fn decrypt_otp_secret(
 #[allow(clippy::missing_errors_doc)]
 impl Repository {
     #[must_use]
+    pub(crate) fn activity_pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    #[must_use]
     pub fn from_pool(pool: PgPool) -> Self {
         Self {
             pool,

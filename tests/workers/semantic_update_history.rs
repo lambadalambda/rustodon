@@ -282,8 +282,7 @@ impl HistoryApi {
                 thumbnail_versions: None,
                 icons: Vec::new(),
                 languages: vec!["en".to_owned()],
-                active_month: 0,
-                active_halfyear: 0,
+
                 translation_enabled: false,
                 limited_federation: false,
                 single_user_mode: false,

@@ -1501,7 +1501,10 @@ async fn fixture_core_instance_v2(State(state): State<CoreRestFixture>) -> Respo
 async fn fixture_core_instance(state: CoreRestFixture, v1: bool) -> Response {
     let loader =
         RestProjectionLoader::new(state.repository, None, "fixture-v4-6-5.rustodon.invalid");
-    let Ok(instance) = loader.instance(fixture_instance_runtime()).await else {
+    let Ok(instance) = loader
+        .instance(fixture_instance_runtime(), Default::default())
+        .await
+    else {
         return fixture_internal_error();
     };
     let serializer = RestSerializer::new(
@@ -1567,8 +1570,6 @@ fn fixture_instance_runtime() -> InstanceRuntimeConfig {
         thumbnail_versions: None,
         icons,
         languages: vec!["en".to_owned()],
-        active_month: 0,
-        active_halfyear: 0,
         translation_enabled: false,
         limited_federation: false,
         single_user_mode: false,

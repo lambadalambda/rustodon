@@ -2117,6 +2117,7 @@ impl RestProjectionLoader {
     pub async fn instance(
         &self,
         runtime: InstanceRuntimeConfig,
+        activity: super::InstanceActivityCounts,
     ) -> sqlx::Result<InstanceProjection> {
         let counts = self.repository.rest_instance_counts().await?;
         let settings = self
@@ -2168,6 +2169,7 @@ impl RestProjectionLoader {
             }
         }
         Ok(InstanceProjection {
+            activity,
             runtime,
             title: setting_string(&settings, "site_title").unwrap_or_else(|| "Mastodon".to_owned()),
             short_description: setting_string(&settings, "site_short_description")

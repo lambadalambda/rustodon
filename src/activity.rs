@@ -1,4 +1,4 @@
-//! Rust-owned exact daily activity. No public counts or historical backfill.
+//! Rust-owned exact daily activity, cached UTC reporting and bounded cleanup.
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{Postgres, Transaction};
 
@@ -102,20 +102,26 @@ async fn record_member_in(
     let expires_at = now + Duration::seconds(RETENTION_SECONDS);
     // Insert before locking handles a concurrent first write. Every membership
     // mutation holds this bucket lock, including clearing an expired generation.
-    sqlx::query(
-        "INSERT INTO rustodon.activity_buckets (day, expires_at) VALUES ($1, $2) \
+    let previous_expiry = loop {
+        sqlx::query(
+            "INSERT INTO rustodon.activity_buckets (day, expires_at) VALUES ($1, $2) \
          ON CONFLICT (day) DO NOTHING",
-    )
-    .bind(day)
-    .bind(expires_at)
-    .execute(&mut **tx)
-    .await?;
-    let previous_expiry = sqlx::query_scalar::<_, DateTime<Utc>>(
-        "SELECT expires_at FROM rustodon.activity_buckets WHERE day = $1 FOR UPDATE",
-    )
-    .bind(day)
-    .fetch_one(&mut **tx)
-    .await?;
+        )
+        .bind(day)
+        .bind(expires_at)
+        .execute(&mut **tx)
+        .await?;
+        let previous_expiry = sqlx::query_scalar::<_, DateTime<Utc>>(
+            "SELECT expires_at FROM rustodon.activity_buckets WHERE day = $1 FOR UPDATE",
+        )
+        .bind(day)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(expiry) = previous_expiry {
+            break expiry;
+        }
+        // Cleanup won between conflict detection and locking; recreate safely.
+    };
     // Like Redis EXPIRE after PFADD: renew from the actual write clock after
     // waiting for the bucket lock, not from a possibly delayed event timestamp.
     let expiry_write_time = write_time_in(tx).await?;
@@ -143,3 +149,164 @@ async fn record_member_in(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod aggregation_tests;
+
+use crate::mastodon::rest::InstanceActivityCounts;
+use chrono::NaiveDate;
+use sqlx::PgPool;
+use std::{future::Future, sync::Arc, time::Instant};
+use tokio::sync::Mutex;
+
+const CACHE_TTL: std::time::Duration = std::time::Duration::from_mins(1);
+const FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn reporting_days(now: DateTime<Utc>) -> (NaiveDate, NaiveDate, NaiveDate) {
+    let today = now.date_naive();
+    (
+        today - Duration::days(28),
+        today - Duration::days(168),
+        today,
+    )
+}
+
+/// UTC/as-of captured once. A single snapshot counts exact unions, not daily sums.
+async fn aggregate(pool: &PgPool, now: DateTime<Utc>) -> sqlx::Result<InstanceActivityCounts> {
+    let (month, halfyear, today) = reporting_days(now);
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '3000ms'")
+        .execute(&mut *tx)
+        .await?;
+    let (active_month, active_halfyear) = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT count(DISTINCT member.user_id) FILTER (WHERE bucket.day >= $1), \
+                count(DISTINCT member.user_id) \
+         FROM rustodon.activity_buckets bucket \
+         JOIN rustodon.activity_members member USING (day) \
+         WHERE bucket.day >= $2 AND bucket.day < $3 AND bucket.expires_at > $4",
+    )
+    .bind(month)
+    .bind(halfyear)
+    .bind(today)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(InstanceActivityCounts {
+        active_month,
+        active_halfyear,
+    })
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ActivityCache(Arc<Mutex<Option<CachedActivity>>>);
+
+struct CachedActivity {
+    day: NaiveDate,
+    until: Instant,
+    counts: Option<InstanceActivityCounts>,
+}
+
+impl ActivityCache {
+    pub(crate) async fn get(&self, pool: &PgPool) -> sqlx::Result<InstanceActivityCounts> {
+        self.get_with(|| (Utc::now(), Instant::now()), |now| aggregate(pool, now))
+            .await
+    }
+
+    #[cfg(test)]
+    async fn get_at<F, Fut>(
+        &self,
+        now: DateTime<Utc>,
+        tick: Instant,
+        load: F,
+    ) -> sqlx::Result<InstanceActivityCounts>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = sqlx::Result<InstanceActivityCounts>>,
+    {
+        self.get_with(|| (now, tick), |_| load()).await
+    }
+
+    async fn get_with<C, F, Fut>(&self, clock: C, load: F) -> sqlx::Result<InstanceActivityCounts>
+    where
+        C: Fn() -> (DateTime<Utc>, Instant),
+        F: FnOnce(DateTime<Utc>) -> Fut,
+        Fut: Future<Output = sqlx::Result<InstanceActivityCounts>>,
+    {
+        // Held through refresh: clones of WebState share one flight. Cancellation
+        // drops the lock and the SQL transaction; it cannot publish partial data.
+        let mut entry = self.0.lock().await;
+        let (now, tick) = clock();
+        if let Some(cached) = entry.as_ref()
+            && cached.day == now.date_naive()
+            && tick < cached.until
+        {
+            return cached.counts.ok_or(sqlx::Error::PoolTimedOut);
+        }
+        let result = tokio::time::timeout(QUERY_TIMEOUT, load(now))
+            .await
+            .unwrap_or(Err(sqlx::Error::PoolTimedOut));
+        let (finished, finished_tick) = clock();
+        if finished.date_naive() != now.date_naive() {
+            // Do not publish yesterday's snapshot across midnight. Next request
+            // starts a fresh flight for the new reporting date.
+            *entry = None;
+            return Err(sqlx::Error::PoolTimedOut);
+        }
+        *entry = Some(CachedActivity {
+            day: now.date_naive(),
+            until: finished_tick
+                + if result.is_ok() {
+                    CACHE_TTL
+                } else {
+                    FAILURE_TTL
+                },
+            counts: result.as_ref().ok().copied(),
+        });
+        result
+    }
+}
+
+/// Existing maintenance caller supplies its writer pool, never runtime credentials.
+/// At most 100 buckets and 1,000 members total per invocation. Bucket locks match
+/// recording's lock order; SKIP LOCKED avoids delaying a live renewal.
+pub(crate) async fn prune(pool: &PgPool) -> sqlx::Result<u64> {
+    tokio::time::timeout(QUERY_TIMEOUT, prune_inner(pool))
+        .await
+        .unwrap_or(Err(sqlx::Error::PoolTimedOut))
+}
+
+async fn prune_inner(pool: &PgPool) -> sqlx::Result<u64> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '3000ms'")
+        .execute(&mut *tx)
+        .await?;
+    let days = sqlx::query_scalar::<_, NaiveDate>(
+        "SELECT day FROM rustodon.activity_buckets WHERE expires_at <= clock_timestamp() \
+         ORDER BY expires_at, day LIMIT 100 FOR UPDATE SKIP LOCKED",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut remaining = 1000_i64;
+    for day in days {
+        let removed = sqlx::query(
+            "DELETE FROM rustodon.activity_members WHERE day = $1 AND user_id IN \
+             (SELECT user_id FROM rustodon.activity_members WHERE day = $1 ORDER BY user_id LIMIT $2)",
+        ).bind(day).bind(remaining).execute(&mut *tx).await?.rows_affected();
+        remaining -= i64::try_from(removed).expect("bounded member chunk");
+        sqlx::query(
+            "DELETE FROM rustodon.activity_buckets WHERE day = $1 \
+            AND expires_at <= clock_timestamp() \
+            AND NOT EXISTS (SELECT 1 FROM rustodon.activity_members WHERE day = $1)",
+        )
+        .bind(day)
+        .execute(&mut *tx)
+        .await?;
+        if remaining == 0 {
+            break;
+        }
+    }
+    tx.commit().await?;
+    Ok(u64::try_from(1000 - remaining).expect("nonnegative member count"))
+}

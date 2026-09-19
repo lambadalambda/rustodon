@@ -28,3 +28,5 @@
 - [ ] [Compute real instance activity metrics](issues/compute-real-instance-activity-metrics.md)
 - [ ] [Record transactional daily instance activity](issues/record-transactional-daily-instance-activity.md)
 - [ ] [Support featured-tag peer AddHashtag/RemoveHashtag](issues/support-featured-tag-peer-add-remove.md)
+
+- [ ] [Aggregate and cache instance activity metrics](issues/aggregate-and-cache-instance-activity-metrics.md)

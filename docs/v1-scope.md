@@ -600,3 +600,28 @@ Mastodon 4.6.5 instance with 1-20 local users:
   silently ignored.
 - Redis can be removed after cutover, and restoring Mastodon remains possible
   without reversing a user-data migration.
+
+### Instance activity API semantics
+
+The v2 instance `usage.users.active_month` is the exact distinct membership union
+for UTC `[today - 28 days, today)`. NodeInfo 2.0 `usage.users.activeMonth` and
+`activeHalfyear` use `[today - 28 days, today)` and `[today - 168 days, today)`.
+Only buckets whose expiry is strictly after the captured aggregation time count;
+there is no join against current user approval, confirmation, disabled, or deleted
+state. Limited federation suppresses only the v2/initial-instance month value.
+NodeInfo deliberately retains both raw counts.
+
+A shared per-WebState singleflight cache limits aggregation to one successful
+refresh per 60 seconds, invalidates on UTC rollover, and coalesces failures for
+5 seconds. Invalid/absent cached counts plus a refresh failure produce HTTP 503
+on metadata-bearing responses (including the frontend document); there is no
+stale-count fallback. Manifest and instance-rules responses do not load activity
+counts and remain available during an activity-only failure. The aggregation
+SELECT has a 3-second statement timeout
+inside a 5-second refresh deadline. Startup does not seed permanent zeroes.
+Initial frontend `instance` metadata is serialized using the same v2 projection;
+the pinned sidebar itself fetches `/api/v2/instance`.
+
+See README's rollout notes: no backfill, today's records excluded, first ordinary
+nonzero result after UTC rollover. Browser rendering evidence is separate from
+API and initial-document integration evidence.

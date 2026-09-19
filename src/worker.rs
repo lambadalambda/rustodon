@@ -8441,6 +8441,7 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
 ) -> Result<HandlerRegistry, WorkerError> {
     let handlers = HandlerRegistry::new();
     let pool = queue.pool().clone();
+    let activity_writer = mastodon_writer.clone();
     let report_mail_enabled = mail_runtime.is_some();
     let domain_block_media_root = federation
         .as_ref()
@@ -9115,7 +9116,13 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
         move |_job| {
             let pool = pool.clone();
             let maintenance_queue = maintenance_queue.clone();
+            let activity_writer = activity_writer.clone();
             async move {
+                if let Some(writer) = activity_writer {
+                    crate::activity::prune(&writer)
+                        .await
+                        .map_err(|_| HandlerFailure::retry("activity cleanup failed"))?;
+                }
                 sqlx::raw_sql(
                     "DELETE FROM rustodon.idempotency_keys WHERE expires_at <= clock_timestamp(); \
                        DELETE FROM rustodon.ordering_markers marker \
@@ -10889,3 +10896,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod activity_tests;

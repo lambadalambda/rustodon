@@ -22,9 +22,11 @@ The bundled public frontend always shows zero active users because Rustodon init
 
 - [Record transactional daily instance activity](record-transactional-daily-instance-activity.md): first bounded operational-storage/authentication slice; cached aggregation and public counts remain here for the next slice.
 
+- [Aggregate and cache instance activity metrics](aggregate-and-cache-instance-activity-metrics.md): bounded aggregation, shared cache, publication and maintenance pruning follow-up.
+
 ## Evidence
 
 - Mastodon 4.6.5 records user IDs in daily `activity:logins` unique sets when an account is approved and when a confirmed user returns, then unions the preceding 4 or 24 weeks for instance metrics.
 - `rustodon.social` displayed `0 active users` although one enabled, confirmed local user had signed in within 30 days and posted that day.
 - `GET /api/v2/instance` returned `usage.users.active_month: 0`.
-- `src/main.rs` currently constructs runtime instance metadata with `active_month: 0` and `active_halfyear: 0`; the serializers only forward those values (apart from limited-federation suppression).
+- At the original report, `src/main.rs` constructed runtime instance metadata with `active_month: 0` and `active_halfyear: 0`; the serializers only forward those values (apart from limited-federation suppression).

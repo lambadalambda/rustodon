@@ -47,9 +47,9 @@ use crate::mail::MailConfig;
 use crate::mastodon::rest::{
     AccountListKind, AccountListOptions, AccountSearchError, AccountStatusesOptions, ApiDateTime,
     ConversationProjection, DecimalId, FollowCollectionKind, FollowCollectionOptions,
-    FollowedTagsOptions, InstanceProjection, InstanceRuntimeConfig, ListProjection,
-    NotificationOptions, PreferencesProjection, RestAccount, RestConversation, RestError,
-    RestMarker, RestPreferences, RestProjectionLoader, RestRole, RestSerializer,
+    FollowedTagsOptions, InstanceActivityCounts, InstanceProjection, InstanceRuntimeConfig,
+    ListProjection, NotificationOptions, PreferencesProjection, RestAccount, RestConversation,
+    RestError, RestMarker, RestPreferences, RestProjectionLoader, RestRole, RestSerializer,
     SUPPORTED_MIME_TYPES, SavedStatusKind, SavedStatusesOptions, StatusShape, TagTimelineOptions,
     TimelineOptions, media_projection, notification_type_filter_with_exclusions,
 };
@@ -2608,6 +2608,7 @@ pub struct WebState {
     media_route_path: String,
     media_route_authority: Option<String>,
     instance_runtime: InstanceRuntimeConfig,
+    activity_cache: crate::activity::ActivityCache,
     frontend: FrontendAssets,
     csrf_signing_key: [u8; 32],
     trusted_proxies: Vec<IpNetwork>,
@@ -2680,11 +2681,32 @@ impl WebState {
             media_route_path,
             media_route_authority,
             instance_runtime,
+            activity_cache: crate::activity::ActivityCache::default(),
             frontend,
             csrf_signing_key: derive_browser_csrf_signing_key(&random_auth_token(32)),
             trusted_proxies,
             allowed_hosts,
         })
+    }
+
+    // Only for metadata that never serializes activity counts (manifest/rules).
+    async fn static_instance(&self) -> sqlx::Result<InstanceProjection> {
+        self.loader(None)
+            .instance(
+                self.instance_runtime.clone(),
+                InstanceActivityCounts::default(),
+            )
+            .await
+    }
+
+    async fn instance(&self) -> sqlx::Result<InstanceProjection> {
+        let counts = self
+            .activity_cache
+            .get(self.repository.activity_pool())
+            .await?;
+        self.loader(None)
+            .instance(self.instance_runtime.clone(), counts)
+            .await
     }
 
     #[must_use]
@@ -3088,19 +3110,26 @@ async fn frontend_html_response(
     } else {
         None
     };
-    let instance = state
-        .loader(None)
-        .instance(state.instance_runtime.clone())
-        .await
-        .ok();
+    let Ok(instance) = state.instance().await else {
+        return activity_unavailable();
+    };
     let secure = state.origin.scheme() == "https";
     let (csrf_token, csrf_cookie) = browser_page_csrf(headers, secure, &state.csrf_signing_key);
     let csp_nonce = random_auth_token(32);
+    let Some(serialized_instance) = state
+        .serializer()
+        .instance_v2(&instance)
+        .ok()
+        .and_then(|value| serde_json::to_value(value).ok())
+    else {
+        return internal_error();
+    };
     let Some(document) = frontend_document(
         &state.frontend,
         &state.instance_runtime,
         path,
-        instance.as_ref(),
+        Some(&instance),
+        Some(serialized_instance),
         authenticated.as_ref(),
         &csrf_token,
         &csp_nonce,
@@ -3120,11 +3149,7 @@ async fn frontend_html_response(
 }
 
 async fn frontend_manifest(State(state): State<WebState>) -> Response<Body> {
-    let Ok(instance) = state
-        .loader(None)
-        .instance(state.instance_runtime.clone())
-        .await
-    else {
+    let Ok(instance) = state.static_instance().await else {
         return internal_error();
     };
     let Some(value) = frontend_manifest_value(&state.frontend, &instance.title) else {
@@ -3297,11 +3322,13 @@ fn frontend_manifest_value(frontend: &FrontendAssets, title: &str) -> Option<ser
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn frontend_document(
     frontend: &FrontendAssets,
     runtime: &InstanceRuntimeConfig,
     path: &str,
     instance: Option<&InstanceProjection>,
+    serialized_instance: Option<serde_json::Value>,
     authenticated: Option<&FrontendAuthenticatedState>,
     csrf_token: &str,
     csp_nonce: &str,
@@ -3312,7 +3339,10 @@ fn frontend_document(
     let application = frontend.entry("entrypoints/application.ts")?;
     let logo = frontend.asset_url("images/logo.svg")?;
     let logo_symbol = frontend.asset_url("images/logo-symbol-icon.svg")?;
-    let initial_state = frontend_initial_state(runtime, instance, authenticated)?;
+    let mut initial_state = frontend_initial_state(runtime, instance, authenticated)?;
+    if let Some(value) = serialized_instance {
+        initial_state["instance"] = value;
+    }
     let initial_state = json_script(&initial_state)?;
     let props = json_script(&serde_json::json!({"locale": "en"}))?;
     let title = instance.map_or("Mastodon", |value| value.title.as_str());
@@ -5147,13 +5177,9 @@ async fn federation_nodeinfo_discovery(State(state): State<WebState>) -> Respons
 
 #[allow(clippy::manual_let_else)]
 async fn federation_nodeinfo(State(state): State<WebState>) -> Response<Body> {
-    let instance = match state
-        .loader(None)
-        .instance(state.instance_runtime.clone())
-        .await
-    {
+    let instance = match state.instance().await {
         Ok(instance) => instance,
-        Err(_) => return internal_error(),
+        Err(_) => return activity_unavailable(),
     };
     activity_response(
         StatusCode::OK,
@@ -5164,8 +5190,8 @@ async fn federation_nodeinfo(State(state): State<WebState>) -> Response<Body> {
             &instance.short_description,
             instance.user_count,
             instance.status_count,
-            instance.runtime.active_month,
-            instance.runtime.active_halfyear,
+            instance.activity.active_month,
+            instance.activity.active_halfyear,
             instance.registrations_mode != "none" && !instance.runtime.single_user_mode,
         ),
     )
@@ -8938,6 +8964,13 @@ async fn readiness(State(state): State<WebState>) -> Response<Body> {
     }
 }
 
+fn activity_unavailable() -> Response<Body> {
+    json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        br#"{"error":"Instance activity unavailable"}"#.to_vec(),
+    )
+}
+
 async fn instance_v1(State(state): State<WebState>) -> Response<Body> {
     instance_response(state, true).await
 }
@@ -8947,12 +8980,8 @@ async fn instance_v2(State(state): State<WebState>) -> Response<Body> {
 }
 
 async fn instance_response(state: WebState, v1: bool) -> Response<Body> {
-    let Ok(instance) = state
-        .loader(None)
-        .instance(state.instance_runtime.clone())
-        .await
-    else {
-        return internal_error();
+    let Ok(instance) = state.instance().await else {
+        return activity_unavailable();
     };
     let serializer = state.serializer();
     let body = if v1 {
@@ -8970,11 +8999,7 @@ async fn instance_response(state: WebState, v1: bool) -> Response<Body> {
 }
 
 async fn instance_rules(State(state): State<WebState>) -> Response<Body> {
-    let Ok(instance) = state
-        .loader(None)
-        .instance(state.instance_runtime.clone())
-        .await
-    else {
+    let Ok(instance) = state.static_instance().await else {
         return internal_error();
     };
     match serde_json::to_vec(&RestSerializer::rules(&instance)) {
@@ -20632,8 +20657,6 @@ mod tests {
             thumbnail_versions: None,
             icons: Vec::new(),
             languages: vec!["en".to_owned()],
-            active_month: 0,
-            active_halfyear: 0,
             translation_enabled: false,
             limited_federation: false,
             single_user_mode: false,
@@ -20645,6 +20668,7 @@ mod tests {
             &frontend,
             &runtime,
             "/home",
+            None,
             None,
             None,
             "csrf-value",

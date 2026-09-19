@@ -1055,8 +1055,6 @@ pub struct InstanceRuntimeConfig {
     pub thumbnail_versions: Option<(String, String)>,
     pub icons: Vec<(String, String)>,
     pub languages: Vec<String>,
-    pub active_month: i64,
-    pub active_halfyear: i64,
     pub translation_enabled: bool,
     pub limited_federation: bool,
     pub single_user_mode: bool,
@@ -1065,8 +1063,15 @@ pub struct InstanceRuntimeConfig {
     pub wrapstodon: Option<i32>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InstanceActivityCounts {
+    pub active_month: i64,
+    pub active_halfyear: i64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct InstanceProjection {
+    pub activity: InstanceActivityCounts,
     pub runtime: InstanceRuntimeConfig,
     pub title: String,
     pub short_description: String,

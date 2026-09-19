@@ -127,3 +127,27 @@ decisions are recorded in [DEVLOG.md](DEVLOG.md).
 ## License
 
 No license has been selected yet.
+
+### Instance activity metrics
+
+Daily activity recording starts empty on upgrade: there is no historical sign-in
+backfill. Counts use exact distinct user IDs across the preceding **4 weeks (28
+UTC days)** and **24 weeks (168 UTC days)**, excluding today and expired buckets.
+New activity first contributes after the next UTC midnight; disabling or deleting
+an account later does not rewrite its recorded history.
+
+`GET /api/v2/instance` and initial frontend instance metadata publish the 4-week
+count; the sidebar fetches that same API. Limited federation suppresses this value
+as `0`, while `/nodeinfo/2.0` still publishes both raw windows. Counts share a
+process-local, singleflight cache per web state, valid for at most 60 seconds and
+never across a UTC date change. Each refresh has a 3-second PostgreSQL statement
+timeout and a 5-second overall deadline. Without valid counts these metadata
+responses return **503**, not fabricated zeroes or unbounded stale data. Failed
+refreshes are cached for 5 seconds to avoid a retry storm. A real empty result is
+still `0`.
+
+The existing maintenance prune handler uses its writer pool (runtime remains
+SELECT-only on activity tables). Each invocation locks at most 100 expired
+buckets, removes at most 1,000 membership rows in total, and deletes only empty
+expired buckets in the same transaction, with a 5-second overall deadline.
+No new migration, grant, job, or historical backfill is needed for aggregation.

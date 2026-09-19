@@ -3421,3 +3421,26 @@ acceptance. Closure reran 5+8 offline tests, Rust fmt and diff checks. Ten tags 
 persisted in signed-in public-route response/DOM, not necessarily simultaneously
 visible; warning correctness is after readiness only. Strict Rails FAIL 54/59 and
 peer/Redis exclusions remain unchanged. No production push.
+
+## Bounded instance activity aggregation after 3df2724
+
+Created/indexed aggregation subissue before code. Dynamic exact UTC 4/24-week
+unions now replace main's permanent zeroes, with shared singleflight TTL/date
+cache, fail-closed 503s, endpoint-specific limited-federation privacy, and matching
+initial metadata. Existing writer-backed maintenance prunes bounded member chunks
+under bucket locks; no grants/migration/job/backfill. Rollout excludes today.
+NAS7203/PG14 focused activity 7/7, maintenance handler 1/1, actual-main HTTP 1/1,
+ordinary library 359 passing, serializers 20/20, all-target check and focused
+strict Clippy pass. Full strict Clippy has pre-existing test-helper lints. Details,
+failed attempts and evidence boundaries are in the aggregation issue. Browser and
+independent parent review remain pending (subagent nesting limit); uncommitted,
+no production or full-matrix claim.
+
+### Activity aggregation review 1 follow-up
+
+Removed activity availability coupling only from manifest/rules via the existing
+instance projection loader. Actual main HTTP regression went red (rules 503), then
+green (rules and both manifest aliases 200 during cold activity failure, while
+count-bearing endpoints remain 503). Focused main test, strict Clippy, fmt and diff
+checks passed on the bounded NAS7203/PG14 fixture. No TTL/privacy changes or extra
+lanes; uncommitted for parent review 2, browser next.

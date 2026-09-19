@@ -387,7 +387,7 @@ impl<'a> RestSerializer<'a> {
         let active_month = if instance.runtime.limited_federation {
             0
         } else {
-            instance.runtime.active_month
+            instance.activity.active_month
         };
         let registration_message = if registrations {
             None
