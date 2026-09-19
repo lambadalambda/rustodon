@@ -22,6 +22,8 @@ use tokio::sync::Barrier;
 use tokio::time::{Duration, timeout};
 
 const TABLES: &[&str] = &[
+    "activity_buckets",
+    "activity_members",
     "domain_health",
     "durable_jobs",
     "heartbeats",
@@ -35,9 +37,9 @@ const TABLES: &[&str] = &[
 
 #[test]
 fn migration_plan_requires_an_exact_known_prefix() {
-    assert_eq!(migration_plan(&[]).unwrap(), vec![1, 2, 3, 4, 5]);
+    assert_eq!(migration_plan(&[]).unwrap(), vec![1, 2, 3, 4, 5, 6]);
     let current = vec![MigrationRecord::known(1).expect("migration 1 exists")];
-    assert_eq!(migration_plan(&current).unwrap(), vec![2, 3, 4, 5]);
+    assert_eq!(migration_plan(&current).unwrap(), vec![2, 3, 4, 5, 6]);
 
     let unknown = vec![MigrationRecord {
         version: CURRENT_VERSION + 1,
@@ -45,7 +47,7 @@ fn migration_plan_requires_an_exact_known_prefix() {
     }];
     assert!(matches!(
         migration_plan(&unknown),
-        Err(MigrationError::UnknownVersion(6))
+        Err(MigrationError::UnknownVersion(7))
     ));
 
     let wrong_checksum = vec![MigrationRecord {
@@ -1324,4 +1326,85 @@ async fn applied_at(connection: &mut PgConnection) -> Result<String, sqlx::Error
     sqlx::query_scalar("SELECT applied_at::text FROM rustodon.schema_migrations WHERE version = 1")
         .fetch_one(connection)
         .await
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable migrated PG14 database with restricted runtime/writer roles"]
+async fn instance_activity_upgrade_from_five_preserves_history_and_grants()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut owner =
+        PgConnection::connect(&std::env::var("RUSTODON_OPERATIONAL_DATABASE_URL")?).await?;
+    let mut writer =
+        PgConnection::connect(&std::env::var("RUSTODON_WORKER_WRITE_DATABASE_URL")?).await?;
+    let mut reader = PgConnection::connect(&std::env::var("RUSTODON_WORKER_DATABASE_URL")?).await?;
+    let writer_name: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&mut writer)
+        .await?;
+    rustodon::preflight::validate_writer_connection(&mut writer).await?;
+    let public_before: serde_json::Value =
+        sqlx::query_scalar("SELECT jsonb_agg(to_jsonb(u) ORDER BY id) FROM public.users u")
+            .fetch_one(&mut owner)
+            .await?;
+    sqlx::raw_sql("DROP TABLE rustodon.activity_members, rustodon.activity_buckets; DELETE FROM rustodon.schema_migrations WHERE version=6")
+        .execute(&mut owner).await?;
+    for _ in 0..2 {
+        rustodon::operational_schema::migrate_with_writer_role(&mut owner, Some(&writer_name))
+            .await?;
+    }
+    let public_after: serde_json::Value =
+        sqlx::query_scalar("SELECT jsonb_agg(to_jsonb(u) ORDER BY id) FROM public.users u")
+            .fetch_one(&mut owner)
+            .await?;
+    assert_eq!(public_before, public_after);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM rustodon.activity_members")
+            .fetch_one(&mut reader)
+            .await?,
+        0,
+        "upgrade does not invent activation history"
+    );
+    sqlx::query("SELECT set_config('rustodon.writer_role', $1, false)")
+        .bind(&writer_name)
+        .execute(&mut reader)
+        .await?;
+    rustodon::operational_schema::validate(&mut reader).await?;
+    for table in ["activity_buckets", "activity_members"] {
+        for privilege in ["SELECT", "INSERT", "UPDATE", "DELETE"] {
+            assert!(
+                sqlx::query_scalar::<_, bool>("SELECT has_table_privilege(current_user, $1, $2)")
+                    .bind(format!("rustodon.{table}"))
+                    .bind(privilege)
+                    .fetch_one(&mut writer)
+                    .await?
+            );
+        }
+        for privilege in [
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "TRUNCATE",
+            "REFERENCES",
+            "TRIGGER",
+        ] {
+            assert!(
+                !sqlx::query_scalar::<_, bool>("SELECT has_table_privilege(current_user, $1, $2)")
+                    .bind(format!("rustodon.{table}"))
+                    .bind(privilege)
+                    .fetch_one(&mut reader)
+                    .await?
+            );
+        }
+    }
+    sqlx::query("ALTER TABLE rustodon.activity_buckets ADD COLUMN drift bigint")
+        .execute(&mut owner)
+        .await?;
+    assert!(matches!(
+        rustodon::operational_schema::validate(&mut reader).await,
+        Err(MigrationError::SchemaDrift(_))
+    ));
+    sqlx::query("ALTER TABLE rustodon.activity_buckets DROP COLUMN drift")
+        .execute(&mut owner)
+        .await?;
+    rustodon::operational_schema::validate(&mut reader).await?;
+    Ok(())
 }

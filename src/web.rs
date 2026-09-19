@@ -3046,6 +3046,14 @@ async fn frontend_html_response(
         None => None,
     };
     let authenticated = if let Some(session) = session.as_ref() {
+        if let Some(writer) = state.write_repository.as_ref()
+            && writer
+                .track_interactive_user(session.user_id)
+                .await
+                .is_err()
+        {
+            return internal_error();
+        }
         let loader = state.loader(Some(session.account_id));
         let Ok(Some(credential)) = loader
             .credential_account(session.user_id, session.account_id)
@@ -10406,6 +10414,12 @@ async fn required_browser_session(
     {
         return Err(browser_redirect_response("/auth/sign_in"));
     }
+    if let Some(writer) = state.write_repository.as_ref() {
+        writer
+            .track_interactive_user(session.user_id)
+            .await
+            .map_err(|_| internal_error())?;
+    }
     Ok(session)
 }
 
@@ -12155,6 +12169,14 @@ async fn browser_session(State(state): State<WebState>, headers: HeaderMap) -> R
             .is_ok_and(|touched| touched)
     {
         return browser_auth_error_response(StatusCode::UNAUTHORIZED, "unauthenticated");
+    }
+    if let Some(writer) = state.write_repository.as_ref()
+        && writer
+            .track_interactive_user(session.user_id)
+            .await
+            .is_err()
+    {
+        return internal_error();
     }
     let value = serde_json::json!({
         "authenticated": true,
@@ -17219,6 +17241,14 @@ async fn verify_credentials(State(state): State<WebState>, headers: HeaderMap) -
         Ok(owner) => owner,
         Err(response) => return response,
     };
+    if let Some(writer) = state.write_repository.as_ref()
+        && writer
+            .track_interactive_user(owner.user_id())
+            .await
+            .is_err()
+    {
+        return internal_error();
+    }
     credential_account_response(&state, owner).await
 }
 

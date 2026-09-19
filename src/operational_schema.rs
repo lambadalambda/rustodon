@@ -3,7 +3,7 @@ use std::fmt::{self, Write};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection, Postgres, Row, Transaction};
 
-pub const CURRENT_VERSION: i64 = 5;
+pub const CURRENT_VERSION: i64 = 6;
 
 const BOOTSTRAP_SQL: &str = "CREATE SCHEMA rustodon; \
 CREATE TABLE rustodon.schema_migrations ( \
@@ -20,7 +20,10 @@ const MIGRATION_2_SQL: &str = include_str!("../migrations/rustodon/0002_rate_lim
 const MIGRATION_3_SQL: &str = include_str!("../migrations/rustodon/0003_remote_fetch_leases.sql");
 const MIGRATION_4_SQL: &str = include_str!("../migrations/rustodon/0004_stream_outbox_indexes.sql");
 const MIGRATION_5_SQL: &str = include_str!("../migrations/rustodon/0005_local_uploads.sql");
+const MIGRATION_6_SQL: &str = include_str!("../migrations/rustodon/0006_instance_activity.sql");
 const TABLES: &[&str] = &[
+    "activity_buckets",
+    "activity_members",
     "domain_health",
     "durable_jobs",
     "heartbeats",
@@ -34,6 +37,9 @@ const TABLES: &[&str] = &[
 ];
 const SEQUENCES: &[&str] = &["durable_jobs_id_seq", "outbox_events_id_seq"];
 const INDEXES: &[&str] = &[
+    "activity_buckets_expires_idx",
+    "activity_buckets_pkey",
+    "activity_members_pkey",
     "domain_health_pkey",
     "domain_health_retry_idx",
     "durable_jobs_claim_idx",
@@ -60,8 +66,8 @@ const INDEXES: &[&str] = &[
     "schema_migrations_pkey",
 ];
 const EXPECTED_CATALOG_SHA256: [u8; 32] = [
-    0x99, 0xb8, 0x37, 0x5f, 0x5c, 0x77, 0x3f, 0xc1, 0x20, 0x0a, 0xcc, 0x78, 0x2a, 0x25, 0xec, 0x9d,
-    0x92, 0xe2, 0x37, 0x69, 0x9b, 0x16, 0x5c, 0x2f, 0x96, 0x1c, 0x04, 0xbd, 0xea, 0x52, 0x1f, 0x99,
+    0x60, 0xf2, 0xd8, 0x09, 0xc3, 0xd1, 0x22, 0xff, 0x8d, 0x90, 0x8f, 0x31, 0x50, 0x05, 0xdb, 0x00,
+    0xcf, 0x71, 0x79, 0xdf, 0xdc, 0x33, 0x63, 0x88, 0xbd, 0x05, 0xbe, 0xaa, 0x5b, 0xf6, 0x52, 0xa6,
 ];
 const CATALOG_QUERY: &str = r#"
 WITH schema_info AS (
@@ -695,6 +701,10 @@ fn migration(version: i64) -> Option<Migration> {
             version,
             sql: MIGRATION_5_SQL,
         }),
+        6 => Some(Migration {
+            version,
+            sql: MIGRATION_6_SQL,
+        }),
         _ => None,
     }
 }
@@ -852,7 +862,7 @@ pub(crate) async fn migrate_transaction(
         .await?;
         grant_runtime_privileges_for_migration(transaction, version, runtime_role.as_deref())
             .await?;
-        if version == 5 {
+        if version == 5 || version == 6 {
             let writer = sqlx::query_scalar::<_, String>(
                 "SELECT pg_catalog.quote_ident(rolname) FROM pg_catalog.pg_roles \
                  WHERE rolname = pg_catalog.current_setting('rustodon.writer_role', true)",
@@ -861,7 +871,12 @@ pub(crate) async fn migrate_transaction(
             .await?;
             if let Some(writer) = writer {
                 sqlx::query(&format!(
-                    "GRANT SELECT, INSERT, UPDATE, DELETE ON rustodon.local_uploads TO {writer}"
+                    "GRANT SELECT, INSERT, UPDATE, DELETE ON {} TO {writer}",
+                    if version == 5 {
+                        "rustodon.local_uploads"
+                    } else {
+                        "rustodon.activity_buckets, rustodon.activity_members"
+                    }
                 ))
                 .execute(&mut **transaction)
                 .await?;
@@ -1027,6 +1042,7 @@ async fn validate_catalog(
     }
     let unexpected_columns = sqlx::query_scalar::<_, String>(
         "WITH expected(table_name, column_count) AS (VALUES \
+           ('activity_buckets', 2), ('activity_members', 2), \
            ('domain_health', 7), ('durable_jobs', 15), ('heartbeats', 6), \
            ('idempotency_keys', 6), ('local_uploads', 11), ('ordering_markers', 6), \
            ('outbox_events', 6), ('rate_limit_windows', 4), \
@@ -1167,6 +1183,10 @@ async fn grant_runtime_privileges_for_migration(
         3 => &[(
             "SELECT, INSERT, DELETE",
             "TABLE rustodon.remote_fetch_leases",
+        )],
+        6 => &[(
+            "SELECT",
+            "TABLE rustodon.activity_buckets, rustodon.activity_members",
         )],
         _ => &[],
     };
@@ -1341,6 +1361,8 @@ async fn runtime_role_privileges(
 
 fn expected_runtime_role_privileges() -> Vec<String> {
     [
+        "activity_buckets:SELECT:false",
+        "activity_members:SELECT:false",
         "domain_health:DELETE:false",
         "domain_health:INSERT:false",
         "domain_health:SELECT:false",
@@ -1459,10 +1481,10 @@ mod tests {
     use super::{CATALOG_QUERY, EXPECTED_CATALOG_SHA256, crc32, hex};
 
     #[test]
-    fn expected_catalog_hash_is_pinned_postgresql_14_23_v5_catalog() {
+    fn expected_catalog_hash_is_pinned_postgresql_14_23_v6_catalog() {
         assert_eq!(
             hex(&EXPECTED_CATALOG_SHA256),
-            "99b8375f5c773fc1200acc782a25ec9d92e237699b165c2f961c04bdea521f99"
+            "60f2d809c3d122ff8d908f315005db00cf7179dfdc336388bd05beaa5bf652a6"
         );
     }
 

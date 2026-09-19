@@ -18,6 +18,10 @@ The bundled public frontend always shows zero active users because Rustodon init
 - A deployment with newly recorded eligible activity reports a nonzero 4-week value in `GET /api/v2/instance` and the bundled public sidebar; the rollout behavior for preexisting sign-ins is tested and documented.
 - NodeInfo reports both 4-week and 24-week counts; under limited federation only the v2 instance value is suppressed.
 
+## Subissues
+
+- [Record transactional daily instance activity](record-transactional-daily-instance-activity.md): first bounded operational-storage/authentication slice; cached aggregation and public counts remain here for the next slice.
+
 ## Evidence
 
 - Mastodon 4.6.5 records user IDs in daily `activity:logins` unique sets when an account is approved and when a confirmed user returns, then unions the preceding 4 or 24 weeks for instance metrics.

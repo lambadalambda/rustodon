@@ -344,6 +344,12 @@ async fn standalone_bootstrap_installs_and_verifies_exact_baseline() {
             .expect("install standalone baseline"),
         BootstrapOutcome::Installed
     );
+    let activity_before: (i64, String) = sqlx::query_as(
+        "SELECT count(*), max(b.expires_at)::text FROM rustodon.activity_members m \
+         JOIN rustodon.activity_buckets b USING (day) JOIN public.users u ON u.id=m.user_id \
+         WHERE u.email='alice@bootstrap.invalid' AND m.day=(clock_timestamp() AT TIME ZONE 'UTC')::date",
+    ).fetch_one(&mut connection).await.expect("fresh owner activation after migration");
+    assert_eq!(activity_before.0, 1);
     let identity_before = sqlx::query_as::<_, (String, String, String)>(
         "SELECT actor.public_key, admin.public_key, user_record.encrypted_password \
          FROM public.accounts actor CROSS JOIN public.accounts admin \
@@ -367,6 +373,31 @@ async fn standalone_bootstrap_installs_and_verifies_exact_baseline() {
             .expect("verify standalone baseline"),
         BootstrapOutcome::Verified
     );
+    let activity_after: (i64, String) = sqlx::query_as(
+        "SELECT count(*), max(b.expires_at)::text FROM rustodon.activity_members m \
+         JOIN rustodon.activity_buckets b USING (day) JOIN public.users u ON u.id=m.user_id \
+         WHERE u.email='alice@bootstrap.invalid' AND m.day=(clock_timestamp() AT TIME ZONE 'UTC')::date",
+    ).fetch_one(&mut connection).await.expect("read activity after verification-only rerun");
+    assert_eq!(
+        activity_before, activity_after,
+        "verification must not renew activation"
+    );
+    sqlx::query("INSERT INTO rustodon.activity_members (day, user_id) SELECT day, -999 FROM rustodon.activity_buckets")
+        .execute(&mut connection).await.expect("add extraneous baseline activity");
+    assert!(bootstrap_instance(&mut connection, &request).await.is_err());
+    sqlx::query("DELETE FROM rustodon.activity_members WHERE user_id=-999")
+        .execute(&mut connection)
+        .await
+        .expect("restore exact owner membership");
+    sqlx::query("UPDATE rustodon.activity_buckets SET expires_at=expires_at+interval '1 day'")
+        .execute(&mut connection)
+        .await
+        .expect("add invalid future expiry");
+    assert!(bootstrap_instance(&mut connection, &request).await.is_err());
+    sqlx::query("UPDATE rustodon.activity_buckets SET expires_at=expires_at-interval '1 day'")
+        .execute(&mut connection)
+        .await
+        .expect("restore exact expiry");
     let identity_after = sqlx::query_as::<_, (String, String, String)>(
         "SELECT actor.public_key, admin.public_key, user_record.encrypted_password \
          FROM public.accounts actor CROSS JOIN public.accounts admin \

@@ -12558,6 +12558,7 @@ impl WriteRepository {
         .bind(user_id)
         .execute(&mut *transaction)
         .await?;
+        crate::activity::record_activation_in(&mut transaction, user_id, false).await?;
         transaction.commit().await?;
         Ok(true)
     }
@@ -12620,6 +12621,7 @@ impl WriteRepository {
         if let Some((_, _, confirmation_job)) = confirmation {
             record_outbox_in(&mut transaction, confirmation_job).await?;
         }
+        crate::activity::record_activation_in(&mut transaction, user_id, false).await?;
         transaction.commit().await?;
         Ok(CreatedLocalUser {
             account_id,
@@ -12731,8 +12733,16 @@ impl WriteRepository {
         .bind(user_id)
         .fetch_one(&mut *transaction)
         .await?;
+        crate::activity::record_login_in(&mut transaction, user_id).await?;
         transaction.commit().await?;
         Ok(session_id)
+    }
+
+    /// Track only explicit interactive routes, never generic bearer/media reads.
+    pub async fn track_interactive_user(&self, user_id: i64) -> sqlx::Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        crate::activity::track_returning_in(&mut transaction, user_id).await?;
+        transaction.commit().await
     }
 
     pub async fn touch_browser_session(&self, session_id: &str) -> sqlx::Result<bool> {

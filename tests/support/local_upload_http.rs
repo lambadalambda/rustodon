@@ -780,7 +780,7 @@ async fn media_session(pool: &PgPool, session: &str, token: &str) -> TestResult 
 }
 
 async fn session_snapshot(pool: &PgPool) -> TestResult<Value> {
-    Ok(sqlx::query_scalar("SELECT jsonb_build_object('sessions', (SELECT jsonb_agg(to_jsonb(s) ORDER BY id) FROM session_activations s), 'tokens', (SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM oauth_access_tokens t))")
+    Ok(sqlx::query_scalar("SELECT jsonb_build_object('sessions', (SELECT jsonb_agg(to_jsonb(s) ORDER BY id) FROM session_activations s), 'tokens', (SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM oauth_access_tokens t), 'sign_ins', (SELECT jsonb_agg(jsonb_build_array(id, current_sign_in_at, last_sign_in_at, sign_in_count) ORDER BY id) FROM users), 'activity_buckets', (SELECT jsonb_agg(to_jsonb(b) ORDER BY day) FROM rustodon.activity_buckets b), 'activity_members', (SELECT jsonb_agg(to_jsonb(m) ORDER BY day, user_id) FROM rustodon.activity_members m))")
         .fetch_one(pool).await?)
 }
 
@@ -833,6 +833,13 @@ async fn local_upload_browser_media_access() -> TestResult {
     WriteRepository::from_pool(writer_pool.clone())
         .delete_browser_session("media-logout")
         .await?;
+    // A regression that globally tracks cookie reads must not hide behind the
+    // throttle: make this retained, functional owner due before media GET/HEAD.
+    sqlx::query(
+        "UPDATE users SET current_sign_in_at=clock_timestamp()-interval '25 hours' WHERE id=101",
+    )
+    .execute(&pool)
+    .await?;
     let snapshot = session_snapshot(&pool).await?;
     let state = WebState::new(
         Repository::from_pool(runtime_pool.clone()),
@@ -1333,5 +1340,121 @@ async fn local_upload_browser_media_access() -> TestResult {
         .await?;
     }
     assert_eq!(snapshot, session_snapshot(&pool).await?);
+    assert_interactive_activity_subset(&pool, &client, &base).await?;
+    Ok(())
+}
+
+// Reuse the persisted browser/media fixture to prove explicit tracking call sites,
+// not broad middleware coverage and not an executable-browser gate.
+#[allow(clippy::too_many_lines)]
+async fn assert_interactive_activity_subset(
+    pool: &PgPool,
+    client: &Client,
+    base: &str,
+) -> TestResult {
+    sqlx::query("DELETE FROM rustodon.activity_members WHERE user_id=101")
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE users SET current_sign_in_at=NULL WHERE id=101")
+        .execute(pool)
+        .await?;
+    let count_before: i64 =
+        sqlx::query_scalar("SELECT sign_in_count::bigint FROM users WHERE id=101")
+            .fetch_one(pool)
+            .await?;
+    let ordinary = client
+        .get(format!("{base}/api/v1/preferences"))
+        .header("host", DOMAIN)
+        .bearer_auth(OWNER_TOKEN)
+        .send()
+        .await?;
+    assert_eq!(ordinary.status().as_u16(), 200);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM rustodon.activity_members WHERE user_id=101"
+        )
+        .fetch_one(pool)
+        .await?,
+        0,
+        "generic bearer reads do not track"
+    );
+    for _ in 0..2 {
+        let response = client
+            .get(format!("{base}/api/v1/accounts/verify_credentials"))
+            .header("host", DOMAIN)
+            .bearer_auth(OWNER_TOKEN)
+            .send()
+            .await?;
+        assert_eq!(response.status().as_u16(), 200);
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM rustodon.activity_members WHERE user_id=101"
+        )
+        .fetch_one(pool)
+        .await?,
+        1
+    );
+    let previous: chrono::NaiveDateTime =
+        sqlx::query_scalar("SELECT current_sign_in_at FROM users WHERE id=101")
+            .fetch_one(pool)
+            .await?;
+    // Same user, retained browser: no second update while not due.
+    let response = client
+        .get(format!("{base}/home"))
+        .header("host", DOMAIN)
+        .header("cookie", "_mastodon_session=media-owner")
+        .send()
+        .await?;
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        sqlx::query_scalar::<_, chrono::NaiveDateTime>(
+            "SELECT current_sign_in_at FROM users WHERE id=101"
+        )
+        .fetch_one(pool)
+        .await?,
+        previous
+    );
+    for path in ["/home", "/settings/profile", "/auth/session"] {
+        sqlx::query("DELETE FROM rustodon.activity_members WHERE user_id=101")
+            .execute(pool)
+            .await?;
+        sqlx::query(
+            "UPDATE users SET current_sign_in_at=clock_timestamp()-interval '25 hours' WHERE id=101",
+        )
+        .execute(pool)
+        .await?;
+        let response = client
+            .get(format!("{base}{path}"))
+            .header("host", DOMAIN)
+            .header("cookie", "_mastodon_session=media-owner")
+            .send()
+            .await?;
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM rustodon.activity_members WHERE user_id=101"
+            )
+            .fetch_one(pool)
+            .await?,
+            1,
+            "{path} tracks a due retained browser"
+        );
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT current_sign_in_at > clock_timestamp()-interval '1 minute' \
+                 AND last_sign_in_at < clock_timestamp()-interval '24 hours' FROM users WHERE id=101",
+            )
+            .fetch_one(pool)
+            .await?,
+            "{path} claims the due sign-in timestamp"
+        );
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT sign_in_count::bigint FROM users WHERE id=101")
+            .fetch_one(pool)
+            .await?,
+        count_before
+    );
     Ok(())
 }

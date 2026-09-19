@@ -248,7 +248,8 @@ GRANT UPDATE (lease_expires_at, updated_at) ON TABLE rustodon.durable_jobs
   TO :"writer_role";
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   rustodon.idempotency_keys, rustodon.outbox_events,
-  rustodon.ordering_markers, rustodon.rate_limit_windows, rustodon.local_uploads
+  rustodon.ordering_markers, rustodon.rate_limit_windows, rustodon.local_uploads,
+  rustodon.activity_buckets, rustodon.activity_members
   TO :"writer_role";
 
 COMMIT;

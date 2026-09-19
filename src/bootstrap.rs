@@ -700,7 +700,7 @@ async fn install_fresh(
     .await?;
     seed_roles(transaction).await?;
     seed_instance_actor(transaction, &actor_keys).await?;
-    seed_admin(transaction, inputs, &admin_keys, &password_hash).await?;
+    let admin_user_id = seed_admin(transaction, inputs, &admin_keys, &password_hash).await?;
     seed_settings_and_username_blocks(
         transaction,
         &inputs.site_title,
@@ -724,6 +724,7 @@ async fn install_fresh(
         .execute(&mut **transaction)
         .await?;
     operational_schema::migrate_transaction(transaction).await?;
+    crate::activity::record_activation_in(transaction, admin_user_id, false).await?;
     apply_writer_grants(transaction, &inputs.writer_role).await?;
     apply_runtime_grants(transaction, &inputs.runtime_role).await?;
     validate_complete(transaction, inputs, password).await
@@ -819,8 +820,8 @@ async fn seed_admin(
     inputs: &BootstrapInputs,
     keys: &(String, String),
     password_hash: &str,
-) -> Result<(), BootstrapError> {
-    sqlx::query(
+) -> Result<i64, BootstrapError> {
+    let user_id = sqlx::query_scalar(
         "WITH new_account AS ( \
            INSERT INTO public.accounts (username, actor_type, private_key, public_key, created_at, updated_at) \
            VALUES ($1, 'Person', $2, $3, clock_timestamp(), clock_timestamp()) RETURNING id), \
@@ -832,16 +833,16 @@ async fn seed_admin(
            created_at, updated_at) \
          SELECT new_account.id, $4, $5, true, false, clock_timestamp(), 3, \
                 clock_timestamp(), clock_timestamp() \
-         FROM new_account JOIN new_stats ON new_stats.account_id = new_account.id",
+         FROM new_account JOIN new_stats ON new_stats.account_id = new_account.id RETURNING id",
     )
     .bind(&inputs.admin_username)
     .bind(&keys.0)
     .bind(&keys.1)
     .bind(&inputs.admin_email)
     .bind(password_hash)
-    .execute(&mut **transaction)
+    .fetch_one(&mut **transaction)
     .await?;
-    Ok(())
+    Ok(user_id)
 }
 
 async fn seed_settings_and_username_blocks(
@@ -935,7 +936,8 @@ async fn apply_runtime_grants(
            rustodon.ordering_markers, rustodon.domain_health, rustodon.heartbeats, \
            rustodon.rate_limit_windows TO {role}; \
          GRANT SELECT, INSERT, DELETE ON TABLE rustodon.remote_fetch_leases TO {role}; \
-         GRANT SELECT ON TABLE rustodon.schema_migrations TO {role}; \
+         GRANT SELECT ON TABLE rustodon.schema_migrations, \
+           rustodon.activity_buckets, rustodon.activity_members TO {role}; \
          GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, \
            rustodon.outbox_events_id_seq TO {role};"
     );
@@ -1028,7 +1030,8 @@ async fn validate_empty_work_tables(
            AND NOT (namespace.nspname = 'public' AND relation.relname IN ( \
              'accounts', 'account_stats', 'users', 'user_roles', 'username_blocks', \
              'settings', 'schema_migrations')) \
-           AND NOT (namespace.nspname = 'rustodon' AND relation.relname = 'schema_migrations') \
+           AND NOT (namespace.nspname = 'rustodon' AND relation.relname IN ( \
+             'schema_migrations', 'activity_buckets', 'activity_members')) \
          ORDER BY namespace.nspname COLLATE \"C\", relation.relname COLLATE \"C\"",
     )
     .fetch_all(&mut **transaction)
@@ -1065,6 +1068,15 @@ async fn validate_complete(
              = (SELECT array_agg(version ORDER BY version COLLATE \"C\") FROM unnest($1::text[]) version) \
            AND (SELECT count(*) FROM public.accounts) = 2 \
            AND (SELECT count(*) FROM public.users) = 1 \
+           AND (SELECT count(*) FROM rustodon.activity_members) = 1 \
+           AND (SELECT count(*) FROM rustodon.activity_buckets) = 1 \
+           AND EXISTS (SELECT 1 FROM rustodon.activity_members member \
+             JOIN rustodon.activity_buckets bucket USING (day) \
+             JOIN public.users user_record ON user_record.id = member.user_id \
+             WHERE bucket.day BETWEEN user_record.created_at::date \
+               AND ((bucket.expires_at - make_interval(secs => $5::bigint)) AT TIME ZONE 'UTC')::date \
+               AND bucket.expires_at >= (user_record.created_at AT TIME ZONE 'UTC') + make_interval(secs => $5::bigint) \
+               AND bucket.expires_at <= clock_timestamp() + make_interval(secs => $5::bigint)) \
            AND (SELECT count(*) FROM public.account_stats) = 2 \
            AND (SELECT count(*) FROM public.user_roles) = 4 \
            AND (SELECT count(*) FROM public.username_blocks) = 23 \
@@ -1121,6 +1133,7 @@ async fn validate_complete(
     .bind(&inputs.admin_username)
     .bind(&inputs.admin_email)
     .bind(site_title_yaml(&inputs.site_title))
+    .bind(crate::activity::RETENTION_SECONDS)
     .fetch_one(&mut **transaction)
     .await?;
     if !baseline_valid {

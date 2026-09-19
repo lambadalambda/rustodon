@@ -22,7 +22,7 @@ async fn durable_upload_schema_contract() -> Result<(), Box<dyn std::error::Erro
         "filename-null rollback staging has no durable upload owner"
     );
     // Simulate precisely the previous applied prefix, then exercise additive upgrade.
-    sqlx::raw_sql("DROP TABLE rustodon.local_uploads; DELETE FROM rustodon.schema_migrations WHERE version = 5")
+    sqlx::raw_sql("DROP TABLE rustodon.activity_members, rustodon.activity_buckets, rustodon.local_uploads; DELETE FROM rustodon.schema_migrations WHERE version IN (5, 6)")
         .execute(&mut db).await?;
     sqlx::query("CREATE ROLE upload_upgrade_writer")
         .execute(&mut db)
@@ -38,7 +38,7 @@ async fn durable_upload_schema_contract() -> Result<(), Box<dyn std::error::Erro
         .await?;
         assert!(granted);
     }
-    sqlx::raw_sql("REVOKE ALL ON rustodon.local_uploads FROM upload_upgrade_writer; DROP ROLE upload_upgrade_writer")
+    sqlx::raw_sql("REVOKE ALL ON rustodon.local_uploads, rustodon.activity_buckets, rustodon.activity_members FROM upload_upgrade_writer; DROP ROLE upload_upgrade_writer")
         .execute(&mut db).await?;
     rustodon::operational_schema::migrate(&mut db).await?;
     Ok(())

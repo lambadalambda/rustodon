@@ -215,7 +215,7 @@ psql_peer "$RUSTODON_DB" >>"$RUN_ROOT/grants.log" <<SQL
 GRANT USAGE ON SCHEMA rustodon TO $WORKER_RUNTIME;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE rustodon.durable_jobs, rustodon.outbox_events, rustodon.idempotency_keys, rustodon.ordering_markers, rustodon.domain_health, rustodon.heartbeats, rustodon.rate_limit_windows TO $WORKER_RUNTIME;
 GRANT SELECT, INSERT, DELETE ON TABLE rustodon.remote_fetch_leases TO $WORKER_RUNTIME;
-GRANT SELECT ON TABLE rustodon.schema_migrations TO $WORKER_RUNTIME;
+GRANT SELECT ON TABLE rustodon.schema_migrations, rustodon.activity_buckets, rustodon.activity_members TO $WORKER_RUNTIME;
 GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq TO $WORKER_RUNTIME;
 SQL
 prepare_differential_writer_database "$RUSTODON_DB" >>"$RUN_ROOT/grants.log"

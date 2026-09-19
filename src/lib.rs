@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod activity;
 pub mod bootstrap;
 pub mod config;
 pub mod crypto;

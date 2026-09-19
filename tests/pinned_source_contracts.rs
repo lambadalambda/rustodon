@@ -1154,3 +1154,46 @@ fn pinned_featured_editor_waits_for_delayed_instance_limit() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires the read-only pinned Mastodon source checkout"]
+fn pinned_daily_activity_records_and_interactive_tracking_contract() {
+    let source = mastodon_source();
+    let tracker = read(&source.join("app/lib/activity_tracker.rb"));
+    for evidence in [
+        "EXPIRE_AFTER = 6.months.seconds",
+        "redis.pfadd(key, value)",
+        "redis.expire(key, EXPIRE_AFTER)",
+        "start_at.to_date...end_at.to_date",
+        "redis.pfcount(*keys)",
+    ] {
+        assert!(tracker.contains(evidence), "{evidence}");
+    }
+    let user = read(&source.join("app/models/user.rb"));
+    for evidence in [
+        "prepare_new_user! if confirmed?",
+        "if approved?\n      prepare_new_user!",
+        "return unless confirmed?",
+        "ActivityTracker.record('activity:logins', id)",
+        "increment(:sign_in_count) if new_sign_in",
+        "current_sign_in_at || new_current",
+    ] {
+        assert!(user.contains(evidence), "{evidence}");
+    }
+    let tracking = read(&source.join("app/controllers/concerns/user_tracking_concern.rb"));
+    assert!(tracking.contains("SIGN_IN_UPDATE_FREQUENCY = 24.hours.freeze"));
+    assert!(tracking.contains("before_action :update_user_sign_in"));
+    assert!(tracking.contains("current_user.current_sign_in_at < SIGN_IN_UPDATE_FREQUENCY.ago"));
+    let api = read(&source.join("app/controllers/api/base_controller.rb"));
+    assert!(api.contains("elsif !current_user.functional?"));
+    assert!(api.contains("else\n      update_user_sign_in"));
+    let credentials =
+        read(&source.join("app/controllers/api/v1/accounts/credentials_controller.rb"));
+    assert!(credentials.contains("before_action :require_user!"));
+    let presenter = read(&source.join("app/presenters/instance_presenter.rb"));
+    assert!(presenter.contains("def active_user_count(num_weeks = 4)"));
+    assert!(presenter.contains(".sum(num_weeks.weeks.ago)"));
+    let nodeinfo = read(&source.join("app/serializers/node_info/serializer.rb"));
+    assert!(nodeinfo.contains("active_user_count(24)"));
+    assert!(read(&source.join("Gemfile.lock")).contains("activesupport (8.1.3)"));
+}

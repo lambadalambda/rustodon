@@ -739,6 +739,14 @@ SELECT
      AND pg_catalog.has_table_privilege(role.oid, 'rustodon.rate_limit_windows', 'INSERT')
      AND pg_catalog.has_table_privilege(role.oid, 'rustodon.rate_limit_windows', 'UPDATE')
      AND pg_catalog.has_table_privilege(role.oid, 'rustodon.rate_limit_windows', 'DELETE')
+     AND pg_catalog.has_table_privilege(role.oid, 'rustodon.activity_buckets', 'SELECT')
+     AND pg_catalog.has_table_privilege(role.oid, 'rustodon.activity_buckets', 'INSERT')
+     AND pg_catalog.has_table_privilege(role.oid, 'rustodon.activity_buckets', 'UPDATE')
+     AND pg_catalog.has_table_privilege(role.oid, 'rustodon.activity_buckets', 'DELETE')
+     AND pg_catalog.has_table_privilege(role.oid, 'rustodon.activity_members', 'SELECT')
+     AND pg_catalog.has_table_privilege(role.oid, 'rustodon.activity_members', 'INSERT')
+     AND pg_catalog.has_table_privilege(role.oid, 'rustodon.activity_members', 'UPDATE')
+     AND pg_catalog.has_table_privilege(role.oid, 'rustodon.activity_members', 'DELETE')
      AND pg_catalog.has_table_privilege(role.oid, 'rustodon.local_uploads', 'SELECT')
      AND pg_catalog.has_table_privilege(role.oid, 'rustodon.local_uploads', 'INSERT')
      AND pg_catalog.has_table_privilege(role.oid, 'rustodon.local_uploads', 'UPDATE')
@@ -1207,7 +1215,7 @@ SELECT
                'web_push_subscriptions', 'webauthn_credentials', 'web_settings'))
               OR (namespace.nspname = 'rustodon' AND relation.relname IN (
                  'durable_jobs', 'idempotency_keys', 'ordering_markers', 'outbox_events',
-                 'rate_limit_windows', 'local_uploads'))
+                 'rate_limit_windows', 'local_uploads', 'activity_buckets', 'activity_members'))
            ))
            OR
            (acl.privilege_type = 'INSERT' AND NOT (
@@ -1226,7 +1234,7 @@ SELECT
                 'session_activations', 'status_edits', 'status_pins', 'status_stats',
                 'statuses', 'statuses_tags', 'tags', 'tombstones'))
              OR (namespace.nspname = 'rustodon' AND relation.relname IN (
-                 'idempotency_keys', 'ordering_markers', 'outbox_events', 'rate_limit_windows', 'local_uploads'))
+                 'idempotency_keys', 'ordering_markers', 'outbox_events', 'rate_limit_windows', 'local_uploads', 'activity_buckets', 'activity_members'))
           ))
           OR
           (acl.privilege_type = 'UPDATE' AND NOT (
@@ -1241,7 +1249,7 @@ SELECT
               'account_relationship_severance_events', 'session_activations', 'status_pins',
               'status_stats', 'statuses', 'tags'))
             OR (namespace.nspname = 'rustodon' AND relation.relname IN (
-                 'idempotency_keys', 'ordering_markers', 'outbox_events', 'rate_limit_windows', 'local_uploads'))
+                 'idempotency_keys', 'ordering_markers', 'outbox_events', 'rate_limit_windows', 'local_uploads', 'activity_buckets', 'activity_members'))
          ))
          OR (acl.privilege_type = 'DELETE' AND NOT (
             (namespace.nspname = 'public' AND relation.relname IN (
@@ -1261,7 +1269,7 @@ SELECT
                'fasp_follow_recommendations'))
             OR (namespace.nspname = 'rustodon' AND relation.relname IN (
                  'durable_jobs', 'idempotency_keys', 'ordering_markers', 'outbox_events',
-                 'rate_limit_windows', 'local_uploads'))
+                 'rate_limit_windows', 'local_uploads', 'activity_buckets', 'activity_members'))
          ))
         )
     )

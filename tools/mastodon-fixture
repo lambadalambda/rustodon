@@ -1141,9 +1141,11 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   rustodon.ordering_markers, rustodon.domain_health, rustodon.heartbeats,
   rustodon.rate_limit_windows
   TO $WORKER_RUNTIME;
-GRANT SELECT ON TABLE rustodon.schema_migrations TO $WORKER_RUNTIME;
+GRANT SELECT ON TABLE rustodon.schema_migrations, rustodon.activity_buckets, rustodon.activity_members TO $WORKER_RUNTIME;
 GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq
   TO $WORKER_RUNTIME;
+DROP TABLE rustodon.activity_members, rustodon.activity_buckets;
+DELETE FROM rustodon.schema_migrations WHERE version = 6;
 DROP TABLE rustodon.local_uploads;
 DELETE FROM rustodon.schema_migrations WHERE version = 5;
 DROP INDEX rustodon.outbox_events_stream_created_at_idx;
@@ -1379,7 +1381,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   rustodon.rate_limit_windows
   TO $WORKER_RUNTIME;
 GRANT SELECT, INSERT, DELETE ON TABLE rustodon.remote_fetch_leases TO $WORKER_RUNTIME;
-GRANT SELECT ON TABLE rustodon.schema_migrations TO $WORKER_RUNTIME;
+GRANT SELECT ON TABLE rustodon.schema_migrations, rustodon.activity_buckets, rustodon.activity_members TO $WORKER_RUNTIME;
 GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq
   TO $WORKER_RUNTIME;
 EOF
@@ -1491,7 +1493,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   rustodon.rate_limit_windows
   TO $WORKER_RUNTIME;
 GRANT SELECT, INSERT, DELETE ON TABLE rustodon.remote_fetch_leases TO $WORKER_RUNTIME;
-GRANT SELECT ON TABLE rustodon.schema_migrations TO $WORKER_RUNTIME;
+GRANT SELECT ON TABLE rustodon.schema_migrations, rustodon.activity_buckets, rustodon.activity_members TO $WORKER_RUNTIME;
 GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq
   TO $WORKER_RUNTIME;
 EOF
@@ -1734,7 +1736,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   rustodon.rate_limit_windows
   TO $DATABASE_READER;
 GRANT SELECT, INSERT, DELETE ON TABLE rustodon.remote_fetch_leases TO $DATABASE_READER;
-GRANT SELECT ON TABLE rustodon.schema_migrations TO $DATABASE_READER;
+GRANT SELECT ON TABLE rustodon.schema_migrations, rustodon.activity_buckets, rustodon.activity_members TO $DATABASE_READER;
 GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq
   TO $DATABASE_READER;
 EOF
@@ -2130,7 +2132,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   rustodon.ordering_markers, rustodon.domain_health, rustodon.heartbeats,
   rustodon.rate_limit_windows TO $WORKER_RUNTIME;
 GRANT SELECT, INSERT, DELETE ON TABLE rustodon.remote_fetch_leases TO $WORKER_RUNTIME;
-GRANT SELECT ON TABLE rustodon.schema_migrations TO $WORKER_RUNTIME;
+GRANT SELECT ON TABLE rustodon.schema_migrations, rustodon.activity_buckets, rustodon.activity_members TO $WORKER_RUNTIME;
 GRANT USAGE ON SEQUENCE rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq
   TO $WORKER_RUNTIME;
 EOF

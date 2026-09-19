@@ -146,6 +146,41 @@ not established by these HTTP results. For writable installations, `admin
 worker-readiness` also requires a fresh local-upload-capable Maintenance heartbeat;
 `/ready` retains its existing database-only meaning.
 
+## Focused instance-activity storage/auth slice
+
+Migration 6 adds exact daily memberships and per-bucket sliding expiry. The new
+runtime grants are SELECT-only; writer grants remain separate. Use a fresh,
+disposable PG14 restore with the owner/runtime/writer URLs and documented grant
+profiles described above. Run these selectors serially, with explicit resource
+and wall-time bounds:
+
+```console
+cargo test --locked --all-features --lib activity:: -- --ignored --nocapture --test-threads=1
+cargo test --locked --all-features --test operational_schema instance_activity_upgrade_from_five_preserves_history_and_grants -- --ignored --exact --nocapture --test-threads=1
+cargo test --locked --all-features --test media_state local_upload_http::local_upload_browser_media_access -- --ignored --exact --nocapture --test-threads=1
+```
+
+The upgrade selector deliberately drops/recreates the two activity tables and
+version-6 ledger entry in its task-owned fixture; never point it at an instance.
+The media selector reuses persisted GET/HEAD cookie/bearer cases, snapshots
+activity/sign-in state with a due owner, then tests explicit credentials and
+frontend HTML tracking. This is HTTP evidence, not an executable-browser gate.
+Only these interactive routes and existing browser settings/session hooks track
+retained activity; this is not full Rails controller or generic bearer tracking.
+
+Fresh bootstrap's existing selector now verifies the owner's initial activation,
+unchanged expiry on verification rerun, and invalid baseline activity rejection.
+The pinned source lane includes `pinned_daily_activity_records_and_interactive_tracking_contract`.
+Neither executable test source nor this documentation claims those gates ran;
+DEVLOG records exact bounded runs and environment/tool limitations.
+
+No historical sign-ins are backfilled. Retention is **15,778,476 seconds** reset
+on every eligible bucket write, not 24 weeks. Cached aggregation/public values
+and physical maintenance pruning remain a subsequent slice: readers must exclude
+expired buckets and today from the preceding 28/168-day unions. Cleanup must
+lock each bucket and remove members and bucket together, preserving the
+transactional relationship without a public user FK or historical-state filtering.
+
 ## Standalone bootstrap
 
 `mise run standalone-bootstrap-integration` starts from an empty PostgreSQL 14

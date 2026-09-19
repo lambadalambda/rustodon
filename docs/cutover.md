@@ -97,7 +97,7 @@ record; `PF_*` codes are intended for remediation and rollback diagnostics.
            rustodon.rate_limit_windows TO :"runtime_role";
          GRANT SELECT, INSERT, DELETE ON TABLE
            rustodon.remote_fetch_leases TO :"runtime_role";
-         GRANT SELECT ON TABLE rustodon.schema_migrations TO :"runtime_role";
+         GRANT SELECT ON TABLE rustodon.schema_migrations, rustodon.activity_buckets, rustodon.activity_members TO :"runtime_role";
          GRANT USAGE ON SEQUENCE
            rustodon.durable_jobs_id_seq, rustodon.outbox_events_id_seq
            TO :"runtime_role";'

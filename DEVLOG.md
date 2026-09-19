@@ -1,3 +1,161 @@
+## 2026-09-19 — Activity review-2 fixture reliability follow-up (tests only)
+
+- Parent accepted production source with no high-severity findings. Addressed
+  the medium fixed-date reliability finding without production edits: exact
+  midnight is now 23:59:59 UTC two database-clock days before the test, safely
+  separate from today's activations. Expired renewal uses an expiry explicitly
+  before PostgreSQL's clock; strict-24h and union-window simulations derive their
+  reference time from that same database, not January/September 2026 constants.
+  Exact midnight, strict 24h, TTL-duration and 28/168-day boundary checks remain.
+- Reused the existing HTTP fixture for due `/settings/profile` and `/auth/session`
+  requests alongside `/home`. Each must record membership and previous/current
+  sign-in timestamps without incrementing sign-in count. Existing media GET/HEAD
+  immutability and ordinary-bearer nontracking assertions remain. No browser
+  infrastructure, aggregate, prune, auth-policy or other production change.
+- Final serial restricted-role PG14.23 / NAS7203 reruns: activity **4 passed**
+  (`r2-final-activity.log`, 10.15s); media plus interactive HTTP **1 passed**
+  (`r2-final-http.log`, 27.93s); focused strict library/media-test Clippy passed
+  (`r2-final-clippy.log`); local formatting/diff checks passed. These are the
+  focused reruns, not a new full-matrix or bootstrap claim.
+- Same task workspace and bounded tool runner as the prior slice: 4 CPU/6 GiB/
+  512 PIDs/870s, 900s outer bound; newly created internal network and PG14
+  container with 1 CPU/512 MiB/128 PIDs/3600s lifetime, no published ports.
+  Initial provisioning caught the PostgreSQL temporary startup socket; roles
+  and a fresh restore were retried after TCP readiness. That setup failure and
+  initial Clippy function-length rejection are retained; a test-only length
+  allowance keeps the single HTTP scenario together. No production access.
+- Only `src/activity/tests.rs` and `tests/support/local_upload_http.rs` changed
+  relative to the prior tested source manifest; all other source/schema/grant
+  hashes remain identical. Final worker/local **22/22 hashes matched**.
+  Prior evidence was not overwritten: new logs, tests-only patch, manifests and
+  cleanup evidence are in ignored `target/daily-activity-evidence/review2/` and
+  remote `evidence/r2-*`. Task container/anonymous volume/network removed;
+  shared caches and workspace retained. Left uncommitted for parent review 2.
+
+## 2026-09-19 — Transactional daily activity storage/auth implemented, review pending
+
+- Continued the approved `16c751c` slice with migration **6**, two Rust-owned
+  tables (`activity_buckets(day, expires_at)` and exact
+  `activity_members(day, user_id)`), and no FKs/public historical-state joins.
+  Bucket renewal and expired-member removal serialize under a bucket lock.
+  Every eligible duplicate resets the shared expiry from the actual PostgreSQL
+  clock **after acquiring that lock**, not the earlier event/TOTP timestamp.
+  Later maintenance pruning must lock buckets and remove both tables' rows in
+  one transaction; no new job or pruning implementation in this slice.
+- Confirmed+approved activation is transactional for confirmed creation,
+  approved confirmation and fresh admin bootstrap; future approval reuse is
+  tested by simulation. Bootstrap retains the admin ID across migration and
+  records once afterward in the install transaction. Its exact baseline now
+  validates that one activation; reruns do not refresh it. Complete
+  password/TOTP/backup session creation records after the final credential fence
+  and rereads confirmed locality. No count at the earlier login audit, no auth
+  transaction merge, no new global disabled/suspended/approval policy.
+- Strict nil or **older than 24h** retained claims hold the user lock and commit
+  previous/current sign-in timestamps with membership, without incrementing
+  `sign_in_count`. Explicit hooks cover frontend HTML, `verify_credentials`,
+  required browser settings and session requests. This is a bounded subset of
+  pinned controller tracking, not broad API/bearer tracking. Media GET/HEAD
+  cookie auth and repository session reads remain mutation-free.
+- Reader gains **SELECT only** on the two tables; known writer gains operational
+  CRUD. Updated bootstrap, migration grant discovery, exact operational/writer
+  validation and fixture grant/downgrade profiles; public grants unchanged.
+  Derived PG14.23 catalogs directly from migration SQL: v5 reproduced
+  `99b8375f5c773fc1200acc782a25ec9d92e237699b165c2f961c04bdea521f99`, v6 is
+  `60f2d809c3d122ff8d908f315005db00cf7179dfdc336388bd05beaa5bf652a6`.
+- Exact clean pinned Mastodon source verified with
+  `tools/mastodon-fixture verify-source target/mastodon-v4.6.5`. Only explicit
+  tracked files needed by the focused source test were archived read-only onto
+  the worker, not `.git` or build output. ActiveSupport **8.1.3** matches its
+  Gemfile.lock. The 7203 tools image has no Ruby gem source; read the exact
+  cached dependency at `/usr/local/bundle/gems/activesupport-8.1.3/lib/active_support/duration.rb`
+  in cached image `36f828650457` (read-only, no network, 1 CPU/256 MiB/64 PIDs/30s).
+  `ruby -r active_support -r active_support/core_ext/integer/time -e
+  'puts ActiveSupport.version; puts 6.months.seconds'` printed **8.1.3** and
+  **15778476**. Duration is 182 days 14:54:36, not calendar months or 168 days.
+  This dependency check is not Mastodon image/peer evidence.
+- Rollout has **empty historical activity**, with no timestamp backfill. A fresh
+  bootstrap owner is a new activation. Public instance/NodeInfo values remain
+  unchanged. Future aggregation must use `D-28 <= day < D` / `D-168 <= day < D`
+  and exclude expired buckets before physical cleanup. SQL fixture queries prove
+  that storage contract, not a cached/public aggregation implementation.
+
+### Actual bounded evidence
+
+- NAS workspace `/srv/workspaces/rustodon-daily-activity-16c751c-alice`, image
+  `7203e0222e2bb72e0b83ab623051873604874cc41a688e318b84691bfa77ad8a`;
+  4 CPUs/6 GiB/512 PIDs, 870s container + 900s outer timeout/15s kill,
+  read-only source/root and a bounded temporary filesystem. Shared cargo caches
+  reused, not copied/pruned. Dedicated internal network, no published ports.
+  Task-owned PostgreSQL **14.23** image
+  `1a6c2409ab71f4d054d676ba09d9b74b5d843d805bd5a0cf08314d27ca659d37`;
+  1 CPU/512 MiB/128 PIDs/14400s hard lifetime. All heavy invocations sequential.
+  No production, environment/credential/backup synchronization or deployment.
+- TDD RED migration prefix `[1..5] != [1..6]` (`red-plan.log`) → GREEN.
+  Bootstrap initially rejected newly recorded activity as unexpected work-table
+  rows → exact initial-activation baseline and rerun/drift tests GREEN.
+- `--all-features --lib activity:: -- --ignored --nocapture --test-threads=1`:
+  **4 passed** (`activity-green.log`, 14.61s). Eligibility/locality, first
+  transition simulation, unconfirmed creation, confirmation, failed/partial
+  authentication, complete password/TOTP/backup, final password fence,
+  membership-failure session rollback, retry/daily uniqueness, nil/strict 24h
+  concurrent claims, actual-clock TTL refresh, expired-generation removal,
+  historical disable/suspend/delete, restricted SQLSTATE 42501 and future union
+  boundaries. A repeated fixture attempt initially reused a confirmation token;
+  test tokens are now unique and the final run used a fresh restore.
+- `--test media_state local_upload_http::local_upload_browser_media_access`:
+  **1 passed** (`media-final.log`, 29.54s) on a fresh restored fixture with actual
+  runtime/writer pools. Existing GET/HEAD media checks now snapshot user sign-in
+  fields plus both activity tables, with a deliberately due retained owner.
+  Subsequent real HTTP checks cover untracked ordinary bearer reads and tracked
+  credentials/HTML requests, daily dedup/throttle and unchanged sign-in count.
+  This is not a browser gate or the full media lane.
+- `--test standalone_bootstrap standalone_bootstrap_installs_and_verifies_exact_baseline`:
+  **1 passed** (`bootstrap-final.log`, 39.19s) on a separate fresh empty database
+  with distinct non-superuser installer/runtime/writer roles and task-owned
+  temporary media. Includes real HTTP smoke, exact roles, first activation,
+  verification-only expiry preservation and extra-member/future-expiry rejection.
+- `--test operational_schema instance_activity_upgrade_from_five_preserves_history_and_grants`:
+  **1 passed** (`upgrade-final.log`, 18.41s): exact v5→v6, no backfill/user changes,
+  rerun, runtime SELECT/no writes, writer CRUD and exact writer/reader validation,
+  catalog drift rejection. Fresh operational lifecycle **1 passed** earlier
+  (`schema-lifecycle.log`, 105.59s); final fresh migration setup also passed.
+- Focused pinned activity source contract **1 passed** (`source-final.log`).
+  Ordinary all-feature library **356 passed / 26 ignored** (`ordinary-lib-green.log`);
+  migration plan **1 passed** (`plan-green.log`). Existing upload schema upgrade
+  **1 passed** on its separate owner-only fresh fixture
+  (`upload-schema-isolated.log`); initial use of the restricted fixture correctly
+  rejected an unconfigured known-writer ACL, not a migration defect.
+- Strict Clippy on library plus changed integration targets **passed**
+  (`lint-final.log`). Full all-target Clippy is **not green**: existing untouched
+  test-helper lints in paperclip/worker/media_processor remain; the new test's
+  unreadable literal was fixed. Aggregate offline harness passed peer/image/
+  selector shell checks, then stopped because the tools image has no Node.
+  Standalone Python harness could not start because it also lacks Python.
+  No full matrix, browser, differential, peer or release claim.
+- Logs, scripts, source hashes, direct catalog extracts and dependency evidence
+  retained under ignored `target/daily-activity-evidence/` and the task workspace.
+  Final local/worker SHA256 comparison **22/22 matched**; formatting and diff
+  whitespace checks passed. Removed only the task PG container/anonymous volume
+  and internal network; no task containers remain. Shared caches/workspaces were
+  retained. Parent independent review pending; no commit or push.
+
+## 2026-09-19 — Daily activity storage/auth slice scoped, not implemented
+
+- Created/indexed `record-transactional-daily-instance-activity` beneath the
+  instance metrics parent, with the requested storage, retention, auth/media,
+  least-privilege, rollout and bounded verification requirements.
+- Verified clean pinned Mastodon HEAD `1440d55b139e39ec722c2a3db7f60b66cd889048`
+  and operational current version 5 on base `16c751c`. Recorded candidate
+  bucket/member design and exact write-expiry/window source references in issue.
+- Traced separate credential-verification and fenced session-creation
+  transactions: activity belongs after the final fence in the session
+  transaction, not at the earlier committed success audit. Main frontend reads
+  sessions without the settings/session touch hook; media intentionally remains
+  mutation-free. No auth refactor or implementation undertaken.
+- Subagent delegation unavailable (`nesting limit reached (depth 1 of 1)`);
+  parent independent review remains outstanding. No TDD or NAS/PG14 fixture
+  gates run, no full-matrix claim, no production access, no commit.
+
 ## 2026-09-19 — Reviewed bounded hashtag acceptance closure (75f770)
 
 - Parent review 75f770 approves the bounded harness commit without blockers.

@@ -44,7 +44,7 @@ CHECK
             extra = '''# Only the public fixture key is exposed to the source verifier.
 podman exec "$PG" psql -U postgres -d remote_browser -At -c "SELECT public_key FROM accounts WHERE id=-99" > run-fixture/searcher.pub
 podman exec "$PG" psql -U postgres -d remote_browser -At -c "SELECT max(version) FROM rustodon.schema_migrations" > evidence/migration-version.txt
-test "$(cat evidence/migration-version.txt)" = 5
+test "$(cat evidence/migration-version.txt)" = 6
 '''
             extra += 'podman exec "$PG" psql -U postgres -d remote_browser -At -v ON_ERROR_STOP=1 -c "' + PRIVACY_SQL + '" > evidence/privacy-before.json\n'
             extra += '''podman exec "$PG" psql -U postgres -d remote_browser -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM statuses WHERE uri LIKE 'https://remote.fixture.invalid/notes/status-search-c3497f5-%'" > evidence/uncached-before.txt
