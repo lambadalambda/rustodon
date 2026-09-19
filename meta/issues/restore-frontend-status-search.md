@@ -1,5 +1,28 @@
 # Restore status search in the bundled frontend
 
+## Current disposition — post-0994711
+
+Accepted and archived on parent approval. The approved minimum is canonical exact-URL status search without Elasticsearch, not broad text search or complete URL discovery. Known (`54dc5c9`), uncached (`c3497f5`) and browser (`0994711`) slices are accepted under reviews `knownlookupreview2collision`, `uncachedreview2policy`, and `browserreview8e75`, with no remaining high-severity/minimum-criterion blocker reported. Focused HTTP tests cover visibility, type and pagination; final uninterrupted native-input browser evidence covers Posts, exact navigation/reload, cached additional fetches 0, one signed TLS public GET, denied empty results and no private persistence/mention. Coordinator harness reruns: local 4 passed / 1 pinned-source skip; Linux pinned-source 5 passed. All-tab empty results and exactly-one public-fetch count were observed rather than hard assertions; these reviewer follow-ups are nonblocking.
+
+Closure is bounded to canonical exact URLs without ES. HTML alternate discovery,
+unredirected mismatched display URL/canonical ID discovery, actor-URL dispatch and
+full-text search remain unsupported/deferred. Existing cached display-URL lookup
+is not a claim of broader discovery. Full fixture matrix remains pending;
+nonzero-offset browser execution is not claimed.
+
+Pinned Mastodon SearchService uses an exclusive resolve=true URL branch: zero
+limit returns none; positive offset suppresses a typed result, while absent/blank
+type ignores offset. account_id/min_id/max_id belong to textual status search;
+following is passed to account search. None constrains exact URL lookup. This
+clarifies the original account-filter requirement, not broad-text implementation.
+Stricter search mute/block/domain suppression is an intentional safety divergence
+from reference context silencing.
+
+
+This disposition supersedes historical open/review-pending/leave-uncommitted
+statements below. Original requirements, hashes, timings and red/green records
+are retained as historical evidence, not fresh current-tree gate claims.
+
 ## Summary
 
 Rustodon's v2 search response always contains an empty `statuses` array. Signed-in users therefore cannot find posts through the bundled frontend, including exact URLs of already known or resolvable statuses.

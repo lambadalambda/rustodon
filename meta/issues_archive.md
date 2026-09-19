@@ -122,3 +122,7 @@
 - [x] [Package a standalone Mastodon-compatible schema](issues/package-standalone-mastodon-schema.md)
 - [x] [Implement the standalone instance bootstrap command](issues/implement-standalone-bootstrap-command.md)
 - [x] [Test and document standalone Rustodon bootstrap](issues/test-and-document-standalone-bootstrap.md)
+- [x] [Restore status search in the bundled frontend](issues/restore-frontend-status-search.md)
+- [x] [Search known exact status URLs](issues/search-known-exact-status-urls.md)
+- [x] [Resolve uncached exact status URLs in search](issues/search-uncached-exact-status-urls.md)
+- [x] [Bounded status-search browser acceptance](issues/accept-status-search-browser.md)

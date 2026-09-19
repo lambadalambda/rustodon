@@ -1,3 +1,27 @@
+## 2026-09-19 — Status-search reconciliation after 0994711
+
+- Docs-only archive of four status-search issues on parent approval. Accepted
+  reviews: `knownlookupreview2collision`, `uncachedreview2policy`,
+  `browserreview8e75`; no remaining high/minimum-criterion blocker reported.
+  Current issue dispositions supersede stale pending/uncommitted statements;
+  historical hashes, timings, red/green notes and original bytes preserved.
+- Canonical exact-URL minimum without ES accepted, including final uninterrupted
+  real-input Posts/exact navigation/reload, cached additional fetches 0, signed
+  TLS public GET 1, denied empty and no private persistence/mention evidence.
+  Coordinator reruns: local 4 pass / 1 pinned-source skip; Linux pinned-source
+  5 pass. Not rerun by this docs-only reconciliation.
+- Pinned URL-branch account/text filters do not apply to exact lookup; following
+  belongs to account search. Stricter mute/block suppression is intentional.
+  HTML alternates, unredirected mismatched display URLs, actor-URL dispatch and
+  full-text remain deferred. All-tab empty and exactly-one public-fetch checks
+  were observed, not hard assertions: nonblocking reviewer follow-ups only.
+- Only four index links moved; issue details retained. Full matrix pending.
+  User's entire batch remains open: hashtags/activity next, then combined
+  verification. No code, production, deployment or push. TDD inapplicable to
+  docs-only reconciliation. Index/link/history-preservation and diff checks pass.
+  Fresh docs review delegation hit the session nesting limit; no new independent
+  docs review claimed. Accepted parent implementation reviews remain as above.
+
 ## 2026-09-19 — Bounded status-search browser acceptance (exact c3497f5)
 
 - Indexed `accept-status-search-browser` before new harness files. Reused the

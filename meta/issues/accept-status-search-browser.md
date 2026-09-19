@@ -1,5 +1,13 @@
 # Bounded status-search browser acceptance
 
+## Current disposition — post-0994711
+
+Accepted and archived on parent approval. Accepted parent review `browserreview8e75` found no high-severity blocker; harness committed in `0994711`. Final fresh uninterrupted real-input controller passed Posts, exact navigation/reload, cached additional fetches 0, one verified signed TLS public GET, denied empty results and no private persistence/mention. Nonblocking reviewer follow-ups: All-tab empty results were observed, not explicitly asserted; exactly one public fetch was observed, not hard-asserted. Record these without expanding this slice. Main coordinator reruns accepted: local 4 passed / 1 pinned-source skip; Linux pinned-source 5 passed. These are coordinator-reported results, not new runs by this docs-only task.
+
+This disposition supersedes historical open/review-pending/leave-uncommitted
+statements below. Original requirements, hashes, timings and red/green records
+are retained as historical evidence, not fresh current-tree gate claims.
+
 ## Summary
 
 Browser acceptance of exact application c3497f5cdf71678c70542689e079ac589de253a1, following [Restore frontend status search](restore-frontend-status-search.md) and its known/uncached URL slices.

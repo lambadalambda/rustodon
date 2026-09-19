@@ -1,5 +1,13 @@
 # Resolve uncached exact status URLs in search
 
+## Current disposition — post-0994711
+
+Accepted and archived on parent approval. Accepted parent review `uncachedreview2policy` closes the isolated-policy follow-up; implementation committed in `c3497f5`. Focused signed-transport gates below satisfy the canonical Note/Question URL minimum. The later browser slice supplies controlled signed TLS evidence, not live-peer proof.
+
+This disposition supersedes historical open/review-pending/leave-uncommitted
+statements below. Original requirements, hashes, timings and red/green records
+are retained as historical evidence, not fresh current-tree gate claims.
+
 ## Summary
 
 Bounded follow-up to [Restore status search in the bundled frontend](restore-frontend-status-search.md), based on `54dc5c9`.

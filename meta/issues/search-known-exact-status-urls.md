@@ -1,5 +1,13 @@
 # Search known exact status URLs
 
+## Current disposition — post-0994711
+
+Accepted and archived on parent approval. Accepted parent review `knownlookupreview2collision` closes the collision follow-up; implementation committed in `54dc5c9`. Focused persisted/HTTP gates below satisfy the known-URL minimum.
+
+This disposition supersedes historical open/review-pending/leave-uncommitted
+statements below. Original requirements, hashes, timings and red/green records
+are retained as historical evidence, not fresh current-tree gate claims.
+
 ## Summary
 
 First bounded slice of [Restore status search in the bundled frontend](restore-frontend-status-search.md), based on f93b6ef. Return already persisted, eligible exact status URLs without remote fetching or Elasticsearch.
