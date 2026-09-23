@@ -899,7 +899,8 @@ async fn wait_for_status(
     url: &str,
     expected: StatusCode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for _ in 0..100 {
+    // 30 s: debug binaries on a loaded host can need far more than 5 s.
+    for _ in 0..600 {
         if client
             .get(url)
             .send()
@@ -1131,13 +1132,5 @@ async fn wait_for_activity_main(
     client: &reqwest::Client,
     base: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for _ in 0..6 {
-        if wait_for_status(client, &format!("{base}/health"), StatusCode::OK)
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
-    }
-    Err("main did not become healthy within 30s".into())
+    wait_for_status(client, &format!("{base}/health"), StatusCode::OK).await
 }

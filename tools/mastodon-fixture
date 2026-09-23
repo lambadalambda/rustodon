@@ -1422,13 +1422,14 @@ EOF
   start_worker_cli "$runtime_url" "$worker_log" "$writer_url" &
   worker_pid=$!
   ready=false
-  for _ in $(seq 1 60); do
+  # Same budget as the cutover worker: loaded hosts can need far more than 6 s.
+  for _ in $(seq 1 120); do
     if run_worker_cli "$runtime_url" admin worker-readiness >/dev/null 2>&1
     then
       ready=true
       break
     fi
-    sleep 0.1
+    sleep 1
   done
   if [ "$ready" != true ]; then
     kill -TERM "$worker_pid" >/dev/null 2>&1 || true
