@@ -148,3 +148,4 @@
 - [x] [Keep instance routes available when activity counts fail](issues/keep-instance-routes-available-when-activity-fails.md)
 - [x] [Skip the activity user-row lock when tracking is not due](issues/skip-activity-user-lock-when-not-due.md)
 - [x] [Ignore unsigned HTTP signature expiry](issues/ignore-unsigned-signature-expiry.md)
+- [x] [Update rustls for RUSTSEC-2026-0285](issues/update-rustls-for-rustsec-2026-0285.md)
