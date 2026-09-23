@@ -10819,8 +10819,8 @@ async fn delete_remote_status_notifications(
     Ok(())
 }
 
-/// Account-scoped advisory lock keyed by the raw account ID. Serializes
-/// notification, notification-request, mute, block and conversation writes.
+/// Account-scoped advisory lock keyed by the raw account ID. Serializes an
+/// account's notification, notification-request, mute, block and status writes.
 async fn lock_account_advisory(
     transaction: &mut Transaction<'_, Postgres>,
     account_id: i64,

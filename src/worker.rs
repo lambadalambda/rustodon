@@ -12,7 +12,13 @@ mod ingress;
 use ingress::*;
 mod poll_expiration;
 #[allow(clippy::wildcard_imports)] // split-out part of this module
-pub use poll_expiration::*;
+use poll_expiration::*;
+#[cfg(feature = "test-support")]
+pub use poll_expiration::{
+    reconcile_poll_expirations_with_exhausted_primary_timeout_for_test,
+    reconcile_poll_expirations_with_exhausted_raw_budget_for_test,
+    reconcile_poll_expirations_with_primary_timeout_for_test,
+};
 pub mod local_uploads;
 mod profile_media;
 

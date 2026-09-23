@@ -14,7 +14,11 @@ mod frontend;
 use frontend::*;
 mod routes;
 #[allow(clippy::wildcard_imports)] // split-out part of this module
-pub use routes::*;
+use routes::*;
+pub use routes::{
+    API_ROUTE_INVENTORY, ApiAuthentication, ApiMethod, ApiRouteContract, ApiRouteSupport,
+    PaginationContract, V1_REQUIRED_API_ROUTES,
+};
 mod rate_limit;
 #[allow(clippy::wildcard_imports)] // split-out part of this module
 use rate_limit::*;
