@@ -18,8 +18,5 @@
 - [ ] [Stream public, hashtag, and list timelines](issues/stream-public-hashtag-list-timelines.md)
 - [ ] [Support polls in the bundled frontend](issues/support-poll-voting-and-refresh.md)
 - [ ] [Support featured-tag peer AddHashtag/RemoveHashtag](issues/support-featured-tag-peer-add-remove.md)
-- [ ] [Keep instance routes available when activity counts fail](issues/keep-instance-routes-available-when-activity-fails.md)
-- [ ] [Skip the activity user-row lock when tracking is not due](issues/skip-activity-user-lock-when-not-due.md)
-- [ ] [Ignore unsigned HTTP signature expiry](issues/ignore-unsigned-signature-expiry.md)
 - [ ] [Complete v1 external acceptance](issues/complete-v1-external-acceptance.md)
 - [ ] [Prove post-v1 durability under disk-full, power loss and load](issues/prove-post-v1-durability.md)

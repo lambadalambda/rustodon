@@ -16,3 +16,7 @@ first and writes only when due.
 
 - A regression proves a not-due tracked request does not wait on a locked user row.
 - Existing activity recording tests pass.
+
+## Done 2026-09-23
+
+Red/green on the NAS PG14 fixture; see DEVLOG 2026-09-23.

@@ -145,3 +145,6 @@
 - [x] [Implement the minimal account UI](issues/implement-minimal-account-ui.md)
 - [x] [Build the executable v1 acceptance matrix](issues/build-v1-acceptance-matrix.md)
 - [x] [Harden the v1 release](issues/harden-v1-release.md)
+- [x] [Keep instance routes available when activity counts fail](issues/keep-instance-routes-available-when-activity-fails.md)
+- [x] [Skip the activity user-row lock when tracking is not due](issues/skip-activity-user-lock-when-not-due.md)
+- [x] [Ignore unsigned HTTP signature expiry](issues/ignore-unsigned-signature-expiry.md)

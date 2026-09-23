@@ -1,3 +1,24 @@
+## 2026-09-23 — Review fixes and a NAS runner for fixture lanes
+
+- Review of the whole tree found the web UI, instance and NodeInfo routes
+  returned 503 whenever the activity count query failed. The cache now serves
+  the last good counts for up to 24 h, else zeroes (reverses the fail-closed
+  choice). Also: activity prune failure no longer skips operational cleanup,
+  tracked requests skip the user-row lock when not due, and an unsigned
+  signature `expires` can only shorten the Date window.
+- Fixture lanes run on the NAS from a derived tools image with a podman client
+  wrapper for the host socket, host networking and identical workspace paths.
+  Sync must not preserve Mac mtimes (tar did, so cargo reused stale builds);
+  a checksum rsync without `--times` works.
+- New `worker-test instance_activity` case. Red/green on NAS PG14: activity
+  storage 8/8, maintenance 2/2, signatures 8/8, startup activity test passes.
+  Strict Clippy (all targets, after test-only lint fixes), fmt, ordinary
+  all-feature and default suites pass; preflight 12/12 needs `--cap-drop=all`
+  (root bypasses the 0600 check).
+- Not proven: `web_probes_and_trusted_forwarding_are_operational` (5 s health
+  wait) and the worker lane's CLI readiness step (6 s) timed out while another
+  job saturated NAS disk I/O. Rerun before claiming the startup/worker lanes.
+
 ## 2026-09-19 — Combined b64e94d verification, partial / paused
 
 - Exact tracked b64e94d archive on native NAS Linux x86-64; all 6485 source

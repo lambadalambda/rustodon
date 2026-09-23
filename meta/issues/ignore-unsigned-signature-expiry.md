@@ -17,3 +17,7 @@ gap; the activity-ID dedup limits the impact.
 
 - A unit test proves an unsigned far-future `expires` does not extend the window.
 - Existing signature tests pass.
+
+## Done 2026-09-23
+
+Red/green on the NAS PG14 fixture; see DEVLOG 2026-09-23.

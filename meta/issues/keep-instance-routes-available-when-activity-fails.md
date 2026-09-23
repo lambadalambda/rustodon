@@ -32,3 +32,7 @@ before idempotency-key and ordering-marker cleanup runs.
   [aggregate-and-cache-instance-activity-metrics](aggregate-and-cache-instance-activity-metrics.md).
   A user count is not worth making the whole web UI unavailable. Approved by the
   user on 2026-09-23 after review.
+
+## Done 2026-09-23
+
+Red/green on the NAS PG14 fixture; see DEVLOG 2026-09-23.
