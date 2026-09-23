@@ -1,3 +1,17 @@
+## 2026-09-23 — Split the three largest files
+
+- Pure moves, one area per commit, each gated by check, strict Clippy and lib
+  tests on the NAS; an independent review diffed every commit (only mechanical
+  edits). web.rs 23.6k -> 12.9k, worker.rs 10.9k -> 4.1k, write_repository.rs
+  24.8k -> 13.4k lines (all including tests).
+- New modules: web/{federation,oauth,browser,rate_limit,routes,frontend,
+  request_params,stream_socket,media}, worker/{push,delivery,pull,ingress,
+  poll_expiration}, write_repository/{auth,moderation,remote_ingest,remote_note,
+  purge}. Interim pattern: pub(super) items and glob imports marked with allows;
+  change a child to explicit `use super::{...}` when it stabilizes.
+- One shared `lock_account_advisory` replaces ten copies of the raw account-id
+  lock (same SQL and keys). Hashed and namespaced locks stay per call site.
+
 ## 2026-09-23 — Dead letters, small fixes, AGPL
 
 - Production dead letters (174) are mostly remote 404/5xx. Two real bugs filed:
