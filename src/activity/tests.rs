@@ -266,6 +266,34 @@ async fn returning_claim_is_strict_atomic_and_serialized() -> TestResult {
 
 #[tokio::test]
 #[ignore = "requires a disposable migrated PG14 database and distinct restricted roles"]
+async fn returning_tracking_that_is_not_due_takes_no_user_lock() -> TestResult {
+    let (owner, writer, reader) = pools().await?;
+    let id = user(&owner, "not-due", true, true).await?;
+    sqlx::query(
+        "UPDATE users SET current_sign_in_at = clock_timestamp() AT TIME ZONE 'UTC' WHERE id=$1",
+    )
+    .bind(id)
+    .execute(&owner)
+    .await?;
+    let mut holder = owner.begin().await?;
+    sqlx::query("SELECT 1 FROM users WHERE id=$1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut *holder)
+        .await?;
+    let mut tx = writer.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '200ms'")
+        .execute(&mut *tx)
+        .await?;
+    let tracked = track_returning_in(&mut tx, id).await;
+    tx.rollback().await?;
+    holder.rollback().await?;
+    tracked?;
+    assert_eq!(count(&reader).await, 0);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable migrated PG14 database and distinct restricted roles"]
 #[allow(clippy::too_many_lines)]
 async fn complete_session_only_records_after_password_totp_or_backup_fence() -> TestResult {
     let (owner, _, reader) = pools().await?;

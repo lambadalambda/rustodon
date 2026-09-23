@@ -64,7 +64,18 @@ pub(crate) async fn track_returning_in(
     tx: &mut Transaction<'_, Postgres>,
     user_id: i64,
 ) -> sqlx::Result<()> {
-    if !eligible_user_in(tx, user_id, false).await? {
+    // Lock-free fast path: most tracked requests are not due, so they must not
+    // queue on the user row. The locked claim below re-checks due-ness.
+    let due = sqlx::query_scalar::<_, bool>(
+        "SELECT current_sign_in_at IS NULL \
+             OR current_sign_in_at < (clock_timestamp() AT TIME ZONE 'UTC') - interval '24 hours' \
+         FROM public.users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .unwrap_or(false);
+    if !due || !eligible_user_in(tx, user_id, false).await? {
         return Ok(());
     }
     let now = write_time_in(tx).await?;
