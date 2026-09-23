@@ -149,3 +149,7 @@
 - [x] [Skip the activity user-row lock when tracking is not due](issues/skip-activity-user-lock-when-not-due.md)
 - [x] [Ignore unsigned HTTP signature expiry](issues/ignore-unsigned-signature-expiry.md)
 - [x] [Update rustls for RUSTSEC-2026-0285](issues/update-rustls-for-rustsec-2026-0285.md)
+- [x] [Diagnose missing remote animated media](issues/diagnose-missing-remote-animated-media.md)
+- [x] [Support frontend web settings API](issues/support-frontend-web-settings-api.md)
+- [x] [Address release-readiness review findings](issues/address-release-readiness-review-findings.md)
+- [x] [Set up a local federating Rustodon instance](issues/set-up-local-federating-instance.md)

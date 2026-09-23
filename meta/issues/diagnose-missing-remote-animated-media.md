@@ -62,3 +62,7 @@ The user reports that a remote GIF does not display. The affected post URL is no
   The diagnosed GIF is repaired. Keep this issue open only for confirmation that
   this was the user's intended attachment; request its post URL if another GIF
   remains broken. Static timeline-preview behavior remains deliberately unchanged.
+
+## Closed 2026-09-23
+
+Closed by the user on 2026-09-23. The repaired GIF was live-verified on 2026-09-11.

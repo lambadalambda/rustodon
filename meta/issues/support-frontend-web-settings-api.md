@@ -217,3 +217,7 @@ above passed. No new dependencies were added.
 Use `tools/mastodon-fixture schema-read-test web_settings` on an isolated Linux
 worker. It replaces the historical temporary harness; the original execution
 evidence remains unchanged.
+
+## Closed 2026-09-23
+
+Closed by the user on 2026-09-23. Deployed 2026-09-12; the fixture proves save/reload.

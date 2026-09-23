@@ -45,3 +45,7 @@ Resolve the correctness, security, and compatibility gaps found in the September
 - Keep this issue open until URI-only Create is exercised against a live pinned
   Rails runtime or the acceptance criterion is explicitly revised to accept the
   pinned-source contract plus restored-worker proof.
+
+## Closed 2026-09-23
+
+Closed by the user on 2026-09-23. The user accepts the pinned Rails source contract plus restored-worker delivery proof for URI-only Create, instead of a live Rails runtime run.

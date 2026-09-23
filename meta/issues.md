@@ -1,8 +1,6 @@
 # Open Issues
 
 - [ ] [Prove Mastodon peer federation compatibility](issues/prove-mastodon-peer-federation-compatibility.md)
-- [ ] [Address release-readiness review findings](issues/address-release-readiness-review-findings.md)
-- [ ] [Set up a local federating Rustodon instance](issues/set-up-local-federating-instance.md)
 - [ ] [Repair ActivityPub ingestion and audiences](issues/repair-activitypub-ingestion-and-audiences.md)
 - [ ] [Run essential parity gates and peer tests on an isolated worker](issues/run-essential-parity-gates-on-isolated-worker.md)
 - [ ] [Add isolated bidirectional federation peer tests](issues/add-isolated-federation-peer-tests.md)
@@ -12,11 +10,11 @@
 - [ ] [Render stale login rejection as authentication failure](issues/render-stale-login-rejection-as-authentication-failure.md)
 - [ ] [Define hashtag stream history cleanup](issues/define-hashtag-stream-history-cleanup.md)
 - [ ] [Investigate reciprocal follow convergence under concurrency](issues/investigate-reciprocal-follow-convergence.md)
-- [ ] [Diagnose missing remote animated media](issues/diagnose-missing-remote-animated-media.md)
-- [ ] [Support frontend web settings API](issues/support-frontend-web-settings-api.md)
 - [ ] [Self-heal missing account statistics](issues/self-heal-missing-account-statistics.md)
 - [ ] [Stream public, hashtag, and list timelines](issues/stream-public-hashtag-list-timelines.md)
 - [ ] [Support polls in the bundled frontend](issues/support-poll-voting-and-refresh.md)
 - [ ] [Support featured-tag peer AddHashtag/RemoveHashtag](issues/support-featured-tag-peer-add-remove.md)
 - [ ] [Complete v1 external acceptance](issues/complete-v1-external-acceptance.md)
 - [ ] [Prove post-v1 durability under disk-full, power loss and load](issues/prove-post-v1-durability.md)
+- [ ] [Resolve split-domain remote actors](issues/resolve-split-domain-remote-actors.md)
+- [ ] [Accept remote notes without content](issues/accept-remote-notes-without-content.md)

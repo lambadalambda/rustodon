@@ -46,3 +46,7 @@ HTTPS origin so it can participate in ActivityPub federation.
   not ingest the account. This is the external federation blocker; keep this
   setup issue open alongside [Prove Mastodon peer federation compatibility](prove-mastodon-peer-federation-compatibility.md).
 - Pleroma 2.10.2 at `lain.com` accepted an outbound mention Create and fetched the local actor after Rustodon was fixed to accept its trailing-whitespace public-key PEM. The peer's signed actor GET returned HTTP 200, and its public API exposed the imported status under the original Rustodon object URI. The pinned Mastodon 4.6.5 HTTP 503 remains a separate blocker.
+
+## Closed 2026-09-23
+
+Closed 2026-09-23. All acceptance criteria are met: Pleroma resolved the account, and the Mastodon HTTP 503 blocker was fixed before the 2026-09-13 peer `public` scenario passed (discovery and follow in both directions). rustodon.social is the live instance.
