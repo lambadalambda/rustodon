@@ -1,14 +1,6 @@
 # Open Issues
 
-- [ ] [Implement v1 policy and abuse controls](issues/implement-v1-policy-and-abuse-controls.md)
-- [ ] [Handle ActivityPub relationship activities](issues/handle-activitypub-relationship-activities.md)
-- [ ] [Handle ActivityPub Note activities](issues/handle-activitypub-note-activities.md)
-- [ ] [Implement outbound ActivityPub delivery](issues/implement-outbound-activitypub-delivery.md)
-- [ ] [Serve the Mastodon web client](issues/serve-mastodon-web-client.md)
-- [ ] [Implement the minimal account UI](issues/implement-minimal-account-ui.md)
-- [ ] [Build the executable v1 acceptance matrix](issues/build-v1-acceptance-matrix.md)
 - [ ] [Prove Mastodon peer federation compatibility](issues/prove-mastodon-peer-federation-compatibility.md)
-- [ ] [Harden the v1 release](issues/harden-v1-release.md)
 - [ ] [Address release-readiness review findings](issues/address-release-readiness-review-findings.md)
 - [ ] [Set up a local federating Rustodon instance](issues/set-up-local-federating-instance.md)
 - [ ] [Repair ActivityPub ingestion and audiences](issues/repair-activitypub-ingestion-and-audiences.md)
@@ -26,3 +18,8 @@
 - [ ] [Stream public, hashtag, and list timelines](issues/stream-public-hashtag-list-timelines.md)
 - [ ] [Support polls in the bundled frontend](issues/support-poll-voting-and-refresh.md)
 - [ ] [Support featured-tag peer AddHashtag/RemoveHashtag](issues/support-featured-tag-peer-add-remove.md)
+- [ ] [Keep instance routes available when activity counts fail](issues/keep-instance-routes-available-when-activity-fails.md)
+- [ ] [Skip the activity user-row lock when tracking is not due](issues/skip-activity-user-lock-when-not-due.md)
+- [ ] [Ignore unsigned HTTP signature expiry](issues/ignore-unsigned-signature-expiry.md)
+- [ ] [Complete v1 external acceptance](issues/complete-v1-external-acceptance.md)
+- [ ] [Prove post-v1 durability under disk-full, power loss and load](issues/prove-post-v1-durability.md)

@@ -23,3 +23,8 @@ The bundled composer exposes poll creation and historical or remote polls can re
 - Mastodon 4.6.5's bundled frontend calls `GET /api/v1/polls/:id` and `POST /api/v1/polls/:id/votes` with `choices: string[]`, then imports the returned Poll JSON.
 - Rustodon serializes existing polls but registers neither read/vote route; both fall through to JSON 404. Its status-write contract explicitly excludes poll creation.
 - This makes the bundled frontend's ordinary poll lifecycle unavailable end to end rather than merely omitting an optional search/API feature.
+
+## Status 2026-09-23
+
+Implemented (see git log and DEVLOG). Acceptance waits for the final-tree
+sweep in [complete-v1-external-acceptance](complete-v1-external-acceptance.md).

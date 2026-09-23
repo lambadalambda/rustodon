@@ -42,3 +42,8 @@ Map every authoritative v1 requirement to implementation and proof.
 - Current acceptance gates also pass for the 35-case Mastodon schema suite,
   operational schema and streaming integration, startup safety, preflight,
   worker integration (45/45), and the cutover/rollback rehearsal.
+
+## Closed 2026-09-23
+
+Implementation complete. Remaining peer, browser, mobile and production
+evidence moved to [complete-v1-external-acceptance](complete-v1-external-acceptance.md).

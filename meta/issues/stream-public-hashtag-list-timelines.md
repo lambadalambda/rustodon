@@ -24,3 +24,8 @@ Rustodon accepts only user, notification, and direct WebSocket subscriptions. Th
 - Mastodon 4.6.5's streaming server declares and implements all nine channels in `target/mastodon-v4.6.5/streaming/index.js`; its frontend connectors derive the public local/remote/media variants and subscribe to hashtag/list streams without periodic polling fallback.
 - Rustodon's `StreamName` and `ClientCommand` accept only `user`, `user:notification`, and `direct`. `src/web.rs` silently ignores unsupported dynamic commands.
 - The result is an ordinary UI freshness failure rather than an obscure API gap: Live Feeds, hashtag timelines, and list columns can remain stale while they look connected.
+
+## Status 2026-09-23
+
+Implemented (see git log and DEVLOG). Acceptance waits for the final-tree
+sweep in [complete-v1-external-acceptance](complete-v1-external-acceptance.md).

@@ -102,3 +102,8 @@ Process core remote Note and social activities idempotently.
   fixture: a real bounded HTTP response is persisted through Paperclip with
   original and GIF-thumbnail files, metadata, blurhash, and durable-job
   completion. The full differential and adversarial peer matrix remain open.
+
+## Closed 2026-09-23
+
+Implementation complete. Remaining peer, browser, mobile and production
+evidence moved to [complete-v1-external-acceptance](complete-v1-external-acceptance.md).

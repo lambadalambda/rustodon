@@ -76,3 +76,10 @@ Prove crash, retry, resource-failure, small-instance load, and rollback safety.
   power-loss, and production database/media reopen verification remain open.
 - Live peer, browser/mobile, and production cutover evidence remain external
   acceptance work rather than claims covered by this local test.
+
+## Closed 2026-09-23
+
+Disk-full, power-loss and sustained-load proofs moved out of v1 to
+[prove-post-v1-durability](prove-post-v1-durability.md). Production database and
+media reopen moved to
+[complete-v1-external-acceptance](complete-v1-external-acceptance.md).

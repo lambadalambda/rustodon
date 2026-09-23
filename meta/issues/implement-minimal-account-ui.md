@@ -35,3 +35,8 @@ Provide Rust-owned authentication and essential account settings pages.
   `POST`/`DELETE /auth/sign_out` preserve the pinned JSON `redirect_to` contract
   and revoke the browser session. The browser authentication and account-settings
   differential cases both exercise logout and reject the old session afterward.
+
+## Closed 2026-09-23
+
+Implementation complete. Remaining peer, browser, mobile and production
+evidence moved to [complete-v1-external-acceptance](complete-v1-external-acceptance.md).

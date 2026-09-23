@@ -24,3 +24,8 @@ An otherwise healthy local account can have no `account_stats` row. The bundled 
 - Read-only database checks confirmed one enabled local user, four undeleted local statuses, and no local `account_stats` row.
 - `GET /api/v1/instance` consequently reported `status_count: 0`.
 - Current local-user creation inserts `account_stats`, so this is also an upgrade/legacy-integrity gap: existing missing rows do not self-heal, and counter updates are update-only.
+
+## Status 2026-09-23
+
+Implemented (see git log and DEVLOG). Acceptance waits for the final-tree
+sweep in [complete-v1-external-acceptance](complete-v1-external-acceptance.md).

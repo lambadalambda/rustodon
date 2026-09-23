@@ -41,3 +41,8 @@ Package and serve the exact Mastodon 4.6.5 frontend contract.
 - Full Rails `Web::Setting` persistence, Web Push subscription management, and
   non-English locale parity remain outside the current v1 web-client slice;
   essential account settings continue through the Rust REST surface.
+
+## Closed 2026-09-23
+
+Implementation complete. Remaining peer, browser, mobile and production
+evidence moved to [complete-v1-external-acceptance](complete-v1-external-acceptance.md).

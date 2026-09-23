@@ -178,3 +178,8 @@ Centralize authorization, moderation-state, and abuse limits across protocols.
     teardown removes reports, collection links, notifications, notification and
     mail jobs, durable jobs, and immutable stream-event outbox rows for accepted,
     suspended, and rejected activity URIs.
+
+## Closed 2026-09-23
+
+Implementation complete. Remaining peer, browser, mobile and production
+evidence moved to [complete-v1-external-acceptance](complete-v1-external-acceptance.md).

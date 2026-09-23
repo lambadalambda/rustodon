@@ -58,3 +58,8 @@ Process remote relationship and actor lifecycle activities idempotently.
   convergence assertions for the relationship row; the worker integration gate
   passes 45/45. Full live-peer duplicate and cross-instance ordering evidence
   remains open.
+
+## Closed 2026-09-23
+
+Implementation complete. Remaining peer, browser, mobile and production
+evidence moved to [complete-v1-external-acceptance](complete-v1-external-acceptance.md).

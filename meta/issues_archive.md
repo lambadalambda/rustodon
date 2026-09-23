@@ -136,3 +136,12 @@
 - [x] [Record transactional daily instance activity](issues/record-transactional-daily-instance-activity.md)
 - [x] [Aggregate and cache instance activity metrics](issues/aggregate-and-cache-instance-activity-metrics.md)
 - [x] [Accept instance activity in the bundled browser](issues/accept-instance-activity-browser.md)
+
+- [x] [Implement v1 policy and abuse controls](issues/implement-v1-policy-and-abuse-controls.md)
+- [x] [Handle ActivityPub relationship activities](issues/handle-activitypub-relationship-activities.md)
+- [x] [Handle ActivityPub Note activities](issues/handle-activitypub-note-activities.md)
+- [x] [Implement outbound ActivityPub delivery](issues/implement-outbound-activitypub-delivery.md)
+- [x] [Serve the Mastodon web client](issues/serve-mastodon-web-client.md)
+- [x] [Implement the minimal account UI](issues/implement-minimal-account-ui.md)
+- [x] [Build the executable v1 acceptance matrix](issues/build-v1-acceptance-matrix.md)
+- [x] [Harden the v1 release](issues/harden-v1-release.md)

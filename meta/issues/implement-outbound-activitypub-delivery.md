@@ -166,3 +166,8 @@ Fan out and durably deliver core local activities to remote inboxes.
     - Outbound `401` classification now consults the source account's deletion
       request state, matching Mastodon’s permanent-unavailability behavior while
       preserving retries for active and temporarily suspended accounts.
+
+## Closed 2026-09-23
+
+Implementation complete. Remaining peer, browser, mobile and production
+evidence moved to [complete-v1-external-acceptance](complete-v1-external-acceptance.md).
