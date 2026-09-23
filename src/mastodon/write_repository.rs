@@ -12366,6 +12366,27 @@ mod tests {
     }
 
     #[test]
+    fn misskey_media_only_notes_parse_with_empty_text() {
+        let actor = "https://misskey.example/users/8qse4sxjxs";
+        let mut object = json!({
+            "type": "Note", "id": "https://misskey.example/notes/aray5sh51c",
+            "attributedTo": actor, "content": null, "summary": null,
+            "attachment": [], "to": ["https://www.w3.org/ns/activitystreams#Public"]
+        });
+        let note = RemoteNoteData::parse(&object, actor).expect("null content is empty text");
+        assert_eq!((note.content.as_str(), note.summary.as_str()), ("", ""));
+        object.as_object_mut().unwrap().remove("content");
+        assert_eq!(RemoteNoteData::parse(&object, actor).unwrap().content, "");
+        object["contentMap"] = json!({"ja": "<p>hi</p>"});
+        assert_eq!(
+            RemoteNoteData::parse(&object, actor).unwrap().content,
+            "<p>hi</p>"
+        );
+        object["content"] = json!(42);
+        assert!(RemoteNoteData::parse(&object, actor).is_err());
+    }
+
+    #[test]
     fn remote_note_atom_tags_are_metadata_not_lookup_authority() {
         let actor = "https://remote.example/users/alice";
         let mut object = json!({

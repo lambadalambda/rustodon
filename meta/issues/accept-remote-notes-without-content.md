@@ -17,3 +17,8 @@ Mastodon accepts such notes with empty text.
 ## Acceptance Criteria
 
 - Unit tests with a Misskey-shaped media-only Note for Create and Announce.
+
+## Done 2026-09-23
+
+Shared `remote_note_content` helper for inbox validation and the writer.
+Red/green unit tests for null, missing, `contentMap`-only and non-string content.

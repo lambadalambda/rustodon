@@ -116,18 +116,8 @@ impl RemoteNoteData {
                 "remote Note author does not match its signer",
             ));
         }
-        let content = object
-            .get("content")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                object
-                    .get("contentMap")
-                    .and_then(Value::as_object)
-                    .and_then(|values| values.values().find_map(Value::as_str))
-            })
-            .filter(|value| value.chars().count() <= 20 * 1024)
-            .ok_or(WriteError::InvalidInput("remote Note content is invalid"))?
-            .to_owned();
+        let content = crate::mastodon::activitypub_inbox::remote_note_content(object)
+            .ok_or(WriteError::InvalidInput("remote Note content is invalid"))?;
         let content_map = object.get("contentMap").and_then(Value::as_object);
         let language = object
             .get("language")

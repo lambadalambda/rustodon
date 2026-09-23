@@ -525,6 +525,22 @@ fn parse_actor_update_parts(
     })
 }
 
+/// Note text: `content`, else the first `contentMap` string, else empty when both
+/// are absent or null (Misskey media-only notes). Other types or oversized text
+/// are invalid.
+pub(crate) fn remote_note_content(object: &serde_json::Map<String, Value>) -> Option<String> {
+    let text = match object.get("content") {
+        Some(Value::String(text)) => text.as_str(),
+        None | Some(Value::Null) => object
+            .get("contentMap")
+            .and_then(Value::as_object)
+            .and_then(|map| map.values().find_map(Value::as_str))
+            .unwrap_or_default(),
+        Some(_) => return None,
+    };
+    (text.chars().count() <= 20 * 1024).then(|| text.to_owned())
+}
+
 pub(crate) fn validate_note_object(
     actor_uri: &str,
     object: &serde_json::Map<String, Value>,
@@ -534,19 +550,7 @@ pub(crate) fn validate_note_object(
     if attributed_to != actor_uri {
         return Err(InboxParseError::Activity);
     }
-    let content = object
-        .get("content")
-        .or_else(|| {
-            object
-                .get("contentMap")
-                .and_then(Value::as_object)
-                .and_then(|map| map.values().next())
-        })
-        .and_then(Value::as_str)
-        .ok_or(InboxParseError::Activity)?;
-    if content.chars().count() > 20 * 1024 {
-        return Err(InboxParseError::Activity);
-    }
+    remote_note_content(object).ok_or(InboxParseError::Activity)?;
     for field in ["url", "inReplyTo"] {
         optional_uri(object.get(field))?;
     }
@@ -984,7 +988,7 @@ mod tests {
 
     use super::{
         InboxActivity, InboxParseError, MAX_REMOTE_EMOJIS, MAX_REMOTE_TAGS, RemoteEmojiTag,
-        parse_activity, parse_job_arguments, parse_note_emojis,
+        parse_activity, parse_job_arguments, parse_note_emojis, validate_note_object,
     };
 
     #[test]
@@ -1224,6 +1228,20 @@ mod tests {
                 Err(InboxParseError::Activity)
             );
         }
+    }
+
+    #[test]
+    fn misskey_media_only_notes_are_valid() {
+        let actor = "https://misskey.example/users/8qse4sxjxs";
+        let mut note = json!({
+            "id": "https://misskey.example/notes/aray5sh51c", "type": "Note",
+            "attributedTo": actor, "content": null, "summary": null, "attachment": []
+        });
+        assert!(validate_note_object(actor, note.as_object().unwrap()).is_ok());
+        note.as_object_mut().unwrap().remove("content");
+        assert!(validate_note_object(actor, note.as_object().unwrap()).is_ok());
+        note["content"] = json!(["not", "text"]);
+        assert!(validate_note_object(actor, note.as_object().unwrap()).is_err());
     }
 
     #[test]
