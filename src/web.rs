@@ -2703,7 +2703,7 @@ impl WebState {
         let counts = self
             .activity_cache
             .get(self.repository.activity_pool())
-            .await?;
+            .await;
         self.loader(None)
             .instance(self.instance_runtime.clone(), counts)
             .await
@@ -3111,7 +3111,7 @@ async fn frontend_html_response(
         None
     };
     let Ok(instance) = state.instance().await else {
-        return activity_unavailable();
+        return internal_error();
     };
     let secure = state.origin.scheme() == "https";
     let (csrf_token, csrf_cookie) = browser_page_csrf(headers, secure, &state.csrf_signing_key);
@@ -5175,11 +5175,9 @@ async fn federation_nodeinfo_discovery(State(state): State<WebState>) -> Respons
     )
 }
 
-#[allow(clippy::manual_let_else)]
 async fn federation_nodeinfo(State(state): State<WebState>) -> Response<Body> {
-    let instance = match state.instance().await {
-        Ok(instance) => instance,
-        Err(_) => return activity_unavailable(),
+    let Ok(instance) = state.instance().await else {
+        return internal_error();
     };
     activity_response(
         StatusCode::OK,
@@ -8964,13 +8962,6 @@ async fn readiness(State(state): State<WebState>) -> Response<Body> {
     }
 }
 
-fn activity_unavailable() -> Response<Body> {
-    json_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        br#"{"error":"Instance activity unavailable"}"#.to_vec(),
-    )
-}
-
 async fn instance_v1(State(state): State<WebState>) -> Response<Body> {
     instance_response(state, true).await
 }
@@ -8981,7 +8972,7 @@ async fn instance_v2(State(state): State<WebState>) -> Response<Body> {
 
 async fn instance_response(state: WebState, v1: bool) -> Response<Body> {
     let Ok(instance) = state.instance().await else {
-        return activity_unavailable();
+        return internal_error();
     };
     let serializer = state.serializer();
     let body = if v1 {

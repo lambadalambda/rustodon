@@ -140,11 +140,11 @@ an account later does not rewrite its recorded history.
 count; the sidebar fetches that same API. Limited federation suppresses this value
 as `0`, while `/nodeinfo/2.0` still publishes both raw windows. Counts share a
 process-local, singleflight cache per web state, valid for at most 60 seconds and
-never across a UTC date change. Each refresh has a 3-second PostgreSQL statement
-timeout and a 5-second overall deadline. Without valid counts these metadata
-responses return **503**, not fabricated zeroes or unbounded stale data. Failed
-refreshes are cached for 5 seconds to avoid a retry storm. A real empty result is
-still `0`.
+and a cache entry never crosses a UTC date change. Each refresh has a 3-second PostgreSQL statement
+timeout and a 5-second overall deadline. A failed refresh serves the last good
+counts for up to 24 hours, then zeroes, so an activity failure never takes down the
+web client or instance metadata. Failed refreshes are cached for 5 seconds to avoid
+a retry storm.
 
 The existing maintenance prune handler uses its writer pool (runtime remains
 SELECT-only on activity tables). Each invocation locks at most 100 expired

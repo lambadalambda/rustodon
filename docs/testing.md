@@ -419,7 +419,7 @@ Main-process testing uses the existing `RUSTODON_STARTUP_DATABASE_URL`,
 `RUSTODON_STARTUP_WRITE_DATABASE_URL`, `RUSTODON_STARTUP_OWNER_DATABASE_URL`, and
 `RUSTODON_STARTUP_MEDIA_ROOT` fixture variables. It launches actual web binaries,
 checks both federation modes, initial HTML metadata, cache sharing with activity
-tables exclusively locked, and fail-closed responses with an empty cache. This
+tables exclusively locked, and zero-count fallback with an empty cache. This
 is not a browser/sidebar rendering gate or the complete startup lane. Worker
 coverage invokes the registered maintenance handler with restricted pools; it is
 not a claim of the complete durable worker lifecycle lane.

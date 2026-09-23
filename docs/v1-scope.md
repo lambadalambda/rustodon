@@ -612,11 +612,11 @@ state. Limited federation suppresses only the v2/initial-instance month value.
 NodeInfo deliberately retains both raw counts.
 
 A shared per-WebState singleflight cache limits aggregation to one successful
-refresh per 60 seconds, invalidates on UTC rollover, and coalesces failures for
-5 seconds. Invalid/absent cached counts plus a refresh failure produce HTTP 503
-on metadata-bearing responses (including the frontend document); there is no
-stale-count fallback. Manifest and instance-rules responses do not load activity
-counts and remain available during an activity-only failure. The aggregation
+refresh per 60 seconds, invalidates its entry on UTC rollover, and coalesces failures for
+5 seconds. A refresh failure serves the last good counts for up to 24 hours,
+otherwise zeroes; metadata-bearing responses (including the frontend document)
+stay available. Manifest and instance-rules responses do not load activity
+counts. The aggregation
 SELECT has a 3-second statement timeout
 inside a 5-second refresh deadline. Startup does not seed permanent zeroes.
 Initial frontend `instance` metadata is serialized using the same v2 projection;

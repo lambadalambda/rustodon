@@ -162,6 +162,9 @@ use tokio::sync::Mutex;
 const CACHE_TTL: std::time::Duration = std::time::Duration::from_mins(1);
 const FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Failed refreshes serve the last good counts up to this age, then zeroes. A
+/// user count is not worth failing the web client, instance or `NodeInfo` routes.
+const STALE_LIMIT: std::time::Duration = std::time::Duration::from_hours(24);
 
 fn reporting_days(now: DateTime<Utc>) -> (NaiveDate, NaiveDate, NaiveDate) {
     let today = now.date_naive();
@@ -200,7 +203,13 @@ async fn aggregate(pool: &PgPool, now: DateTime<Utc>) -> sqlx::Result<InstanceAc
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct ActivityCache(Arc<Mutex<Option<CachedActivity>>>);
+pub(crate) struct ActivityCache(Arc<Mutex<CacheState>>);
+
+#[derive(Default)]
+struct CacheState {
+    current: Option<CachedActivity>,
+    last_good: Option<(Instant, InstanceActivityCounts)>,
+}
 
 struct CachedActivity {
     day: NaiveDate,
@@ -208,8 +217,17 @@ struct CachedActivity {
     counts: Option<InstanceActivityCounts>,
 }
 
+impl CacheState {
+    fn fallback(&self, tick: Instant) -> InstanceActivityCounts {
+        self.last_good
+            .filter(|(at, _)| tick.saturating_duration_since(*at) <= STALE_LIMIT)
+            .map(|(_, counts)| counts)
+            .unwrap_or_default()
+    }
+}
+
 impl ActivityCache {
-    pub(crate) async fn get(&self, pool: &PgPool) -> sqlx::Result<InstanceActivityCounts> {
+    pub(crate) async fn get(&self, pool: &PgPool) -> InstanceActivityCounts {
         self.get_with(|| (Utc::now(), Instant::now()), |now| aggregate(pool, now))
             .await
     }
@@ -220,7 +238,7 @@ impl ActivityCache {
         now: DateTime<Utc>,
         tick: Instant,
         load: F,
-    ) -> sqlx::Result<InstanceActivityCounts>
+    ) -> InstanceActivityCounts
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = sqlx::Result<InstanceActivityCounts>>,
@@ -228,7 +246,7 @@ impl ActivityCache {
         self.get_with(|| (now, tick), |_| load()).await
     }
 
-    async fn get_with<C, F, Fut>(&self, clock: C, load: F) -> sqlx::Result<InstanceActivityCounts>
+    async fn get_with<C, F, Fut>(&self, clock: C, load: F) -> InstanceActivityCounts
     where
         C: Fn() -> (DateTime<Utc>, Instant),
         F: FnOnce(DateTime<Utc>) -> Fut,
@@ -236,35 +254,35 @@ impl ActivityCache {
     {
         // Held through refresh: clones of WebState share one flight. Cancellation
         // drops the lock and the SQL transaction; it cannot publish partial data.
-        let mut entry = self.0.lock().await;
+        let mut state = self.0.lock().await;
         let (now, tick) = clock();
-        if let Some(cached) = entry.as_ref()
+        if let Some(cached) = state.current.as_ref()
             && cached.day == now.date_naive()
             && tick < cached.until
         {
-            return cached.counts.ok_or(sqlx::Error::PoolTimedOut);
+            return cached.counts.unwrap_or_else(|| state.fallback(tick));
         }
         let result = tokio::time::timeout(QUERY_TIMEOUT, load(now))
             .await
-            .unwrap_or(Err(sqlx::Error::PoolTimedOut));
+            .unwrap_or(Err(sqlx::Error::PoolTimedOut))
+            .ok();
         let (finished, finished_tick) = clock();
-        if finished.date_naive() != now.date_naive() {
-            // Do not publish yesterday's snapshot across midnight. Next request
-            // starts a fresh flight for the new reporting date.
-            *entry = None;
-            return Err(sqlx::Error::PoolTimedOut);
+        if let Some(counts) = result {
+            state.last_good = Some((finished_tick, counts));
         }
-        *entry = Some(CachedActivity {
+        // Do not publish yesterday's snapshot across midnight. Next request
+        // starts a fresh flight for the new reporting date.
+        state.current = (finished.date_naive() == now.date_naive()).then(|| CachedActivity {
             day: now.date_naive(),
             until: finished_tick
-                + if result.is_ok() {
+                + if result.is_some() {
                     CACHE_TTL
                 } else {
                     FAILURE_TTL
                 },
-            counts: result.as_ref().ok().copied(),
+            counts: result,
         });
-        result
+        result.unwrap_or_else(|| state.fallback(finished_tick))
     }
 }
 

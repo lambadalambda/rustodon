@@ -1070,7 +1070,7 @@ async fn main_runtime_activity_counts_cache_privacy_and_initial_metadata()
         let _ = child.kill();
         child.wait()?;
     }
-    // A fresh main cache cannot silently return zero on failed aggregation.
+    // A failed cold aggregation serves zero counts instead of failing the routes.
     let port = unused_port()?;
     let child = ChildCleanup::new(
         command_with_writer("web", &runtime_url, port, Some(&writer_url)).spawn()?,
@@ -1096,8 +1096,30 @@ async fn main_runtime_activity_counts_cache_privacy_and_initial_metadata()
             .header("x-forwarded-proto", "https")
             .send()
             .await?;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
     }
+    let api: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{base}/api/v2/instance"))
+            .header("host", "fixture-v4-6-5.rustodon.invalid")
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await?
+            .text()
+            .await?,
+    )?;
+    assert_eq!(api["usage"]["users"]["active_month"], 0);
+    let node: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{base}/nodeinfo/2.0"))
+            .header("host", "fixture-v4-6-5.rustodon.invalid")
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await?
+            .text()
+            .await?,
+    )?;
+    assert_eq!(node["usage"]["users"]["activeHalfyear"], 0);
     sqlx::query("ROLLBACK").execute(&mut owner).await?;
     let mut child = child.into_child();
     let _ = child.kill();
