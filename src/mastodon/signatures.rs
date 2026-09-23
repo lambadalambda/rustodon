@@ -12,7 +12,6 @@ use crate::crypto::{RsaKeyError, sign_rsa_sha256, verify_rsa_sha256};
 const ALGORITHM: &str = "rsa-sha256";
 const REQUEST_TARGET: &str = "(request-target)";
 const CLOCK_SKEW_MARGIN: Duration = Duration::from_hours(1);
-const EXPIRATION_WINDOW_LIMIT: Duration = Duration::from_hours(12);
 const DEFAULT_EXPIRATION_WINDOW: Duration = Duration::from_mins(5);
 
 /// The request fields covered by a draft Cavage HTTP signature.
@@ -542,11 +541,13 @@ fn verify_time_window(
     if created > now + CLOCK_SKEW_MARGIN {
         return Err(HttpSignatureError::OutsideTimeWindow);
     }
+    // `expires` is never covered by the signature, so it may only shorten the
+    // default window; an attacker-appended value cannot extend replay validity.
+    let default_expires = created + DEFAULT_EXPIRATION_WINDOW;
     let expires = expires_value
         .map(parse_unix_timestamp)
         .transpose()?
-        .unwrap_or(created + DEFAULT_EXPIRATION_WINDOW);
-    let expires = std::cmp::min(expires, created + EXPIRATION_WINDOW_LIMIT);
+        .map_or(default_expires, |expires| expires.min(default_expires));
     if now > expires + CLOCK_SKEW_MARGIN {
         return Err(HttpSignatureError::OutsideTimeWindow);
     }

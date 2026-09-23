@@ -294,6 +294,32 @@ fn rejects_missing_strength_headers_bad_digest_and_stale_dates() {
 }
 
 #[test]
+fn unsigned_expires_cannot_extend_the_default_window() {
+    let public_key_pem = public_key();
+    let far_future = now()
+        .duration_since(UNIX_EPOCH)
+        .expect("test date should be after the epoch")
+        .as_secs()
+        + 12 * 60 * 60;
+    let signature = format!("{GET_SIGNATURE},expires=\"{far_future}\"");
+    let headers = get_headers(Some(&signature));
+    let verify_at = |offset| {
+        verify_http_signature(
+            &get_request(&headers, "/activitypub/success"),
+            &key(&public_key_pem),
+            now() + offset,
+        )
+        .map(drop)
+    };
+    // Default window: five minutes plus the one-hour clock-skew margin.
+    assert_eq!(verify_at(Duration::from_mins(64)), Ok(()));
+    assert_eq!(
+        verify_at(Duration::from_hours(2)),
+        Err(HttpSignatureError::OutsideTimeWindow)
+    );
+}
+
+#[test]
 fn binds_signature_to_expected_key_and_rejects_newer_message_signatures() {
     let headers = get_headers(Some(GET_SIGNATURE));
     let request = get_request(&headers, "/activitypub/success");

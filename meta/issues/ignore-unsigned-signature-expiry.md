@@ -10,8 +10,8 @@ gap; the activity-ID dedup limits the impact.
 
 ## Requirements
 
-- Use `expires` only when `(expires)` is part of the signed headers; otherwise
-  apply the default `Date` window.
+- An unsigned `expires` may only shorten the default `Date` window (Mastodon
+  behavior, covered by an existing test); it can never extend it.
 
 ## Acceptance Criteria
 
