@@ -155,3 +155,4 @@
 - [x] [Set up a local federating Rustodon instance](issues/set-up-local-federating-instance.md)
 - [x] [Render stale login rejection as authentication failure](issues/render-stale-login-rejection-as-authentication-failure.md)
 - [x] [License Rustodon under the AGPL like Mastodon](issues/license-under-agpl.md)
+- [x] [Accept ordinary ActivityPub tag atom identifiers](issues/accept-activitypub-tag-atom-identifiers.md)

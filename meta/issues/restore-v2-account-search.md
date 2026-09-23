@@ -133,3 +133,9 @@ v2-search differential/client run and fresh peer use of v2 discovery have not
 been claimed, so this issue remains open rather than treating the named HTTP
 regression as complete client acceptance.
 
+
+## Status 2026-09-23
+
+Live anonymous `GET /api/v2/search?q=lain&type=accounts` on rustodon.social returns
+local and cached remote accounts. Only the real-client check remains; the user
+will do it with the mobile-client run.

@@ -1,3 +1,15 @@
+## 2026-09-23 — Dead letters, small fixes, AGPL
+
+- Production dead letters (174) are mostly remote 404/5xx. Two real bugs filed:
+  split-domain actors fail WebFinger verification, and Misskey notes with null
+  content are rejected.
+- Fixed stale-login session denial returning 500. Tag atom identifiers pass
+  their first run (3 unit, `worker-test update_versions` 2/2).
+- The worker lane's CLI readiness step still fails on the loaded NAS: startup's
+  media capability check (15 conversions, one 60 s deadline) times out under
+  ~65% I/O pressure. The same check passes in an idle container.
+- Licensed under AGPL-3.0-or-later, like Mastodon.
+
 ## 2026-09-23 — rustls advisory, reply peer scenario, partial sweep
 
 - cargo-deny flagged RUSTSEC-2026-0285 (rustls 0.23.43); updated to 0.23.45.

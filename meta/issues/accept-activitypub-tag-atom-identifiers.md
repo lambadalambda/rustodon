@@ -49,3 +49,11 @@ The R10 receiver regression exposed another ordinary ingestion gap: locally seri
   source-only. No local builds, tests, formatting, lint or containers ran. R10's
   old HTTP-URI isolation is removed in source but acceptance remains pending until
   remote red/green and aggregate gates execute. Do not archive this issue yet.
+
+## Done 2026-09-23
+
+First execution of the source repair (a3fe48a) on the NAS PG14 fixture:
+3 atom unit tests and `worker-test update_versions` (2/2, including the
+two-database Create/Update/Delete convergence with a persisted tag URI) pass.
+No red run exists: the fix predates this execution, and reverting it only for a
+red run was not proportionate.

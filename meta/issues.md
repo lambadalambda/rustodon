@@ -4,7 +4,6 @@
 - [ ] [Repair ActivityPub ingestion and audiences](issues/repair-activitypub-ingestion-and-audiences.md)
 - [ ] [Run essential parity gates and peer tests on an isolated worker](issues/run-essential-parity-gates-on-isolated-worker.md)
 - [ ] [Add isolated bidirectional federation peer tests](issues/add-isolated-federation-peer-tests.md)
-- [ ] [Accept ordinary ActivityPub tag atom identifiers](issues/accept-activitypub-tag-atom-identifiers.md)
 - [ ] [Restore v2 account search for clients](issues/restore-v2-account-search.md)
 - [ ] [Support account-scoped legacy tag identities](issues/support-account-scoped-legacy-tag-identities.md)
 - [ ] [Define hashtag stream history cleanup](issues/define-hashtag-stream-history-cleanup.md)
