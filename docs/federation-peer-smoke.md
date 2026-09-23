@@ -16,6 +16,7 @@ mise run peer-privacy
 mise run peer-notes
 mise run peer-profile
 mise run peer-interactions
+mise run peer-replies
 ```
 
 Each invocation requires the mode-600 marker and starts from the physical
@@ -35,6 +36,11 @@ All five bounded scenarios have passed against the pinned Mastodon peer:
 | `notes` | Public/private Note create, update, delete, identity preservation, and visibility preservation. |
 | `profile` | Profile text, flags, fields, and avatar/header URL updates through signed actor Update. |
 | `interactions` | Like/Undo and followers-only Announce/Undo with exact activity identity and audience. |
+
+The `replies` scenario (added 2026-09-23) has not passed yet: each side replies
+to the other's public root, and the author's peer must thread the reply under
+its own root and list it in `/context`. Its first NAS attempts hit the runner's
+600-second deadline during fixture restore under unrelated disk contention.
 
 The retained run predates later browser/API changes. It does not prove the exact
 current tree, an explicit reply flow, simultaneous reciprocal-follow stress,

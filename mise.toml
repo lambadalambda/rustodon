@@ -134,6 +134,10 @@ run = "RUSTODON_PEER_SMOKE=1 tools/federation-peer-smoke profile"
 description = "Manual isolated real-peer interactions and Undo (cache-only)"
 run = "RUSTODON_PEER_SMOKE=1 tools/federation-peer-smoke interactions"
 
+[tasks.peer-replies]
+description = "Manual isolated real-peer reply threading (cache-only)"
+run = "RUSTODON_PEER_SMOKE=1 tools/federation-peer-smoke replies"
+
 [tasks.check]
 description = "Run bounded ordinary/profile, static fixture, and offline harness checks"
 depends = ["fmt", "lint", "test", "test-default", "test-release", "deny", "fixture-verify", "worker-media-verify", "harness-tests"]

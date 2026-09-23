@@ -5,7 +5,7 @@ PEER_ROOT=$(CDPATH= cd -P -- "$(dirname -- "$0")/.." && pwd)
 source "$PEER_ROOT/tools/peer-tests/preflight.sh"
 die() { echo "peer smoke: $*" >&2; exit 2; }
 peer_contract "$(pwd -P)" "$PEER_ROOT" "$PEER_ROOT/target/.rustodon-peer-workspace"
-[[ $# -le 1 ]] || { echo 'Use public, privacy, notes, profile or interactions' >&2; exit 2; }
+[[ $# -le 1 ]] || { echo 'Use public, privacy, notes, profile, interactions or replies' >&2; exit 2; }
 SCENARIO=${1:-public}
 case "$SCENARIO" in
   public) TEST=discovery_follow_and_public_push_both_directions ;;
@@ -13,7 +13,8 @@ case "$SCENARIO" in
   notes) TEST=note_create_edit_delete_both_directions ;;
   profile) TEST=full_profile_update_both_directions ;;
   interactions) TEST=like_and_private_announce_undo_both_directions ;;
-  *) echo 'Use public, privacy, notes, profile or interactions' >&2; exit 2 ;;
+  replies) TEST=reply_thread_both_directions ;;
+  *) echo 'Use public, privacy, notes, profile, interactions or replies' >&2; exit 2 ;;
 esac
 if [[ ${PEER_SMOKE_DEADLINE:-0} != 1 ]]; then
   exec timeout --signal=TERM --kill-after=60 600 \

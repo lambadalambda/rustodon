@@ -927,6 +927,90 @@ async fn wait_note_deleted(
 }
 
 #[tokio::test]
+#[ignore = "requires task-owned live peers from tools/federation-peer-smoke replies"]
+async fn reply_thread_both_directions() -> Result<()> {
+    tokio::time::timeout(Duration::from_mins(4), replies()).await?
+}
+
+async fn replies() -> Result<()> {
+    let smoke = setup().await?;
+    for (author, replier) in [
+        (&smoke.mastodon, &smoke.rustodon),
+        (&smoke.rustodon, &smoke.mastodon),
+    ] {
+        let root = create_note(
+            &smoke,
+            author,
+            "public",
+            format!("{}-{}-reply-root", smoke.run, author.name),
+        )
+        .await?;
+        let received_root = wait_note(&smoke, author, replier, &root, "Create")
+            .await?
+            .to_string();
+        let marker = format!("{}-{}-reply", smoke.run, replier.name);
+        let text = format!("@{}@{}.peer.invalid {marker}", author.name, author.name);
+        let created = replier
+            .api(
+                &smoke.client,
+                Method::POST,
+                "/api/v1/statuses",
+                &[
+                    ("status", &text),
+                    ("visibility", "public"),
+                    ("in_reply_to_id", &received_root),
+                ],
+            )
+            .await?;
+        assert_eq!(created["in_reply_to_id"], received_root.as_str());
+        let reply = Note {
+            id: created["id"].as_str().ok_or("missing reply ID")?.to_owned(),
+            uri: created["uri"]
+                .as_str()
+                .ok_or("missing reply URI")?
+                .to_owned(),
+            marker,
+            visibility: "public",
+            warning: String::new(),
+        };
+        let received_reply = wait_note(&smoke, replier, author, &reply, "Create").await?;
+        let parent: (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT in_reply_to_id, in_reply_to_account_id FROM statuses WHERE id=$1",
+        )
+        .bind(received_reply)
+        .fetch_one(&author.pool)
+        .await?;
+        assert_eq!(
+            parent,
+            (Some(root.id.parse()?), Some(author.local_id)),
+            "reply is not threaded under the author's own root"
+        );
+        let context = author
+            .api(
+                &smoke.client,
+                Method::GET,
+                &format!("/api/v1/statuses/{}/context", root.id),
+                &[],
+            )
+            .await?;
+        assert!(
+            context["descendants"]
+                .as_array()
+                .ok_or("missing context descendants")?
+                .iter()
+                .any(|status| status["uri"] == reply.uri.as_str()),
+            "{} context lacks the reply: {context}",
+            author.name
+        );
+        println!(
+            "PASS reply {} -> {}: {}",
+            replier.name, author.name, reply.uri
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires task-owned live peers from tools/federation-peer-smoke profile"]
 async fn full_profile_update_both_directions() -> Result<()> {
     tokio::time::timeout(Duration::from_mins(3), profile_updates()).await?

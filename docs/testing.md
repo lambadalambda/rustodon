@@ -55,7 +55,7 @@ mise run harness-tests
 | Full differential | `mise run differential-full` | Runs every registered differential case plus both media-root representations. |
 | Cutover | `mise run cutover-integration` | Rehearses migration, Rustodon smoke, rollback, Mastodon reopen, and preservation checks. |
 | Browser | `mise run browser-integration` | Drives the pinned frontend in Chromium within the HTTPS cutover fixture. |
-| Real peer | `mise run peer-public`, `peer-privacy`, `peer-notes`, `peer-profile`, `peer-interactions` | Runs explicit manual scenarios against a disposable pinned Mastodon peer. |
+| Real peer | `mise run peer-public`, `peer-privacy`, `peer-notes`, `peer-profile`, `peer-interactions`, `peer-replies` | Runs explicit manual scenarios against a disposable pinned Mastodon peer. |
 
 The `media-processor` lane requires the production `ffmpeg` and `ffprobe`
 executables on `PATH`; it is the named real-codec gate and runs serially. The
@@ -346,6 +346,7 @@ mise run peer-privacy
 mise run peer-notes
 mise run peer-profile
 mise run peer-interactions
+mise run peer-replies
 ```
 
 The scenarios cover discovery/follow/public delivery, followers-only and direct
