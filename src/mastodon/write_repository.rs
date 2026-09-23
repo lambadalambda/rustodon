@@ -2026,10 +2026,7 @@ impl WriteRepository {
     ) -> Result<(), WriteError> {
         let (account_id, mut transaction) =
             self.begin_account_write(authenticated, WRITE_MUTES).await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(account_id)
-            .execute(&mut *transaction)
-            .await?;
+        lock_account_advisory(&mut transaction, account_id).await?;
         let conversation_id = sqlx::query_scalar::<_, Option<i64>>(
             "SELECT conversation_id FROM statuses \
              WHERE id = $1 AND deleted_at IS NULL",
@@ -2071,10 +2068,7 @@ impl WriteRepository {
         let (account_id, mut transaction) = self
             .begin_account_write(authenticated, super::oauth::WRITE_ACCOUNTS)
             .await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(account_id)
-            .execute(&mut *transaction)
-            .await?;
+        lock_account_advisory(&mut transaction, account_id).await?;
         let (status_account_id, visibility, reblog_of_id) =
             sqlx::query_as::<_, (i64, i32, Option<i64>)>(
                 "SELECT account_id, visibility, reblog_of_id FROM statuses \
@@ -5028,10 +5022,7 @@ impl WriteRepository {
             _ => None,
         };
         if blocking {
-            sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                .bind(account_id)
-                .execute(&mut *transaction)
-                .await?;
+            lock_account_advisory(&mut transaction, account_id).await?;
             let mut outgoing_follow_uris = Vec::new();
             let mut incoming_follow_uris = Vec::new();
             let mut incoming_request_uris = Vec::new();
@@ -5198,10 +5189,7 @@ impl WriteRepository {
         }
         let hide_notifications = hide_notifications.unwrap_or(true);
         if muting && hide_notifications {
-            sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                .bind(account_id)
-                .execute(&mut *transaction)
-                .await?;
+            lock_account_advisory(&mut transaction, account_id).await?;
         }
         if muting {
             let mute_id = sqlx::query_scalar::<_, i64>(
@@ -5413,10 +5401,7 @@ impl WriteRepository {
         let (account_id, mut transaction) = self
             .begin_account_write(authenticated, WRITE_NOTIFICATIONS)
             .await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(account_id)
-            .execute(&mut *transaction)
-            .await?;
+        lock_account_advisory(&mut transaction, account_id).await?;
         let from_account_id = sqlx::query_scalar::<_, i64>(
             "SELECT from_account_id FROM notification_requests \
              WHERE account_id = $1 AND id = $2 FOR UPDATE",
@@ -5457,10 +5442,7 @@ impl WriteRepository {
         let (account_id, mut transaction) = self
             .begin_account_write(authenticated, WRITE_NOTIFICATIONS)
             .await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(account_id)
-            .execute(&mut *transaction)
-            .await?;
+        lock_account_advisory(&mut transaction, account_id).await?;
         let from_account_id = sqlx::query_scalar::<_, i64>(
             "DELETE FROM notification_requests WHERE account_id = $1 AND id = $2
              RETURNING from_account_id",
@@ -5487,10 +5469,7 @@ impl WriteRepository {
         let (account_id, mut transaction) = self
             .begin_account_write(authenticated, WRITE_NOTIFICATIONS)
             .await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(account_id)
-            .execute(&mut *transaction)
-            .await?;
+        lock_account_advisory(&mut transaction, account_id).await?;
         let requests = sqlx::query_as::<_, (i64, i64)>(
             "SELECT id, from_account_id FROM notification_requests \
              WHERE account_id = $1 AND id = ANY($2) FOR UPDATE",
@@ -5538,10 +5517,7 @@ impl WriteRepository {
         let (account_id, mut transaction) = self
             .begin_account_write(authenticated, WRITE_NOTIFICATIONS)
             .await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(account_id)
-            .execute(&mut *transaction)
-            .await?;
+        lock_account_advisory(&mut transaction, account_id).await?;
         sqlx::query("DELETE FROM notification_requests WHERE account_id = $1 AND id = ANY($2)")
             .bind(account_id)
             .bind(request_ids)
@@ -5559,10 +5535,7 @@ impl WriteRepository {
         let (account_id, mut transaction) = self
             .begin_account_write(authenticated, WRITE_NOTIFICATIONS)
             .await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(account_id)
-            .execute(&mut *transaction)
-            .await?;
+        lock_account_advisory(&mut transaction, account_id).await?;
         let policy = sqlx::query_as::<_, NotificationPolicy>(
             "INSERT INTO notification_policies ( \
                account_id, for_bots, for_limited_accounts, for_new_accounts, \
@@ -5698,10 +5671,7 @@ impl WriteRepository {
         request: NotificationCreate,
     ) -> Result<NotificationCreateOutcome, WriteError> {
         let mut transaction = self.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(request.recipient_account_id)
-            .execute(&mut *transaction)
-            .await?;
+        lock_account_advisory(&mut transaction, request.recipient_account_id).await?;
         let Some(activity) = resolve_notification_activity(
             &mut transaction,
             request.activity,
@@ -10785,7 +10755,7 @@ async fn delete_activity_notifications(
     activity_id: i64,
     activity_type: &str,
 ) -> Result<(), WriteError> {
-    lock_notification_recipient(transaction, recipient_account_id).await?;
+    lock_account_advisory(transaction, recipient_account_id).await?;
     cancel_pending_notification_jobs_locked(transaction, recipient_account_id, activity_id).await?;
     let from_account_ids = sqlx::query_scalar::<_, i64>(
         "DELETE FROM notifications WHERE account_id = $1 AND activity_id = $2 \
@@ -10849,12 +10819,14 @@ async fn delete_remote_status_notifications(
     Ok(())
 }
 
-async fn lock_notification_recipient(
+/// Account-scoped advisory lock keyed by the raw account ID. Serializes
+/// notification, notification-request, mute, block and conversation writes.
+async fn lock_account_advisory(
     transaction: &mut Transaction<'_, Postgres>,
-    recipient_account_id: i64,
+    account_id: i64,
 ) -> Result<(), WriteError> {
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(recipient_account_id)
+        .bind(account_id)
         .execute(&mut **transaction)
         .await?;
     Ok(())
@@ -10865,7 +10837,7 @@ async fn cancel_pending_notification_jobs(
     recipient_account_id: i64,
     activity_id: i64,
 ) -> Result<(), WriteError> {
-    lock_notification_recipient(transaction, recipient_account_id).await?;
+    lock_account_advisory(transaction, recipient_account_id).await?;
     cancel_pending_notification_jobs_locked(transaction, recipient_account_id, activity_id).await
 }
 
