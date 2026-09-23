@@ -1,5 +1,6 @@
-//! ActivityPub federation handlers: inbox, actors, notes, collections and signatures.
+//! `ActivityPub` federation handlers: inbox, actors, notes, collections and signatures.
 
+#[allow(clippy::wildcard_imports)] // shares the parent module namespace
 use super::*;
 
 pub(super) async fn federation_account(

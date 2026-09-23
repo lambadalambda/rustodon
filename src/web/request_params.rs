@@ -1,5 +1,6 @@
 //! Form, JSON, multipart and Rack-style request parameter parsing.
 
+#[allow(clippy::wildcard_imports)] // shares the parent module namespace
 use super::*;
 
 #[derive(Clone)]

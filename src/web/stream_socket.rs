@@ -1,5 +1,6 @@
-//! WebSocket streaming: authentication, subscriptions, replay and event delivery.
+//! `WebSocket` streaming: authentication, subscriptions, replay and event delivery.
 
+#[allow(clippy::wildcard_imports)] // shares the parent module namespace
 use super::*;
 
 pub(super) async fn streaming(

@@ -1,5 +1,6 @@
 //! Poll expiration notifications: bounded startup and periodic reconciliation.
 
+#[allow(clippy::wildcard_imports)] // shares the parent module namespace
 use super::*;
 
 pub(super) const POLL_EXPIRATION_REPAIR_PAGE_SIZE: i64 = 256;

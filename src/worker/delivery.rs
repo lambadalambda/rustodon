@@ -1,5 +1,6 @@
 //! Outbound delivery: currency checks for updates, deletes and quotes, and failure classification.
 
+#[allow(clippy::wildcard_imports)] // shares the parent module namespace
 use super::*;
 
 pub(super) fn update_delivery_is_current(

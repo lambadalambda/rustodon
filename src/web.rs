@@ -1,22 +1,31 @@
 mod media;
 #[cfg(feature = "test-support")]
 pub use media::cleanup_media_after_response_failure_for_test;
+#[allow(clippy::wildcard_imports)] // split-out part of this module
 use media::*;
 mod stream_socket;
+#[allow(clippy::wildcard_imports)] // split-out part of this module
 use stream_socket::*;
 mod request_params;
+#[allow(clippy::wildcard_imports)] // split-out part of this module
 use request_params::*;
 mod frontend;
+#[allow(clippy::wildcard_imports)] // split-out part of this module
 use frontend::*;
 mod routes;
+#[allow(clippy::wildcard_imports)] // split-out part of this module
 pub use routes::*;
 mod rate_limit;
+#[allow(clippy::wildcard_imports)] // split-out part of this module
 use rate_limit::*;
 mod browser;
+#[allow(clippy::wildcard_imports)] // split-out part of this module
 use browser::*;
 mod oauth;
+#[allow(clippy::wildcard_imports)] // split-out part of this module
 use oauth::*;
 mod federation;
+#[allow(clippy::wildcard_imports)] // split-out part of this module
 use federation::*;
 mod hashtag_controls;
 use std::cmp::Reverse;

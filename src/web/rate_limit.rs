@@ -1,5 +1,6 @@
-//! In-process and shared PostgreSQL rate limiters and signature fetch circuits.
+//! In-process and shared `PostgreSQL` rate limiters and signature fetch circuits.
 
+#[allow(clippy::wildcard_imports)] // shares the parent module namespace
 use super::*;
 
 pub(super) const MAX_RATE_LIMIT_WINDOWS: usize = 65_536;

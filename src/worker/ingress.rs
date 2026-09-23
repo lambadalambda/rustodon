@@ -1,5 +1,6 @@
-//! Inbound ActivityPub processing: inbox actors, relationships, notes and quotes.
+//! Inbound `ActivityPub` processing: inbox actors, relationships, notes and quotes.
 
+#[allow(clippy::wildcard_imports)] // shares the parent module namespace
 use super::*;
 
 pub(super) async fn schedule_remote_follow_reject(

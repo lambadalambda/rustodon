@@ -1,5 +1,6 @@
 //! Bundled Mastodon web client: shell document, initial state, manifest and assets.
 
+#[allow(clippy::wildcard_imports)] // shares the parent module namespace
 use super::*;
 
 pub(super) async fn frontend_app(

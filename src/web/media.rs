@@ -1,5 +1,6 @@
 //! Media upload, update, show and delete endpoints.
 
+#[allow(clippy::wildcard_imports)] // shares the parent module namespace
 use super::*;
 
 pub(super) async fn media_create_v1(

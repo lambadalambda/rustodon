@@ -1,12 +1,17 @@
 mod push;
+#[allow(clippy::wildcard_imports)] // split-out part of this module
 use push::*;
 mod delivery;
+#[allow(clippy::wildcard_imports)] // split-out part of this module
 use delivery::*;
 mod pull;
+#[allow(clippy::wildcard_imports)] // split-out part of this module
 use pull::*;
 mod ingress;
+#[allow(clippy::wildcard_imports)] // split-out part of this module
 use ingress::*;
 mod poll_expiration;
+#[allow(clippy::wildcard_imports)] // split-out part of this module
 pub use poll_expiration::*;
 pub mod local_uploads;
 mod profile_media;

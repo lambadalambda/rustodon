@@ -1,5 +1,6 @@
 //! Browser sign-in, password reset, settings pages, sessions and CSRF.
 
+#[allow(clippy::wildcard_imports)] // shares the parent module namespace
 use super::*;
 
 #[derive(Clone, Copy)]

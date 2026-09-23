@@ -1,5 +1,6 @@
 //! Remote fetches: reply threads, notes, announces, media and emoji.
 
+#[allow(clippy::wildcard_imports)] // shares the parent module namespace
 use super::*;
 
 pub(super) fn remote_thread_fetch_failure(error: &RemoteFetchError) -> HandlerFailure {

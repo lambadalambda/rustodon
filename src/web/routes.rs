@@ -1,5 +1,6 @@
 //! Advertised API route inventory and the required v1 route contract.
 
+#[allow(clippy::wildcard_imports)] // shares the parent module namespace
 use super::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

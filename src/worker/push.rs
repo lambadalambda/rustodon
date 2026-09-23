@@ -1,5 +1,6 @@
 //! Status and account distribution to remote followers and mentioned inboxes.
 
+#[allow(clippy::wildcard_imports)] // shares the parent module namespace
 use super::*;
 
 pub(super) struct QuoteRequestDistribution {

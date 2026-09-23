@@ -1,5 +1,6 @@
-//! OAuth authorization, token, revocation and metadata endpoints.
+//! `OAuth` authorization, token, revocation and metadata endpoints.
 
+#[allow(clippy::wildcard_imports)] // shares the parent module namespace
 use super::*;
 
 pub(super) async fn oauth_token(
