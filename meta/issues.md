@@ -7,7 +7,6 @@
 - [ ] [Accept ordinary ActivityPub tag atom identifiers](issues/accept-activitypub-tag-atom-identifiers.md)
 - [ ] [Restore v2 account search for clients](issues/restore-v2-account-search.md)
 - [ ] [Support account-scoped legacy tag identities](issues/support-account-scoped-legacy-tag-identities.md)
-- [ ] [Render stale login rejection as authentication failure](issues/render-stale-login-rejection-as-authentication-failure.md)
 - [ ] [Define hashtag stream history cleanup](issues/define-hashtag-stream-history-cleanup.md)
 - [ ] [Investigate reciprocal follow convergence under concurrency](issues/investigate-reciprocal-follow-convergence.md)
 - [ ] [Self-heal missing account statistics](issues/self-heal-missing-account-statistics.md)

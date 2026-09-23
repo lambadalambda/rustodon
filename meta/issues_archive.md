@@ -153,3 +153,4 @@
 - [x] [Support frontend web settings API](issues/support-frontend-web-settings-api.md)
 - [x] [Address release-readiness review findings](issues/address-release-readiness-review-findings.md)
 - [x] [Set up a local federating Rustodon instance](issues/set-up-local-federating-instance.md)
+- [x] [Render stale login rejection as authentication failure](issues/render-stale-login-rejection-as-authentication-failure.md)

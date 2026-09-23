@@ -22,3 +22,11 @@ A login whose verified password becomes stale during recovery is now safely deni
 - The security fence passed remote regressions; the remaining HTTP rendering behavior was source-reviewed, not a new security bypass.
 
 - Tracking only: no implementation or tests were performed for this issue. Builds, tests, formatting, lint and containers remain isolated-worker-only.
+
+## Done 2026-09-23
+
+`browser_session_creation_error_response` maps `WriteError::Unauthorized` from
+`create_browser_session` to the generic "Invalid email or password" response
+(422 JSON, 200 HTML); other errors stay 500. Red/green response-level unit test on
+the NAS. Proof is proportionate: no barrier-controlled HTTP race harness was added,
+because the security fence itself is unchanged and already proven.

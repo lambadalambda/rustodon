@@ -12135,11 +12135,21 @@ async fn browser_sign_in(
             );
         }
     };
-    let Ok(session_id) = writer
+    let session_id = match writer
         .create_browser_session(&authentication, ip, user_agent)
         .await
-    else {
-        return internal_error();
+    {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            return browser_session_creation_error_response(
+                state.origin.scheme() == "https",
+                &state.csrf_signing_key,
+                &headers,
+                email,
+                &error,
+                return_to,
+            );
+        }
     };
     let csrf_token = new_browser_csrf_token(&state.csrf_signing_key);
     let mut response = browser_redirect_response(return_to.unwrap_or("/"));
@@ -12294,6 +12304,30 @@ fn browser_csrf_is_valid(
     };
     valid_browser_csrf_token(cookie, signing_key)
         && constant_time_equal(cookie.as_bytes(), attempt.as_bytes())
+}
+
+/// A session denied after authentication (a password recovery raced the login)
+/// is an ordinary credential failure; it must not reveal the recovery.
+fn browser_session_creation_error_response(
+    secure: bool,
+    signing_key: &[u8],
+    headers: &HeaderMap,
+    email: &str,
+    error: &WriteError,
+    return_to: Option<&str>,
+) -> Response<Body> {
+    if matches!(error, WriteError::Unauthorized) {
+        browser_authentication_error_response(
+            secure,
+            signing_key,
+            headers,
+            email,
+            &BrowserAuthenticationError::InvalidCredentials,
+            return_to,
+        )
+    } else {
+        internal_error()
+    }
 }
 
 fn browser_authentication_error_response(
@@ -20622,6 +20656,31 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[tokio::test]
+    async fn stale_login_session_denial_is_an_authentication_failure() {
+        let headers = HeaderMap::new();
+        let respond = |error: &WriteError| {
+            browser_session_creation_error_response(
+                true,
+                b"test-signing-key",
+                &headers,
+                "alice@example.invalid",
+                error,
+                None,
+            )
+        };
+        let denied = respond(&WriteError::Unauthorized);
+        assert_eq!(denied.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(denied.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("invalid_credentials"));
+        assert_eq!(
+            respond(&WriteError::Sqlx(sqlx::Error::PoolTimedOut)).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     #[test]
     fn paperclip_media_requires_status_access_unless_moderating_discarded_media() {
