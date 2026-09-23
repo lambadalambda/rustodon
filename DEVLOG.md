@@ -1,3 +1,11 @@
+## 2026-09-23 — rustls advisory, reply peer scenario, partial sweep
+
+- cargo-deny flagged RUSTSEC-2026-0285 (rustls 0.23.43); updated to 0.23.45.
+- Added `peer-replies` (two-way reply threading and `/context`). Not passed yet:
+  two NAS attempts hit the 600 s runner deadline during fixture restore.
+- Static and ordinary gates pass on ff825be; heavy fixture lanes remain for a
+  quiet NAS (see the v1 external acceptance issue for the exact list).
+
 ## 2026-09-23 — Review fixes and a NAS runner for fixture lanes
 
 - Review of the whole tree found the web UI, instance and NodeInfo routes

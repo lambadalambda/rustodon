@@ -40,3 +40,14 @@ the archived parent issues listed below.
   implement-minimal-account-ui, build-v1-acceptance-matrix, harden-v1-release.
 - Durability beyond v1 is tracked in
   [prove-post-v1-durability](prove-post-v1-durability.md).
+
+## Progress 2026-09-23 (tree ff825be)
+
+- Passed on the NAS: fmt, strict Clippy, ordinary all-feature/default/release
+  suites, cargo-deny (after the rustls update), fixture verify, worker media,
+  pinned source contracts 12/12, offline harnesses, focused activity lanes.
+- Not yet run or not passed: full schema-read, operational schema, full worker,
+  startup (one 5 s health wait timed out), preflight/cutover, differential,
+  browser, standalone bootstrap, and all peer scenarios. The new `replies`
+  scenario exists but hit the runner deadline during fixture restore. All of
+  these were blocked by another job saturating NAS disk I/O; rerun when idle.
