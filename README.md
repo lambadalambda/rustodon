@@ -126,7 +126,8 @@ decisions are recorded in [DEVLOG.md](DEVLOG.md).
 
 ## License
 
-No license has been selected yet.
+Rustodon is licensed under the GNU Affero General Public License v3.0 or later,
+the same license as Mastodon. See [LICENSE](LICENSE).
 
 ### Instance activity metrics
 
