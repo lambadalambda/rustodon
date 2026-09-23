@@ -9118,11 +9118,11 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
             let maintenance_queue = maintenance_queue.clone();
             let activity_writer = activity_writer.clone();
             async move {
-                if let Some(writer) = activity_writer {
-                    crate::activity::prune(&writer)
-                        .await
-                        .map_err(|_| HandlerFailure::retry("activity cleanup failed"))?;
-                }
+                // Activity cleanup failure must not starve the operational cleanup below.
+                let activity = match activity_writer {
+                    Some(writer) => crate::activity::prune(&writer).await.map(drop),
+                    None => Ok(()),
+                };
                 sqlx::raw_sql(
                     "DELETE FROM rustodon.idempotency_keys WHERE expires_at <= clock_timestamp(); \
                        DELETE FROM rustodon.ordering_markers marker \
@@ -9152,7 +9152,7 @@ pub fn infrastructure_handlers_with_writer_and_mail_and_federation(
                     .prune_stream_history()
                     .await
                     .map_err(|_| HandlerFailure::retry("stream history cleanup failed"))?;
-                Ok(())
+                activity.map_err(|_| HandlerFailure::retry("activity cleanup failed"))
             }
         },
     )?;
