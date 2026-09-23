@@ -8968,6 +8968,7 @@ async fn high_fanout_status_write_takes_stream_order_lock_only_at_terminal_flush
 
 #[tokio::test]
 #[ignore = "starts a restored Mastodon PostgreSQL fixture through the Mise task"]
+#[allow(clippy::too_many_lines)]
 async fn conversation_updates_conflict_concurrently() -> Result<(), Box<dyn Error>> {
     let database_url = database_url();
     let owner_url = std::env::var("RUSTODON_MASTODON_OWNER_DATABASE_URL")

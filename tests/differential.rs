@@ -1502,7 +1502,10 @@ async fn fixture_core_instance(state: CoreRestFixture, v1: bool) -> Response {
     let loader =
         RestProjectionLoader::new(state.repository, None, "fixture-v4-6-5.rustodon.invalid");
     let Ok(instance) = loader
-        .instance(fixture_instance_runtime(), Default::default())
+        .instance(
+            fixture_instance_runtime(),
+            rustodon::mastodon::rest::InstanceActivityCounts::default(),
+        )
         .await
     else {
         return fixture_internal_error();

@@ -272,6 +272,7 @@ async fn commit_ambiguity_and_partial_output_replay_preserve_published_bytes() -
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL"]
 async fn recovery_exact_ownership_raw_validation_and_legacy_staging_guard() -> TestResult {
+    use std::os::unix::fs::{PermissionsExt, symlink};
     let mut f = Fixture::new().await;
     let id = f.stage("image/png", &image(), false).await;
     f.age(id).await;
@@ -335,7 +336,6 @@ async fn recovery_exact_ownership_raw_validation_and_legacy_staging_guard() -> T
     super::super::process_local_media_cleanup_job(f.pool.clone(), f.root.clone(), &json!({"account_id": f.account,"media_id":guarded.media_id,"action":"rollback_create","paths":[path]})).await.unwrap();
     assert!(public_state(&f.pool, guarded).await?.is_some());
     assert!(parse_paperclip_path(&format!(".local-upload-input/{}", raw_path(guarded))).is_none());
-    use std::os::unix::fs::{PermissionsExt, symlink};
     assert_eq!(
         std::fs::metadata(f.directory.join(".local-upload-input"))?
             .permissions()

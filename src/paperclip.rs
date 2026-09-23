@@ -2934,6 +2934,7 @@ fn safe_relative_path(path: &Path) -> bool {
 mod media_probe_tests {
     use super::*;
 
+    #[allow(clippy::needless_pass_by_value)]
     fn video_probe(format_name: &str, width: Value, height: Value) -> Value {
         json!({
             "format": {

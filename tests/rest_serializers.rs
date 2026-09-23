@@ -933,7 +933,7 @@ fn profile_read_preserves_raw_fields_and_nullable_images() {
 fn instance_featured_tag_limit_is_at_the_frontend_selector_path() {
     use rustodon::mastodon::rest::{InstanceProjection, InstanceRuntimeConfig};
     let instance = InstanceProjection {
-        activity: Default::default(),
+        activity: rustodon::mastodon::rest::InstanceActivityCounts::default(),
         runtime: InstanceRuntimeConfig {
             domain: "fixture-v4-6-5.rustodon.invalid".into(),
             version: "4.6.5".into(),

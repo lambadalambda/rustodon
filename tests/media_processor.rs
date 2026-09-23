@@ -1,4 +1,6 @@
 #![cfg(feature = "test-support")]
+// Assertions check exact lowercase output extensions on purpose.
+#![allow(clippy::case_sensitive_file_extension_comparisons)]
 
 use std::io::Write as _;
 use std::path::Path;
@@ -270,6 +272,7 @@ mod supervisor_tests {
         }
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn config(script: std::path::PathBuf, timeout: Duration) -> MediaProcessorConfig {
         MediaProcessorConfig::new(&script, &script, timeout)
     }
