@@ -41,6 +41,9 @@ if dispatch schema-read-test unknown > "$work/error" 2>&1; then die 'unknown sel
 : > "$work/worker-selected"
 dispatch worker-test quote_federation_lifecycle
 [ "$(cat "$work/worker-selected")" = quote_federation_lifecycle ] || die 'wrong worker selector'
+: > "$work/worker-selected"
+dispatch worker-test instance_activity
+[ "$(cat "$work/worker-selected")" = instance_activity ] || die 'wrong activity worker selector'
 if dispatch worker-test one two > "$work/error" 2>&1; then die 'extra worker selector accepted'; fi
 
 cargo_mode=present
@@ -69,6 +72,11 @@ grep -F -- '--test media_state' "$work/cargo" >/dev/null || die 'incorrect media
 worker_rust_test quote_federation_lifecycle
 grep -F -- '--features test-support --test workers quote_lifecycle::quote_federation_lifecycle' "$work/cargo" >/dev/null || die 'incorrect quote worker target'
 [ "$(wc -l < "$work/cargo" | tr -d ' ')" = 2 ] || die 'expected worker list check then exact execution'
+: > "$work/cargo"
+worker_rust_test instance_activity
+grep -F -- '--features test-support --lib activity::tests::' "$work/cargo" >/dev/null || die 'incorrect activity storage target'
+grep -F -- '--features test-support --lib worker::activity_tests::' "$work/cargo" >/dev/null || die 'incorrect activity worker target'
+[ "$(wc -l < "$work/cargo" | tr -d ' ')" = 4 ] || die 'expected list check then execution per activity group'
 if (worker_rust_test unknown) > "$work/error" 2>&1; then die 'unknown worker selector accepted'; fi
 : > "$work/cargo"
 schema_read_rust_test quote_lifecycle

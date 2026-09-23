@@ -1312,12 +1312,19 @@ worker_rust_test() {
   case "$1" in
     quote_federation_lifecycle)
       test_name="quote_lifecycle::$1"
+      require_ignored_tests exact --features test-support --test workers "$test_name" || return $?
+      cargo test --locked --features test-support --test workers "$test_name" \
+        -- --ignored --exact --nocapture --test-threads=1
+      ;;
+    instance_activity)
+      for selector in activity::tests:: worker::activity_tests::; do
+        require_ignored_tests group --features test-support --lib "$selector" || return $?
+        cargo test --locked --features test-support --lib "$selector" \
+          -- --ignored --nocapture --test-threads=1 || return $?
+      done
       ;;
     *) die "unknown worker test: $1" ;;
   esac
-  require_ignored_tests exact --features test-support --test workers "$test_name" || return $?
-  cargo test --locked --features test-support --test workers "$test_name" \
-    -- --ignored --exact --nocapture --test-threads=1
 }
 
 worker_test() {
@@ -1325,7 +1332,7 @@ worker_test() {
   if [ -n "$case_name" ]; then
     case "$case_name" in
       ''|*[!a-z0-9_]*) die 'worker case must use lowercase letters, digits, or underscores' ;;
-      quote_federation_lifecycle) ;;
+      quote_federation_lifecycle|instance_activity) ;;
       *) die "unknown worker case: $case_name" ;;
     esac
   fi
@@ -1396,23 +1403,21 @@ CREATE DATABASE $receiver_database TEMPLATE $DATABASE_NAME;
 REVOKE ALL ON DATABASE $receiver_database FROM PUBLIC;
 GRANT CONNECT ON DATABASE $receiver_database TO $WORKER_RUNTIME;
 EOF
-  if [ -n "$case_name" ]; then
-    RUSTODON_WORKER_RECEIVER_DATABASE_URL="postgresql://$WORKER_RUNTIME:$WORKER_RUNTIME_PASSWORD@127.0.0.1:$published_port/$receiver_database" \
-    RUSTODON_WORKER_RECEIVER_OWNER_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$receiver_database" \
-    RUSTODON_WORKER_DATABASE_URL="$runtime_url" \
-    RUSTODON_WORKER_ADMIN_DATABASE_URL="$migrator_url" \
-    RUSTODON_WORKER_WRITE_DATABASE_URL="$writer_url" \
-    RUSTODON_WORKER_OWNER_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+  (
+    export RUSTODON_WORKER_RECEIVER_DATABASE_URL="postgresql://$WORKER_RUNTIME:$WORKER_RUNTIME_PASSWORD@127.0.0.1:$published_port/$receiver_database"
+    export RUSTODON_WORKER_RECEIVER_OWNER_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$receiver_database"
+    export RUSTODON_WORKER_DATABASE_URL="$runtime_url"
+    export RUSTODON_WORKER_ADMIN_DATABASE_URL="$migrator_url"
+    export RUSTODON_WORKER_WRITE_DATABASE_URL="$writer_url"
+    export RUSTODON_WORKER_OWNER_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME"
+    export RUSTODON_OPERATIONAL_DATABASE_URL="$RUSTODON_WORKER_OWNER_DATABASE_URL"
+    if [ -n "$case_name" ]; then
       worker_rust_test "$case_name"
-  else
-    RUSTODON_WORKER_RECEIVER_DATABASE_URL="postgresql://$WORKER_RUNTIME:$WORKER_RUNTIME_PASSWORD@127.0.0.1:$published_port/$receiver_database" \
-    RUSTODON_WORKER_RECEIVER_OWNER_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$receiver_database" \
-    RUSTODON_WORKER_DATABASE_URL="$runtime_url" \
-    RUSTODON_WORKER_ADMIN_DATABASE_URL="$migrator_url" \
-    RUSTODON_WORKER_WRITE_DATABASE_URL="$writer_url" \
-    RUSTODON_WORKER_OWNER_DATABASE_URL="postgresql://$DATABASE_USER:$DATABASE_PASSWORD@127.0.0.1:$published_port/$DATABASE_NAME" \
+    else
       cargo test --locked --features test-support --test workers -- --ignored --nocapture --test-threads=1
-  fi
+      worker_rust_test instance_activity
+    fi
+  )
 
   start_worker_cli "$runtime_url" "$worker_log" "$writer_url" &
   worker_pid=$!
