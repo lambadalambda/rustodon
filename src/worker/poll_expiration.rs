@@ -210,6 +210,15 @@ pub(super) fn parse_poll_expiration_scan_mode(
     }
 }
 
+pub(super) const POLL_EXPIRATION_WRITER_UNAVAILABLE: &str =
+    "poll expiration writer connection is unavailable";
+
+/// The writer pool could not provide a connection: an availability problem, not
+/// a scan without progress.
+pub(super) fn poll_expiration_writer_unavailable() -> HandlerFailure {
+    HandlerFailure::retry(POLL_EXPIRATION_WRITER_UNAVAILABLE)
+}
+
 pub(super) fn poll_expiration_no_progress() -> HandlerFailure {
     HandlerFailure::retry("poll expiration reconciliation made no cursor progress")
 }
@@ -277,11 +286,10 @@ pub(super) enum PollExpirationHighWater {
 }
 
 pub(super) async fn poll_expiration_high_water(
-    writer_pool: &PgPool,
+    writer: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
     work_deadline: tokio::time::Instant,
 ) -> Result<PollExpirationHighWater, HandlerFailure> {
-    let mut transaction = writer_pool
-        .begin()
+    let mut transaction = sqlx::Connection::begin(&mut **writer)
         .await
         .map_err(|_| HandlerFailure::retry("poll expiration repair transaction failed"))?;
     let statement_timeout = work_deadline
@@ -822,13 +830,25 @@ pub(super) async fn reconcile_poll_expirations_inner(
     let through_poll_id = match arguments.get("through_poll_id") {
         Some(Value::Null) | None => {
             let remaining = POLL_EXPIRATION_REPAIR_WORK_TIME.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(poll_expiration_no_progress());
+            }
+            let Ok(Ok(mut writer)) = tokio::time::timeout(
+                remaining.min(POLL_EXPIRATION_REPAIR_OPERATION_TIMEOUT),
+                writer_pool.acquire(),
+            )
+            .await
+            else {
+                return Err(poll_expiration_writer_unavailable());
+            };
+            let remaining = POLL_EXPIRATION_REPAIR_WORK_TIME.saturating_sub(started.elapsed());
             let high_water = if remaining.is_zero() {
                 PollExpirationHighWater::TimedOut
             } else {
                 match tokio::time::timeout(
                     remaining.min(POLL_EXPIRATION_REPAIR_OPERATION_TIMEOUT),
                     poll_expiration_high_water(
-                        &writer_pool,
+                        &mut writer,
                         started + POLL_EXPIRATION_REPAIR_WORK_TIME,
                     ),
                 )

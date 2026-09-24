@@ -87,7 +87,7 @@ async fn startup_poll_reconciliation_has_a_hard_readiness_bound()
         heartbeats, 0,
         "neither a failed owner nor its waiting peer may advertise readiness"
     );
-    let (retry_reservations, generation, lease_expires_at): (i64, i64, DateTime<Utc>) =
+    let (retry_reservations, generation, lease_expires_at): (i64, i64, Option<DateTime<Utc>>) =
         sqlx::query_as(
             "SELECT count(*) OVER (), lease_generation, lease_expires_at \
              FROM rustodon.durable_jobs WHERE kind = $1 AND dead_at IS NULL",
@@ -95,6 +95,8 @@ async fn startup_poll_reconciliation_has_a_hard_readiness_bound()
         .bind(MASTODON_POLL_EXPIRATION_RECONCILE_JOB_KIND)
         .fetch_one(&owner)
         .await?;
+    let lease_expires_at = lease_expires_at
+        .ok_or("startup left no lease on its reservation")?;
     assert_eq!(retry_reservations, 1);
     assert_eq!(generation, 1, "startup must claim the exact reservation");
     assert!(

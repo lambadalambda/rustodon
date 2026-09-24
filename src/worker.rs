@@ -363,6 +363,12 @@ pub struct HandlerFailure {
 }
 
 impl HandlerFailure {
+    /// Poll-expiration reconciliation found no writer connection: an availability
+    /// problem that a startup must not charge as a failed attempt.
+    fn is_poll_writer_unavailable(&self) -> bool {
+        self.message == POLL_EXPIRATION_WRITER_UNAVAILABLE
+    }
+
     #[must_use]
     pub fn retry(message: impl Into<String>) -> Self {
         Self {
@@ -2473,7 +2479,15 @@ async fn reconcile_poll_expirations_at_startup(
                     )
                     .await;
                     if let Err(failure) = result {
-                        transition_handler_failure(&queue, &job, &failure).await?;
+                        // A startup that exhausted its readiness budget or found no writer
+                        // connection keeps its fixed, nonrenewed lease: the next start takes
+                        // over this same reservation once the lease expires. Other failures
+                        // (such as zero progress) consume an attempt as usual.
+                        if tokio::time::Instant::now() < startup_deadline
+                            && !failure.is_poll_writer_unavailable()
+                        {
+                            transition_handler_failure(&queue, &job, &failure).await?;
+                        }
                         return Err(WorkerError::StartupReconciliationFailed);
                     }
                     if queue
