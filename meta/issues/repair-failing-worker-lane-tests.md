@@ -80,3 +80,39 @@ of the fixed tests passes 7/7. Classified so far:
 
 - Actor deletion emits two idempotent deletes per user stream (keys `:0` and
   `:<version>`); consider one key.
+- Review 2026-09-24: `apply_remote_note_delete` holds the actor row FOR UPDATE and
+  then takes recipient advisory locks for notification cleanup, while
+  `create_notification` takes the recipient lock and then needs a KEY SHARE on the
+  actor (FK). A concurrent quoted_update job and remote Delete can deadlock (40P01);
+  both retry. Pre-existing pattern in `delete_remote_status_notifications`.
+- Local status delete detaches quotes but keeps quoted_update notifications (like
+  Mastodon); the remote delete path now removes them. Decide one behavior.
+
+## Progress 2026-09-24 (second pass)
+
+Full lane 118 passed / 4 failed on 0d7ec35-era code; after the later fixes the
+focused runs pass everything except two tests. Fixed since the first pass:
+
+- Product: resolved-Note replay recorded forwarding only after a refetch (a failed
+  fetch dropped it) — now before the refetch and after the domain policy check.
+- Product: remote Note delete detached quotes before its notification cleanup, so
+  quoted_update notifications survived; late quoted_update jobs now also skip
+  quotes whose quoted status is gone or soft-deleted.
+- Tests: quote test delivered to the fixture's protocol-0 Bob and required a
+  lazily created status_stats row; poll zero-progress test lacked the activation
+  marker; repair test asserted the late job before the scan start instead of at
+  its poll expiry; update_versions failures were load/leftover related.
+
+## Still open (need a behavior decision)
+
+- `poll_expirations::startup_poll_reconciliation_has_a_hard_readiness_bound`: with
+  the single writer connection held, startup times out without having claimed
+  the reservation job (`lease_expires_at` NULL). The test expects the claim to
+  happen before writer access. Decide whether startup should claim first.
+- `quote_lifecycle::quote_federation_lifecycle` (scalar step): the test expects
+  quotes_count 2, but its own earlier step revokes the allowed quote and the
+  scalar instrument arrives as a legacy quote. Mastodon 4.6.5 counts a quote
+  created accepted even when legacy (`after_create_commit` checks only
+  `accepted?`); Rustodon's insert path skips legacy quotes. Verify Mastodon's
+  create/accept order for scalar QuoteRequests (differential) before changing
+  either the counter or the test.

@@ -1,3 +1,12 @@
+## 2026-09-24 — Worker lane second pass
+
+- Full worker lane 118/4, then focused fixes; only two tests remain, both needing a
+  behavior decision (poll startup claim order; legacy quote counting vs Mastodon).
+- Product fixes: replay forwarding before refetch (after policy), quoted_update
+  cleanup order and late-job guard. Test fixes: protocol-0 fixture account, lazy
+  status_stats, activation marker, poll expiry assertion, racy outbox inserts.
+- Deployed c2ae939 (outbox timestamp fix).
+
 ## 2026-09-24 — Worker lane repair, first pass
 
 - Full worker lane from 93/29 to 105/17, then focused fixes 7/7. One product bug
