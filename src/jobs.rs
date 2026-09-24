@@ -358,8 +358,8 @@ pub(crate) async fn record_poll_expiration_effect_in(
     outcome: PollExpirationEffectOutcome,
 ) -> Result<(), JobError> {
     sqlx::query(
-        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload, dispatched_at) \
-         VALUES ($1, $2, $3, clock_timestamp()) \
+        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload, created_at, dispatched_at) \
+         SELECT $1, $2, $3, stamp.at, stamp.at FROM (SELECT clock_timestamp() AS at) stamp \
          ON CONFLICT (kind, logical_key) WHERE logical_key IS NOT NULL DO NOTHING",
     )
     .bind(MASTODON_POLL_EXPIRATION_EFFECT_KIND)
@@ -2678,8 +2678,8 @@ pub(crate) async fn stage_stream_events_in(
     for event in events.drain(..) {
         sqlx::query(
             "INSERT INTO rustodon.outbox_events \
-                 (kind, logical_key, payload, dispatched_at) \
-             VALUES ($1, $2, $3, clock_timestamp()) \
+                 (kind, logical_key, payload, created_at, dispatched_at) \
+             SELECT $1, $2, $3, stamp.at, stamp.at FROM (SELECT clock_timestamp() AS at) stamp \
              ON CONFLICT (kind, logical_key) WHERE logical_key IS NOT NULL DO NOTHING",
         )
         .bind(STREAM_EVENT_STAGING_KIND)
@@ -2713,9 +2713,10 @@ pub(crate) async fn flush_staged_stream_events_in(
     lock_stream_event_order(transaction).await?;
     sqlx::query(
         "INSERT INTO rustodon.outbox_events \
-             (kind, logical_key, payload, dispatched_at) \
-         SELECT $1, logical_key, payload, clock_timestamp() \
-           FROM rustodon.outbox_events WHERE kind = $2 ORDER BY id \
+             (kind, logical_key, payload, created_at, dispatched_at) \
+         SELECT $1, staged.logical_key, staged.payload, stamp.at, stamp.at \
+           FROM rustodon.outbox_events staged, (SELECT clock_timestamp() AS at) stamp \
+          WHERE staged.kind = $2 ORDER BY staged.id \
          ON CONFLICT (kind, logical_key) WHERE logical_key IS NOT NULL DO NOTHING",
     )
     .bind(STREAM_EVENT_KIND)
@@ -2764,8 +2765,8 @@ async fn insert_pending_stream_event_in(
 ) -> Result<i64, JobError> {
     let payload = stream_event_payload(event);
     if let Some(id) = sqlx::query_scalar::<_, i64>(
-        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload, dispatched_at) \
-          VALUES ($1, $2, $3, clock_timestamp()) \
+        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload, created_at, dispatched_at) \
+          SELECT $1, $2, $3, stamp.at, stamp.at FROM (SELECT clock_timestamp() AS at) stamp \
           ON CONFLICT (kind, logical_key) WHERE logical_key IS NOT NULL \
           DO NOTHING RETURNING id",
     )
