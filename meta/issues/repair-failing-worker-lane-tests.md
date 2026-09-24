@@ -132,3 +132,11 @@ focused runs pass everything except two tests. Fixed since the first pass:
   lost job means a lost notification. Rustodon's reconciliation and its
   claim-before-writer guard are Rustodon's own design; the test expresses that
   design, so the decision is ours.
+
+## Resolution 2026-09-24
+
+Full lane green on the NAS: 122 passed, activity groups 8/8 and 2/2, worker
+readiness passes. Poll startup now keeps its lease when no writer connection is
+available (claim-before-writer kept as Rustodon's design). Quote deliveries were
+missing because of a wrong Accept/Reject sender check (product bug) and test
+state leaks; see DEVLOG.

@@ -1,5 +1,6 @@
 # Completed Issues
 
+- [x] [Repair the failing worker lane tests](issues/repair-failing-worker-lane-tests.md)
 - [x] [Support advertised media attachments in the bundled frontend](issues/support-frontend-video-attachments.md)
 - [x] [Cache remote rich media with previews](issues/cache-remote-rich-media-previews.md)
 - [x] [Accept remote rich media in the pinned browser](issues/accept-remote-rich-media-browser.md)

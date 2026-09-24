@@ -1,3 +1,15 @@
+## 2026-09-24 — Worker lane green
+
+- Full worker lane 122/0, and the CLI readiness step after it now passes too.
+  Clippy clean.
+- Product fixes: a poll startup that finds no writer connection keeps its fixed
+  lease (the retry path used to clear it); quote Accept/Reject delivery compared
+  the remote requester with the local sender, so it never sent.
+- Test isolation was the rest: the account purge test rewrote every remote inbox
+  (forwarding then skipped the "source" inbox), an outbox row without
+  max_attempts, activity test users without keys (preflight refused the worker),
+  and the fixture server read only `Content-Length` (hyper sends lowercase).
+
 ## 2026-09-24 — Worker lane second pass
 
 - Full worker lane 118/4, then focused fixes; only two tests remain, both needing a
