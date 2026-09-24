@@ -1851,10 +1851,15 @@ impl WriteRepository {
         existing_id: Option<i64>,
     ) -> Result<i64, WriteError> {
         let mut transaction = self.pool.begin().await?;
-        if !remote_domain_allowed_in_transaction(&mut transaction, domain, limited_federation)
-            .await?
-        {
-            return Err(WriteError::Validation("remote actor domain is not allowed"));
+        // Split-domain actors: both the account domain and the actor host must pass.
+        let actor_host = crate::remote::canonical_remote_domain_from_url(&actor.id)
+            .map_err(|_| WriteError::InvalidInput("remote actor URI is invalid"))?;
+        for checked in [domain, actor_host.as_str()] {
+            if !remote_domain_allowed_in_transaction(&mut transaction, checked, limited_federation)
+                .await?
+            {
+                return Err(WriteError::Validation("remote actor domain is not allowed"));
+            }
         }
         let uri = actor.id.as_str();
         let profile_url = actor.profile_url.as_ref().map_or(uri, Url::as_str);
@@ -4331,6 +4336,77 @@ impl WriteRepository {
         insert_remote_note_tombstone(&mut transaction, account_id, activity_uri).await?;
         flush_stream_events_in(&mut transaction, &mut pending_stream_events).await?;
         transaction.commit().await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod split_domain_tests {
+    use super::*;
+
+    fn actor(id: &str, username: &str, domain: &str) -> RemoteActor {
+        let id = Url::parse(id).unwrap();
+        RemoteActor {
+            inbox: id.join("inbox").unwrap(),
+            id,
+            username: username.to_owned(),
+            domain: domain.to_owned(),
+            actor_type: "Person".to_owned(),
+            display_name: String::new(),
+            note: String::new(),
+            suspended: false,
+            profile_url: None,
+            avatar: None,
+            header: None,
+            shared_inbox: None,
+            followers: None,
+            following: None,
+            public_keys: Vec::new(),
+            key_set_complete: true,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the disposable worker PostgreSQL fixture"]
+    async fn split_domain_actors_store_the_account_domain_and_honor_host_blocks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let owner = PgPool::connect(&std::env::var("RUSTODON_WORKER_OWNER_DATABASE_URL")?).await?;
+        let writer =
+            WriteRepository::connect(&std::env::var("RUSTODON_WORKER_WRITE_DATABASE_URL")?).await?;
+        sqlx::query(
+            "INSERT INTO domain_blocks (domain, severity, reject_media, reject_reports, \
+               obfuscate, created_at, updated_at) \
+             VALUES ('evil.split.invalid', 1, false, false, false, now(), now()) \
+             ON CONFLICT (domain) DO NOTHING",
+        )
+        .execute(&owner)
+        .await?;
+        let blocked = actor(
+            "https://evil.split.invalid/users/m",
+            "m",
+            "clean.split.invalid",
+        );
+        assert!(
+            writer
+                .upsert_remote_actor("m", "clean.split.invalid", false, &blocked)
+                .await
+                .is_err(),
+            "a blocked actor host must not hide behind an allowed account domain"
+        );
+        let split = actor(
+            "https://social.split.invalid/users/jae",
+            "jae",
+            "split.invalid",
+        );
+        let id = writer
+            .upsert_remote_actor("jae", "split.invalid", false, &split)
+            .await?;
+        let domain: Option<String> =
+            sqlx::query_scalar("SELECT domain FROM accounts WHERE id = $1")
+                .bind(id)
+                .fetch_one(&owner)
+                .await?;
+        assert_eq!(domain.as_deref(), Some("split.invalid"));
         Ok(())
     }
 }

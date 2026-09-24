@@ -111,12 +111,9 @@ pub(super) async fn resolve_inbox_actor(
             .await
             .map_err(|_| HandlerFailure::retry("remote inbox actor lookup failed"))?
             .ok_or_else(|| HandlerFailure::permanent("remote inbox signer account is missing"))?;
-        if account
-            .domain
-            .as_deref()
-            .is_none_or(|domain| !domain.eq_ignore_ascii_case(&job.remote_domain))
-            || account.uri != actor_uri
-        {
+        // actor_uri's host already matched the signer above; accounts.domain may be
+        // a split account domain (acct:jae@bsd.cafe for mastodon.bsd.cafe).
+        if account.domain.is_none() || account.uri != actor_uri {
             return Err(HandlerFailure::permanent(
                 "remote inbox actor does not match the verified signer",
             ));
@@ -161,7 +158,7 @@ pub(super) async fn resolve_inbox_actor(
     WriteRepository::from_pool(pool.clone())
         .upsert_remote_actor(
             &resolution.actor.username,
-            &resolution.domain,
+            &resolution.actor.domain,
             config.limited_federation,
             &resolution.actor,
         )

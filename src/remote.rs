@@ -1385,6 +1385,9 @@ pub struct RemotePublicKey {
 pub struct RemoteActor {
     pub id: Url,
     pub username: String,
+    /// Account domain confirmed by `WebFinger`; differs from the actor host on
+    /// split-domain servers.
+    pub domain: String,
     pub actor_type: String,
     pub display_name: String,
     pub note: String,
@@ -1405,6 +1408,8 @@ pub struct RemoteActor {
 pub struct RemoteKeyResolution {
     pub actor: RemoteActor,
     pub key: RemotePublicKey,
+    /// The signer's actor host, used for domain policy and job keys; the account
+    /// domain is [`RemoteActor::domain`].
     pub domain: String,
 }
 
@@ -1532,6 +1537,7 @@ impl RemoteAccountResolver {
                 .first()
                 .cloned()
                 .ok_or(RemoteFetchError::InvalidRepresentation)?;
+            let domain = remote_actor_domain(&actor.id)?;
             return Ok(RemoteKeyResolution { actor, key, domain });
         }
 
@@ -1593,10 +1599,11 @@ impl RemoteAccountResolver {
             return Err(RemoteFetchError::OriginMismatch);
         }
         let (username, domain) = remote_actor_handle(&document, &actor_url)?;
-        self.verify_remote_actor_webfinger(&username, &domain, &actor_url)
+        let confirmed = self
+            .verify_remote_actor_webfinger(&username, &domain, &actor_url)
             .await?;
         let (actor, references) =
-            parse_remote_actor_document(&response.body, &actor_url, &username, &domain)?;
+            parse_confirmed_actor_document(&response.body, &actor_url, confirmed)?;
         let key = actor
             .public_keys
             .iter()
@@ -1609,6 +1616,7 @@ impl RemoteAccountResolver {
                     RemoteFetchError::IdentityMismatch
                 }
             })?;
+        let domain = remote_actor_domain(&actor.id)?;
         Ok(RemoteKeyResolution { actor, key, domain })
     }
 
@@ -1642,37 +1650,47 @@ impl RemoteAccountResolver {
             return Err(RemoteFetchError::IdentityMismatch);
         }
         let (username, domain) = remote_actor_handle(&document, &actor_url)?;
-        self.verify_remote_actor_webfinger(&username, &domain, owner_url)
+        let confirmed = self
+            .verify_remote_actor_webfinger(&username, &domain, owner_url)
             .await?;
-        let parsed = parse_remote_actor_document(&response.body, &actor_url, &username, &domain)?;
+        let parsed = parse_confirmed_actor_document(&response.body, &actor_url, confirmed)?;
         if !actor_contains_key(&parsed.0, &parsed.1, key_id) {
             return Err(RemoteFetchError::IdentityMismatch);
         }
         Ok(parsed)
     }
 
+    /// Returns the confirmed account handle, which may name another domain than
+    /// the actor host (split-domain servers such as `WEB_DOMAIN` deployments).
     async fn verify_remote_actor_webfinger(
         &self,
         username: &str,
         domain: &str,
         actor_url: &Url,
-    ) -> Result<(), RemoteFetchError> {
-        let expected_origin = remote_url_origin(actor_url)?;
-        let domain = canonical_domain_for_url(&expected_origin, domain)?;
-        let response = self
-            .fetcher
-            .get_bound_to_origin(
-                webfinger_url_at_origin(username, &domain, &expected_origin)?,
-                WEBFINGER_CONTENT_TYPES,
-                Some(expected_origin.clone()),
-            )
-            .await?;
-        let document = parse_webfinger_document(&response.body, username, &expected_origin)?;
-        if document.self_link == *actor_url {
-            Ok(())
-        } else {
-            Err(RemoteFetchError::IdentityMismatch)
-        }
+    ) -> Result<(String, String), RemoteFetchError> {
+        let actor_origin = remote_url_origin(actor_url)?;
+        let actor_host = remote_actor_domain(actor_url)?;
+        confirm_webfinger(username, domain, actor_url, |username, domain| {
+            // The actor's own host is queried at its exact origin (scheme and port).
+            let origin = if domain.eq_ignore_ascii_case(&actor_host) {
+                Ok(actor_origin.clone())
+            } else {
+                remote_origin(&domain)
+            };
+            async move {
+                let origin = origin?;
+                let response = self
+                    .fetcher
+                    .get_bound_to_origin(
+                        webfinger_url_at_origin(&username, &domain, &origin)?,
+                        WEBFINGER_CONTENT_TYPES,
+                        Some(origin.clone()),
+                    )
+                    .await?;
+                parse_webfinger_document(&response.body)
+            }
+        })
+        .await
     }
 
     async fn resolve_with_signer_inner(
@@ -1717,7 +1735,29 @@ impl RemoteAccountResolver {
             Err(error) => return Err(error),
         };
         ensure_remote_origin(&response.url, domain)?;
-        let document = parse_webfinger_document(&response.body, username, &expected_origin)?;
+        let document = parse_webfinger_document(&response.body)?;
+        if !parse_account_subject(&document.subject).is_some_and(
+            |(subject_user, subject_domain)| {
+                subject_user.eq_ignore_ascii_case(username)
+                    && subject_domain.eq_ignore_ascii_case(domain)
+            },
+        ) {
+            return Err(RemoteFetchError::IdentityMismatch);
+        }
+        if !same_origin_url(&document.self_link, &expected_origin) {
+            // Split-domain account: the actor lives on another host and must confirm
+            // this handle through the same two-step WebFinger as a URI resolution.
+            let actor = self
+                .resolve_actor_uri_inner(&document.self_link, signer)
+                .await?;
+            return if actor.username.eq_ignore_ascii_case(username)
+                && actor.domain.eq_ignore_ascii_case(domain)
+            {
+                Ok(actor)
+            } else {
+                Err(RemoteFetchError::IdentityMismatch)
+            };
+        }
         let actor_response = self
             .fetcher
             .get_bound_to_origin_with_signer(
@@ -1780,10 +1820,11 @@ impl RemoteAccountResolver {
             return Err(RemoteFetchError::IdentityMismatch);
         }
         let (username, domain) = remote_actor_handle(&document, actor_url)?;
-        self.verify_remote_actor_webfinger(&username, &domain, actor_url)
+        let confirmed = self
+            .verify_remote_actor_webfinger(&username, &domain, actor_url)
             .await?;
         let (mut actor, key_references) =
-            parse_remote_actor_document(&response.body, actor_url, &username, &domain)?;
+            parse_confirmed_actor_document(&response.body, actor_url, confirmed)?;
         actor.key_set_complete = true;
         for key_id in key_references {
             match self
@@ -1829,7 +1870,7 @@ impl RemoteAccountResolver {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct WebFingerDocument {
     subject: String,
     self_link: Url,
@@ -1927,11 +1968,9 @@ fn canonical_remote_domain_from_origin(origin: &Url) -> Result<String, RemoteFet
     })
 }
 
-fn parse_webfinger_document(
-    body: &[u8],
-    username: &str,
-    expected_origin: &Url,
-) -> Result<WebFingerDocument, RemoteFetchError> {
+/// Parses subject and `ActivityPub` self link; callers decide which subject and
+/// origin they accept.
+fn parse_webfinger_document(body: &[u8]) -> Result<WebFingerDocument, RemoteFetchError> {
     let document = serde_json::from_slice::<Value>(body)
         .map_err(|_| RemoteFetchError::InvalidRepresentation)?;
     let subject = document
@@ -1939,11 +1978,6 @@ fn parse_webfinger_document(
         .and_then(Value::as_str)
         .filter(|subject| !subject.trim().is_empty())
         .ok_or(RemoteFetchError::InvalidRepresentation)?;
-    let domain = canonical_remote_domain_from_url(expected_origin)?;
-    let expected_subject = format!("acct:{username}@{domain}");
-    if !subject.eq_ignore_ascii_case(&expected_subject) {
-        return Err(RemoteFetchError::IdentityMismatch);
-    }
     let links = document
         .get("links")
         .and_then(Value::as_array)
@@ -1964,13 +1998,50 @@ fn parse_webfinger_document(
         .and_then(|href| Url::parse(href).ok())
         .ok_or(RemoteFetchError::InvalidRepresentation)?;
     validate_remote_url(&self_link)?;
-    if !same_origin_url(&self_link, expected_origin) {
-        return Err(RemoteFetchError::OriginMismatch);
-    }
     Ok(WebFingerDocument {
         subject: subject.to_owned(),
         self_link,
     })
+}
+
+/// Mastodon's `check_webfinger!`: the handle's domain must confirm the actor. When
+/// the first answer names another account, that account's domain is asked once
+/// more and must name itself and the same actor; no further redirects.
+async fn confirm_webfinger<F, Fut>(
+    username: &str,
+    domain: &str,
+    actor_url: &Url,
+    fetch: F,
+) -> Result<(String, String), RemoteFetchError>
+where
+    F: Fn(String, String) -> Fut,
+    Fut: Future<Output = Result<WebFingerDocument, RemoteFetchError>>,
+{
+    let first = fetch(username.to_owned(), domain.to_owned()).await?;
+    let (confirmed_user, confirmed_domain) =
+        parse_account_subject(&first.subject).ok_or(RemoteFetchError::InvalidRepresentation)?;
+    if confirmed_user.eq_ignore_ascii_case(username)
+        && confirmed_domain.eq_ignore_ascii_case(domain)
+    {
+        return if first.self_link == *actor_url {
+            Ok((username.to_owned(), domain.to_owned()))
+        } else {
+            Err(RemoteFetchError::IdentityMismatch)
+        };
+    }
+    let confirmed_domain = canonical_remote_domain(confirmed_domain)?;
+    if !valid_remote_username(confirmed_user) {
+        return Err(RemoteFetchError::InvalidRepresentation);
+    }
+    let second = fetch(confirmed_user.to_owned(), confirmed_domain.clone()).await?;
+    let confirms = parse_account_subject(&second.subject).is_some_and(|(user, domain)| {
+        user.eq_ignore_ascii_case(confirmed_user) && domain.eq_ignore_ascii_case(&confirmed_domain)
+    });
+    if confirms && second.self_link == *actor_url {
+        Ok((confirmed_user.to_owned(), confirmed_domain))
+    } else {
+        Err(RemoteFetchError::IdentityMismatch)
+    }
 }
 
 fn parse_host_meta_webfinger_url(
@@ -2048,6 +2119,19 @@ fn parse_remote_actor(
     domain: &str,
 ) -> Result<RemoteActor, RemoteFetchError> {
     parse_remote_actor_document(body, actor_url, username, domain).map(|(actor, _)| actor)
+}
+
+/// Parses an actor whose handle `WebFinger` confirmed via [`confirm_webfinger`]; the
+/// account domain may then differ from the actor host.
+fn parse_confirmed_actor_document(
+    body: &[u8],
+    actor_url: &Url,
+    (username, domain): (String, String),
+) -> Result<(RemoteActor, Vec<Url>), RemoteFetchError> {
+    let (mut actor, references) =
+        parse_remote_actor_document(body, actor_url, &username, &remote_actor_domain(actor_url)?)?;
+    actor.domain = domain;
+    Ok((actor, references))
 }
 
 fn parse_remote_actor_document(
@@ -2138,6 +2222,7 @@ fn parse_remote_actor_document(
         RemoteActor {
             id: actor_url.clone(),
             username: actor_username,
+            domain,
             actor_type,
             display_name,
             note,
@@ -2205,23 +2290,26 @@ fn remote_actor_handle(
     document: &Value,
     actor_url: &Url,
 ) -> Result<(String, String), RemoteFetchError> {
-    let domain = remote_actor_domain(actor_url)?;
-    let username = document
+    // FEP-2c59 `webfinger` may name another domain; WebFinger must confirm it.
+    if let Some((username, domain)) = document
         .get("webfinger")
         .and_then(Value::as_str)
         .and_then(parse_account_subject)
-        .filter(|(_, actor_domain)| actor_domain.eq_ignore_ascii_case(&domain))
-        .map(|(username, _)| username.to_owned())
-        .or_else(|| {
-            document
-                .get("preferredUsername")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_owned)
+        .filter(|(username, _)| valid_remote_username(username))
+        .and_then(|(username, domain)| {
+            canonical_remote_domain(domain)
+                .ok()
+                .map(|domain| (username.to_owned(), domain))
         })
-        .filter(|username| valid_remote_username(username))
+    {
+        return Ok((username, domain));
+    }
+    let username = document
+        .get("preferredUsername")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && valid_remote_username(value))
         .ok_or(RemoteFetchError::InvalidRepresentation)?;
-    Ok((username, domain))
+    Ok((username.to_owned(), remote_actor_domain(actor_url)?))
 }
 
 fn actor_contains_key(actor: &RemoteActor, references: &[Url], key_id: &Url) -> bool {
@@ -3809,7 +3897,6 @@ mod tests {
 
     #[test]
     fn webfinger_requires_a_matching_activitypub_self_link() {
-        let expected_origin = Url::parse("https://remote.example/").unwrap();
         let document = parse_webfinger_document(
             br#"{
                 "subject": "acct:Alice@remote.example",
@@ -3817,8 +3904,6 @@ mod tests {
                     {"rel": "self", "type": "application/activity+json", "href": "https://remote.example/users/alice"}
                 ]
             }"#,
-            "Alice",
-            &expected_origin,
         )
         .unwrap();
 
@@ -3828,11 +3913,7 @@ mod tests {
             Url::parse("https://remote.example/users/alice").unwrap()
         );
         assert!(matches!(
-            parse_webfinger_document(
-                br#"{"subject":"acct:Alice@remote.example","links":[]}"#,
-                "Alice",
-                &expected_origin
-            ),
+            parse_webfinger_document(br#"{"subject":"acct:Alice@remote.example","links":[]}"#),
             Err(RemoteFetchError::InvalidRepresentation)
         ));
     }
@@ -3857,10 +3938,11 @@ mod tests {
                     {"rel": "self", "type": "application/activity+json", "href": "http://remote.example:443/users/alice"}
                 ]
             }"#,
-            "Alice",
-            &expected_origin,
         );
-        assert!(document.is_ok());
+        assert_eq!(
+            document.unwrap().self_link.as_str(),
+            "http://remote.example:443/users/alice"
+        );
     }
 
     #[test]
@@ -4018,6 +4100,104 @@ mod tests {
             ["images.fixture.invalid", "cdn.fixture.invalid"]
         );
         server.join().unwrap();
+    }
+
+    fn webfinger(subject: &str, href: &str) -> WebFingerDocument {
+        WebFingerDocument {
+            subject: subject.to_owned(),
+            self_link: Url::parse(href).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn webfinger_confirmation_follows_one_split_domain_redirect() {
+        let actor = Url::parse("https://mastodon.bsd.example/users/jae").unwrap();
+        let calls = std::sync::Mutex::new(Vec::new());
+        let confirm = |second: WebFingerDocument| {
+            let calls = &calls;
+            let actor = &actor;
+            async move {
+                confirm_webfinger("jae", "mastodon.bsd.example", actor, |user, domain| {
+                    calls.lock().unwrap().push(format!("{user}@{domain}"));
+                    let document = if domain == "mastodon.bsd.example" {
+                        webfinger("acct:jae@bsd.example", actor.as_str())
+                    } else {
+                        second.clone()
+                    };
+                    async move { Ok(document) }
+                })
+                .await
+            }
+        };
+        let confirmed = confirm(webfinger("acct:jae@bsd.example", actor.as_str())).await;
+        assert_eq!(
+            confirmed.unwrap(),
+            ("jae".to_owned(), "bsd.example".to_owned())
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["jae@mastodon.bsd.example", "jae@bsd.example"]
+        );
+        // The confirming domain must vouch for exactly this actor, with no second redirect.
+        for second in [
+            webfinger(
+                "acct:jae@bsd.example",
+                "https://mastodon.bsd.example/users/other",
+            ),
+            webfinger("acct:jae@third.example", actor.as_str()),
+            webfinger("acct:other@bsd.example", actor.as_str()),
+        ] {
+            assert!(matches!(
+                confirm(second).await,
+                Err(RemoteFetchError::IdentityMismatch)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn webfinger_confirmation_same_domain_requires_self_link() {
+        let actor = Url::parse("https://remote.example/users/alice").unwrap();
+        let check = |href: &'static str| {
+            confirm_webfinger("alice", "remote.example", &actor, move |_, _| async move {
+                Ok(webfinger("acct:Alice@remote.example", href))
+            })
+        };
+        assert_eq!(
+            check("https://remote.example/users/alice").await.unwrap(),
+            ("alice".to_owned(), "remote.example".to_owned())
+        );
+        assert!(matches!(
+            check("https://remote.example/users/mallory").await,
+            Err(RemoteFetchError::IdentityMismatch)
+        ));
+    }
+
+    #[test]
+    fn verified_split_domain_actor_keeps_its_account_domain() {
+        let url = Url::parse("https://mastodon.bsd.example/users/jae").unwrap();
+        let document = serde_json::json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "id": url.as_str(), "type": "Person", "preferredUsername": "jae",
+            "inbox": "https://mastodon.bsd.example/users/jae/inbox"
+        });
+        let body = serde_json::to_vec(&document).unwrap();
+        let (actor, _) =
+            parse_confirmed_actor_document(&body, &url, ("jae".into(), "bsd.example".into()))
+                .unwrap();
+        assert_eq!(actor.domain, "bsd.example");
+        // Without WebFinger confirmation the plain parser still refuses another domain.
+        assert!(matches!(
+            parse_remote_actor(&body, &url, "jae", "bsd.example"),
+            Err(RemoteFetchError::OriginMismatch)
+        ));
+        let own = parse_remote_actor(
+            &serde_json::to_vec(&document).unwrap(),
+            &url,
+            "jae",
+            "mastodon.bsd.example",
+        )
+        .unwrap();
+        assert_eq!(own.domain, "mastodon.bsd.example");
     }
 
     #[test]

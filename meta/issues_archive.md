@@ -157,3 +157,4 @@
 - [x] [License Rustodon under the AGPL like Mastodon](issues/license-under-agpl.md)
 - [x] [Accept ordinary ActivityPub tag atom identifiers](issues/accept-activitypub-tag-atom-identifiers.md)
 - [x] [Accept remote notes without content](issues/accept-remote-notes-without-content.md)
+- [x] [Resolve split-domain remote actors](issues/resolve-split-domain-remote-actors.md)

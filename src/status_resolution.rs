@@ -159,9 +159,13 @@ impl RemoteStatusResolver<'_> {
             if actor.id != actor_location || actor.suspended {
                 return Ok(None);
             }
-            let domain = canonical_remote_domain_from_url(&actor_location).map_err(|_| ())?;
             self.writer
-                .upsert_remote_actor(&actor.username, &domain, self.limited_federation, &actor)
+                .upsert_remote_actor(
+                    &actor.username,
+                    &actor.domain,
+                    self.limited_federation,
+                    &actor,
+                )
                 .await
                 .map_err(|_| ())?
         };

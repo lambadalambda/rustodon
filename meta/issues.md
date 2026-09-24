@@ -14,4 +14,4 @@
 - [ ] [Support featured-tag peer AddHashtag/RemoveHashtag](issues/support-featured-tag-peer-add-remove.md)
 - [ ] [Complete v1 external acceptance](issues/complete-v1-external-acceptance.md)
 - [ ] [Prove post-v1 durability under disk-full, power loss and load](issues/prove-post-v1-durability.md)
-- [ ] [Resolve split-domain remote actors](issues/resolve-split-domain-remote-actors.md)
+- [ ] [Repair the failing worker lane tests](issues/repair-failing-worker-lane-tests.md)

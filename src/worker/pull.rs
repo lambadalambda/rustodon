@@ -922,7 +922,7 @@ pub(super) async fn resolve_remote_note_author(
     writer
         .upsert_remote_actor(
             &actor.username,
-            &actor_domain,
+            &actor.domain,
             config.limited_federation,
             &actor,
         )
@@ -1523,7 +1523,7 @@ pub(super) async fn process_activitypub_thread_resolution(
         writer
             .upsert_remote_actor(
                 &actor.username,
-                &actor_domain,
+                &actor.domain,
                 config.limited_federation,
                 &actor,
             )

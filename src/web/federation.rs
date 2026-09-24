@@ -382,7 +382,7 @@ pub(super) async fn refresh_remote_federation_signature(
     writer
         .upsert_remote_actor(
             &actor.username,
-            &resolution.domain,
+            &actor.domain,
             state.instance_runtime.limited_federation,
             &actor,
         )

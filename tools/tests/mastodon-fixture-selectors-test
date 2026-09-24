@@ -73,6 +73,9 @@ worker_rust_test quote_federation_lifecycle
 grep -F -- '--features test-support --test workers quote_lifecycle::quote_federation_lifecycle' "$work/cargo" >/dev/null || die 'incorrect quote worker target'
 [ "$(wc -l < "$work/cargo" | tr -d ' ')" = 2 ] || die 'expected worker list check then exact execution'
 : > "$work/cargo"
+worker_rust_test split_domain
+grep -F -- '--features test-support --lib split_domain_tests::' "$work/cargo" >/dev/null || die 'incorrect split-domain worker target'
+: > "$work/cargo"
 worker_rust_test update_versions
 grep -F -- '--features test-support --test workers update_versions::' "$work/cargo" >/dev/null || die 'incorrect update-versions worker target'
 [ "$(wc -l < "$work/cargo" | tr -d ' ')" = 2 ] || die 'expected update-versions list check then execution'

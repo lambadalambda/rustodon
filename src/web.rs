@@ -3395,7 +3395,7 @@ async fn search_accounts(
             if writer
                 .upsert_remote_actor(
                     &actor_username,
-                    domain,
+                    &actor.domain,
                     state.instance_runtime.limited_federation,
                     &actor,
                 )
