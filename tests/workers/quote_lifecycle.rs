@@ -104,7 +104,10 @@ async fn quote_update_effect_counts(
 ) -> Result<(i64, i64), sqlx::Error> {
     sqlx::query_as(
         "SELECT
-           (SELECT count(*) FROM rustodon.outbox_events
+           -- One update fans out to a global event plus one per recipient; they
+           -- share the version suffix of their logical keys.
+           (SELECT count(DISTINCT regexp_replace(logical_key, '^.*:', ''))
+              FROM rustodon.outbox_events
              WHERE kind = 'rustodon.mastodon.stream_event'
                AND (payload ->> 'object_id')::bigint = $1
                AND payload ->> 'event' = 'status.update'),
@@ -177,14 +180,30 @@ async fn expire_quote_delivery_lease(
     Ok(())
 }
 
+/// Records each delivery in `seen` as it arrives, so a timeout can report them.
 async fn quote_delivery_server(
     listener: TcpListener,
     count: usize,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 ) -> Result<Vec<Vec<u8>>, std::io::Error> {
     let mut requests = Vec::with_capacity(count);
     for _ in 0..count {
         let (mut socket, _) = listener.accept().await?;
-        requests.push(fixture_delivery_request(&mut socket).await?);
+        let request = fixture_delivery_request(&mut socket).await?;
+        let text = String::from_utf8_lossy(&request);
+        let first_line = text.lines().next().unwrap_or_default().to_owned();
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let summary = serde_json::from_str::<Value>(body).map_or_else(
+            |_| {
+                format!(
+                    "{first_line} (unparsed body: {})",
+                    body.chars().take(120).collect::<String>()
+                )
+            },
+            |body| format!("{first_line} {} {}", body["type"], body["id"]),
+        );
+        seen.lock().expect("delivery log").push(summary);
+        requests.push(request);
         socket
             .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .await?;
@@ -447,7 +466,12 @@ async fn quote_federation_lifecycle() -> Result<(), Box<dyn std::error::Error>> 
     .bind(delivery_inbox)
     .execute(&owner)
     .await?;
-    let delivery_server = tokio::spawn(quote_delivery_server(delivery_listener, 3));
+    let delivery_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let delivery_server = tokio::spawn(quote_delivery_server(
+        delivery_listener,
+        3,
+        delivery_log.clone(),
+    ));
 
     let operation = async {
         if !executor
@@ -915,12 +939,24 @@ async fn quote_federation_lifecycle() -> Result<(), Box<dyn std::error::Error>> 
         {
             return Err("scalar QuoteRequest fetch was not retried with Alice's signature".into());
         }
-        let delivery_requests = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            delivery_server,
-        )
-        .await
-        .map_err(|_| "timed out waiting for quote deliveries")???;
+        let Ok(delivery_requests) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), delivery_server).await
+        else {
+            let jobs: Vec<Value> = sqlx::query_scalar(
+                "SELECT jsonb_build_object('kind', kind, 'attempts', attempts, 'dead', \
+                        dead_at IS NOT NULL, 'error', last_error, \
+                        'type', arguments #>> '{body,type}', 'inbox', arguments ->> 'inbox_url') \
+                   FROM rustodon.durable_jobs WHERE lane = 'push'",
+            )
+            .fetch_all(&owner)
+            .await?;
+            return Err(format!(
+                "timed out waiting for quote deliveries; received {:?}; push jobs {jobs:?}",
+                delivery_log.lock().expect("delivery log")
+            )
+            .into());
+        };
+        let delivery_requests = delivery_requests??;
         let delivered_bodies = delivery_requests
             .iter()
             .map(|request| {
@@ -1034,8 +1070,21 @@ async fn quote_federation_lifecycle() -> Result<(), Box<dyn std::error::Error>> 
         if count != baseline + 1 {
             return Err("accepted quote did not increment the exact target counter".into());
         }
-        if quote_update_effect_counts(&owner, ACCEPT_STATUS).await? != (1, 1) {
-            return Err("quote acceptance did not record exactly one stream and distribution update".into());
+        let effects = quote_update_effect_counts(&owner, ACCEPT_STATUS).await?;
+        if effects != (1, 1) {
+            let events: Vec<Value> = sqlx::query_scalar(
+                "SELECT jsonb_build_object('key', logical_key, 'account', payload ->> 'account_id') \
+                   FROM rustodon.outbox_events WHERE kind = 'rustodon.mastodon.stream_event' \
+                    AND (payload ->> 'object_id')::bigint = $1 AND payload ->> 'event' = 'status.update'",
+            )
+            .bind(ACCEPT_STATUS)
+            .fetch_all(&owner)
+            .await?;
+            return Err(format!(
+                "quote acceptance did not record exactly one stream and distribution update: \
+                 {effects:?}; stream events {events:?}"
+            )
+            .into());
         }
         process_activity(
             &queue,
@@ -1271,8 +1320,9 @@ async fn quote_federation_lifecycle() -> Result<(), Box<dyn std::error::Error>> 
             return Err("remote quoting Note deletion retained pending quote jobs".into());
         }
         let authorization_delete: (String, String) = sqlx::query_as(
+            // Mastodon embeds the QuoteAuthorization object in its Delete.
             "SELECT payload #>> '{arguments,body,type}',
-                    payload #>> '{arguments,body,object}'
+                    payload #>> '{arguments,body,object,id}'
                FROM rustodon.outbox_events
               WHERE kind = $1 AND logical_key LIKE $2
               ORDER BY id LIMIT 1",
