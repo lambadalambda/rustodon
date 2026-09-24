@@ -1,3 +1,12 @@
+## 2026-09-24 — Worker lane repair, first pass
+
+- Full worker lane from 93/29 to 105/17, then focused fixes 7/7. One product bug
+  (outbox dispatched_at before created_at) and several outdated tests; a filtered
+  `worker-test filter` case with several libtest filters makes reruns cheap.
+- Remaining failures are listed in the worker-lane issue; they need real analysis
+  (late notification job, forwarding replay, quote lifecycle, poll startup, test
+  isolation).
+
 ## 2026-09-24 — Misskey null content, split-domain actors, worker lane state
 
 - Remote Notes with `"content": null` (Misskey media-only) are accepted as empty

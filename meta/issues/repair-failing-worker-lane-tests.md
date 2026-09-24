@@ -45,3 +45,38 @@ from shared fixture state or test ordering.
 - Each failure is classified as a product bug, test-isolation bug or timing
   sensitivity, and fixed.
 - The full worker lane passes on an idle worker host.
+
+## Progress 2026-09-24
+
+Full lane now 105 passed / 17 failed before the latest test fixes; a focused run
+of the fixed tests passes 7/7. Classified so far:
+
+- Product bug fixed (43cb557): outbox rows inserted as dispatched could get
+  `dispatched_at` one microsecond before `created_at` and violate
+  `outbox_events_dispatched_check`, failing purge/unsuspend writes.
+- Outdated tests fixed (a49e72a, f695f83): the audience-independent stream hint
+  (account 0) is intended and must only be unroutable; poll `expires_at` is
+  `timestamp`; pending local quotes carry the RE: fallback (Mastodon does the
+  same); poll statuses federate as Question; the runtime test must pass its
+  writer pool; parent-fetch tests now scope to their own rows and restore their
+  missing-stats precondition.
+- Cascade: the domain-purge failure left rows that broke parent-fetch tests.
+
+## Still failing
+
+- `activitypub_note_create_update_and_delete_are_processed_idempotently`: a
+  `quoted_update` notification for the deleted note remains (likely created by a
+  late job after the delete cleanup).
+- `uri_only_create_is_deduplicated_retried_materialized_and_replayed`: replay after
+  the materialization boundary does not restore forwarding work.
+- `quote_lifecycle::quote_federation_lifecycle`: `RowNotFound` without context.
+- `lifecycles::update_versions::*`: pass alone, fail in the full run (dead letters).
+- `poll_expirations::` bounded startup ordering, repair timing
+  (`repaired_late <= scan_started_at`), hard readiness bound (unexpected NULL),
+  deferral timeout, zero-progress retry: reconciliation startup under load and
+  shared state.
+
+## Follow-up (not a test failure)
+
+- Actor deletion emits two idempotent deletes per user stream (keys `:0` and
+  `:<version>`); consider one key.
