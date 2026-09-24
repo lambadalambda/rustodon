@@ -202,19 +202,21 @@ async fn quote_federation_lifecycle() -> Result<(), Box<dyn std::error::Error>> 
     let writer =
         sqlx::PgPool::connect(&std::env::var("RUSTODON_WORKER_WRITE_DATABASE_URL")?).await?;
     reset().await?;
-    let baseline: i64 =
-        sqlx::query_scalar("SELECT quotes_count FROM status_stats WHERE status_id = $1")
-            .bind(REMOTE_TARGET)
-            .fetch_one(&owner)
-            .await?;
+    // Mastodon creates status_stats rows lazily; a missing row means zero quotes.
+    let baseline: i64 = sqlx::query_scalar(
+        "SELECT COALESCE((SELECT quotes_count FROM status_stats WHERE status_id = $1), 0)",
+    )
+    .bind(REMOTE_TARGET)
+    .fetch_one(&owner)
+    .await?;
     let (target_ap_id, target_web_link): (String, Option<String>) =
         sqlx::query_as("SELECT uri, url FROM statuses WHERE id = $1")
             .bind(REMOTE_TARGET)
             .fetch_one(&owner)
             .await?;
     let target_web_link = target_web_link.unwrap_or_else(|| target_ap_id.clone());
-    let bob_inboxes: (String, String) =
-        sqlx::query_as("SELECT inbox_url, shared_inbox_url FROM accounts WHERE id = $1")
+    let bob_inboxes: (String, String, i32) =
+        sqlx::query_as("SELECT inbox_url, shared_inbox_url, protocol FROM accounts WHERE id = $1")
             .bind(BOB)
             .fetch_one(&owner)
             .await?;
@@ -437,11 +439,14 @@ async fn quote_federation_lifecycle() -> Result<(), Box<dyn std::error::Error>> 
         Some(config),
     )?;
     let executor = WorkerExecutor::new(queue.clone(), handlers, 1, 1)?;
-    sqlx::query("UPDATE accounts SET inbox_url = $2, shared_inbox_url = $2 WHERE id = $1")
-        .bind(BOB)
-        .bind(delivery_inbox)
-        .execute(&owner)
-        .await?;
+    // Delivery only reaches ActivityPub accounts; the fixture's Bob is protocol 0.
+    sqlx::query(
+        "UPDATE accounts SET inbox_url = $2, shared_inbox_url = $2, protocol = 1 WHERE id = $1",
+    )
+    .bind(BOB)
+    .bind(delivery_inbox)
+    .execute(&owner)
+    .await?;
     let delivery_server = tokio::spawn(quote_delivery_server(delivery_listener, 3));
 
     let operation = async {
@@ -1299,12 +1304,15 @@ async fn quote_federation_lifecycle() -> Result<(), Box<dyn std::error::Error>> 
     }
     .await;
 
-    sqlx::query("UPDATE accounts SET inbox_url = $2, shared_inbox_url = $3 WHERE id = $1")
-        .bind(BOB)
-        .bind(&bob_inboxes.0)
-        .bind(&bob_inboxes.1)
-        .execute(&owner)
-        .await?;
+    sqlx::query(
+        "UPDATE accounts SET inbox_url = $2, shared_inbox_url = $3, protocol = $4 WHERE id = $1",
+    )
+    .bind(BOB)
+    .bind(&bob_inboxes.0)
+    .bind(&bob_inboxes.1)
+    .bind(bob_inboxes.2)
+    .execute(&owner)
+    .await?;
     sqlx::query("DELETE FROM blocks WHERE account_id = $1 AND target_account_id = $2 AND uri = $3")
         .bind(ALICE)
         .bind(BOB)

@@ -384,12 +384,21 @@ async fn zero_progress_poll_reconciliation_retries_same_rows_until_dead_letter()
             .bind(job_id)
             .fetch_one(&owner)
             .await?;
+            let last_error: Option<String> =
+                sqlx::query_scalar("SELECT last_error FROM rustodon.durable_jobs WHERE id = $1")
+                    .bind(job_id)
+                    .fetch_one(&owner)
+                    .await?;
             assert_eq!(persisted.0, job_id, "{label} retry changed job ID");
             assert_eq!(persisted.1, attempt);
             assert_eq!(persisted.2, 2);
             assert_eq!(persisted.3, arguments, "{label} retry mutated arguments");
             assert_eq!(persisted.4, logical_key, "{label} retry mutated its key");
-            assert_eq!(persisted.5.is_some(), attempt == 2);
+            assert_eq!(
+                persisted.5.is_some(),
+                attempt == 2,
+                "{label} attempt {attempt}: {last_error:?}"
+            );
 
             let durable_history: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM rustodon.durable_jobs \

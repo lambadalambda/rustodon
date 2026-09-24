@@ -303,17 +303,19 @@ async fn delivered_updates(profile: bool) -> TestResult {
             );
         }
         for queue in [&queue, &receiver_queue] {
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM rustodon.durable_jobs WHERE kind = $1 OR kind = $2"
+            let leftover = sqlx::query_scalar::<_, Value>(
+                "SELECT jsonb_build_object('kind', kind, 'attempts', attempts,
+                        'dead', dead_at IS NOT NULL, 'error', last_error)
+                   FROM rustodon.durable_jobs WHERE kind = $1 OR kind = $2",
             )
             .bind(ACTIVITYPUB_DELIVERY_JOB_KIND)
             .bind(ACTIVITYPUB_INBOX_JOB_KIND)
-            .fetch_one(queue.pool())
-            .await?,
-            0,
-            "both sides must finish, without retrying or dead-letter jobs"
-        );
+            .fetch_all(queue.pool())
+            .await?;
+            assert!(
+                leftover.is_empty(),
+                "both sides must finish, without retrying or dead-letter jobs: {leftover:?}"
+            );
         }
     }
     assert_ne!(delivered[0]["id"], delivered[1]["id"]);
