@@ -249,10 +249,16 @@ async fn check_audience(audience: Audience) -> TestResult {
                  WHERE kind = $1 AND payload ->> 'object_id' = $2
                    AND payload ->> 'event' = 'update'
                    AND (payload ->> 'account_id' IS NULL
-                        OR (payload ->> 'account_id')::bigint <> ALL($3::bigint[]))",
+                        OR (payload ->> 'account_id')::bigint <> ALL($3::bigint[]))
+                   -- The audience-independent event (account 0) is a routing hint that
+                   -- streaming filters per subscriber; it must not route anywhere.
+                   AND NOT ((payload ->> 'account_id')::bigint = 0
+                        AND NOT coalesce((payload -> 'after' ->> 'public')::boolean, false)
+                        AND NOT coalesce((payload -> 'after' ->> 'hashtag')::boolean, false)
+                        AND coalesce(jsonb_array_length(payload -> 'after' -> 'lists'), 0) = 0)",
             ).bind(STREAM_EVENT_KIND).bind(id.to_string())
                 .bind(expected.iter().map(|(id, _)| *id).collect::<Vec<_>>())
-                .fetch_one(&runtime).await?, 0, "no status stream to nonrecipients");
+                .fetch_one(&runtime).await?, 0, "no routable status stream to nonrecipients");
             assert_eq!(sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM rustodon.outbox_events WHERE kind = $1",
             ).bind(ACTIVITYPUB_DELIVERY_JOB_KIND).fetch_one(&runtime).await?, 0,
