@@ -874,7 +874,10 @@ async fn quote_federation_lifecycle() -> Result<(), Box<dyn std::error::Error>> 
         .bind(INBOUND_SCALAR_URI)
         .fetch_one(&owner)
         .await?;
-        if scalar_result != (1, 2) {
+        // Mastodon 4.6.5: the allowed quote was revoked above (count back to 0), and a
+        // quoteUrl-only instrument is a legacy quote, whose acceptance is never counted
+        // (Quote#update_counter_caches! returns on legacy?).
+        if scalar_result != (1, 0) {
             let target_quotes: Vec<Value> = sqlx::query_scalar(
                 "SELECT jsonb_build_object('id', quote.id, 'state', quote.state, 'legacy', quote.legacy, \
                         'status_uri', status.uri) \
