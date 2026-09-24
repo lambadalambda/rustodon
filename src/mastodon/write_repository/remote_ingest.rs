@@ -3657,6 +3657,14 @@ impl WriteRepository {
                 .fetch_all(&mut *transaction)
                 .await?;
                 if !quoting_quotes.is_empty() {
+                    // Before detaching: the notification cleanup below can no longer
+                    // find quoting statuses once quoted_status_id is NULL.
+                    let quoting_status_ids = quoting_quotes
+                        .iter()
+                        .map(|(_, quoting_status_id, _)| *quoting_status_id)
+                        .collect::<Vec<_>>();
+                    delete_quoted_update_notifications(&mut transaction, &quoting_status_ids)
+                        .await?;
                     sqlx::query(
                         "UPDATE quotes SET quoted_status_id = NULL, approval_uri = NULL, \
                                 updated_at = clock_timestamp() \

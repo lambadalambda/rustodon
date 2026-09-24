@@ -7241,7 +7241,7 @@ async fn resolve_quoted_update_activity(
         "SELECT quote.quoted_account_id, quote.account_id, status.created_at \
          FROM statuses status JOIN quotes quote ON quote.status_id = status.id \
          WHERE status.id = $1 AND status.deleted_at IS NULL \
-           AND quote.quoted_account_id IS NOT NULL",
+           AND quote.quoted_account_id IS NOT NULL AND quote.quoted_status_id IS NOT NULL",
     )
     .bind(id)
     .fetch_optional(&mut **transaction)
@@ -10815,6 +10815,40 @@ async fn delete_remote_status_notifications(
             &activity_type,
         )
         .await?;
+    }
+    Ok(())
+}
+
+/// Removes `quoted_update` notifications about quoting statuses whose quoted
+/// status is going away.
+async fn delete_quoted_update_notifications(
+    transaction: &mut Transaction<'_, Postgres>,
+    quoting_status_ids: &[i64],
+) -> Result<(), WriteError> {
+    // Same order as delete_activity_notifications: recipient lock, then delete.
+    let recipients = sqlx::query_scalar::<_, i64>(
+        "SELECT DISTINCT account_id FROM notifications
+          WHERE type = 'quoted_update' AND activity_type = 'Status'
+            AND activity_id = ANY($1)
+          ORDER BY account_id",
+    )
+    .bind(quoting_status_ids)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for recipient_account_id in recipients {
+        lock_account_advisory(transaction, recipient_account_id).await?;
+        let from_account_ids = sqlx::query_scalar::<_, i64>(
+            "DELETE FROM notifications
+              WHERE account_id = $1 AND type = 'quoted_update'
+                AND activity_type = 'Status' AND activity_id = ANY($2)
+          RETURNING from_account_id",
+        )
+        .bind(recipient_account_id)
+        .bind(quoting_status_ids)
+        .fetch_all(&mut **transaction)
+        .await?;
+        reconcile_notification_requests(transaction, recipient_account_id, &from_account_ids)
+            .await?;
     }
     Ok(())
 }
