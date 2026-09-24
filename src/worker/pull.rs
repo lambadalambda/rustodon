@@ -394,18 +394,33 @@ pub(super) async fn process_activitypub_note_resolution(
         .map_err(|error| {
             remote_note_write_failure(&error, "remote Note resolution state lookup failed")
         })?;
-    if resolved && let Some(delivery_target_account_id) = delivery_target_account_id {
-        writer
-            .ensure_remote_note_reference_delivery(
-                source_account_id,
-                actor_uri,
-                object_uri,
-                delivery_target_account_id,
-            )
-            .await
-            .map_err(|error| {
-                remote_note_write_failure(&error, "remote Note delivery target repair failed")
-            })?;
+    let has_ld_signature = activity
+        .get("signature")
+        .is_some_and(|signature| !signature.is_null());
+    if resolved {
+        if let Some(delivery_target_account_id) = delivery_target_account_id {
+            writer
+                .ensure_remote_note_reference_delivery(
+                    source_account_id,
+                    actor_uri,
+                    object_uri,
+                    delivery_target_account_id,
+                )
+                .await
+                .map_err(|error| {
+                    remote_note_write_failure(&error, "remote Note delivery target repair failed")
+                })?;
+        }
+        // Crash replay: restore forwarding for the stored Note before the optional
+        // refetch, so a failed fetch cannot drop it. Forwarding is idempotent.
+        if has_ld_signature {
+            writer
+                .record_remote_note_reference_forwarding(actor_uri, object_uri, activity)
+                .await
+                .map_err(|error| {
+                    remote_note_write_failure(&error, "resolved remote Note forwarding failed")
+                })?;
+        }
     }
     let target = Url::parse(object_uri)
         .map_err(|_| HandlerFailure::permanent("remote Create object URI is invalid"))?;
@@ -541,10 +556,7 @@ pub(super) async fn process_activitypub_note_resolution(
                 remote_note_write_failure(&error, "resolved remote QuoteAuthorization write failed")
             })?;
     }
-    if activity
-        .get("signature")
-        .is_some_and(|signature| !signature.is_null())
-    {
+    if has_ld_signature {
         writer
             .record_remote_note_reference_forwarding(actor_uri, object_uri, activity)
             .await
