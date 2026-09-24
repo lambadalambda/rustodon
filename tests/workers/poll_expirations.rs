@@ -2715,7 +2715,8 @@ async fn poll_expiration_reconciliation_repairs_exact_generations_and_preserves_
          VALUES ($1, $2, jsonb_build_object( \
              'lane', 'core', 'arguments', jsonb_build_object( \
                  'poll_id', $3::bigint, 'expires_at_micros', $4::bigint), \
-             'run_at', to_jsonb((clock_timestamp() + interval '7 days')::text)))",
+             'run_at', to_jsonb((clock_timestamp() + interval '7 days')::text), \
+             'max_attempts', 25))",
     )
     .bind(MASTODON_POLL_EXPIRATION_JOB_KIND)
     .bind(&pending_rescheduled_key)
@@ -3030,7 +3031,18 @@ async fn poll_expiration_reconciliation_repairs_exact_generations_and_preserves_
     shutdown_sender
         .send(())
         .expect("startup runtime is listening");
-    runtime.await??;
+    if let Err(error) = runtime.await? {
+        let undispatched: Vec<Value> = sqlx::query_scalar(
+            "SELECT jsonb_build_object('kind', kind, 'key', logical_key, 'payload', payload) \
+               FROM rustodon.outbox_events \
+              WHERE dispatched_at IS NULL AND kind <> 'rustodon.mastodon.stream_event'",
+        )
+        .fetch_all(&owner)
+        .await?;
+        return Err(
+            format!("startup runtime failed: {error:?}; undispatched {undispatched:?}").into(),
+        );
+    }
 
     sqlx::query(
         "UPDATE rustodon.outbox_events SET payload = jsonb_build_object('version', 0) \
