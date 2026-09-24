@@ -399,6 +399,10 @@ cargo test --locked --all-features --lib activity::tests:: -- --ignored --test-t
 cargo test --locked --all-features --lib worker::activity_tests:: -- --ignored --test-threads=1
 ```
 
+Focused worker cases: `worker-test update_versions` (two-database receiver
+regressions) and `worker-test split_domain` (split-domain actor persistence and
+host blocks).
+
 `tools/mastodon-fixture worker-test instance_activity` runs the two ignored
 selectors on a fresh restored fixture with the correct roles; the full worker
 lane includes them.

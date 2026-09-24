@@ -1,3 +1,18 @@
+## 2026-09-24 — Misskey null content, split-domain actors, worker lane state
+
+- Remote Notes with `"content": null` (Misskey media-only) are accepted as empty
+  text; one shared helper serves inbox validation and the writer.
+- Split-domain actors (actor on mastodon.bsd.cafe, handle acct:jae@bsd.cafe) now
+  resolve with Mastodon's two-step WebFinger check and are stored under the
+  confirmed domain. An independent security review caught three blockers before
+  commit: host-level domain policy, host-based key-resolution domain, and the
+  known-key ingress comparison. Red/green `worker-test split_domain` (the first
+  red was invalid: severity 2 is `noop`, not `suspend`).
+- The full worker lane fails on main: 93 passed / 29 failed on both baseline
+  31244a8 and the change; filed as its own issue. Several failures only appear
+  in the full run, so test isolation is part of the problem.
+- Deployed 341e784 before these fixes.
+
 ## 2026-09-23 — Split the three largest files
 
 - Pure moves, one area per commit, each gated by check, strict Clippy and lib
