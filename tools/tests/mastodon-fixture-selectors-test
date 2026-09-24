@@ -73,8 +73,8 @@ worker_rust_test quote_federation_lifecycle
 grep -F -- '--features test-support --test workers quote_lifecycle::quote_federation_lifecycle' "$work/cargo" >/dev/null || die 'incorrect quote worker target'
 [ "$(wc -l < "$work/cargo" | tr -d ' ')" = 2 ] || die 'expected worker list check then exact execution'
 : > "$work/cargo"
-RUSTODON_WORKER_TEST_FILTER=direct_visibility:: worker_rust_test filter
-grep -F -- '--features test-support --test workers direct_visibility::' "$work/cargo" >/dev/null || die 'incorrect filtered worker target'
+RUSTODON_WORKER_TEST_FILTER='direct_visibility:: poll_' worker_rust_test filter
+grep -F -- '--ignored --nocapture --test-threads=1 direct_visibility:: poll_' "$work/cargo" >/dev/null || die 'incorrect filtered worker target'
 if (RUSTODON_WORKER_TEST_FILTER='x; rm' worker_rust_test filter) > "$work/error" 2>&1; then die 'unsafe worker filter accepted'; fi
 : > "$work/cargo"
 worker_rust_test split_domain

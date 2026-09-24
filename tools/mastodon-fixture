@@ -1317,14 +1317,17 @@ worker_rust_test() {
         -- --ignored --exact --nocapture --test-threads=1
       ;;
     filter)
-      # Debugging aid: run the ignored worker tests whose names contain the filter.
+      # Debugging aid: run the ignored worker tests matching any space-separated filter.
       test_filter=${RUSTODON_WORKER_TEST_FILTER:-}
       case "$test_filter" in
-        ''|*[!a-z0-9_:]*) die 'RUSTODON_WORKER_TEST_FILTER must use lowercase letters, digits, underscores or ::' ;;
+        ''|*[!a-z0-9_:\ ]*) die 'RUSTODON_WORKER_TEST_FILTER must use lowercase letters, digits, underscores, :: or spaces' ;;
       esac
-      require_ignored_tests group --features test-support --test workers "$test_filter" || return $?
-      cargo test --locked --features test-support --test workers "$test_filter" \
-        -- --ignored --nocapture --test-threads=1
+      for selector in $test_filter; do
+        require_ignored_tests group --features test-support --test workers "$selector" || return $?
+      done
+      # shellcheck disable=SC2086 # intentional word splitting into libtest filters
+      cargo test --locked --features test-support --test workers \
+        -- --ignored --nocapture --test-threads=1 $test_filter
       ;;
     split_domain)
       require_ignored_tests group --features test-support --lib split_domain_tests:: || return $?
