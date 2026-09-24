@@ -401,7 +401,8 @@ cargo test --locked --all-features --lib worker::activity_tests:: -- --ignored -
 
 Focused worker cases: `worker-test update_versions` (two-database receiver
 regressions) and `worker-test split_domain` (split-domain actor persistence and
-host blocks).
+host blocks). For debugging, `RUSTODON_WORKER_TEST_FILTER=direct_visibility::
+tools/mastodon-fixture worker-test filter` runs the matching ignored worker tests.
 
 `tools/mastodon-fixture worker-test instance_activity` runs the two ignored
 selectors on a fresh restored fixture with the correct roles; the full worker

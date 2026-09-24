@@ -1316,6 +1316,16 @@ worker_rust_test() {
       cargo test --locked --features test-support --test workers "$test_name" \
         -- --ignored --exact --nocapture --test-threads=1
       ;;
+    filter)
+      # Debugging aid: run the ignored worker tests whose names contain the filter.
+      test_filter=${RUSTODON_WORKER_TEST_FILTER:-}
+      case "$test_filter" in
+        ''|*[!a-z0-9_:]*) die 'RUSTODON_WORKER_TEST_FILTER must use lowercase letters, digits, underscores or ::' ;;
+      esac
+      require_ignored_tests group --features test-support --test workers "$test_filter" || return $?
+      cargo test --locked --features test-support --test workers "$test_filter" \
+        -- --ignored --nocapture --test-threads=1
+      ;;
     split_domain)
       require_ignored_tests group --features test-support --lib split_domain_tests:: || return $?
       cargo test --locked --features test-support --lib split_domain_tests:: \
@@ -1342,7 +1352,7 @@ worker_test() {
   if [ -n "$case_name" ]; then
     case "$case_name" in
       ''|*[!a-z0-9_]*) die 'worker case must use lowercase letters, digits, or underscores' ;;
-      quote_federation_lifecycle|instance_activity|update_versions|split_domain) ;;
+      quote_federation_lifecycle|instance_activity|update_versions|split_domain|filter) ;;
       *) die "unknown worker case: $case_name" ;;
     esac
   fi
