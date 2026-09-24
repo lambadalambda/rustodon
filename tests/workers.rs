@@ -18103,8 +18103,11 @@ async fn fixture_delivery_request(
         let content_length = headers
             .lines()
             .find_map(|line| {
-                line.strip_prefix("Content-Length:")
-                    .and_then(|value| value.trim().parse::<usize>().ok())
+                // hyper sends lowercase header names.
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
             })
             .unwrap_or_default();
         if request.len() >= header_end + 4 + content_length {
