@@ -71,6 +71,12 @@ async fn check_recovery(label: &str, child_visibility: i32, parent_visibility: i
         .await?,
         ("rustodon_differential_writer".into(), false)
     );
+    // Stats self-heal in earlier worker tests may create the parent author's row;
+    // this scenario needs it missing, as in the restored fixture.
+    sqlx::query("DELETE FROM account_stats WHERE account_id = $1")
+        .bind(PARENT_AUTHOR)
+        .execute(&owner)
+        .await?;
     let baseline: Vec<(i64, i64, Option<NaiveDateTime>)> = sqlx::query_as(
         "SELECT account_id, statuses_count, last_status_at FROM account_stats
          WHERE account_id IN ($1, $2) ORDER BY account_id",
@@ -198,8 +204,10 @@ async fn check_recovery(label: &str, child_visibility: i32, parent_visibility: i
         let initial = status_row(&runtime, child_id).await?;
         assert_eq!(initial, (BOB, child_visibility, false, true, None, None, conversation));
         let options = TimelineOptions { since_id: Some(child_id - 1), ..TimelineOptions::default() };
+        // Only this scenario's statuses: other worker tests may leave newer fixture rows.
         assert_eq!(loader.home_timeline(ALICE, &options).await?.into_iter()
-            .map(|status| status.id).collect::<Vec<_>>(), vec![successor_id],
+            .map(|status| status.id).filter(|id| [child_id, successor_id].contains(id))
+            .collect::<Vec<_>>(), vec![successor_id],
             "unresolved reply is excluded, but its ordered resolved self reply proceeds");
         assert_public_route(&runtime, child_id, false).await?;
         assert_public_route(&runtime, successor_id, child_visibility == 0).await?;
@@ -257,7 +265,9 @@ async fn check_recovery(label: &str, child_visibility: i32, parent_visibility: i
         // One legitimate mention per status, NOT duplicate notifications.
         assert_notifications(&runtime, &[(child_id, BOB), (parent_id, PARENT_AUTHOR), (successor_id, BOB)]).await?;
         let mut feed_ids = loader.home_timeline(ALICE, &options).await?.into_iter()
-            .map(|status| status.id).collect::<Vec<_>>();
+            .map(|status| status.id)
+            .filter(|id| [child_id, parent_id, successor_id].contains(id))
+            .collect::<Vec<_>>();
         feed_ids.sort_unstable();
         let mut expected_ids = vec![child_id, parent_id, successor_id];
         expected_ids.sort_unstable();
@@ -281,9 +291,14 @@ async fn check_recovery(label: &str, child_visibility: i32, parent_visibility: i
             assert_eq!(sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM rustodon.outbox_events WHERE kind = $1
                  AND payload ->> 'event' = 'update' AND payload ->> 'object_id' = $2
-                 AND (payload ->> 'account_id' IS NULL OR payload ->> 'account_id' <> $3)",
+                 AND (payload ->> 'account_id' IS NULL OR payload ->> 'account_id' <> $3)
+                 -- The audience-independent hint (account 0) must not route anywhere.
+                 AND NOT (payload ->> 'account_id' = '0'
+                      AND NOT coalesce((payload -> 'after' ->> 'public')::boolean, false)
+                      AND NOT coalesce((payload -> 'after' ->> 'hashtag')::boolean, false)
+                      AND coalesce(jsonb_array_length(payload -> 'after' -> 'lists'), 0) = 0)",
             ).bind(STREAM_EVENT_KIND).bind(child_id.to_string()).bind(ALICE.to_string())
-                .fetch_one(&runtime).await?, 0, "private reply never streams to a nonrecipient");
+                .fetch_one(&runtime).await?, 0, "private reply never routes to a nonrecipient");
         }
         assert_eq!(sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM rustodon.outbox_events WHERE kind = $1",

@@ -1763,12 +1763,17 @@ async fn remote_expiry_replacement_finalizes_due_generation_before_suppression()
             .is_err(),
         "a malformed exact prior marker must roll back the replacement"
     );
-    let rolled_back: (DateTime<Utc>, Vec<i64>) =
-        sqlx::query_as("SELECT expires_at, cached_tallies FROM polls WHERE id = $1")
-            .bind(malformed_poll)
-            .fetch_one(&owner)
-            .await?;
-    assert_eq!(rolled_back, (malformed_expiry, vec![1, 0]));
+    let rolled_back: (DateTime<Utc>, Vec<i64>) = sqlx::query_as(
+        "SELECT expires_at AT TIME ZONE 'UTC', cached_tallies FROM polls WHERE id = $1",
+    )
+    .bind(malformed_poll)
+    .fetch_one(&owner)
+    .await?;
+    // PostgreSQL keeps microseconds; the Rust-side expiry may carry nanoseconds.
+    assert_eq!(
+        (rolled_back.0.timestamp_micros(), rolled_back.1),
+        (malformed_expiry.timestamp_micros(), vec![1, 0])
+    );
 
     for offset in 0_i64..3 {
         let poll_id = POLL_BASE + offset;
@@ -1858,7 +1863,7 @@ async fn remote_expiry_replacement_finalizes_due_generation_before_suppression()
         );
     }
     let removed_expiry: Option<DateTime<Utc>> =
-        sqlx::query_scalar("SELECT expires_at FROM polls WHERE id = $1")
+        sqlx::query_scalar("SELECT expires_at AT TIME ZONE 'UTC' FROM polls WHERE id = $1")
             .bind(POLL_BASE + 2)
             .fetch_one(&owner)
             .await?;
@@ -2484,7 +2489,7 @@ async fn poll_expiration_reconciliation_repairs_exact_generations_and_preserves_
             .await?;
     }
     let expirations = sqlx::query_as::<_, (i64, DateTime<Utc>)>(
-        "SELECT id, expires_at FROM polls WHERE id BETWEEN $1 AND $2",
+        "SELECT id, expires_at AT TIME ZONE 'UTC' FROM polls WHERE id BETWEEN $1 AND $2",
     )
     .bind(POLL_BASE - 39)
     .bind(POLL_BASE)
