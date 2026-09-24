@@ -326,6 +326,9 @@ async fn zero_progress_poll_reconciliation_retries_same_rows_until_dead_letter()
         },
     )?;
     let executor = WorkerExecutor::new(queue.clone(), handlers, 1, 1)?;
+    // Worker startup normally creates the activation marker before any executor runs;
+    // reset() truncated it, so establish it as the startup would.
+    queue.ensure_poll_expiration_activation_for_test().await?;
     let scan_seed = Utc::now();
 
     for (offset, (label, explicit_raw)) in [("optimized", false), ("raw", true)]
@@ -1642,10 +1645,10 @@ async fn remote_expiry_replacement_finalizes_due_generation_before_suppression()
     let completed_poll = POLL_BASE + 4;
     let completed_expiry = previous_expiries[4].expect("completed generation has an expiry");
     sqlx::query(
-        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload, dispatched_at) \
+        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload, created_at, dispatched_at) \
          VALUES ($1, $2, jsonb_build_object( \
              'version', 1, 'poll_id', $3::bigint, 'expires_at_micros', $4::bigint, \
-             'outcome', 'effects_enqueued'), clock_timestamp())",
+             'outcome', 'effects_enqueued'), now(), now())",
     )
     .bind(MASTODON_POLL_EXPIRATION_EFFECT_KIND)
     .bind(format!(
@@ -1668,8 +1671,8 @@ async fn remote_expiry_replacement_finalizes_due_generation_before_suppression()
     let malformed_poll = POLL_BASE + 6;
     let malformed_expiry = previous_expiries[6].expect("malformed generation has an expiry");
     sqlx::query(
-        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload, dispatched_at) \
-         VALUES ($1, $2, jsonb_build_object('version', 0), clock_timestamp())",
+        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload, created_at, dispatched_at) \
+         VALUES ($1, $2, jsonb_build_object('version', 0), now(), now())",
     )
     .bind(MASTODON_POLL_EXPIRATION_EFFECT_KIND)
     .bind(format!(
@@ -2518,10 +2521,10 @@ async fn poll_expiration_reconciliation_repairs_exact_generations_and_preserves_
             _ => "remote_past_expiry_suppressed",
         };
         sqlx::query(
-            "INSERT INTO rustodon.outbox_events (kind, logical_key, payload, dispatched_at) \
+            "INSERT INTO rustodon.outbox_events (kind, logical_key, payload, created_at, dispatched_at) \
              VALUES ($1, $2, jsonb_build_object( \
                 'version', 1, 'poll_id', $3::bigint, 'expires_at_micros', $4::bigint, \
-                'outcome', $5::text), clock_timestamp())",
+                'outcome', $5::text), now(), now())",
         )
         .bind(MASTODON_POLL_EXPIRATION_EFFECT_KIND)
         .bind(format!(
@@ -2593,10 +2596,10 @@ async fn poll_expiration_reconciliation_repairs_exact_generations_and_preserves_
     let missing_poll = POLL_BASE;
     let old_generation = generation(missing_poll) - 1;
     sqlx::query(
-        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload, dispatched_at) \
+        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload, created_at, dispatched_at) \
          VALUES ($1, $2, jsonb_build_object( \
             'version', 1, 'poll_id', $3::bigint, 'expires_at_micros', $4::bigint, \
-            'outcome', 'effects_enqueued'), clock_timestamp())",
+            'outcome', 'effects_enqueued'), now(), now())",
     )
     .bind(MASTODON_POLL_EXPIRATION_EFFECT_KIND)
     .bind(format!(
@@ -2663,8 +2666,8 @@ async fn poll_expiration_reconciliation_repairs_exact_generations_and_preserves_
 
     let completed_poll = POLL_BASE - 4;
     sqlx::query(
-        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload, dispatched_at) \
-         VALUES ($1, $2, $3, clock_timestamp())",
+        "INSERT INTO rustodon.outbox_events (kind, logical_key, payload, created_at, dispatched_at) \
+         VALUES ($1, $2, $3, now(), now())",
     )
     .bind(MASTODON_POLL_EXPIRATION_EFFECT_KIND)
     .bind(format!(
@@ -2928,7 +2931,12 @@ async fn poll_expiration_reconciliation_repairs_exact_generations_and_preserves_
     .await?;
     assert_eq!(late_after.0, late_id);
     let repaired_late = late_after.1;
-    assert!(repaired_late <= scan_started_at);
+    // The late job (scheduled a week out) is pulled forward to its poll's expiry.
+    assert_eq!(
+        repaired_late.timestamp_micros(),
+        generation(late_poll),
+        "late job run_at {repaired_late} (scan start {scan_started_at})"
+    );
     let completed_jobs: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM rustodon.durable_jobs WHERE arguments ->> 'poll_id' = $1 \
          AND dead_at IS NULL",

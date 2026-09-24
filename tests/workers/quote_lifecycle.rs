@@ -875,7 +875,19 @@ async fn quote_federation_lifecycle() -> Result<(), Box<dyn std::error::Error>> 
         .fetch_one(&owner)
         .await?;
         if scalar_result != (1, 2) {
-            return Err(format!("scalar QuoteRequest result differs: {scalar_result:?}").into());
+            let target_quotes: Vec<Value> = sqlx::query_scalar(
+                "SELECT jsonb_build_object('id', quote.id, 'state', quote.state, 'legacy', quote.legacy, \
+                        'status_uri', status.uri) \
+                   FROM quotes quote JOIN statuses status ON status.id = quote.status_id \
+                  WHERE quote.quoted_status_id = $1 ORDER BY quote.id",
+            )
+            .bind(INBOUND_ALLOW_TARGET)
+            .fetch_all(&owner)
+            .await?;
+            return Err(format!(
+                "scalar QuoteRequest result differs: {scalar_result:?}; target quotes {target_quotes:?}"
+            )
+            .into());
         }
         queue_quote_delivery(&queue, &owner, INBOUND_SCALAR_REQUEST, "accept").await?;
         if !executor
