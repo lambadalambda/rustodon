@@ -7240,8 +7240,9 @@ async fn resolve_quoted_update_activity(
     Ok(sqlx::query_as::<_, (i64, i64, NaiveDateTime)>(
         "SELECT quote.quoted_account_id, quote.account_id, status.created_at \
          FROM statuses status JOIN quotes quote ON quote.status_id = status.id \
+         JOIN statuses quoted ON quoted.id = quote.quoted_status_id AND quoted.deleted_at IS NULL \
          WHERE status.id = $1 AND status.deleted_at IS NULL \
-           AND quote.quoted_account_id IS NOT NULL AND quote.quoted_status_id IS NOT NULL",
+           AND quote.quoted_account_id IS NOT NULL",
     )
     .bind(id)
     .fetch_optional(&mut **transaction)
