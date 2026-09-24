@@ -116,3 +116,19 @@ focused runs pass everything except two tests. Fixed since the first pass:
   `accepted?`); Rustodon's insert path skips legacy quotes. Verify Mastodon's
   create/accept order for scalar QuoteRequests (differential) before changing
   either the counter or the test.
+
+## Mastodon check 2026-09-24
+
+- Quote scalar step: Mastodon 4.6.5 creates the quoteUrl-only instrument quote as
+  legacy and pending, accepts it without a counter change
+  (`Quote#update_counter_caches!` returns on `legacy?`), and the earlier revoke
+  decremented. Expected count 0; Rustodon already gives 0. Test fixed. The test now
+  stops later: "timed out waiting for quote deliveries" (fewer than the 3 expected
+  deliveries reach the mock inbox); needs partial-result diagnostics next.
+  Mastodon asymmetry to keep in mind: destroying an accepted legacy quote still
+  decrements (`decrement_counter_caches!` only checks `accepted?`).
+- Poll startup: Mastodon has no startup reconciliation for poll expirations; it
+  relies on Sidekiq scheduled jobs (`PollExpirationNotifyWorker.perform_at`), and a
+  lost job means a lost notification. Rustodon's reconciliation and its
+  claim-before-writer guard are Rustodon's own design; the test expresses that
+  design, so the decision is ours.
