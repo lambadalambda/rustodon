@@ -35,8 +35,12 @@ async fn user(
     confirmed: bool,
 ) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar(
-        "WITH account AS (INSERT INTO accounts (username, created_at, updated_at) \
-          VALUES ($1, clock_timestamp(), clock_timestamp()) RETURNING id) \
+        // Local accounts need a usable keypair, or the later worker preflight refuses startup.
+        "WITH account AS (INSERT INTO accounts \
+            (username, private_key, public_key, created_at, updated_at) \
+          SELECT $1, private_key, public_key, clock_timestamp(), clock_timestamp() \
+            FROM accounts WHERE domain IS NULL AND private_key IS NOT NULL \
+           ORDER BY id LIMIT 1 RETURNING id) \
          INSERT INTO users (account_id, email, approved, confirmed_at, created_at, updated_at) \
          SELECT id, $1 || '@activity.invalid', $2, CASE WHEN $3 THEN clock_timestamp() END, \
            clock_timestamp(), clock_timestamp() FROM account RETURNING id",
