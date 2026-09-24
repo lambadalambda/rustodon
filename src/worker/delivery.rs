@@ -425,7 +425,9 @@ pub(super) async fn quote_delivery_is_current_and_locked(
                     AND target.account_id = $5 AND source.domain IS NULL \
                     AND source.suspended_at IS NULL \
                     AND requester.domain IS NOT NULL AND requester.protocol = 1 \
-                    AND requester.suspended_at IS NULL AND $6 = $9 \
+                    AND requester.suspended_at IS NULL \
+                    AND ($9 = $10 || '/users/' || source.username \
+                         OR $9 = $10 || '/ap/users/' || source.id::text) \
                   FOR SHARE OF quote",
             )
             .bind(identity.quote_id.expect("checked above"))
