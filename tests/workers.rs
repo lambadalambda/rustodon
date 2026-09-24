@@ -12334,6 +12334,14 @@ async fn due_account_purge_retains_reported_content_and_actor_identity()
         media_root.write_file(Path::new(&path), b"account-purge-media")?;
     }
 
+    let previous_remote_inboxes: Value = sqlx::query_scalar(
+        "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                    'id', id, 'inbox_url', inbox_url, 'shared_inbox_url', shared_inbox_url)),
+                '[]')
+           FROM accounts WHERE domain IS NOT NULL AND protocol = 1",
+    )
+    .fetch_one(&writer_pool)
+    .await?;
     let operation = async {
         sqlx::query(
             r#"INSERT INTO accounts (
@@ -13071,6 +13079,16 @@ async fn due_account_purge_retains_reported_content_and_actor_identity()
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await;
+    sqlx::query(
+        "UPDATE accounts account
+            SET inbox_url = previous.inbox_url, shared_inbox_url = previous.shared_inbox_url
+           FROM jsonb_to_recordset($1)
+                AS previous(id bigint, inbox_url text, shared_inbox_url text)
+          WHERE account.id = previous.id",
+    )
+    .bind(previous_remote_inboxes)
+    .execute(&writer_pool)
+    .await?;
     sqlx::query("DELETE FROM accounts WHERE id = $1")
         .bind(ACCOUNT)
         .execute(&writer_pool)
